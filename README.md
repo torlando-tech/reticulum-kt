@@ -8,7 +8,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Core Protocol** | ~90% | Identity, Destination, Packet, Transport, Link, Channel, Resource |
+| **Core Protocol** | ~80% | Identity, Destination, Packet complete; Transport/Link/Channel partial |
 | **Interfaces** | ~15% | TCP complete; UDP, Serial, RNode, BLE not started |
 | **Utilities/CLI** | ~15% | rnsd-kt daemon implemented |
 | **Crypto** | 100% | Full BouncyCastle implementation |
@@ -20,8 +20,8 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Identity | Complete | Encryption, signing, ratchets, storage |
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK) |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2 |
-| Transport | ~95% | Routing, path tables, persistence, speed monitoring |
-| Link | ~95% | Establishment, encryption, keepalive |
+| Transport | ~60% | Core routing works; missing tunnels, packet caching, remote management |
+| Link | ~85% | Establishment, encryption, keepalive; MTU discovery partial |
 | Channel | ~80% | Core messaging; advanced flow control partial |
 | Resource | ~85% | Transfers work; pause/resume partial |
 | Buffer | Complete | Stream I/O over channels |
