@@ -224,3 +224,38 @@ data class QueuedAnnounce(
 
     override fun hashCode(): Int = destinationHash.contentHashCode()
 }
+
+/**
+ * Information about an active tunnel.
+ */
+data class TunnelInfo(
+    /** Unique tunnel ID. */
+    val tunnelId: ByteArray,
+
+    /** Interface this tunnel operates on. */
+    val interface_: InterfaceRef,
+
+    /** When this tunnel was created (epoch millis). */
+    val createdAt: Long = System.currentTimeMillis(),
+
+    /** Last activity timestamp (epoch millis). */
+    var lastActivity: Long = System.currentTimeMillis(),
+
+    /** Total bytes transmitted through this tunnel. */
+    var txBytes: Long = 0,
+
+    /** Total bytes received through this tunnel. */
+    var rxBytes: Long = 0
+) {
+    /** Check if this tunnel has expired. */
+    fun isExpired(): Boolean =
+        System.currentTimeMillis() - lastActivity > TransportConstants.TUNNEL_EXPIRY
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is TunnelInfo) return false
+        return tunnelId.contentEquals(other.tunnelId)
+    }
+
+    override fun hashCode(): Int = tunnelId.contentHashCode()
+}

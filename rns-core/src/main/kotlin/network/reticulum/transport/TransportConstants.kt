@@ -120,4 +120,52 @@ object TransportConstants {
 
     /** Traffic speed update interval in milliseconds (1 second). */
     const val SPEED_UPDATE_INTERVAL = 1000L
+
+    // ===== Announce Queue Constants =====
+
+    /** Maximum number of announces that can be queued per interface. */
+    const val MAX_QUEUED_ANNOUNCES = 16384
+
+    /** Time in milliseconds after which a queued announce is considered stale (24 hours). */
+    const val QUEUED_ANNOUNCE_LIFE = 24L * 60 * 60 * 1000
+
+    /** Default announce capacity as percentage of interface bitrate (2%). */
+    const val ANNOUNCE_CAP = 0.02
+
+    /** Target announce rate for rate limiting. */
+    const val ANNOUNCE_RATE_TARGET = 0.12
+
+    /** Grace period multiplier for announce rate limiting. */
+    const val ANNOUNCE_RATE_GRACE = 1.5
+
+    /** Penalty multiplier for exceeding announce rate. */
+    const val ANNOUNCE_RATE_PENALTY = 5.0
+
+    // ===== Path State Constants =====
+
+    /** Path state is unknown. */
+    const val PATH_STATE_UNKNOWN = 0
+
+    /** Path is unresponsive. */
+    const val PATH_STATE_UNRESPONSIVE = 1
+
+    /** Path is responsive. */
+    const val PATH_STATE_RESPONSIVE = 2
+
+    /** Path unresponsive timeout in milliseconds (15 minutes). */
+    const val PATH_UNRESPONSIVE_TIMEOUT = 15L * 60 * 1000
+
+    /** Base timeout for first hop in milliseconds (5 seconds). */
+    const val FIRST_HOP_TIMEOUT_BASE = 5000L
+
+    /** Additional timeout per hop in milliseconds (2 seconds). */
+    const val FIRST_HOP_TIMEOUT_PER_HOP = 2000L
+
+    // ===== Tunnel Constants =====
+
+    /** Tunnel expiry time (same as DESTINATION_TIMEOUT - 1 week in milliseconds). */
+    const val TUNNEL_EXPIRY = 7L * 24 * 60 * 60 * 1000
+
+    /** Maximum number of tunnels to maintain. */
+    const val MAX_TUNNELS = 10000
 }

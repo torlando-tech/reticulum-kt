@@ -124,6 +124,16 @@ object Transport {
             System.currentTimeMillis() - timestamp > TransportConstants.PACKET_CACHE_TIMEOUT
     }
 
+    /** Interface traffic statistics. */
+    data class InterfaceTrafficStats(
+        var txBytes: Long = 0,
+        var rxBytes: Long = 0,
+        var txPackets: Long = 0,
+        var rxPackets: Long = 0,
+        var announcesSent: Long = 0,
+        var lastActivity: Long = System.currentTimeMillis()
+    )
+
     /** Packet cache: packet_hash -> CachedPacket. */
     private val packetCache = ConcurrentHashMap<ByteArrayKey, CachedPacket>()
 
@@ -165,6 +175,23 @@ object Transport {
 
     /** Local client interfaces (shared instance clients). */
     private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
+
+    /** Per-interface traffic statistics. */
+    private val interfaceStats = ConcurrentHashMap<ByteArrayKey, InterfaceTrafficStats>()
+
+    /** Per-interface announce queues. */
+    private val interfaceAnnounceQueues = ConcurrentHashMap<ByteArrayKey, MutableList<QueuedAnnounce>>()
+
+    /** Per-interface announce allowed timestamps. */
+    private val interfaceAnnounceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
+
+    // ===== Tunnels =====
+
+    /** Active tunnels: tunnel_id -> TunnelInfo. */
+    private val tunnels = ConcurrentHashMap<ByteArrayKey, TunnelInfo>()
+
+    /** Tunnel interfaces: tunnel_id -> InterfaceRef. */
+    private val tunnelInterfaces = ConcurrentHashMap<ByteArrayKey, InterfaceRef>()
 
     // ===== Traffic Stats =====
 
@@ -258,6 +285,8 @@ object Transport {
         pathRequests.clear()
         discoveryPrTags.clear()
         pendingReceipts.clear()
+        tunnels.clear()
+        tunnelInterfaces.clear()
 
         // Reset speed tracking
         speedRx = 0
@@ -522,6 +551,40 @@ object Transport {
     }
 
     /**
+     * Get path state for a destination.
+     *
+     * @param destinationHash The destination to check
+     * @return Path state constant (PATH_STATE_*), or PATH_STATE_UNKNOWN if no path exists
+     */
+    fun getPathState(destinationHash: ByteArray): Int {
+        val entry = pathTable[destinationHash.toKey()] ?: return TransportConstants.PATH_STATE_UNKNOWN
+
+        return when (entry.state) {
+            PathState.ACTIVE -> TransportConstants.PATH_STATE_RESPONSIVE
+            PathState.UNRESPONSIVE, PathState.STALE -> TransportConstants.PATH_STATE_UNRESPONSIVE
+        }
+    }
+
+    /**
+     * Check if a path is expired or has been unresponsive for too long.
+     *
+     * @param destinationHash The destination to check
+     * @return true if path is unresponsive beyond timeout threshold
+     */
+    fun isPathUnresponsive(destinationHash: ByteArray): Boolean {
+        val entry = pathTable[destinationHash.toKey()] ?: return false
+
+        // Check if path is marked unresponsive
+        if (entry.state == PathState.UNRESPONSIVE || entry.state == PathState.STALE) {
+            return true
+        }
+
+        // Check if path has been inactive too long
+        val timeSinceActivity = System.currentTimeMillis() - entry.timestamp
+        return timeSinceActivity > TransportConstants.PATH_UNRESPONSIVE_TIMEOUT
+    }
+
+    /**
      * Get the interface for the next hop to a destination.
      */
     fun nextHopInterface(destinationHash: ByteArray): InterfaceRef? {
@@ -534,6 +597,9 @@ object Transport {
 
     /**
      * Get the bitrate of the next-hop interface.
+     *
+     * @param destinationHash The destination to check
+     * @return Bitrate in bits per second, or null if unknown
      */
     fun nextHopInterfaceBitrate(destinationHash: ByteArray): Int? {
         val iface = nextHopInterface(destinationHash) ?: return null
@@ -542,6 +608,9 @@ object Transport {
 
     /**
      * Get the hardware MTU of the next-hop interface.
+     *
+     * @param destinationHash The destination to check
+     * @return Hardware MTU in bytes, or null if unknown
      */
     fun nextHopInterfaceHwMtu(destinationHash: ByteArray): Int? {
         val iface = nextHopInterface(destinationHash) ?: return null
@@ -550,6 +619,9 @@ object Transport {
 
     /**
      * Calculate per-bit latency for next hop (seconds).
+     *
+     * @param destinationHash The destination to check
+     * @return Latency per bit in seconds, or null if bitrate unknown
      */
     fun nextHopPerBitLatency(destinationHash: ByteArray): Double? {
         val bitrate = nextHopInterfaceBitrate(destinationHash) ?: return null
@@ -559,6 +631,9 @@ object Transport {
 
     /**
      * Calculate per-byte latency for next hop (seconds).
+     *
+     * @param destinationHash The destination to check
+     * @return Latency per byte in seconds, or null if bitrate unknown
      */
     fun nextHopPerByteLatency(destinationHash: ByteArray): Double? {
         val perBit = nextHopPerBitLatency(destinationHash) ?: return null
@@ -567,20 +642,36 @@ object Transport {
 
     /**
      * Calculate first hop timeout based on MTU and bitrate.
+     * Matches Python RNS implementation: MTU * per_byte_latency + DEFAULT_PER_HOP_TIMEOUT.
+     *
+     * @param destinationHash The destination to check
+     * @return Timeout in milliseconds
      */
     fun firstHopTimeout(destinationHash: ByteArray): Long {
         val perByteLatency = nextHopPerByteLatency(destinationHash)
-        val mtu = nextHopInterfaceHwMtu(destinationHash) ?: RnsConstants.MTU
-
         return if (perByteLatency != null) {
-            val transmitTime = (mtu * perByteLatency * 1000).toLong()
-            maxOf(
-                transmitTime + TransportConstants.DEFAULT_PER_HOP_TIMEOUT,
-                TransportConstants.MIN_FIRST_HOP_TIMEOUT
-            )
+            val transmitTime = (RnsConstants.MTU * perByteLatency * 1000).toLong()
+            transmitTime + TransportConstants.DEFAULT_PER_HOP_TIMEOUT
         } else {
             TransportConstants.DEFAULT_PER_HOP_TIMEOUT
         }
+    }
+
+    /**
+     * Calculate extra timeout for link proofs based on interface characteristics.
+     *
+     * @param interfaceRef The interface to calculate timeout for
+     * @return Extra timeout in milliseconds
+     */
+    fun extraLinkProofTimeout(interfaceRef: InterfaceRef?): Long {
+        if (interfaceRef == null) return 0L
+        val bitrate = interfaceRef.bitrate
+        if (bitrate <= 0) return 0L
+
+        // Calculate time to transmit MTU bytes: (1/bitrate) * 8 * MTU
+        val perBitLatency = 1.0 / bitrate
+        val timeSeconds = perBitLatency * 8 * RnsConstants.MTU
+        return (timeSeconds * 1000).toLong()
     }
 
     // ===== Announce Queue Management =====
@@ -592,7 +683,160 @@ object Transport {
         queuedAnnounces.clear()
         announceRateTable.clear()
         announceAllowedAt.clear()
+        interfaceAnnounceQueues.clear()
+        interfaceAnnounceAllowedAt.clear()
         log("Dropped all announce queues")
+    }
+
+    /**
+     * Queue an announce for transmission on a specific interface.
+     *
+     * @param destinationHash The destination being announced
+     * @param raw The raw announce packet
+     * @param interfaceRef The interface to queue the announce on
+     * @param hops Current hop count
+     * @param emitted When the announce was originally emitted
+     * @return true if queued successfully, false if queue is full
+     */
+    fun queueAnnounce(
+        destinationHash: ByteArray,
+        raw: ByteArray,
+        interfaceRef: InterfaceRef,
+        hops: Int,
+        emitted: Long
+    ): Boolean {
+        val ifaceKey = interfaceRef.hash.toKey()
+        val queue = interfaceAnnounceQueues.getOrPut(ifaceKey) { mutableListOf() }
+
+        // Check queue size limit
+        if (queue.size >= TransportConstants.MAX_QUEUED_ANNOUNCES) {
+            log("Announce queue full on ${interfaceRef.name}, dropping announce")
+            return false
+        }
+
+        // Check if already queued
+        val existing = queue.find { it.destinationHash.contentEquals(destinationHash) }
+
+        if (existing != null) {
+            // Update if this is newer
+            if (emitted > existing.emitted) {
+                queue.remove(existing)
+            } else {
+                // Already queued with same or newer announce
+                return false
+            }
+        }
+
+        // Calculate queue time
+        val now = System.currentTimeMillis()
+        val graceMs = TransportConstants.PATH_REQUEST_GRACE
+        val randomMs = (Math.random() * TransportConstants.PATHFINDER_RW * 1000).toLong()
+        val queueTime = now + graceMs + randomMs
+
+        // Create queued announce
+        val queued = QueuedAnnounce(
+            destinationHash = destinationHash.copyOf(),
+            time = queueTime,
+            hops = hops,
+            emitted = emitted,
+            raw = raw.copyOf()
+        )
+
+        queue.add(queued)
+
+        // Schedule processing if this is the first item
+        if (queue.size == 1) {
+            scheduleAnnounceQueueProcessing(interfaceRef)
+        }
+
+        log("Queued announce for ${destinationHash.toHexString()} on ${interfaceRef.name} (queue size: ${queue.size})")
+        return true
+    }
+
+    /**
+     * Schedule processing of the announce queue for an interface.
+     */
+    private fun scheduleAnnounceQueueProcessing(interfaceRef: InterfaceRef) {
+        val ifaceKey = interfaceRef.hash.toKey()
+        val allowedAt = interfaceAnnounceAllowedAt[ifaceKey] ?: 0L
+        val now = System.currentTimeMillis()
+        val waitTime = maxOf(allowedAt - now, 0L)
+
+        thread(name = "AnnounceQueue-${interfaceRef.name}", isDaemon = true) {
+            Thread.sleep(waitTime)
+            processAnnounceQueue(interfaceRef)
+        }
+    }
+
+    /**
+     * Process queued announces for a specific interface.
+     *
+     * Removes stale announces, selects the best announce to send based on hop count,
+     * and respects bandwidth limits.
+     */
+    fun processAnnounceQueue(interfaceRef: InterfaceRef) {
+        val ifaceKey = interfaceRef.hash.toKey()
+        val queue = interfaceAnnounceQueues[ifaceKey] ?: return
+
+        synchronized(queue) {
+            try {
+                val now = System.currentTimeMillis()
+
+                // Remove stale announces
+                queue.removeAll { now > it.time + TransportConstants.QUEUED_ANNOUNCE_LIFE }
+
+                if (queue.isEmpty()) {
+                    return
+                }
+
+                // Select announce with minimum hops
+                val minHops = queue.minOf { it.hops }
+                val candidates = queue.filter { it.hops == minHops }
+
+                // Sort by time and select earliest
+                val selected = candidates.minByOrNull { it.time } ?: return
+
+                // Calculate transmission time and wait time based on bitrate
+                val bitrate = interfaceRef.bitrate
+                val announceCap = TransportConstants.ANNOUNCE_CAP
+
+                val txTime = if (bitrate > 0) {
+                    (selected.raw.size * 8.0) / bitrate
+                } else {
+                    0.0
+                }
+
+                val waitTime = if (announceCap > 0) {
+                    (txTime / announceCap * 1000).toLong()
+                } else {
+                    0L
+                }
+
+                // Update allowed timestamp
+                interfaceAnnounceAllowedAt[ifaceKey] = now + waitTime
+
+                // Transmit the announce
+                try {
+                    interfaceRef.send(selected.raw)
+                    recordTxBytes(interfaceRef, selected.raw.size)
+                    recordAnnounceSent(interfaceRef)
+                    log("Sent queued announce for ${selected.destinationHash.toHexString()} on ${interfaceRef.name}")
+                } catch (e: Exception) {
+                    log("Failed to send queued announce on ${interfaceRef.name}: ${e.message}")
+                }
+
+                // Remove from queue
+                queue.remove(selected)
+
+                // Schedule next processing if queue not empty
+                if (queue.isNotEmpty()) {
+                    scheduleAnnounceQueueProcessing(interfaceRef)
+                }
+            } catch (e: Exception) {
+                log("Error processing announce queue on ${interfaceRef.name}: ${e.message}")
+                queue.clear()
+            }
+        }
     }
 
     /**
@@ -635,6 +879,85 @@ object Transport {
      * Get count of held announces.
      */
     fun heldAnnounceCount(): Int = heldAnnounces.size
+
+    // ===== Traffic Statistics =====
+
+    /**
+     * Record transmitted bytes for an interface.
+     *
+     * @param interfaceRef The interface that transmitted data
+     * @param bytes Number of bytes transmitted
+     */
+    fun recordTxBytes(interfaceRef: InterfaceRef, bytes: Int) {
+        val stats = interfaceStats.getOrPut(interfaceRef.hash.toKey()) { InterfaceTrafficStats() }
+        stats.txBytes += bytes
+        stats.txPackets++
+        stats.lastActivity = System.currentTimeMillis()
+    }
+
+    /**
+     * Record received bytes for an interface.
+     *
+     * @param interfaceRef The interface that received data
+     * @param bytes Number of bytes received
+     */
+    fun recordRxBytes(interfaceRef: InterfaceRef, bytes: Int) {
+        val stats = interfaceStats.getOrPut(interfaceRef.hash.toKey()) { InterfaceTrafficStats() }
+        stats.rxBytes += bytes
+        stats.rxPackets++
+        stats.lastActivity = System.currentTimeMillis()
+    }
+
+    /**
+     * Record that an announce was sent on an interface.
+     *
+     * @param interfaceRef The interface that sent the announce
+     */
+    fun recordAnnounceSent(interfaceRef: InterfaceRef) {
+        val stats = interfaceStats.getOrPut(interfaceRef.hash.toKey()) { InterfaceTrafficStats() }
+        stats.announcesSent++
+    }
+
+    /**
+     * Get traffic statistics for an interface.
+     *
+     * @param interfaceRef The interface to get stats for
+     * @return Traffic stats or null if no data recorded
+     */
+    fun getInterfaceStats(interfaceRef: InterfaceRef): InterfaceTrafficStats? {
+        return interfaceStats[interfaceRef.hash.toKey()]
+    }
+
+    /**
+     * Get all interfaces prioritized by capacity and current load.
+     * Higher capacity and lower recent traffic = higher priority.
+     *
+     * @return List of interfaces sorted by priority (highest first)
+     */
+    fun prioritizeInterfaces(): List<InterfaceRef> {
+        return interfaces.sortedByDescending { interfaceRef ->
+            val stats = interfaceStats[interfaceRef.hash.toKey()]
+            val bitrate = interfaceRef.bitrate.toLong()
+            val recentTx = stats?.txBytes ?: 0L
+
+            // Higher bitrate and lower recent tx = higher priority
+            if (bitrate > 0) {
+                bitrate.toDouble() / (recentTx + 1)
+            } else {
+                // Interfaces without bitrate info get lower priority
+                1.0 / (recentTx + 1)
+            }
+        }
+    }
+
+    /**
+     * Get active interfaces (online and can send).
+     *
+     * @return List of active interfaces
+     */
+    fun getActiveInterfaces(): List<InterfaceRef> {
+        return interfaces.filter { it.online && it.canSend }
+    }
 
     // ===== Local Client Support =====
 
@@ -843,7 +1166,7 @@ object Transport {
      * Determine if a packet should be cached.
      * Currently returns false (caching disabled by default, matching Python RNS).
      */
-    fun shouldCache(packet: Packet): Boolean {
+    fun shouldCache(@Suppress("UNUSED_PARAMETER") packet: Packet): Boolean {
         // TODO: Implement caching policy (e.g., for Resource proofs)
         // Currently disabled to match Python RNS behavior
         return false
@@ -1281,6 +1604,7 @@ object Transport {
         }
 
         trafficRxBytes += raw.size
+        recordRxBytes(interfaceRef, raw.size)
 
         // Route based on packet type
         when (packet.packetType) {
@@ -1369,6 +1693,7 @@ object Transport {
             }
             interfaceRef.send(transmitData)
             trafficTxBytes += transmitData.size
+            recordTxBytes(interfaceRef, transmitData.size)
         } catch (e: Exception) {
             log("Transmit error on ${interfaceRef.name}: ${e.message}")
         }
@@ -1519,37 +1844,32 @@ object Transport {
 
         rateTimestamps.add(now)
 
-        // Calculate random delay for retransmission
-        val graceMs = TransportConstants.PATH_REQUEST_GRACE
-        val randomMs = (Math.random() * TransportConstants.PATHFINDER_RW * 1000).toLong()
-        val retransmitTime = now + graceMs + randomMs
-
-        // Create queued announce
-        val queuedAnnounce = QueuedAnnounce(
-            destinationHash = destinationHash.copyOf(),
-            time = retransmitTime,
-            hops = packet.hops,
-            emitted = now,
-            raw = packet.raw ?: packet.pack()
-        )
-
         // Store in announce table for potential path request responses
         val announceEntry = AnnounceEntry(
             destinationHash = destinationHash.copyOf(),
             timestamp = now,
             retransmits = 0,
-            retransmitTimeout = retransmitTime,
-            raw = queuedAnnounce.raw,
+            retransmitTimeout = now,
+            raw = packet.raw ?: packet.pack(),
             hops = packet.hops,
             receivingInterfaceHash = receivingInterface.hash,
             localRebroadcasts = 0
         )
         announceTable[destKey] = announceEntry
 
-        // Add to retransmit queue
-        queuedAnnounces.add(queuedAnnounce)
-
-        log("Queued announce for ${destinationHash.toHexString()} (retransmit in ${retransmitTime - now}ms)")
+        // Queue on all interfaces except the receiving one
+        for (iface in interfaces) {
+            if (iface.canSend && iface.online &&
+                !iface.hash.contentEquals(receivingInterface.hash)) {
+                queueAnnounce(
+                    destinationHash = destinationHash,
+                    raw = announceEntry.raw,
+                    interfaceRef = iface,
+                    hops = packet.hops,
+                    emitted = now
+                )
+            }
+        }
     }
 
     private fun processData(packet: Packet, interfaceRef: InterfaceRef) {
@@ -1932,57 +2252,13 @@ object Transport {
 
     /**
      * Process queued announces that are ready for retransmission.
+     * This is now handled per-interface, but we keep this for backwards compatibility
+     * with the old global queue (queuedAnnounces).
      */
-    private fun processQueuedAnnounces(now: Long) {
-        val toRemove = mutableListOf<QueuedAnnounce>()
-
-        for (queued in queuedAnnounces) {
-            if (now >= queued.time) {
-                retransmitAnnounce(queued)
-                toRemove.add(queued)
-            }
-        }
-
-        queuedAnnounces.removeAll(toRemove)
-    }
-
-    /**
-     * Retransmit a queued announce on all interfaces.
-     */
-    private fun retransmitAnnounce(queued: QueuedAnnounce) {
-        val destKey = queued.destinationHash.toKey()
-        val announceEntry = announceTable[destKey] ?: return
-
-        // Check if we've exceeded max local rebroadcasts
-        if (announceEntry.localRebroadcasts >= TransportConstants.LOCAL_REBROADCASTS_MAX) {
-            log("Max rebroadcasts reached for ${queued.destinationHash.toHexString()}")
-            return
-        }
-
-        // Increment hop count in the raw packet
-        val rawCopy = queued.raw.copyOf()
-        rawCopy[1] = ((rawCopy[1].toInt() and 0xFF) + 1).toByte()
-
-        // Transmit on all interfaces except the receiving one
-        var transmitted = false
-        for (iface in interfaces) {
-            if (iface.canSend && iface.online &&
-                !iface.hash.contentEquals(announceEntry.receivingInterfaceHash)) {
-                try {
-                    iface.send(rawCopy)
-                    trafficTxBytes += rawCopy.size
-                    transmitted = true
-                } catch (e: Exception) {
-                    log("Announce retransmit error on ${iface.name}: ${e.message}")
-                }
-            }
-        }
-
-        if (transmitted) {
-            announceEntry.retransmits++
-            announceEntry.localRebroadcasts++
-            log("Retransmitted announce for ${queued.destinationHash.toHexString()} (rebroadcast ${announceEntry.localRebroadcasts})")
-        }
+    private fun processQueuedAnnounces(@Suppress("UNUSED_PARAMETER") now: Long) {
+        // The old global queue is no longer used - announces are now queued per-interface
+        // and processed asynchronously via scheduleAnnounceQueueProcessing()
+        // This method is kept empty for compatibility with the job loop
     }
 
     private fun cullTables() {
@@ -1991,6 +2267,183 @@ object Transport {
 
         // Remove expired reverse entries
         reverseTable.entries.removeIf { it.value.isExpired() }
+
+        // Remove expired tunnels
+        cleanExpiredTunnels()
+    }
+
+    // ===== Tunnel Management =====
+
+    /**
+     * Synthesize a virtual tunnel through an interface.
+     * Used for creating persistent paths through the network.
+     *
+     * @param interface_ The interface to create the tunnel on
+     * @return Tunnel ID, or null if maximum tunnels reached
+     */
+    fun synthesizeTunnel(interface_: InterfaceRef): ByteArray? {
+        if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+            cleanExpiredTunnels()
+            if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+                log("Maximum tunnels reached, cannot create new tunnel")
+                return null
+            }
+        }
+
+        // Generate unique tunnel ID
+        val tunnelId = Hashes.getRandomHash()
+        val key = ByteArrayKey(tunnelId)
+
+        // Create tunnel info
+        val tunnel = TunnelInfo(
+            tunnelId = tunnelId,
+            interface_ = interface_
+        )
+
+        tunnels[key] = tunnel
+        tunnelInterfaces[key] = interface_
+
+        log("Synthesized tunnel ${tunnelId.toHexString()} on ${interface_.name}")
+
+        return tunnelId
+    }
+
+    /**
+     * Handle incoming tunnel synthesis requests.
+     *
+     * @param data Packet data containing tunnel synthesis information
+     * @param packet The packet containing the request
+     * @param receivingInterface The interface that received the packet
+     * @return true if tunnel was created successfully
+     */
+    fun tunnelSynthesizeHandler(data: ByteArray, @Suppress("UNUSED_PARAMETER") packet: Packet, receivingInterface: InterfaceRef): Boolean {
+        if (data.size < RnsConstants.TRUNCATED_HASH_BYTES) {
+            log("Invalid tunnel synthesis request: data too short")
+            return false
+        }
+
+        val tunnelId = data.copyOf(RnsConstants.TRUNCATED_HASH_BYTES)
+        val interface_ = receivingInterface
+
+        // Create tunnel for this request
+        val key = ByteArrayKey(tunnelId)
+
+        if (tunnels.containsKey(key)) {
+            // Tunnel already exists, update activity
+            tunnels[key]?.lastActivity = System.currentTimeMillis()
+            return true
+        }
+
+        if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+            cleanExpiredTunnels()
+            if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+                log("Cannot create tunnel, max tunnels reached")
+                return false
+            }
+        }
+
+        val tunnel = TunnelInfo(
+            tunnelId = tunnelId,
+            interface_ = interface_
+        )
+
+        tunnels[key] = tunnel
+        tunnelInterfaces[key] = interface_
+
+        log("Created tunnel ${tunnelId.toHexString()} from synthesis request")
+
+        return true
+    }
+
+    /**
+     * Remove a tunnel and its associated interface.
+     *
+     * @param tunnelId The tunnel ID to void
+     * @return true if tunnel was removed
+     */
+    fun voidTunnelInterface(tunnelId: ByteArray): Boolean {
+        val key = ByteArrayKey(tunnelId)
+
+        val removed = tunnels.remove(key)
+        tunnelInterfaces.remove(key)
+
+        if (removed != null) {
+            log("Voided tunnel ${tunnelId.toHexString()}")
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Handle packet routing through a tunnel.
+     *
+     * @param tunnelId The tunnel to route through
+     * @param packet The packet data to transmit
+     * @return true if transmitted successfully
+     */
+    fun handleTunnel(tunnelId: ByteArray, packet: ByteArray): Boolean {
+        val key = ByteArrayKey(tunnelId)
+        val tunnel = tunnels[key] ?: return false
+
+        // Update tunnel activity
+        tunnel.lastActivity = System.currentTimeMillis()
+        tunnel.rxBytes += packet.size
+
+        // Get the interface for this tunnel
+        val interface_ = tunnelInterfaces[key] ?: return false
+
+        // Transmit through tunnel interface
+        return try {
+            transmit(interface_, packet)
+            tunnel.txBytes += packet.size
+            true
+        } catch (e: Exception) {
+            log("Failed to transmit through tunnel: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Get tunnel info by ID.
+     *
+     * @param tunnelId The tunnel ID
+     * @return TunnelInfo or null if not found
+     */
+    fun getTunnel(tunnelId: ByteArray): TunnelInfo? {
+        return tunnels[ByteArrayKey(tunnelId)]
+    }
+
+    /**
+     * Check if a tunnel exists.
+     *
+     * @param tunnelId The tunnel ID to check
+     * @return true if tunnel exists
+     */
+    fun hasTunnel(tunnelId: ByteArray): Boolean {
+        return tunnels.containsKey(ByteArrayKey(tunnelId))
+    }
+
+    /**
+     * Get interface for a tunnel.
+     *
+     * @param tunnelId The tunnel ID
+     * @return InterfaceRef or null if not found
+     */
+    fun getTunnelInterface(tunnelId: ByteArray): InterfaceRef? {
+        return tunnelInterfaces[ByteArrayKey(tunnelId)]
+    }
+
+    /**
+     * Remove expired tunnels.
+     */
+    fun cleanExpiredTunnels() {
+        val expired = tunnels.filter { it.value.isExpired() }
+        for ((key, tunnel) in expired) {
+            tunnels.remove(key)
+            tunnelInterfaces.remove(key)
+            log("Cleaned expired tunnel ${tunnel.tunnelId.toHexString()}")
+        }
     }
 
     // ===== Helpers =====
