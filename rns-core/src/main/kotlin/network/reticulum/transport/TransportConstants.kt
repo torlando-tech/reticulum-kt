@@ -98,6 +98,9 @@ object TransportConstants {
     /** Cache clean interval in milliseconds. */
     const val CACHE_CLEAN_INTERVAL = 300_000L
 
+    /** Packet cache timeout in milliseconds (1 hour). */
+    const val PACKET_CACHE_TIMEOUT = 60L * 60 * 1000
+
     /** Interface jobs interval in milliseconds. */
     const val INTERFACE_JOBS_INTERVAL = 5000L
 

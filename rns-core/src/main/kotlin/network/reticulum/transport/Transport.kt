@@ -10,7 +10,9 @@ import network.reticulum.common.RnsConstants
 import network.reticulum.common.TransportType
 import network.reticulum.common.concatBytes
 import network.reticulum.common.toHexString
+import network.reticulum.crypto.CryptoProvider
 import network.reticulum.crypto.Hashes
+import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
@@ -83,6 +85,9 @@ object Transport {
     /** Whether transport has been started. */
     private val started = AtomicBoolean(false)
 
+    /** Crypto provider for IFAC operations. */
+    private val crypto: CryptoProvider by lazy { defaultCryptoProvider() }
+
     /** Lock for job execution. */
     private val jobsLock = ReentrantLock()
 
@@ -106,6 +111,24 @@ object Transport {
     /** Packet hash list for duplicate detection. */
     private val packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
     private val packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
+
+    // ===== Packet Cache =====
+
+    /** Cached packet data class. */
+    data class CachedPacket(
+        val raw: ByteArray,
+        val timestamp: Long,
+        val receivingInterfaceHash: ByteArray?
+    ) {
+        fun isExpired(): Boolean =
+            System.currentTimeMillis() - timestamp > TransportConstants.PACKET_CACHE_TIMEOUT
+    }
+
+    /** Packet cache: packet_hash -> CachedPacket. */
+    private val packetCache = ConcurrentHashMap<ByteArrayKey, CachedPacket>()
+
+    /** Last time cache was cleaned. */
+    private var cacheLastCleaned: Long = 0
 
     // ===== Registered Objects =====
 
@@ -806,6 +829,94 @@ object Transport {
         loadPacketHashlist(java.io.File(directory, "packet_hashlist.txt"))
     }
 
+    // ===== Packet Caching =====
+
+    /**
+     * Determine if a packet should be cached.
+     * Currently returns false (caching disabled by default, matching Python RNS).
+     */
+    fun shouldCache(packet: Packet): Boolean {
+        // TODO: Implement caching policy (e.g., for Resource proofs)
+        // Currently disabled to match Python RNS behavior
+        return false
+    }
+
+    /**
+     * Cache a packet for later retrieval.
+     *
+     * @param packet The packet to cache
+     * @param forceCache Force caching even if shouldCache returns false
+     * @param receivingInterface The interface that received the packet
+     */
+    fun cache(packet: Packet, forceCache: Boolean = false, receivingInterface: InterfaceRef? = null) {
+        if (!forceCache && !shouldCache(packet)) return
+
+        val raw = packet.raw ?: return
+        val hash = packet.packetHash
+
+        packetCache[hash.toKey()] = CachedPacket(
+            raw = raw.copyOf(),
+            timestamp = System.currentTimeMillis(),
+            receivingInterfaceHash = receivingInterface?.hash
+        )
+    }
+
+    /**
+     * Retrieve a cached packet by hash.
+     *
+     * @param packetHash The packet hash to look up
+     * @return The cached packet or null if not found/expired
+     */
+    fun getCachedPacket(packetHash: ByteArray): CachedPacket? {
+        val cached = packetCache[packetHash.toKey()] ?: return null
+
+        if (cached.isExpired()) {
+            packetCache.remove(packetHash.toKey())
+            return null
+        }
+
+        return cached
+    }
+
+    /**
+     * Handle a cache request by re-injecting a cached packet.
+     *
+     * @param packetHash The requested packet hash
+     * @param requestingInterface The interface requesting the packet
+     * @return True if packet was found and re-injected
+     */
+    fun cacheRequest(packetHash: ByteArray, requestingInterface: InterfaceRef): Boolean {
+        val cached = getCachedPacket(packetHash) ?: return false
+
+        // Re-inject the cached packet
+        inbound(cached.raw, requestingInterface)
+        return true
+    }
+
+    /**
+     * Clean expired packets from the cache.
+     */
+    fun cleanCache() {
+        val now = System.currentTimeMillis()
+        if (now - cacheLastCleaned < TransportConstants.CACHE_CLEAN_INTERVAL) return
+
+        var removed = 0
+        val iterator = packetCache.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.isExpired()) {
+                iterator.remove()
+                removed++
+            }
+        }
+
+        if (removed > 0) {
+            log("Cleaned $removed expired packets from cache")
+        }
+
+        cacheLastCleaned = now
+    }
+
     /**
      * Graceful shutdown - persist data before stopping.
      *
@@ -1042,13 +1153,95 @@ object Transport {
             return
         }
 
+        // Handle IFAC unmasking if interface has IFAC enabled
+        val processedRaw = if (interfaceRef.ifacIdentity != null && interfaceRef.ifacSize > 0) {
+            val unmasked = removeIfacMasking(raw, interfaceRef)
+            if (unmasked == null) {
+                // IFAC authentication failed, drop packet silently
+                return
+            }
+            unmasked
+        } else {
+            // No IFAC on interface - check if packet has IFAC flag set (shouldn't)
+            if (raw[0].toInt() and 0x80 == 0x80) {
+                // Drop packets with IFAC flag on non-IFAC interface
+                return
+            }
+            raw
+        }
+
         jobsLock.withLock {
             try {
-                processInbound(raw, interfaceRef)
+                processInbound(processedRaw, interfaceRef)
             } catch (e: Exception) {
                 log("Error processing inbound packet: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Remove IFAC (Interface Access Code) masking from a packet.
+     * Returns null if authentication fails.
+     */
+    private fun removeIfacMasking(raw: ByteArray, interfaceRef: InterfaceRef): ByteArray? {
+        val ifacIdentity = interfaceRef.ifacIdentity ?: return raw
+        val ifacKey = interfaceRef.ifacKey ?: return raw
+        val ifacSize = interfaceRef.ifacSize
+        if (ifacSize <= 0) return raw
+
+        // Check if IFAC flag is set
+        if (raw[0].toInt() and 0x80 != 0x80) {
+            // IFAC flag not set but should be - drop packet
+            return null
+        }
+
+        // Check packet length
+        if (raw.size <= 2 + ifacSize) {
+            return null
+        }
+
+        // Extract IFAC from bytes 2 to 2+ifacSize
+        val ifac = raw.copyOfRange(2, 2 + ifacSize)
+
+        // Generate mask using HKDF
+        val mask = crypto.hkdf(
+            length = raw.size,
+            ikm = ifac,
+            salt = ifacKey,
+            info = null
+        )
+
+        // Unmask the payload
+        val unmaskedRaw = ByteArray(raw.size)
+        for (i in raw.indices) {
+            unmaskedRaw[i] = if (i <= 1 || i > ifacSize + 1) {
+                // Unmask header bytes and payload (after IFAC)
+                (raw[i].toInt() xor mask[i].toInt()).toByte()
+            } else {
+                // Don't unmask IFAC itself
+                raw[i]
+            }
+        }
+
+        // Clear IFAC flag
+        val newHeader = byteArrayOf(
+            (unmaskedRaw[0].toInt() and 0x7F).toByte(),
+            unmaskedRaw[1]
+        )
+
+        // Re-assemble packet without IFAC
+        val newRaw = newHeader + unmaskedRaw.copyOfRange(2 + ifacSize, unmaskedRaw.size)
+
+        // Calculate expected IFAC
+        val signature = ifacIdentity.sign(newRaw)
+        val expectedIfac = signature.copyOfRange(signature.size - ifacSize, signature.size)
+
+        // Verify authentication
+        if (!ifac.contentEquals(expectedIfac)) {
+            return null
+        }
+
+        return newRaw
     }
 
     private fun processInbound(raw: ByteArray, interfaceRef: InterfaceRef) {
@@ -1157,14 +1350,73 @@ object Transport {
 
     /**
      * Transmit raw data on an interface.
+     * Applies IFAC masking if the interface has IFAC enabled.
      */
     private fun transmit(interfaceRef: InterfaceRef, data: ByteArray) {
         try {
-            interfaceRef.send(data)
-            trafficTxBytes += data.size
+            val transmitData = if (interfaceRef.ifacIdentity != null && interfaceRef.ifacSize > 0) {
+                applyIfacMasking(data, interfaceRef)
+            } else {
+                data
+            }
+            interfaceRef.send(transmitData)
+            trafficTxBytes += transmitData.size
         } catch (e: Exception) {
             log("Transmit error on ${interfaceRef.name}: ${e.message}")
         }
+    }
+
+    /**
+     * Apply IFAC (Interface Access Code) masking to a packet.
+     * This authenticates the packet for the specific interface.
+     */
+    private fun applyIfacMasking(raw: ByteArray, interfaceRef: InterfaceRef): ByteArray {
+        val ifacIdentity = interfaceRef.ifacIdentity ?: return raw
+        val ifacKey = interfaceRef.ifacKey ?: return raw
+        val ifacSize = interfaceRef.ifacSize
+        if (ifacSize <= 0) return raw
+
+        // Calculate packet access code by signing and taking last ifacSize bytes
+        val signature = ifacIdentity.sign(raw)
+        val ifac = signature.copyOfRange(signature.size - ifacSize, signature.size)
+
+        // Generate mask using HKDF
+        val mask = crypto.hkdf(
+            length = raw.size + ifacSize,
+            ikm = ifac,
+            salt = ifacKey,
+            info = null
+        )
+
+        // Set IFAC flag in header (bit 7)
+        val newHeader = byteArrayOf(
+            (raw[0].toInt() or 0x80).toByte(),
+            raw[1]
+        )
+
+        // Assemble new payload: header + ifac + rest of packet
+        val newRaw = newHeader + ifac + raw.copyOfRange(2, raw.size)
+
+        // Mask the payload
+        val maskedRaw = ByteArray(newRaw.size)
+        for (i in newRaw.indices) {
+            maskedRaw[i] = when {
+                i == 0 -> {
+                    // Mask first header byte but keep IFAC flag set
+                    ((newRaw[i].toInt() xor mask[i].toInt()) or 0x80).toByte()
+                }
+                i == 1 || i > ifacSize + 1 -> {
+                    // Mask second header byte and payload (after IFAC)
+                    (newRaw[i].toInt() xor mask[i].toInt()).toByte()
+                }
+                else -> {
+                    // Don't mask the IFAC itself
+                    newRaw[i]
+                }
+            }
+        }
+
+        return maskedRaw
     }
 
     /**
@@ -1765,6 +2017,19 @@ interface InterfaceRef {
     /** Hardware MTU in bytes. */
     val hwMtu: Int
         get() = RnsConstants.MTU
+
+    // IFAC (Interface Access Code) properties
+    /** IFAC size in bytes. 0 means IFAC is disabled. */
+    val ifacSize: Int
+        get() = 0
+
+    /** IFAC key derived from network name/key. */
+    val ifacKey: ByteArray?
+        get() = null
+
+    /** IFAC identity for signing packets. */
+    val ifacIdentity: network.reticulum.identity.Identity?
+        get() = null
 
     fun send(data: ByteArray)
 }
