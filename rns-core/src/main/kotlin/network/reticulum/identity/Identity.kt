@@ -40,6 +40,22 @@ class Identity private constructor(
      */
     val hasPrivateKey: Boolean = x25519Private != null && ed25519Private != null
 
+    /**
+     * The Ed25519 signing public key (32 bytes).
+     */
+    val sigPub: ByteArray
+        get() = ed25519Public.copyOf()
+
+    /**
+     * The Ed25519 signing private key (32 bytes).
+     * @throws IllegalStateException if this identity doesn't have a private key
+     */
+    val sigPrv: ByteArray
+        get() {
+            check(hasPrivateKey) { "Identity does not hold a private key" }
+            return ed25519Private!!.copyOf()
+        }
+
     companion object {
         /**
          * Create a new identity with randomly generated keys.

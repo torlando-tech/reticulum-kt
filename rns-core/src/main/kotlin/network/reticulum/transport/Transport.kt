@@ -114,6 +114,10 @@ object Transport {
     /** Queued announces waiting for retransmission. */
     private val queuedAnnounces = CopyOnWriteArrayList<QueuedAnnounce>()
 
+    /** Registered links: link_id -> Link. */
+    private val pendingLinks = ConcurrentHashMap<ByteArrayKey, Any>()
+    private val activeLinks = ConcurrentHashMap<ByteArrayKey, Any>()
+
     // ===== Traffic Stats =====
 
     var trafficRxBytes: Long = 0
@@ -253,6 +257,67 @@ object Transport {
      */
     fun deregisterAnnounceHandler(handler: AnnounceHandler) {
         announceHandlers.remove(handler)
+    }
+
+    // ===== Link Management =====
+
+    /**
+     * Register a link (pending or active).
+     */
+    fun registerLink(link: Any) {
+        // Use Any type to avoid circular dependency with Link class
+        // The link provides its hash via reflection or interface
+        val linkId = getLinkId(link) ?: return
+        pendingLinks[linkId.toKey()] = link
+        log("Registered pending link: ${linkId.toHexString()}")
+    }
+
+    /**
+     * Activate a link (move from pending to active).
+     */
+    fun activateLink(link: Any) {
+        val linkId = getLinkId(link) ?: return
+        val key = linkId.toKey()
+        pendingLinks.remove(key)
+        activeLinks[key] = link
+        log("Activated link: ${linkId.toHexString()}")
+    }
+
+    /**
+     * Deregister a link.
+     */
+    fun deregisterLink(link: Any) {
+        val linkId = getLinkId(link) ?: return
+        val key = linkId.toKey()
+        pendingLinks.remove(key)
+        activeLinks.remove(key)
+        log("Deregistered link: ${linkId.toHexString()}")
+    }
+
+    /**
+     * Find a link by ID.
+     */
+    fun findLink(linkId: ByteArray): Any? {
+        val key = linkId.toKey()
+        return activeLinks[key] ?: pendingLinks[key]
+    }
+
+    /**
+     * Get link ID from a link object using reflection.
+     */
+    private fun getLinkId(link: Any): ByteArray? {
+        return try {
+            val prop = link::class.java.getDeclaredMethod("getLinkId")
+            prop.invoke(link) as? ByteArray
+        } catch (e: Exception) {
+            try {
+                val field = link::class.java.getDeclaredField("linkId")
+                field.isAccessible = true
+                field.get(link) as? ByteArray
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 
     // ===== Path Table Operations =====
