@@ -760,6 +760,75 @@ def cmd_packet_hash(params):
     }
 
 
+# HDLC framing constants and functions
+HDLC_FLAG = 0x7E
+HDLC_ESC = 0x7D
+HDLC_ESC_MASK = 0x20
+
+
+def cmd_hdlc_escape(params):
+    """Escape data for HDLC framing."""
+    data = hex_to_bytes(params['data'])
+
+    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
+    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
+
+    return {
+        'escaped': bytes_to_hex(escaped)
+    }
+
+
+def cmd_hdlc_frame(params):
+    """Frame data with HDLC framing."""
+    data = hex_to_bytes(params['data'])
+
+    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
+    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
+
+    framed = bytes([HDLC_FLAG]) + escaped + bytes([HDLC_FLAG])
+
+    return {
+        'framed': bytes_to_hex(framed),
+        'escaped': bytes_to_hex(escaped)
+    }
+
+
+# KISS framing constants and functions
+KISS_FEND = 0xC0
+KISS_FESC = 0xDB
+KISS_TFEND = 0xDC
+KISS_TFESC = 0xDD
+KISS_CMD_DATA = 0x00
+
+
+def cmd_kiss_escape(params):
+    """Escape data for KISS framing."""
+    data = hex_to_bytes(params['data'])
+
+    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
+    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
+
+    return {
+        'escaped': bytes_to_hex(escaped)
+    }
+
+
+def cmd_kiss_frame(params):
+    """Frame data with KISS framing."""
+    data = hex_to_bytes(params['data'])
+    command = int(params.get('command', KISS_CMD_DATA))
+
+    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
+    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
+
+    framed = bytes([KISS_FEND, command]) + escaped + bytes([KISS_FEND])
+
+    return {
+        'framed': bytes_to_hex(framed),
+        'escaped': bytes_to_hex(escaped)
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -793,6 +862,10 @@ COMMANDS = {
     'packet_pack': cmd_packet_pack,
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
+    'hdlc_escape': cmd_hdlc_escape,
+    'hdlc_frame': cmd_hdlc_frame,
+    'kiss_escape': cmd_kiss_escape,
+    'kiss_frame': cmd_kiss_frame,
 }
 
 
