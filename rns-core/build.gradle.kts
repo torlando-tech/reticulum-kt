@@ -14,6 +14,9 @@ dependencies {
     // Cryptography - BouncyCastle for JVM
     implementation("org.bouncycastle:bcprov-jdk18on:$bouncycastleVersion")
 
+    // MessagePack for serialization
+    implementation("org.msgpack:msgpack-core:0.9.8")
+
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:$junitVersion")

@@ -18,6 +18,9 @@ dependencies {
     // JSON for Python bridge communication
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
 
+    // MessagePack for resource tests
+    testImplementation("org.msgpack:msgpack-core:0.9.8")
+
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:$junitVersion")
