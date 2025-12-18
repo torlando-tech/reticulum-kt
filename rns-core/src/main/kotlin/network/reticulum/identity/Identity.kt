@@ -98,6 +98,33 @@ class Identity private constructor(
         private val identityHashIndex = ConcurrentHashMap<ByteArrayKey, ByteArray>()
 
         /**
+         * Storage for ratchets: destination_hash -> list of (ratchet, timestamp) pairs
+         */
+        private val destinationRatchets = ConcurrentHashMap<ByteArrayKey, MutableList<RatchetEntry>>()
+
+        /**
+         * Ratchet entry with timestamp for expiry tracking.
+         */
+        data class RatchetEntry(val ratchet: ByteArray, val timestamp: Long) {
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (other !is RatchetEntry) return false
+                return ratchet.contentEquals(other.ratchet) && timestamp == other.timestamp
+            }
+
+            override fun hashCode(): Int {
+                var result = ratchet.contentHashCode()
+                result = 31 * result + timestamp.hashCode()
+                return result
+            }
+        }
+
+        /**
+         * Ratchet expiry time in milliseconds (30 days).
+         */
+        const val RATCHET_EXPIRY = 2_592_000_000L  // 30 days in ms
+
+        /**
          * Storage path for persisting known destinations.
          * Set by Reticulum during initialization.
          */
@@ -694,6 +721,117 @@ class Identity private constructor(
             } catch (e: Exception) {
                 println("Error loading known destinations from disk, file will be recreated on exit: ${e.message}")
                 e.printStackTrace()
+            }
+        }
+
+        /**
+         * Remember a ratchet for a destination.
+         * Stores the ratchet with the current timestamp and adds it to the front of the list (newest first).
+         * Automatically cleans expired ratchets for this destination.
+         *
+         * @param destHash The destination hash
+         * @param ratchet The ratchet public key bytes (32 bytes)
+         */
+        fun rememberRatchet(destHash: ByteArray, ratchet: ByteArray) {
+            require(ratchet.size == RnsConstants.KEY_SIZE) {
+                "Ratchet must be ${RnsConstants.KEY_SIZE} bytes, got ${ratchet.size}"
+            }
+
+            val key = destHash.toKey()
+            val now = System.currentTimeMillis()
+            val entry = RatchetEntry(ratchet.copyOf(), now)
+
+            synchronized(destinationRatchets) {
+                val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
+
+                // Check if this ratchet already exists
+                if (entries.any { it.ratchet.contentEquals(ratchet) }) {
+                    return // Already stored
+                }
+
+                // Prepend (newest first)
+                entries.add(0, entry)
+
+                // Clean expired entries for this destination
+                entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+            }
+        }
+
+        /**
+         * Get the most recent ratchet for a destination.
+         *
+         * @param destHash The destination hash
+         * @return The most recent ratchet, or null if none stored
+         */
+        fun getRatchet(destHash: ByteArray): ByteArray? {
+            val key = destHash.toKey()
+            val now = System.currentTimeMillis()
+
+            synchronized(destinationRatchets) {
+                val entries = destinationRatchets[key] ?: return null
+
+                // Clean expired entries
+                entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+
+                // Return most recent (first in list)
+                return entries.firstOrNull()?.ratchet?.copyOf()
+            }
+        }
+
+        /**
+         * Get all non-expired ratchets for a destination (newest first).
+         * Used for trying multiple ratchets during decryption.
+         *
+         * @param destHash The destination hash
+         * @return List of ratchets, newest first
+         */
+        fun getRatchets(destHash: ByteArray): List<ByteArray> {
+            val key = destHash.toKey()
+            val now = System.currentTimeMillis()
+
+            synchronized(destinationRatchets) {
+                val entries = destinationRatchets[key] ?: return emptyList()
+
+                // Clean expired entries
+                entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+
+                // Return all ratchets (already newest first)
+                return entries.map { it.ratchet.copyOf() }
+            }
+        }
+
+        /**
+         * Get the ratchet ID for the current ratchet of a destination.
+         * The ratchet ID is the first 10 bytes of the SHA-256 hash of the ratchet public key.
+         *
+         * @param destHash The destination hash
+         * @return The ratchet ID (10 bytes), or null if no ratchet stored
+         */
+        fun currentRatchetId(destHash: ByteArray): ByteArray? {
+            val ratchet = getRatchet(destHash) ?: return null
+            return Hashes.fullHash(ratchet).copyOfRange(0, RnsConstants.NAME_HASH_BYTES)
+        }
+
+        /**
+         * Clean all expired ratchets from storage.
+         * Should be called periodically to free memory.
+         */
+        fun cleanRatchets() {
+            val now = System.currentTimeMillis()
+            synchronized(destinationRatchets) {
+                val iterator = destinationRatchets.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    val ratchets = entry.value
+
+                    // Remove expired ratchets
+                    ratchets.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+
+                    // Remove destination entry if no ratchets left
+                    if (ratchets.isEmpty()) {
+                        iterator.remove()
+                    }
+                }
             }
         }
     }

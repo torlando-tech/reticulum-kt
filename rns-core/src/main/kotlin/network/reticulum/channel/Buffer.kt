@@ -1,26 +1,53 @@
 package network.reticulum.channel
 
+import network.reticulum.link.LinkConstants
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.Deflater
-import java.util.zip.Inflater
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+import kotlin.concurrent.thread
 
 /**
  * Stream data message for transmitting binary data over a Channel.
+ *
+ * Message type for Channel. StreamDataMessage uses a system-reserved message type.
+ * The stream id is limited to 14 bits (0-16383).
  */
 class StreamDataMessage : MessageBase() {
+    companion object {
+        const val STREAM_ID_MAX = 0x3FFF  // 16383
+
+        // Overhead: 2 for stream data message header, 6 for channel envelope
+        const val OVERHEAD = 2 + 6
+
+        // MAX_DATA_LEN is calculated based on Link MDU
+        // In Python: RNS.Link.MDU - OVERHEAD
+        // Link.MDU is typically 431 bytes for default case
+        val MAX_DATA_LEN = LinkConstants.MDU - OVERHEAD
+    }
+
     override val msgType = SystemMessageTypes.SMT_STREAM_DATA
 
     var streamId: Int = 0
+        set(value) {
+            require(value in 0..STREAM_ID_MAX) { "stream_id must be 0-16383" }
+            field = value
+        }
     var data: ByteArray = ByteArray(0)
     var eof: Boolean = false
     var compressed: Boolean = false
 
     override fun pack(): ByteArray {
+        require(streamId in 0..STREAM_ID_MAX) { "stream_id must be 0-16383" }
+
         // Python format: [header:2][data:N]
         // Header bits:
         //   Bit 15: EOF flag (0x8000)
@@ -47,28 +74,41 @@ class StreamDataMessage : MessageBase() {
         eof = (headerVal and 0x8000) != 0
         compressed = (headerVal and 0x4000) != 0
         data = if (raw.size > 2) raw.copyOfRange(2, raw.size) else ByteArray(0)
+
+        // Decompress if needed
+        if (compressed && data.isNotEmpty()) {
+            data = decompressBZ2(data)
+        }
+    }
+
+    private fun decompressBZ2(data: ByteArray): ByteArray {
+        val inputStream = BZip2CompressorInputStream(ByteArrayInputStream(data))
+        return inputStream.readBytes()
     }
 }
 
 /**
- * Input stream that reads data from a Channel.
+ * An implementation of InputStream that receives binary stream data sent over a Channel.
  *
- * Data arrives asynchronously and is buffered until read.
+ * This class generally need not be instantiated directly.
+ * Use [Buffer.createReader], [Buffer.createWriter], and
+ * [Buffer.createBidirectional] functions to create buffered streams with optional callbacks.
  */
-class ChannelInputStream(
+class RawChannelReader(
     private val streamId: Int,
     private val channel: Channel
 ) : InputStream(), Closeable {
 
+    private val lock = ReentrantLock()
     private val buffer = LinkedBlockingQueue<Byte>()
     private val eofReceived = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
-    private val readyCallbacks = mutableListOf<(Int) -> Unit>()
+    private val listeners = mutableListOf<(Int) -> Unit>()
 
     init {
         // Register stream data message type if not already registered
         try {
-            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA) { StreamDataMessage() }
+            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() })
         } catch (e: ChannelException) {
             // Already registered - OK
         }
@@ -77,29 +117,53 @@ class ChannelInputStream(
         channel.addMessageHandler(this::handleMessage)
     }
 
+    /**
+     * Add a function to be called when new data is available.
+     * The function should have the signature `(readyBytes: Int) -> Unit`
+     */
+    fun addReadyCallback(callback: (Int) -> Unit) {
+        lock.withLock {
+            listeners.add(callback)
+        }
+    }
+
+    /**
+     * Remove a function added with [addReadyCallback]
+     */
+    fun removeReadyCallback(callback: (Int) -> Unit) {
+        lock.withLock {
+            listeners.remove(callback)
+        }
+    }
+
     private fun handleMessage(message: MessageBase): Boolean {
         if (message is StreamDataMessage && message.streamId == streamId) {
-            // Decompress if needed
-            val data = if (message.compressed) {
-                decompress(message.data)
-            } else {
-                message.data
-            }
+            lock.withLock {
+                if (message.data.isNotEmpty()) {
+                    for (b in message.data) {
+                        buffer.offer(b)
+                    }
+                }
+                if (message.eof) {
+                    eofReceived.set(true)
+                }
 
-            // Add to buffer
-            for (b in data) {
-                buffer.offer(b)
+                // Notify callbacks in separate threads
+                val bufferSize = buffer.size
+                listeners.forEach { listener ->
+                    try {
+                        thread(name = "Message Callback", isDaemon = true) {
+                            try {
+                                listener(bufferSize)
+                            } catch (ex: Exception) {
+                                println("Error calling RawChannelReader($streamId) callback: ${ex.message}")
+                            }
+                        }
+                    } catch (ex: Exception) {
+                        println("Error starting RawChannelReader($streamId) callback thread: ${ex.message}")
+                    }
+                }
             }
-
-            if (message.eof) {
-                eofReceived.set(true)
-            }
-
-            // Notify ready callbacks
-            synchronized(readyCallbacks) {
-                readyCallbacks.forEach { it(buffer.size) }
-            }
-
             return true
         }
         return false
@@ -137,65 +201,45 @@ class ChannelInputStream(
 
     override fun available(): Int = buffer.size
 
-    /**
-     * Add a callback for when data is ready to read.
-     */
-    fun addReadyCallback(callback: (Int) -> Unit) {
-        synchronized(readyCallbacks) {
-            readyCallbacks.add(callback)
-        }
-    }
-
-    /**
-     * Remove a ready callback.
-     */
-    fun removeReadyCallback(callback: (Int) -> Unit) {
-        synchronized(readyCallbacks) {
-            readyCallbacks.remove(callback)
-        }
-    }
+    fun readable(): Boolean = true
+    fun writable(): Boolean = false
+    fun seekable(): Boolean = false
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
-            channel.removeMessageHandler(this::handleMessage)
-        }
-    }
-
-    private fun decompress(data: ByteArray): ByteArray {
-        val inflater = Inflater()
-        inflater.setInput(data)
-        val output = mutableListOf<Byte>()
-        val buffer = ByteArray(256)
-        while (!inflater.finished()) {
-            val count = inflater.inflate(buffer)
-            if (count == 0) break
-            for (i in 0 until count) {
-                output.add(buffer[i])
+            lock.withLock {
+                channel.removeMessageHandler(this::handleMessage)
+                listeners.clear()
             }
         }
-        inflater.end()
-        return output.toByteArray()
     }
 }
 
 /**
- * Output stream that writes data to a Channel.
+ * An implementation of OutputStream that sends binary stream data over a Channel.
  *
- * Data is chunked and sent as stream messages.
+ * This class generally need not be instantiated directly.
+ * Use [Buffer.createReader], [Buffer.createWriter], and
+ * [Buffer.createBidirectional] functions to create buffered streams with optional callbacks.
  */
-class ChannelOutputStream(
+class RawChannelWriter(
     private val streamId: Int,
-    private val channel: Channel,
-    private val compress: Boolean = false
+    private val channel: Channel
 ) : OutputStream(), Closeable {
 
+    companion object {
+        const val MAX_CHUNK_LEN = 1024 * 16
+        const val COMPRESSION_TRIES = 4
+    }
+
+    private val eofSent = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
-    private val chunkSize = channel.mdu - 2  // Subtract stream header (2 bytes)
+    private val mdu = channel.mdu - StreamDataMessage.OVERHEAD
 
     init {
         // Register stream data message type if not already registered
         try {
-            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA) { StreamDataMessage() }
+            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() })
         } catch (e: ChannelException) {
             // Already registered - OK
         }
@@ -208,68 +252,106 @@ class ChannelOutputStream(
     override fun write(b: ByteArray, off: Int, len: Int) {
         if (closed.get()) throw IllegalStateException("Stream is closed")
 
-        var offset = off
-        var remaining = len
+        val data = b.copyOfRange(off, off + len)
+        writeInternal(data)
+    }
 
-        while (remaining > 0) {
-            // Wait for channel to be ready
-            while (!channel.isReadyToSend) {
-                Thread.sleep(10)
-                if (closed.get()) return
+    private fun writeInternal(bytes: ByteArray): Int {
+        try {
+            var compTries = COMPRESSION_TRIES
+            var compTry = 1
+            var compSuccess = false
+            var chunkLen = bytes.size
+
+            // Limit chunk size
+            if (chunkLen > MAX_CHUNK_LEN) {
+                chunkLen = MAX_CHUNK_LEN
+            }
+            val limitedBytes = bytes.copyOf(chunkLen)
+
+            var chunk = limitedBytes
+            var processedLength = chunkLen
+
+            // Try compression if chunk is large enough
+            while (chunkLen > 32 && compTry < compTries) {
+                val chunkSegmentLength = chunkLen / compTry
+                val compressedChunk = compressBZ2(limitedBytes.copyOf(chunkSegmentLength))
+                val compressedLength = compressedChunk.size
+
+                if (compressedLength < StreamDataMessage.MAX_DATA_LEN &&
+                    compressedLength < chunkSegmentLength) {
+                    compSuccess = true
+                    chunk = compressedChunk
+                    processedLength = chunkSegmentLength
+                    break
+                } else {
+                    compTry++
+                }
             }
 
-            val toSend = minOf(remaining, chunkSize)
-            val chunk = b.copyOfRange(offset, offset + toSend)
+            // If compression didn't help, send uncompressed
+            if (!compSuccess) {
+                chunk = limitedBytes.copyOf(minOf(StreamDataMessage.MAX_DATA_LEN, limitedBytes.size))
+                processedLength = chunk.size
+            }
 
             val message = StreamDataMessage().apply {
-                this.streamId = this@ChannelOutputStream.streamId
-                this.data = if (compress) compress(chunk) else chunk
-                this.compressed = compress
-                this.eof = false
+                this.streamId = this@RawChannelWriter.streamId
+                this.data = chunk
+                this.eof = eofSent.get()
+                this.compressed = compSuccess
             }
 
             channel.send(message)
+            return processedLength
 
-            offset += toSend
-            remaining -= toSend
+        } catch (cex: ChannelException) {
+            if (cex.type != ChannelExceptionType.ME_LINK_NOT_READY) {
+                throw cex
+            }
         }
+        return 0
     }
+
+    fun writable(): Boolean = true
+    fun readable(): Boolean = false
+    fun seekable(): Boolean = false
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
-            // Send EOF marker
-            while (!channel.isReadyToSend) {
-                Thread.sleep(10)
+            // Calculate timeout based on RTT and pending messages
+            try {
+                val linkRtt = channel.outlet.rtt ?: 5000L
+                val timeout = System.currentTimeMillis() + (linkRtt * 10)
+
+                // Wait for channel to be ready
+                while (System.currentTimeMillis() < timeout && !channel.isReadyToSend()) {
+                    Thread.sleep(50)
+                }
+            } catch (e: Exception) {
+                // Ignore
             }
 
-            val eofMessage = StreamDataMessage().apply {
-                this.streamId = this@ChannelOutputStream.streamId
-                this.data = ByteArray(0)
-                this.eof = true
-            }
-            channel.send(eofMessage)
+            // Send EOF marker
+            eofSent.set(true)
+            writeInternal(ByteArray(0))
         }
     }
 
-    private fun compress(data: ByteArray): ByteArray {
-        val deflater = Deflater(Deflater.BEST_SPEED)
-        deflater.setInput(data)
-        deflater.finish()
-        val output = mutableListOf<Byte>()
-        val buffer = ByteArray(256)
-        while (!deflater.finished()) {
-            val count = deflater.deflate(buffer)
-            for (i in 0 until count) {
-                output.add(buffer[i])
-            }
-        }
-        deflater.end()
-        return output.toByteArray()
+    private fun compressBZ2(data: ByteArray): ByteArray {
+        val outputStream = ByteArrayOutputStream()
+        val bz2Stream = BZip2CompressorOutputStream(outputStream)
+        bz2Stream.write(data)
+        bz2Stream.close()
+        return outputStream.toByteArray()
     }
 }
 
 /**
- * Factory for creating buffered streams over a Channel.
+ * Static functions for creating buffered streams that send and receive over a Channel.
+ *
+ * These functions use standard Java InputStream and OutputStream to add buffering to
+ * RawChannelReader and RawChannelWriter.
  *
  * Usage:
  * ```kotlin
@@ -284,50 +366,68 @@ class ChannelOutputStream(
  * writer.close()
  *
  * val data = reader.readBytes()
+ * reader.close()
  * ```
  */
 object Buffer {
     /**
-     * Create a buffered reader for receiving stream data.
+     * Create a buffered reader that reads binary data sent over a Channel,
+     * with an optional callback when new data is available.
      *
-     * @param streamId Unique identifier for this stream
-     * @param channel The channel to receive data from
-     * @return An InputStream that reads from the channel
+     * Callback signature: `(readyBytes: Int) -> Unit`
+     *
+     * @param streamId the local stream id to receive from
+     * @param channel the channel to receive on
+     * @param readyCallback function to call when new data is available
+     * @return a buffered InputStream
      */
-    fun createReader(streamId: Int, channel: Channel): InputStream {
-        return ChannelInputStream(streamId, channel)
+    fun createReader(
+        streamId: Int,
+        channel: Channel,
+        readyCallback: ((Int) -> Unit)? = null
+    ): InputStream {
+        val reader = RawChannelReader(streamId, channel)
+        if (readyCallback != null) {
+            reader.addReadyCallback(readyCallback)
+        }
+        return reader.buffered()
     }
 
     /**
-     * Create a buffered writer for sending stream data.
+     * Create a buffered writer that writes binary data over a Channel.
      *
-     * @param streamId Unique identifier for this stream
-     * @param channel The channel to send data to
-     * @param compress Whether to compress data before sending
-     * @return An OutputStream that writes to the channel
+     * @param streamId the remote stream id to send to
+     * @param channel the channel to send on
+     * @return a buffered OutputStream
      */
-    fun createWriter(streamId: Int, channel: Channel, compress: Boolean = false): OutputStream {
-        return ChannelOutputStream(streamId, channel, compress)
+    fun createWriter(streamId: Int, channel: Channel): OutputStream {
+        val writer = RawChannelWriter(streamId, channel)
+        return writer.buffered()
     }
 
     /**
-     * Create a bidirectional buffer pair.
+     * Create a buffered reader/writer pair that reads and writes binary data
+     * over a Channel, with an optional callback when new data is available.
      *
-     * @param receiveStreamId Stream ID for receiving
-     * @param sendStreamId Stream ID for sending
-     * @param channel The channel to use
-     * @param compress Whether to compress outgoing data
-     * @return Pair of (reader, writer)
+     * Callback signature: `(readyBytes: Int) -> Unit`
+     *
+     * @param receiveStreamId the local stream id to receive at
+     * @param sendStreamId the remote stream id to send to
+     * @param channel the channel to send and receive on
+     * @param readyCallback function to call when new data is available
+     * @return a Pair of (reader, writer)
      */
     fun createBidirectional(
         receiveStreamId: Int,
         sendStreamId: Int,
         channel: Channel,
-        compress: Boolean = false
+        readyCallback: ((Int) -> Unit)? = null
     ): Pair<InputStream, OutputStream> {
-        return Pair(
-            createReader(receiveStreamId, channel),
-            createWriter(sendStreamId, channel, compress)
-        )
+        val reader = RawChannelReader(receiveStreamId, channel)
+        if (readyCallback != null) {
+            reader.addReadyCallback(readyCallback)
+        }
+        val writer = RawChannelWriter(sendStreamId, channel)
+        return Pair(reader.buffered(), writer.buffered())
     }
 }

@@ -218,6 +218,17 @@ class Destination private constructor(
     private val requestHandlers = ConcurrentHashMap<ByteArrayKey, RequestHandler>()
 
     /**
+     * Path response tag cache for tracking recent path responses.
+     * Maps tag (ByteArray) to (timestamp, announce_data).
+     */
+    private val pathResponses = mutableMapOf<ByteArrayKey, Pair<Long, ByteArray>>()
+
+    /**
+     * Lock for path response tag access.
+     */
+    private val pathResponseLock = ReentrantLock()
+
+    /**
      * Create symmetric keys for a GROUP destination.
      * This generates a random key that can be shared with group members.
      *
@@ -674,6 +685,12 @@ class Destination private constructor(
         const val RATCHET_COUNT = 512
 
         /**
+         * Path response tag window (30 seconds in milliseconds).
+         * Tags within this window are considered duplicates.
+         */
+        const val PR_TAG_WINDOW = 30_000L  // 30 seconds
+
+        /**
          * Proof strategy: Never send proofs.
          */
         const val PROVE_NONE = 0x00
@@ -943,7 +960,11 @@ class Destination private constructor(
      * Encrypt data for this destination.
      *
      * For SINGLE destinations, uses the stored ratchet public key if available.
+     * The ratchet is retrieved from the destination hash and used to modify the
+     * encryption key derivation.
      *
+     * @param plaintext The data to encrypt
+     * @return The encrypted ciphertext
      * @throws IllegalStateException if destination type doesn't support encryption
      * @throws IllegalStateException if identity is not available
      */
@@ -955,11 +976,17 @@ class Destination private constructor(
                 val id = identity ?: throw IllegalStateException(
                     "Cannot encrypt for SINGLE destination without identity"
                 )
-                // Check for stored ratchet
+
+                // Check for stored ratchet public key for this destination
                 val ratchet = getRatchetForDestination(hash)
+
+                // If a ratchet is available, store its ID for tracking
                 if (ratchet != null) {
                     latestRatchetId = getRatchetId(ratchet)
                 }
+
+                // Encrypt using the identity, passing the ratchet if available
+                // The Identity.encrypt() method will use the ratchet to modify key derivation
                 id.encrypt(plaintext, ratchet)
             }
 
@@ -980,9 +1007,17 @@ class Destination private constructor(
     /**
      * Decrypt data from this destination.
      *
-     * For SINGLE destinations, tries ratchet keys first, then the identity key
-     * (unless enforceRatchets is true).
+     * For SINGLE destinations, tries ratchet private keys first (if available),
+     * then falls back to the identity private key (unless enforceRatchets is true).
      *
+     * The decryption process:
+     * 1. If this destination has ratchet private keys, try each one in order (newest first)
+     * 2. If a ratchet successfully decrypts, store its ID in latestRatchetId
+     * 3. If all ratchets fail and enforceRatchets is false, try the base identity key
+     * 4. If enforceRatchets is true and no ratchet works, return null
+     *
+     * @param ciphertext The encrypted data to decrypt
+     * @return The decrypted plaintext, or null if decryption fails
      * @throws IllegalStateException if identity doesn't have private key
      */
     fun decrypt(ciphertext: ByteArray): ByteArray? {
@@ -993,12 +1028,54 @@ class Destination private constructor(
                 val id = identity ?: throw IllegalStateException(
                     "Cannot decrypt for SINGLE destination without identity"
                 )
-                // Use ratchets if available
+
+                var plaintext: ByteArray? = null
+
+                // If we have ratchet private keys for decryption, try them individually
+                // so we can track which one worked
                 if (ratchets.isNotEmpty()) {
-                    id.decrypt(ciphertext, ratchets, enforceRatchets)
+                    val crypto = defaultCryptoProvider()
+
+                    // Try each ratchet in order (newest first)
+                    for (ratchet in ratchets) {
+                        try {
+                            // Try decrypting with this single ratchet
+                            plaintext = id.decrypt(ciphertext, listOf(ratchet), enforceRatchets = true)
+
+                            if (plaintext != null) {
+                                // Success! Compute and store the ratchet ID
+                                val ratchetPublic = crypto.x25519PublicFromPrivate(ratchet)
+                                latestRatchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
+                                break
+                            }
+                        } catch (e: Exception) {
+                            // Try next ratchet
+                            continue
+                        }
+                    }
+
+                    // If ratchets didn't work and enforcement is off, try base key
+                    if (plaintext == null && !enforceRatchets) {
+                        try {
+                            plaintext = id.decrypt(ciphertext, null, enforceRatchets = false)
+                            // If base key worked, clear ratchet ID
+                            if (plaintext != null) {
+                                latestRatchetId = null
+                            }
+                        } catch (e: Exception) {
+                            // Decryption failed
+                        }
+                    }
                 } else {
-                    id.decrypt(ciphertext)
+                    // No ratchets available, use base identity decryption
+                    plaintext = id.decrypt(ciphertext, null, enforceRatchets)
+                    // Clear ratchet ID since we used base key
+                    if (plaintext != null) {
+                        latestRatchetId = null
+                    }
                 }
+
+                plaintext
             }
 
             DestinationType.GROUP -> {
@@ -1154,6 +1231,37 @@ class Destination private constructor(
     }
 
     /**
+     * Check if a path response with this tag was recently processed.
+     * Returns true if duplicate, false if new (and stores it).
+     *
+     * @param tag The path response tag to check
+     * @return true if duplicate, false if new
+     */
+    fun isDuplicatePathResponse(tag: ByteArray): Boolean {
+        pathResponseLock.withLock {
+            val now = System.currentTimeMillis()
+
+            // Clean expired tags
+            val staleKeys = pathResponses.entries
+                .filter { now - it.value.first > PR_TAG_WINDOW }
+                .map { it.key }
+                .toList()
+
+            staleKeys.forEach { pathResponses.remove(it) }
+
+            // Check if tag exists
+            val key = tag.toKey()
+            if (pathResponses.containsKey(key)) {
+                return true  // Duplicate
+            }
+
+            // Store new tag with current timestamp (announce_data will be filled later if needed)
+            pathResponses[key] = Pair(now, ByteArray(0))
+            return false
+        }
+    }
+
+    /**
      * Create and send an announce packet for this destination.
      *
      * Announces broadcast the destination's public keys and optional application data
@@ -1161,16 +1269,25 @@ class Destination private constructor(
      *
      * @param appData Optional application-specific data to include in the announce
      * @param pathResponse Whether this is a path response (used internally by Transport)
+     * @param tag Optional tag for path response deduplication
      * @param send If true, send the packet immediately; if false, return the packet
      * @return The announce Packet if send=false, null otherwise
      * @throws IllegalStateException if destination cannot announce
      */
-    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, send: Boolean = true): network.reticulum.packet.Packet? {
+    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, tag: ByteArray? = null, send: Boolean = true): network.reticulum.packet.Packet? {
         require(type == DestinationType.SINGLE) { "Only SINGLE destination types can be announced" }
         require(direction == DestinationDirection.IN) { "Only IN destination types can be announced" }
 
         val id = identity ?: throw IllegalStateException("Cannot announce destination without identity")
         require(id.hasPrivateKey) { "Cannot announce destination without private key" }
+
+        // Check for duplicate path response
+        if (pathResponse && tag != null) {
+            if (isDuplicatePathResponse(tag)) {
+                // Skip duplicate path response
+                return null
+            }
+        }
 
         // Generate random hash component (5 random bytes + 5 timestamp bytes)
         val randomPart = Hashes.getRandomHash().copyOf(5)

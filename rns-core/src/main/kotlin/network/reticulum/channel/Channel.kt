@@ -6,6 +6,7 @@ import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.math.pow
 
 /**
  * Callback type for message handlers.
@@ -47,12 +48,34 @@ typealias MessageCallback = (MessageBase) -> Boolean
  * ```
  */
 class Channel(
-    private val outlet: ChannelOutlet
+    internal val outlet: ChannelOutlet
 ) : AutoCloseable {
     companion object {
-        private fun log(message: String) {
-            println("[Channel] $message")
-        }
+        // Window configuration
+        const val WINDOW = 2
+        const val WINDOW_MIN = 2
+        const val WINDOW_MIN_LIMIT_SLOW = 2
+        const val WINDOW_MIN_LIMIT_MEDIUM = 5
+        const val WINDOW_MIN_LIMIT_FAST = 16
+
+        const val WINDOW_MAX_SLOW = 5
+        const val WINDOW_MAX_MEDIUM = 12
+        const val WINDOW_MAX_FAST = 48
+        const val WINDOW_MAX = WINDOW_MAX_FAST
+        const val WINDOW_FLEXIBILITY = 4
+
+        // Rate thresholds
+        const val FAST_RATE_THRESHOLD = 10
+        const val RTT_FAST = 180.0  // ms
+        const val RTT_MEDIUM = 750.0  // ms
+        const val RTT_SLOW = 1450.0  // ms
+
+        // Sequence management
+        const val SEQ_MAX = 0xFFFF
+        const val SEQ_MODULUS = 0x10000
+
+        // Retry configuration
+        const val MAX_TRIES = 5
     }
 
     // Message type registry
@@ -62,51 +85,85 @@ class Channel(
     private val messageHandlers = CopyOnWriteArrayList<MessageCallback>()
 
     // Sequence tracking
-    private val txSequence = AtomicInteger(0)
-    private val rxSequence = AtomicInteger(0)
+    private val nextSequence = AtomicInteger(0)
+    private val nextRxSequence = AtomicInteger(0)
 
     // Send/receive rings (deques for ordered delivery)
     private val txRing = LinkedBlockingDeque<Envelope>()
     private val rxRing = LinkedBlockingDeque<Envelope>()
 
     // Window management
-    private var window = ChannelConstants.WINDOW
-    private var windowMax = ChannelConstants.WINDOW_MAX_SLOW
-    private var windowMin = ChannelConstants.WINDOW_MIN
-    private var windowFlexibility = 4
+    @Volatile
+    private var window: Int
+    @Volatile
+    private var windowMax: Int
+    @Volatile
+    private var windowMin: Int
+    @Volatile
+    private var windowFlexibility: Int
+    @Volatile
     private var fastRateRounds = 0
+    @Volatile
     private var mediumRateRounds = 0
 
-    // Tracking
-    private val pendingEnvelopes = ConcurrentHashMap<Any, Envelope>()
+    // Tracking lock
     private val lock = ReentrantLock()
 
     // State
     @Volatile
     private var isShutdown = false
 
+    init {
+        // Initialize window based on RTT
+        val rtt = outlet.rtt ?: 0L
+        if (rtt > RTT_SLOW) {
+            window = 1
+            windowMax = 1
+            windowMin = 1
+            windowFlexibility = 1
+        } else {
+            window = WINDOW
+            windowMax = WINDOW_MAX_SLOW
+            windowMin = WINDOW_MIN
+            windowFlexibility = WINDOW_FLEXIBILITY
+        }
+    }
+
     /**
      * Register a message type for sending/receiving.
      *
      * @param msgType The unique message type identifier
      * @param factory Factory to create new message instances
+     * @param isSystemType Whether this is a system-reserved message type
      */
-    fun registerMessageType(msgType: Int, factory: MessageFactory) {
-        if (msgType >= ChannelConstants.SYSTEM_MESSAGE_MIN) {
-            throw ChannelException(
-                ChannelExceptionType.ME_INVALID_MSG_TYPE,
-                "Message type ${String.format("0x%04X", msgType)} is in reserved range"
-            )
-        }
+    fun registerMessageType(msgType: Int, factory: MessageFactory, isSystemType: Boolean = false) {
+        lock.withLock {
+            if (msgType >= 0xF000 && !isSystemType) {
+                throw ChannelException(
+                    ChannelExceptionType.ME_INVALID_MSG_TYPE,
+                    "Message type ${String.format("0x%04X", msgType)} is in system-reserved range (>= 0xF000)"
+                )
+            }
 
-        if (messageFactories.containsKey(msgType)) {
-            throw ChannelException(
-                ChannelExceptionType.ME_ALREADY_REGISTERED,
-                "Message type ${String.format("0x%04X", msgType)} already registered"
-            )
-        }
+            if (messageFactories.containsKey(msgType)) {
+                throw ChannelException(
+                    ChannelExceptionType.ME_INVALID_MSG_TYPE,
+                    "Message type ${String.format("0x%04X", msgType)} already registered"
+                )
+            }
 
-        messageFactories[msgType] = factory
+            // Validate factory by creating an instance
+            try {
+                factory.create()
+            } catch (e: Exception) {
+                throw ChannelException(
+                    ChannelExceptionType.ME_INVALID_MSG_TYPE,
+                    "Factory raised exception when creating instance: ${e.message}"
+                )
+            }
+
+            messageFactories[msgType] = factory
+        }
     }
 
     /**
@@ -135,75 +192,82 @@ class Channel(
     /**
      * Check if the channel is ready to send messages.
      */
-    val isReadyToSend: Boolean
-        get() {
-            if (isShutdown || !outlet.isUsable) return false
-
-            // Check if we have room in the window
-            return pendingEnvelopes.size < window
+    fun isReadyToSend(): Boolean {
+        if (!outlet.isUsable) {
+            return false
         }
+
+        lock.withLock {
+            var outstanding = 0
+            for (envelope in txRing) {
+                if (envelope.outlet == outlet) {
+                    val packet = envelope.packet
+                    if (packet == null || outlet.getPacketState(packet) != MessageState.DELIVERED) {
+                        outstanding++
+                    }
+                }
+            }
+
+            return outstanding < window
+        }
+    }
 
     /**
      * Send a message over the channel.
      *
      * @param message The message to send
      * @return The envelope tracking this message
-     * @throws ChannelException if channel is not ready or window is full
+     * @throws ChannelException if channel is not ready or message is too big
      */
     fun send(message: MessageBase): Envelope {
-        if (isShutdown) {
-            throw ChannelException(
-                ChannelExceptionType.ME_LINK_NOT_READY,
-                "Channel is shut down"
-            )
-        }
-
-        if (!outlet.isUsable) {
-            throw ChannelException(
-                ChannelExceptionType.ME_LINK_NOT_READY,
-                "Outlet is not usable"
-            )
-        }
-
-        if (pendingEnvelopes.size >= window) {
-            throw ChannelException(
-                ChannelExceptionType.ME_WINDOW_FULL,
-                "Send window is full (${pendingEnvelopes.size}/$window)"
-            )
-        }
-
-        // Create envelope with next sequence number
-        val sequence = txSequence.getAndUpdate { (it + 1) % ChannelConstants.SEQ_MODULUS }
-        val envelope = Envelope(outlet, message, sequence = sequence)
-
-        // Pack and send
-        val raw = envelope.pack()
-
         lock.withLock {
-            txRing.addLast(envelope)
+            if (!isReadyToSend()) {
+                throw ChannelException(
+                    ChannelExceptionType.ME_LINK_NOT_READY,
+                    "Link is not ready"
+                )
+            }
+
+            // Create envelope with next sequence number
+            val sequence = nextSequence.getAndUpdate { (it + 1) % SEQ_MODULUS }
+            val envelope = Envelope(outlet, message, sequence = sequence)
+
+            // Add to TX ring
+            emplaceEnvelope(envelope, txRing)
+
+            // Pack the message
+            envelope.pack()
+
+            // Check size
+            val raw = envelope.raw!!
+            if (raw.size > outlet.mdu) {
+                throw ChannelException(
+                    ChannelExceptionType.ME_INVALID_MSG_TYPE,
+                    "Packed message too big for packet: ${raw.size} > ${outlet.mdu}"
+                )
+            }
 
             // Send via outlet
             val packet = outlet.send(raw)
-            if (packet != null) {
-                envelope.packet = packet
-                envelope.tries = 1
-                envelope.tracked = true
-                pendingEnvelopes[outlet.getPacketId(packet)] = envelope
+            envelope.packet = packet
+            envelope.tries++
 
-                // Set up delivery callback
+            // Set up callbacks if packet was sent
+            if (packet != null) {
                 outlet.setPacketDeliveredCallback(packet) { pkt ->
-                    onPacketDelivered(pkt)
+                    packetDelivered(pkt)
                 }
 
-                // Set up timeout callback
-                val timeout = calculateTimeout()
+                val timeout = getPacketTimeoutTime(envelope.tries)
                 outlet.setPacketTimeoutCallback(packet, { pkt ->
-                    onPacketTimeout(pkt)
+                    packetTimeout(pkt)
                 }, timeout)
             }
-        }
 
-        return envelope
+            updatePacketTimeouts()
+
+            return envelope
+        }
     }
 
     /**
@@ -211,99 +275,146 @@ class Channel(
      * This is called by the Link when data arrives on the channel.
      */
     fun receive(raw: ByteArray) {
-        if (isShutdown) return
-
         try {
             val envelope = Envelope(outlet, raw = raw)
-            val message = envelope.unpack(messageFactories)
 
-            // Check sequence ordering
-            val expectedSeq = rxSequence.get()
-            if (envelope.sequence != expectedSeq) {
-                // Out of order - add to ring for reordering
-                emplaceEnvelope(envelope, rxRing)
-                processRxRing()
-            } else {
-                // In order - process immediately
-                rxSequence.getAndUpdate { (it + 1) % ChannelConstants.SEQ_MODULUS }
-                runCallbacks(message)
-                processRxRing()
+            lock.withLock {
+                val message = envelope.unpack(messageFactories)
+
+                // Validate sequence number
+                val currentRx = nextRxSequence.get()
+                if (envelope.sequence < currentRx) {
+                    // Check if it's within the window overflow range
+                    val windowOverflow = (currentRx + WINDOW_MAX) % SEQ_MODULUS
+                    if (windowOverflow < currentRx) {
+                        // Wrapped around
+                        if (envelope.sequence > windowOverflow) {
+                            // Invalid sequence - drop it
+                            return
+                        }
+                    } else {
+                        // Invalid sequence - drop it
+                        return
+                    }
+                }
+
+                // Try to add to RX ring
+                val isNew = emplaceEnvelope(envelope, rxRing)
+
+                if (!isNew) {
+                    // Duplicate - drop it
+                    return
+                }
             }
 
+            // Process any contiguous messages
+            processContiguousMessages()
+
         } catch (e: ChannelException) {
-            log("Error receiving message: ${e.message}")
+            println("[Channel] Error receiving message: ${e.message}")
         } catch (e: Exception) {
-            log("Unexpected error receiving message: ${e.message}")
+            println("[Channel] Unexpected error receiving message: ${e.message}")
         }
     }
 
     /**
-     * Process any queued messages that are now in order.
+     * Process contiguous messages from the RX ring.
      */
-    private fun processRxRing() {
-        while (rxRing.isNotEmpty()) {
-            val expected = rxSequence.get()
-            val envelope = rxRing.peekFirst()
+    private fun processContiguousMessages() {
+        val contiguous = mutableListOf<Envelope>()
 
-            if (envelope != null && envelope.sequence == expected) {
-                rxRing.pollFirst()
-                rxSequence.getAndUpdate { (it + 1) % ChannelConstants.SEQ_MODULUS }
-                envelope.message?.let { runCallbacks(it) }
-            } else {
-                break
+        lock.withLock {
+            for (envelope in rxRing) {
+                if (envelope.sequence == nextRxSequence.get()) {
+                    contiguous.add(envelope)
+                    nextRxSequence.set((nextRxSequence.get() + 1) % SEQ_MODULUS)
+
+                    // Handle sequence wrap-around
+                    if (nextRxSequence.get() == 0) {
+                        // Continue processing after wrap
+                        for (e in rxRing) {
+                            if (e.sequence == nextRxSequence.get()) {
+                                contiguous.add(e)
+                                nextRxSequence.set((nextRxSequence.get() + 1) % SEQ_MODULUS)
+                            }
+                        }
+                    }
+                } else {
+                    break
+                }
             }
+
+            // Remove processed envelopes from ring
+            for (envelope in contiguous) {
+                rxRing.remove(envelope)
+            }
+        }
+
+        // Run callbacks outside of lock
+        for (envelope in contiguous) {
+            val message = if (!envelope.unpacked) {
+                envelope.unpack(messageFactories)
+            } else {
+                envelope.message
+            }
+
+            message?.let { runCallbacks(it) }
         }
     }
 
     /**
      * Add envelope to a ring in sequence order.
+     * Returns true if the envelope was added, false if it was a duplicate.
      */
     private fun emplaceEnvelope(envelope: Envelope, ring: LinkedBlockingDeque<Envelope>): Boolean {
         lock.withLock {
-            // Find correct position
-            val iterator = ring.iterator()
-            var index = 0
-            while (iterator.hasNext()) {
-                val existing = iterator.next()
-                if (sequenceCompare(envelope.sequence, existing.sequence) < 0) {
-                    break
-                }
+            var insertIndex = 0
+
+            for (existing in ring) {
+                // Check for duplicate
                 if (envelope.sequence == existing.sequence) {
-                    // Duplicate - ignore
+                    // Duplicate envelope
                     return false
                 }
-                index++
+
+                // Find insertion point - sequences are ordered, accounting for wrap-around
+                if (envelope.sequence < existing.sequence &&
+                    !((nextRxSequence.get() - envelope.sequence) > (SEQ_MAX / 2))
+                ) {
+                    // Insert here
+                    val list = ring.toMutableList()
+                    list.add(insertIndex, envelope)
+                    ring.clear()
+                    ring.addAll(list)
+                    envelope.tracked = true
+                    return true
+                }
+
+                insertIndex++
             }
 
-            // Insert at position
-            val list = ring.toMutableList()
-            list.add(index, envelope)
-            ring.clear()
-            ring.addAll(list)
+            // Add at the end
+            envelope.tracked = true
+            ring.add(envelope)
             return true
         }
-    }
-
-    /**
-     * Compare sequence numbers accounting for wrap-around.
-     */
-    private fun sequenceCompare(a: Int, b: Int): Int {
-        val half = ChannelConstants.SEQ_MODULUS / 2
-        val diff = (a - b + ChannelConstants.SEQ_MODULUS) % ChannelConstants.SEQ_MODULUS
-        return if (diff < half) diff else diff - ChannelConstants.SEQ_MODULUS
     }
 
     /**
      * Run message callbacks.
      */
     private fun runCallbacks(message: MessageBase) {
-        for (handler in messageHandlers) {
+        // Make a copy to avoid concurrent modification
+        val callbacks = messageHandlers.toList()
+
+        for (callback in callbacks) {
             try {
-                if (handler(message)) {
+                if (callback(message)) {
                     break
                 }
             } catch (e: Exception) {
-                log("Error in message handler: ${e.message}")
+                println("[Channel] Error in message callback: ${e.message}")
+                e.printStackTrace()
             }
         }
     }
@@ -311,84 +422,142 @@ class Channel(
     /**
      * Handle packet delivery confirmation.
      */
-    private fun onPacketDelivered(packet: Any) {
-        val packetId = outlet.getPacketId(packet)
-        val envelope = pendingEnvelopes.remove(packetId)
-        if (envelope != null) {
-            envelope.tracked = false
-            updateWindow(delivered = true)
+    private fun packetDelivered(packet: Any) {
+        packetTxOp(packet) { envelope ->
+            // Packet was delivered successfully
+            true
         }
     }
 
     /**
-     * Handle packet timeout.
+     * Handle packet timeout and retry logic.
      */
-    private fun onPacketTimeout(packet: Any) {
-        val packetId = outlet.getPacketId(packet)
-        val envelope = pendingEnvelopes[packetId]
+    private fun packetTimeout(packet: Any) {
+        // Only retry if not already delivered
+        if (outlet.getPacketState(packet) != MessageState.DELIVERED) {
+            packetTxOp(packet) { envelope ->
+                retryEnvelope(envelope)
+            }
+        }
+    }
 
-        if (envelope != null && envelope.tracked) {
-            envelope.tries++
+    /**
+     * Execute an operation on a packet in the TX ring.
+     */
+    private fun packetTxOp(packet: Any, op: (Envelope) -> Boolean) {
+        lock.withLock {
+            val packetId = outlet.getPacketId(packet)
+            val envelope = txRing.find { env ->
+                env.packet?.let { outlet.getPacketId(it) == packetId } ?: false
+            }
 
-            if (envelope.tries >= ChannelConstants.MAX_TRIES) {
-                // Give up
-                pendingEnvelopes.remove(packetId)
+            if (envelope != null && op(envelope)) {
                 envelope.tracked = false
-                log("Message delivery failed after ${envelope.tries} tries")
-                updateWindow(delivered = false)
-            } else {
-                // Retry
-                val newPacket = outlet.resend(packet)
-                if (newPacket != null) {
-                    pendingEnvelopes.remove(packetId)
-                    envelope.packet = newPacket
-                    val newId = outlet.getPacketId(newPacket)
-                    pendingEnvelopes[newId] = envelope
-
-                    outlet.setPacketDeliveredCallback(newPacket) { pkt ->
-                        onPacketDelivered(pkt)
+                if (txRing.remove(envelope)) {
+                    // Increase window on success
+                    if (window < windowMax) {
+                        window++
                     }
 
-                    val timeout = calculateTimeout()
-                    outlet.setPacketTimeoutCallback(newPacket, { pkt ->
-                        onPacketTimeout(pkt)
-                    }, timeout)
+                    // Update window limits based on RTT
+                    val rtt = outlet.rtt ?: 0L
+                    if (rtt > 0) {
+                        if (rtt > RTT_FAST) {
+                            fastRateRounds = 0
+
+                            if (rtt > RTT_MEDIUM) {
+                                mediumRateRounds = 0
+                            } else {
+                                mediumRateRounds++
+                                if (windowMax < WINDOW_MAX_MEDIUM && mediumRateRounds == FAST_RATE_THRESHOLD) {
+                                    windowMax = WINDOW_MAX_MEDIUM
+                                    windowMin = WINDOW_MIN_LIMIT_MEDIUM
+                                }
+                            }
+                        } else {
+                            fastRateRounds++
+                            if (windowMax < WINDOW_MAX_FAST && fastRateRounds == FAST_RATE_THRESHOLD) {
+                                windowMax = WINDOW_MAX_FAST
+                                windowMin = WINDOW_MIN_LIMIT_FAST
+                            }
+                        }
+                    }
+                } else {
+                    // Envelope not found in TX ring (already removed)
                 }
+            } else if (envelope == null) {
+                // Spurious message (packet not in our TX ring)
             }
         }
     }
 
     /**
-     * Update window size based on delivery success.
+     * Retry an envelope that timed out.
+     * Returns true if max retries reached (should be removed from ring).
      */
-    private fun updateWindow(delivered: Boolean) {
-        if (delivered) {
-            fastRateRounds++
-            if (fastRateRounds >= ChannelConstants.FAST_RATE_THRESHOLD) {
-                windowMax = ChannelConstants.WINDOW_MAX_FAST
-            } else if (fastRateRounds >= ChannelConstants.MEDIUM_RATE_THRESHOLD) {
-                windowMax = ChannelConstants.WINDOW_MAX_MEDIUM
+    private fun retryEnvelope(envelope: Envelope): Boolean {
+        if (envelope.tries >= MAX_TRIES) {
+            println("[Channel] Retry count exceeded, tearing down Link")
+            shutdown()
+            // Signal outlet that we timed out
+            if (outlet.timedOut) {
+                // Outlet is already timed out
             }
+            return true
+        }
 
-            // Grow window slowly
-            if (window < windowMax) {
-                window++
+        envelope.tries++
+        val packet = envelope.packet ?: return true
+
+        outlet.resend(packet)
+        outlet.setPacketDeliveredCallback(packet) { pkt -> packetDelivered(pkt) }
+        outlet.setPacketTimeoutCallback(
+            packet,
+            { pkt -> packetTimeout(pkt) },
+            getPacketTimeoutTime(envelope.tries)
+        )
+
+        updatePacketTimeouts()
+
+        // Decrease window on timeout
+        if (window > windowMin) {
+            window--
+
+            if (windowMax > (windowMin + windowFlexibility)) {
+                windowMax--
             }
-        } else {
-            // Shrink window on failure
-            fastRateRounds = 0
-            mediumRateRounds = 0
-            windowMax = ChannelConstants.WINDOW_MAX_SLOW
-            window = maxOf(windowMin, window - 1)
+        }
+
+        return false
+    }
+
+    /**
+     * Update timeouts for all pending packets.
+     */
+    private fun updatePacketTimeouts() {
+        for (envelope in txRing) {
+            val updatedTimeout = getPacketTimeoutTime(envelope.tries)
+            val packet = envelope.packet
+
+            if (packet != null) {
+                // Update timeout if it needs to be increased
+                outlet.setPacketTimeoutCallback(
+                    packet,
+                    { pkt -> packetTimeout(pkt) },
+                    updatedTimeout
+                )
+            }
         }
     }
 
     /**
-     * Calculate timeout based on RTT.
+     * Calculate packet timeout based on RTT and number of tries.
      */
-    private fun calculateTimeout(): Long {
-        val rtt = outlet.rtt ?: 5000L
-        return rtt * 3
+    private fun getPacketTimeoutTime(tries: Int): Long {
+        val rtt = outlet.rtt ?: 25L
+        val ringSize = txRing.size
+        val timeout = 1.5.pow(tries - 1) * maxOf(rtt * 2.5, 25.0) * (ringSize + 1.5)
+        return timeout.toLong()
     }
 
     /**
@@ -398,21 +567,31 @@ class Channel(
         get() = outlet.mdu - 6  // Subtract envelope header
 
     /**
-     * Shutdown the channel.
+     * Shutdown the channel and clear all callbacks.
      */
     fun shutdown() {
-        isShutdown = true
-        clearRings()
+        lock.withLock {
+            messageHandlers.clear()
+            clearRings()
+        }
     }
 
     /**
-     * Clear all pending messages.
+     * Clear all pending messages and reset callbacks.
      */
     private fun clearRings() {
         lock.withLock {
+            // Clear callbacks for all pending packets
+            for (envelope in txRing) {
+                val packet = envelope.packet
+                if (packet != null) {
+                    outlet.setPacketTimeoutCallback(packet, null)
+                    outlet.setPacketDeliveredCallback(packet, null)
+                }
+            }
+
             txRing.clear()
             rxRing.clear()
-            pendingEnvelopes.clear()
         }
     }
 

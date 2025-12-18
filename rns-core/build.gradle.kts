@@ -17,6 +17,13 @@ dependencies {
     // MessagePack for serialization
     implementation("org.msgpack:msgpack-core:0.9.8")
 
+    // Compression - Apache Commons Compress for BZ2
+    implementation("org.apache.commons:commons-compress:1.26.0")
+
+    // Logging
+    implementation("io.github.microutils:kotlin-logging-jvm:3.0.5")
+    implementation("org.slf4j:slf4j-simple:2.0.9")
+
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:$junitVersion")

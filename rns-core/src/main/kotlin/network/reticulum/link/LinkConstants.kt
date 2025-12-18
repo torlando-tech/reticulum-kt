@@ -17,10 +17,15 @@ object LinkConstants {
     const val STALE = 0x03
     const val CLOSED = 0x04
 
-    // Close reasons
+    // Teardown/Close reasons
+    const val TEARDOWN_REASON_UNKNOWN = 0x00
     const val TIMEOUT = 0x01
+    const val TEARDOWN_REASON_TIMEOUT = 0x01  // Alias for compatibility
     const val INITIATOR_CLOSED = 0x02
+    const val TEARDOWN_REASON_INITIATOR_CLOSED = 0x02  // Alias for compatibility
     const val DESTINATION_CLOSED = 0x03
+    const val TEARDOWN_REASON_DESTINATION_CLOSED = 0x03  // Alias for compatibility
+    const val TEARDOWN_REASON_LINK_ERROR = 0x04
 
     // Resource strategies
     const val ACCEPT_NONE = 0x00
@@ -69,6 +74,12 @@ object LinkConstants {
         val blockSize = RnsConstants.AES_BLOCK_SIZE
         return ((mtu - headerMin - tokenOverhead) / blockSize) * blockSize - 1
     }
+
+    /**
+     * Link Maximum Data Unit - the maximum payload size for a single packet over a link.
+     * Python: MDU = floor((MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE - 1
+     */
+    val MDU = calculateMdu()
 
     /**
      * Get the derived key length for a given mode.

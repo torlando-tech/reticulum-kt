@@ -71,8 +71,8 @@ class Link private constructor(
 
         // Resource strategy constants
         const val ACCEPT_NONE = 0x00
-        const val ACCEPT_ALL = 0x01
-        const val ACCEPT_APP = 0x02
+        const val ACCEPT_APP = 0x01
+        const val ACCEPT_ALL = 0x02
 
         /**
          * Create an outgoing link to a destination.
@@ -236,6 +236,10 @@ class Link private constructor(
 
     // State
     var status: Int = LinkConstants.PENDING
+        private set
+
+    /** Reason for link teardown. */
+    var teardownReason: Int = LinkConstants.TEARDOWN_REASON_UNKNOWN
         private set
 
     // Timing
@@ -931,18 +935,28 @@ class Link private constructor(
 
     /**
      * Close the link.
+     *
+     * @param reason The teardown reason (defaults based on initiator status)
      */
-    fun teardown(reason: Int = LinkConstants.INITIATOR_CLOSED) {
+    fun teardown(reason: Int = LinkConstants.TEARDOWN_REASON_UNKNOWN) {
         if (status == LinkConstants.CLOSED) return
 
         val previousStatus = status
         status = LinkConstants.CLOSED
 
+        // Set teardown reason
+        teardownReason = if (reason == LinkConstants.TEARDOWN_REASON_UNKNOWN) {
+            if (initiator) LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
+            else LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
+        } else {
+            reason
+        }
+
         watchdogActive = false
 
         if (previousStatus == LinkConstants.ACTIVE) {
             // Send close packet
-            val closeData = byteArrayOf(reason.toByte())
+            val closeData = linkId
             val packet = Packet.createRaw(
                 destinationHash = linkId,
                 data = closeData,
@@ -961,7 +975,7 @@ class Link private constructor(
             }
         }
 
-        log("Link ${linkId.toHexString()} closed")
+        log("Link ${linkId.toHexString()} closed (reason: $teardownReason)")
     }
 
     /**
@@ -1077,7 +1091,7 @@ class Link private constructor(
             LinkConstants.PENDING, LinkConstants.HANDSHAKE -> {
                 if (now - requestTime > establishmentTimeout) {
                     log("Link establishment timeout")
-                    teardown(LinkConstants.TIMEOUT)
+                    teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
                 }
             }
 
@@ -1093,7 +1107,7 @@ class Link private constructor(
                     // Check for stale
                     if (inactivity > staleTime + (rtt ?: 0) * keepaliveTimeoutFactor + LinkConstants.STALE_GRACE) {
                         log("Link timeout (no response)")
-                        teardown(LinkConstants.TIMEOUT)
+                        teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
                     } else if (status != LinkConstants.STALE) {
                         status = LinkConstants.STALE
                         log("Link marked stale")
@@ -1105,7 +1119,7 @@ class Link private constructor(
                 val inactivity = noInboundFor()
                 if (inactivity > staleTime + (rtt ?: 0) * keepaliveTimeoutFactor + LinkConstants.STALE_GRACE) {
                     log("Stale link timeout")
-                    teardown(LinkConstants.TIMEOUT)
+                    teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
                 }
             }
         }
@@ -1388,7 +1402,7 @@ class Link private constructor(
             }
         } catch (e: Exception) {
             log("Error processing RTT packet: ${e.message}")
-            teardown(LinkConstants.TIMEOUT)
+            teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
         }
     }
 
@@ -1403,9 +1417,9 @@ class Link private constructor(
             if (plaintext.contentEquals(linkId)) {
                 log("Received link close packet")
                 val closeReason = if (initiator) {
-                    LinkConstants.DESTINATION_CLOSED
+                    LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
                 } else {
-                    LinkConstants.INITIATOR_CLOSED
+                    LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
                 }
                 teardown(closeReason)
             }

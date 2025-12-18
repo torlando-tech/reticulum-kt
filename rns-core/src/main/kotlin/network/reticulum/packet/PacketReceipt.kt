@@ -86,6 +86,10 @@ class PacketReceipt internal constructor(
     var timeout: Double = calculateTimeout()
         private set
 
+    /** Number of retries attempted. */
+    var retries: Int = 0
+        private set
+
     /**
      * Calculate the timeout based on destination type and hops.
      */
@@ -130,10 +134,12 @@ class PacketReceipt internal constructor(
     /**
      * Check and handle timeout.
      * Updates status and fires timeout callback if timed out.
+     *
+     * @return true if timed out, false otherwise
      */
-    fun checkTimeout() {
+    fun checkTimeout(): Boolean {
         if (status == SENT && isTimedOut()) {
-            status = if (timeout == -1.0) {
+            status = if (retries > 0) {
                 CULLED
             } else {
                 FAILED
@@ -151,7 +157,9 @@ class PacketReceipt internal constructor(
                     }
                 }
             }
+            return true
         }
+        return false
     }
 
     /**
