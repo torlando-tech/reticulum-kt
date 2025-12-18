@@ -103,4 +103,18 @@ object TransportConstants {
 
     /** Application name for transport destinations. */
     const val APP_NAME = "rnstransport"
+
+    // ===== Latency and Timeout Constants =====
+
+    /** Default per-hop timeout in milliseconds (6 seconds). */
+    const val DEFAULT_PER_HOP_TIMEOUT = 6000L
+
+    /** Minimum first hop timeout in milliseconds (3 seconds). */
+    const val MIN_FIRST_HOP_TIMEOUT = 3000L
+
+    /** Held announce timeout in milliseconds (30 seconds). */
+    const val HELD_ANNOUNCE_TIMEOUT = 30_000L
+
+    /** Traffic speed update interval in milliseconds (1 second). */
+    const val SPEED_UPDATE_INTERVAL = 1000L
 }

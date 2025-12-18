@@ -134,12 +134,33 @@ object Transport {
     /** Pending receipts: packet_hash -> ProofCallback. */
     private val pendingReceipts = ConcurrentHashMap<ByteArrayKey, ProofCallback>()
 
+    /** Announce timing per destination: dest_hash -> allowed_at timestamp. */
+    private val announceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
+
+    /** Held announces awaiting retransmission: dest_hash -> (timestamp, raw_data). */
+    private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, Pair<Long, ByteArray>>()
+
+    /** Local client interfaces (shared instance clients). */
+    private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
+
     // ===== Traffic Stats =====
 
     var trafficRxBytes: Long = 0
         private set
     var trafficTxBytes: Long = 0
         private set
+
+    /** Current RX speed in bytes/sec. */
+    var speedRx: Long = 0
+        private set
+
+    /** Current TX speed in bytes/sec. */
+    var speedTx: Long = 0
+        private set
+
+    /** Last traffic snapshot for speed calculation. */
+    private var lastTrafficSnapshot = Pair(0L, 0L)
+    private var lastTrafficTime = 0L
 
     // ===== Timestamps =====
 
@@ -206,6 +227,20 @@ object Transport {
         announceTable.clear()
         packetHashlist.clear()
         packetHashlistPrev.clear()
+        announceAllowedAt.clear()
+        heldAnnounces.clear()
+        localClientInterfaces.clear()
+        queuedAnnounces.clear()
+        announceRateTable.clear()
+        pathRequests.clear()
+        discoveryPrTags.clear()
+        pendingReceipts.clear()
+
+        // Reset speed tracking
+        speedRx = 0
+        speedTx = 0
+        lastTrafficSnapshot = Pair(0L, 0L)
+        lastTrafficTime = 0L
 
         log("Transport stopped")
     }
@@ -436,6 +471,369 @@ object Transport {
             entry.failureCount = 0
             log("Path to ${destinationHash.toHexString()} marked ACTIVE")
         }
+    }
+
+    /**
+     * Check if a path is currently unresponsive.
+     */
+    fun pathIsUnresponsive(destinationHash: ByteArray): Boolean {
+        val entry = pathTable[destinationHash.toKey()] ?: return false
+        return entry.state == PathState.UNRESPONSIVE || entry.state == PathState.STALE
+    }
+
+    /**
+     * Mark a path as unknown state (reset for re-discovery).
+     */
+    fun markPathUnknownState(destinationHash: ByteArray) {
+        val entry = pathTable[destinationHash.toKey()] ?: return
+        entry.state = PathState.ACTIVE
+        entry.failureCount = 0
+    }
+
+    /**
+     * Get the interface for the next hop to a destination.
+     */
+    fun nextHopInterface(destinationHash: ByteArray): InterfaceRef? {
+        val entry = pathTable[destinationHash.toKey()] ?: return null
+        if (entry.isExpired()) return null
+        return findInterfaceByHash(entry.receivingInterfaceHash)
+    }
+
+    // ===== Interface Latency Calculations =====
+
+    /**
+     * Get the bitrate of the next-hop interface.
+     */
+    fun nextHopInterfaceBitrate(destinationHash: ByteArray): Int? {
+        val iface = nextHopInterface(destinationHash) ?: return null
+        return iface.bitrate
+    }
+
+    /**
+     * Get the hardware MTU of the next-hop interface.
+     */
+    fun nextHopInterfaceHwMtu(destinationHash: ByteArray): Int? {
+        val iface = nextHopInterface(destinationHash) ?: return null
+        return iface.hwMtu
+    }
+
+    /**
+     * Calculate per-bit latency for next hop (seconds).
+     */
+    fun nextHopPerBitLatency(destinationHash: ByteArray): Double? {
+        val bitrate = nextHopInterfaceBitrate(destinationHash) ?: return null
+        if (bitrate == 0) return null
+        return 1.0 / bitrate
+    }
+
+    /**
+     * Calculate per-byte latency for next hop (seconds).
+     */
+    fun nextHopPerByteLatency(destinationHash: ByteArray): Double? {
+        val perBit = nextHopPerBitLatency(destinationHash) ?: return null
+        return perBit * 8
+    }
+
+    /**
+     * Calculate first hop timeout based on MTU and bitrate.
+     */
+    fun firstHopTimeout(destinationHash: ByteArray): Long {
+        val perByteLatency = nextHopPerByteLatency(destinationHash)
+        val mtu = nextHopInterfaceHwMtu(destinationHash) ?: RnsConstants.MTU
+
+        return if (perByteLatency != null) {
+            val transmitTime = (mtu * perByteLatency * 1000).toLong()
+            maxOf(
+                transmitTime + TransportConstants.DEFAULT_PER_HOP_TIMEOUT,
+                TransportConstants.MIN_FIRST_HOP_TIMEOUT
+            )
+        } else {
+            TransportConstants.DEFAULT_PER_HOP_TIMEOUT
+        }
+    }
+
+    // ===== Announce Queue Management =====
+
+    /**
+     * Drop all pending announces (for cleanup).
+     */
+    fun dropAnnounceQueues() {
+        queuedAnnounces.clear()
+        announceRateTable.clear()
+        announceAllowedAt.clear()
+        log("Dropped all announce queues")
+    }
+
+    /**
+     * Check if announce is allowed (rate limiting).
+     */
+    private fun announceAllowed(destinationHash: ByteArray): Boolean {
+        val allowedAt = announceAllowedAt[destinationHash.toKey()] ?: return true
+        return System.currentTimeMillis() >= allowedAt
+    }
+
+    /**
+     * Schedule next announce time for a destination.
+     */
+    private fun scheduleNextAnnounce(destinationHash: ByteArray, delayMs: Long) {
+        announceAllowedAt[destinationHash.toKey()] = System.currentTimeMillis() + delayMs
+    }
+
+    // ===== Held Announces =====
+
+    /**
+     * Hold an announce for later retransmission.
+     */
+    fun holdAnnounce(destinationHash: ByteArray, rawData: ByteArray) {
+        heldAnnounces[destinationHash.toKey()] = Pair(System.currentTimeMillis(), rawData.copyOf())
+        log("Held announce for ${destinationHash.toHexString()}")
+    }
+
+    /**
+     * Release a held announce for transmission.
+     */
+    fun releaseHeldAnnounce(destinationHash: ByteArray): ByteArray? {
+        val held = heldAnnounces.remove(destinationHash.toKey())
+        if (held != null) {
+            log("Released held announce for ${destinationHash.toHexString()}")
+        }
+        return held?.second
+    }
+
+    /**
+     * Get count of held announces.
+     */
+    fun heldAnnounceCount(): Int = heldAnnounces.size
+
+    // ===== Local Client Support =====
+
+    /**
+     * Register a local client interface.
+     */
+    fun registerLocalClientInterface(interfaceRef: InterfaceRef) {
+        localClientInterfaces.add(interfaceRef)
+        interfaces.add(interfaceRef)
+        log("Registered local client interface: ${interfaceRef.name}")
+    }
+
+    /**
+     * Deregister a local client interface.
+     */
+    fun deregisterLocalClientInterface(interfaceRef: InterfaceRef) {
+        localClientInterfaces.remove(interfaceRef)
+        interfaces.remove(interfaceRef)
+        log("Deregistered local client interface: ${interfaceRef.name}")
+    }
+
+    /**
+     * Check if interface is a local client.
+     */
+    fun isLocalClientInterface(interfaceRef: InterfaceRef): Boolean {
+        return localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
+    }
+
+    /**
+     * Check if packet came from a local client.
+     */
+    fun fromLocalClient(interfaceRef: InterfaceRef): Boolean {
+        return isLocalClientInterface(interfaceRef)
+    }
+
+    /**
+     * Handle shared connection disappearing.
+     */
+    fun sharedConnectionDisappeared() {
+        localClientInterfaces.clear()
+        log("Shared connection disappeared, cleared local clients")
+    }
+
+    /**
+     * Handle shared connection reappearing.
+     */
+    fun sharedConnectionReappeared() {
+        // Re-announce local destinations
+        for (dest in destinations) {
+            if (dest.direction == DestinationDirection.IN) {
+                val announcePacket = Packet.createAnnounce(dest)
+                if (announcePacket != null) {
+                    outbound(announcePacket)
+                }
+            }
+        }
+        log("Shared connection reappeared, re-announced destinations")
+    }
+
+    /**
+     * Get count of local client interfaces.
+     */
+    fun localClientCount(): Int = localClientInterfaces.size
+
+    // ===== Persistence =====
+
+    /**
+     * Save path table to a file.
+     *
+     * Format: one line per entry, fields separated by |
+     * destHash|nextHop|hops|expires|interfaceHash|announceHash|state|failureCount
+     */
+    fun savePathTable(file: java.io.File) {
+        try {
+            val lines = pathTable.entries.mapNotNull { (key, entry) ->
+                if (entry.isExpired()) return@mapNotNull null
+                listOf(
+                    key.toString(),
+                    entry.nextHop.toHexString(),
+                    entry.hops.toString(),
+                    entry.expires.toString(),
+                    entry.receivingInterfaceHash.toHexString(),
+                    entry.announcePacketHash.toHexString(),
+                    entry.state.ordinal.toString(),
+                    entry.failureCount.toString()
+                ).joinToString("|")
+            }
+            file.writeText(lines.joinToString("\n"))
+            log("Saved ${lines.size} path entries to ${file.absolutePath}")
+        } catch (e: Exception) {
+            log("Failed to save path table: ${e.message}")
+        }
+    }
+
+    /**
+     * Load path table from a file.
+     */
+    fun loadPathTable(file: java.io.File) {
+        if (!file.exists()) return
+        try {
+            val lines = file.readLines().filter { it.isNotBlank() }
+            var loaded = 0
+            for (line in lines) {
+                val parts = line.split("|")
+                if (parts.size < 8) continue
+
+                try {
+                    val destHash = hexToBytes(parts[0])
+                    val nextHop = hexToBytes(parts[1])
+                    val hops = parts[2].toInt()
+                    val expires = parts[3].toLong()
+                    val interfaceHash = hexToBytes(parts[4])
+                    val announceHash = hexToBytes(parts[5])
+                    val stateOrdinal = parts[6].toInt()
+                    val failureCount = parts[7].toInt()
+
+                    // Skip expired entries
+                    if (System.currentTimeMillis() > expires) continue
+
+                    val entry = PathEntry(
+                        timestamp = System.currentTimeMillis(),
+                        nextHop = nextHop,
+                        hops = hops,
+                        expires = expires,
+                        randomBlobs = mutableListOf(),
+                        receivingInterfaceHash = interfaceHash,
+                        announcePacketHash = announceHash,
+                        state = PathState.entries.getOrElse(stateOrdinal) { PathState.ACTIVE },
+                        failureCount = failureCount
+                    )
+                    pathTable[destHash.toKey()] = entry
+                    loaded++
+                } catch (e: Exception) {
+                    // Skip malformed entries
+                }
+            }
+            log("Loaded $loaded path entries from ${file.absolutePath}")
+        } catch (e: Exception) {
+            log("Failed to load path table: ${e.message}")
+        }
+    }
+
+    /**
+     * Save packet hashlist to a file.
+     *
+     * Format: one hash per line, hex-encoded
+     */
+    fun savePacketHashlist(file: java.io.File) {
+        try {
+            val hashes = (packetHashlist + packetHashlistPrev).map { it.toString() }
+            file.writeText(hashes.joinToString("\n"))
+            log("Saved ${hashes.size} packet hashes to ${file.absolutePath}")
+        } catch (e: Exception) {
+            log("Failed to save packet hashlist: ${e.message}")
+        }
+    }
+
+    /**
+     * Load packet hashlist from a file.
+     */
+    fun loadPacketHashlist(file: java.io.File) {
+        if (!file.exists()) return
+        try {
+            val lines = file.readLines().filter { it.isNotBlank() }
+            var loaded = 0
+            for (line in lines) {
+                try {
+                    val hash = hexToBytes(line.trim())
+                    packetHashlist.add(hash.toKey())
+                    loaded++
+                } catch (e: Exception) {
+                    // Skip malformed entries
+                }
+            }
+            log("Loaded $loaded packet hashes from ${file.absolutePath}")
+        } catch (e: Exception) {
+            log("Failed to load packet hashlist: ${e.message}")
+        }
+    }
+
+    /**
+     * Persist all transport data to a directory.
+     *
+     * @param directory Directory to save data to (created if needed)
+     */
+    fun persistData(directory: java.io.File) {
+        directory.mkdirs()
+        savePathTable(java.io.File(directory, "path_table.txt"))
+        savePacketHashlist(java.io.File(directory, "packet_hashlist.txt"))
+    }
+
+    /**
+     * Load all transport data from a directory.
+     *
+     * @param directory Directory to load data from
+     */
+    fun loadPersistedData(directory: java.io.File) {
+        if (!directory.exists()) return
+        loadPathTable(java.io.File(directory, "path_table.txt"))
+        loadPacketHashlist(java.io.File(directory, "packet_hashlist.txt"))
+    }
+
+    /**
+     * Graceful shutdown - persist data before stopping.
+     *
+     * @param dataDirectory Directory to save data to
+     */
+    fun shutdown(dataDirectory: java.io.File? = null) {
+        if (!started.get()) return
+
+        if (dataDirectory != null) {
+            persistData(dataDirectory)
+        }
+
+        stop()
+    }
+
+    /**
+     * Convert hex string to bytes.
+     */
+    private fun hexToBytes(hex: String): ByteArray {
+        val len = hex.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) +
+                          Character.digit(hex[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
     }
 
     // ===== Path Requests =====
@@ -1176,6 +1574,12 @@ object Transport {
         // Process queued announces
         processQueuedAnnounces(now)
 
+        // Process held announces (expire old ones)
+        processHeldAnnounces(now)
+
+        // Update traffic speed
+        updateTrafficSpeed(now)
+
         // Cull stale table entries
         if (now - tablesLastCulled > TransportConstants.TABLES_CULL_INTERVAL) {
             cullTables()
@@ -1186,6 +1590,33 @@ object Transport {
         if (now - hashlistLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             packetHashlistPrev.clear()
             hashlistLastCleaned = now
+        }
+    }
+
+    /**
+     * Process held announces - expire old ones.
+     */
+    private fun processHeldAnnounces(now: Long) {
+        val expireCutoff = now - TransportConstants.HELD_ANNOUNCE_TIMEOUT
+        val expired = heldAnnounces.entries.filter { it.value.first < expireCutoff }
+        expired.forEach { heldAnnounces.remove(it.key) }
+    }
+
+    /**
+     * Update traffic speed calculations.
+     */
+    private fun updateTrafficSpeed(now: Long) {
+        val elapsed = now - lastTrafficTime
+
+        if (elapsed >= TransportConstants.SPEED_UPDATE_INTERVAL) {
+            val rxDelta = trafficRxBytes - lastTrafficSnapshot.first
+            val txDelta = trafficTxBytes - lastTrafficSnapshot.second
+
+            speedRx = if (elapsed > 0) (rxDelta * 1000) / elapsed else 0
+            speedTx = if (elapsed > 0) (txDelta * 1000) / elapsed else 0
+
+            lastTrafficSnapshot = Pair(trafficRxBytes, trafficTxBytes)
+            lastTrafficTime = now
         }
     }
 
@@ -1276,6 +1707,14 @@ interface InterfaceRef {
     val canSend: Boolean
     val canReceive: Boolean
     val online: Boolean
+
+    /** Bitrate in bits per second (0 if unknown). */
+    val bitrate: Int
+        get() = 0
+
+    /** Hardware MTU in bytes. */
+    val hwMtu: Int
+        get() = RnsConstants.MTU
 
     fun send(data: ByteArray)
 }
