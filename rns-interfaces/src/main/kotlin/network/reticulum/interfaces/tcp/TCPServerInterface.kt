@@ -34,8 +34,10 @@ class TCPServerInterface(
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
-    override val canReceive: Boolean = false // Server itself doesn't receive, clients do
-    override val canSend: Boolean = false // Server itself doesn't send, clients do
+    // Server can receive/send via its spawned client interfaces
+    // processOutgoing broadcasts to all connected clients
+    override val canReceive: Boolean = true
+    override val canSend: Boolean = true
 
     private var serverSocket: ServerSocket? = null
     private val clientCounter = AtomicInteger(0)
@@ -91,6 +93,17 @@ class TCPServerInterface(
                 clientInterface.onPacketReceived = { data, iface ->
                     // Forward received packets to our callback
                     onPacketReceived?.invoke(data, iface)
+
+                    // Rebroadcast to all OTHER clients (not the sender)
+                    for (otherClient in clients) {
+                        if (otherClient !== iface && otherClient.online.get()) {
+                            try {
+                                otherClient.processOutgoing(data)
+                            } catch (e: Exception) {
+                                // Client will be cleaned up by its own error handling
+                            }
+                        }
+                    }
                 }
 
                 clientInterface.start()
