@@ -48,6 +48,19 @@ fun interface PacketCallback {
 }
 
 /**
+ * Callback for proof reception.
+ */
+fun interface ProofCallback {
+    /**
+     * Called when a proof is received for a packet.
+     *
+     * @param packet The proof packet
+     * @return true if the proof was validated successfully
+     */
+    fun onProofReceived(packet: Packet): Boolean
+}
+
+/**
  * The Transport singleton manages routing and packet delivery.
  *
  * This is the core routing engine that:
@@ -117,6 +130,9 @@ object Transport {
     /** Registered links: link_id -> Link. */
     private val pendingLinks = ConcurrentHashMap<ByteArrayKey, Any>()
     private val activeLinks = ConcurrentHashMap<ByteArrayKey, Any>()
+
+    /** Pending receipts: packet_hash -> ProofCallback. */
+    private val pendingReceipts = ConcurrentHashMap<ByteArrayKey, ProofCallback>()
 
     // ===== Traffic Stats =====
 
@@ -320,6 +336,28 @@ object Transport {
         }
     }
 
+    // ===== Receipt Management =====
+
+    /**
+     * Register a callback for when a proof is received for a packet.
+     *
+     * @param packetHash The hash of the packet to wait for proof
+     * @param callback The callback to invoke when proof is received
+     */
+    fun registerReceipt(packetHash: ByteArray, callback: ProofCallback) {
+        pendingReceipts[packetHash.toKey()] = callback
+        log("Registered receipt for ${packetHash.toHexString()}")
+    }
+
+    /**
+     * Deregister a pending receipt.
+     *
+     * @param packetHash The packet hash to stop waiting for
+     */
+    fun deregisterReceipt(packetHash: ByteArray) {
+        pendingReceipts.remove(packetHash.toKey())
+    }
+
     // ===== Path Table Operations =====
 
     /**
@@ -361,11 +399,43 @@ object Transport {
 
     /**
      * Mark a path as unresponsive.
+     *
+     * Tracks failure count and transitions path through states:
+     * ACTIVE -> UNRESPONSIVE (after first failure)
+     * UNRESPONSIVE -> STALE (after 3 failures)
+     * STALE paths are automatically expired.
      */
     fun markPathUnresponsive(destinationHash: ByteArray) {
-        // For now, just expire it
-        // TODO: Track path state separately
-        expirePath(destinationHash)
+        val key = destinationHash.toKey()
+        val entry = pathTable[key] ?: return
+
+        entry.failureCount++
+
+        when {
+            entry.failureCount >= 3 -> {
+                entry.state = PathState.STALE
+                log("Path to ${destinationHash.toHexString()} marked STALE, expiring")
+                expirePath(destinationHash)
+            }
+            entry.failureCount >= 1 -> {
+                entry.state = PathState.UNRESPONSIVE
+                log("Path to ${destinationHash.toHexString()} marked UNRESPONSIVE (${entry.failureCount} failures)")
+            }
+        }
+    }
+
+    /**
+     * Mark a path as responsive (reset failure state).
+     */
+    fun markPathResponsive(destinationHash: ByteArray) {
+        val key = destinationHash.toKey()
+        val entry = pathTable[key] ?: return
+
+        if (entry.state != PathState.ACTIVE || entry.failureCount > 0) {
+            entry.state = PathState.ACTIVE
+            entry.failureCount = 0
+            log("Path to ${destinationHash.toHexString()} marked ACTIVE")
+        }
     }
 
     // ===== Path Requests =====
@@ -856,7 +926,21 @@ object Transport {
                 // Record in link table for return path
                 val pathEntry = pathTable[packet.destinationHash.toKey()]
                 if (pathEntry != null) {
-                    // TODO: Create link table entry
+                    // Create link table entry for return routing of proofs
+                    val linkEntry = LinkEntry(
+                        timestamp = System.currentTimeMillis(),
+                        nextHop = pathEntry.nextHop,
+                        nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
+                        remainingHops = pathEntry.hops,
+                        receivingInterfaceHash = interfaceRef.hash,
+                        takenHops = packet.hops,
+                        destinationHash = packet.destinationHash,
+                        validated = false,
+                        proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
+                    )
+                    linkTable[packet.truncatedHash.toKey()] = linkEntry
+                    log("Created link table entry for ${packet.truncatedHash.toHexString()}")
+
                     forwardPacket(packet, interfaceRef)
                 }
             }
@@ -876,8 +960,27 @@ object Transport {
             return
         }
 
-        // Check if it's for a local destination
-        // TODO: Receipt handling
+        // Check if there's a pending receipt for this proof
+        // The proof's destination hash should match the original packet hash
+        val receiptKey = packet.destinationHash.toKey()
+        val callback = pendingReceipts.remove(receiptKey)
+
+        if (callback != null) {
+            try {
+                val validated = callback.onProofReceived(packet)
+                if (validated) {
+                    log("Proof validated for ${packet.destinationHash.toHexString()}")
+                    // Mark path as responsive if we have one
+                    markPathResponsive(packet.destinationHash)
+                } else {
+                    log("Proof validation failed for ${packet.destinationHash.toHexString()}")
+                }
+            } catch (e: Exception) {
+                log("Proof callback error: ${e.message}")
+            }
+        } else {
+            log("Received proof with no pending receipt: ${packet.destinationHash.toHexString()}")
+        }
     }
 
     private fun forwardPacket(packet: Packet, receivingInterface: InterfaceRef) {
@@ -920,9 +1023,61 @@ object Transport {
         pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
     }
 
-    private fun deliverPacket(destination: Destination, @Suppress("UNUSED_PARAMETER") packet: Packet) {
-        // TODO: Decrypt if needed and deliver via callback
-        log("Delivering packet to ${destination.hexHash}")
+    private fun deliverPacket(destination: Destination, packet: Packet) {
+        val data = packet.data
+        if (data.isEmpty()) {
+            log("Ignoring empty packet for ${destination.hexHash}")
+            return
+        }
+
+        try {
+            // Handle based on packet type
+            when (packet.packetType) {
+                PacketType.DATA -> {
+                    // Decrypt the data if needed
+                    val plaintext = when (destination.type) {
+                        DestinationType.PLAIN -> data
+                        else -> destination.decrypt(data) ?: run {
+                            log("Failed to decrypt packet for ${destination.hexHash}")
+                            return
+                        }
+                    }
+
+                    // Deliver via callback
+                    val callback = destination.packetCallback
+                    if (callback != null) {
+                        callback(plaintext, packet)
+                        log("Delivered packet to ${destination.hexHash} (${plaintext.size} bytes)")
+                    } else {
+                        log("No callback registered for ${destination.hexHash}")
+                    }
+                }
+
+                PacketType.LINKREQUEST -> {
+                    // Check if destination accepts link requests
+                    if (!destination.acceptLinkRequests) {
+                        log("Destination ${destination.hexHash} not accepting link requests")
+                        return
+                    }
+
+                    // Deliver to link callback if set
+                    val linkCallback = destination.linkRequestCallback
+                    if (linkCallback != null) {
+                        val linkId = packet.truncatedHash
+                        val accepted = linkCallback(linkId)
+                        log("Link request for ${destination.hexHash}: ${if (accepted) "accepted" else "rejected"}")
+                    } else {
+                        log("No link callback registered for ${destination.hexHash}")
+                    }
+                }
+
+                else -> {
+                    log("Unexpected packet type ${packet.packetType} for delivery")
+                }
+            }
+        } catch (e: Exception) {
+            log("Error delivering packet to ${destination.hexHash}: ${e.message}")
+        }
     }
 
     // ===== Announce Validation =====

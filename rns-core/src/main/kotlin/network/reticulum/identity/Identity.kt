@@ -1,11 +1,14 @@
 package network.reticulum.identity
 
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.toHexString
+import network.reticulum.common.toKey
 import network.reticulum.crypto.CryptoProvider
 import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.Token
 import network.reticulum.crypto.defaultCryptoProvider
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Identity is the core authentication primitive in Reticulum.
@@ -56,7 +59,44 @@ class Identity private constructor(
             return ed25519Private!!.copyOf()
         }
 
+    /**
+     * Data stored for known identities.
+     */
+    data class IdentityData(
+        val timestamp: Long,
+        val packetHash: ByteArray,
+        val publicKey: ByteArray,
+        val appData: ByteArray?
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is IdentityData) return false
+            return timestamp == other.timestamp &&
+                packetHash.contentEquals(other.packetHash) &&
+                publicKey.contentEquals(other.publicKey) &&
+                (appData?.contentEquals(other.appData ?: byteArrayOf()) ?: (other.appData == null))
+        }
+
+        override fun hashCode(): Int {
+            var result = timestamp.hashCode()
+            result = 31 * result + packetHash.contentHashCode()
+            result = 31 * result + publicKey.contentHashCode()
+            result = 31 * result + (appData?.contentHashCode() ?: 0)
+            return result
+        }
+    }
+
     companion object {
+        /**
+         * Storage for known destinations: destination_hash -> IdentityData
+         */
+        private val knownDestinations = ConcurrentHashMap<ByteArrayKey, IdentityData>()
+
+        /**
+         * Index for identity hash lookups: identity_hash -> destination_hash
+         */
+        private val identityHashIndex = ConcurrentHashMap<ByteArrayKey, ByteArray>()
+
         /**
          * Create a new identity with randomly generated keys.
          */
@@ -125,16 +165,94 @@ class Identity private constructor(
         }
 
         /**
-         * Recall a known identity by its hash.
+         * Recall a known identity by its destination hash.
          * Returns null if no identity is known for this hash.
          *
-         * Note: This requires an IdentityStorage implementation to be set up.
-         * In the initial implementation, this always returns null.
+         * @param hash The destination hash to look up
+         * @return The Identity, or null if not found
          */
         fun recall(hash: ByteArray): Identity? {
-            // TODO: Implement identity storage lookup
-            return null
+            val data = knownDestinations[hash.toKey()] ?: return null
+            return try {
+                fromPublicKey(data.publicKey)
+            } catch (e: Exception) {
+                null
+            }
         }
+
+        /**
+         * Recall a known identity by its identity hash (truncated hash of public key).
+         * Returns null if no identity is known for this hash.
+         *
+         * @param identityHash The identity hash to look up
+         * @return The Identity, or null if not found
+         */
+        fun recallByIdentityHash(identityHash: ByteArray): Identity? {
+            val destHash = identityHashIndex[identityHash.toKey()] ?: return null
+            return recall(destHash)
+        }
+
+        /**
+         * Recall app_data for a known destination.
+         *
+         * @param hash The destination hash
+         * @return The app_data, or null if not found
+         */
+        fun recallAppData(hash: ByteArray): ByteArray? {
+            return knownDestinations[hash.toKey()]?.appData?.copyOf()
+        }
+
+        /**
+         * Remember an identity after successful announce validation.
+         * This stores the identity data for later recall.
+         *
+         * @param packetHash The hash of the announce packet
+         * @param destHash The destination hash
+         * @param publicKey The 64-byte public key
+         * @param appData Optional application data from the announce
+         */
+        fun remember(
+            packetHash: ByteArray,
+            destHash: ByteArray,
+            publicKey: ByteArray,
+            appData: ByteArray? = null
+        ) {
+            val data = IdentityData(
+                timestamp = System.currentTimeMillis(),
+                packetHash = packetHash.copyOf(),
+                publicKey = publicKey.copyOf(),
+                appData = appData?.copyOf()
+            )
+            knownDestinations[destHash.toKey()] = data
+
+            // Index by identity hash for reverse lookups
+            val identityHash = Hashes.truncatedHash(publicKey)
+            identityHashIndex[identityHash.toKey()] = destHash.copyOf()
+        }
+
+        /**
+         * Check if a destination is known.
+         *
+         * @param hash The destination hash
+         * @return true if the identity is stored
+         */
+        fun isKnown(hash: ByteArray): Boolean {
+            return knownDestinations.containsKey(hash.toKey())
+        }
+
+        /**
+         * Clear all stored identities.
+         * Useful for testing or resetting state.
+         */
+        fun clearKnownDestinations() {
+            knownDestinations.clear()
+            identityHashIndex.clear()
+        }
+
+        /**
+         * Get the number of known destinations.
+         */
+        fun knownDestinationCount(): Int = knownDestinations.size
     }
 
     /**

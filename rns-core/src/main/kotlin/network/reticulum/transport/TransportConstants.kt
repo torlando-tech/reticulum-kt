@@ -59,6 +59,9 @@ object TransportConstants {
     /** Reverse table entry timeout in milliseconds (8 minutes). */
     const val REVERSE_TIMEOUT = 8L * 60 * 1000
 
+    /** Link proof timeout in milliseconds (10 minutes). */
+    const val LINK_PROOF_TIMEOUT = 10L * 60 * 1000
+
     /** Destination table entry timeout (1 week in milliseconds). */
     const val DESTINATION_TIMEOUT = 7L * 24 * 60 * 60 * 1000
 

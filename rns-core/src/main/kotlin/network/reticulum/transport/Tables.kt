@@ -3,6 +3,20 @@ package network.reticulum.transport
 import network.reticulum.common.toHexString
 
 /**
+ * State of a path in the path table.
+ */
+enum class PathState {
+    /** Path is active and responding. */
+    ACTIVE,
+
+    /** Path has had failed transmissions but not enough to be considered stale. */
+    UNRESPONSIVE,
+
+    /** Path has too many failures and should be expired. */
+    STALE
+}
+
+/**
  * Entry in the path table, storing routing information to a destination.
  *
  * The path table maps destination hashes to routing information needed
@@ -28,7 +42,13 @@ data class PathEntry(
     val receivingInterfaceHash: ByteArray,
 
     /** Hash of the announce packet that created this path. */
-    val announcePacketHash: ByteArray
+    val announcePacketHash: ByteArray,
+
+    /** Current state of this path. */
+    var state: PathState = PathState.ACTIVE,
+
+    /** Number of consecutive failures for this path. */
+    var failureCount: Int = 0
 ) {
     /** Check if this path has expired. */
     fun isExpired(): Boolean = System.currentTimeMillis() > expires
