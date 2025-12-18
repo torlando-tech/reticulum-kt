@@ -829,6 +829,232 @@ def cmd_kiss_frame(params):
     }
 
 
+# Link operations
+
+def cmd_link_id_from_packet(params):
+    """Compute link ID from link request packet data.
+
+    Link ID = truncated_hash(hashable_part of packet)
+    where hashable_part excludes transport_id and masks flags.
+    For link requests, we also exclude MTU signalling bytes if present.
+    """
+    raw = hex_to_bytes(params['raw'])
+
+    flags = raw[0]
+    header_type = (flags & 0b01000000) >> 6
+
+    DST_LEN = 16
+    ECPUBSIZE = 64  # X25519 (32) + Ed25519 (32) public keys
+
+    # Mask flags to only keep lower 4 bits
+    masked_flags = bytes([flags & 0b00001111])
+
+    if header_type == 1:  # HEADER_2
+        hashable_part = masked_flags + raw[2+DST_LEN:]
+    else:  # HEADER_1
+        hashable_part = masked_flags + raw[2:]
+
+    # For link requests, if data is longer than ECPUBSIZE,
+    # exclude the extra bytes (MTU signalling) from hash
+    # Parse to find data portion
+    if header_type == 1:
+        header_len = 2 + DST_LEN + DST_LEN + 1  # flags + hops + transport_id + dest + context
+    else:
+        header_len = 2 + DST_LEN + 1  # flags + hops + dest + context
+
+    data_start = header_len
+    data = raw[data_start:]
+
+    if len(data) > ECPUBSIZE:
+        diff = len(data) - ECPUBSIZE
+        hashable_part = hashable_part[:-diff]
+
+    full_hash = hashlib.sha256(hashable_part).digest()
+    link_id = full_hash[:16]
+
+    return {
+        'link_id': bytes_to_hex(link_id),
+        'hashable_part': bytes_to_hex(hashable_part)
+    }
+
+
+def cmd_link_derive_key(params):
+    """Derive link encryption keys using HKDF.
+
+    For AES-256-CBC mode, derives 64 bytes:
+    - First 32 bytes: encryption key
+    - Last 32 bytes: signing key
+
+    Note: Link.get_context() returns None in Python RNS, so context is None.
+    """
+    shared_key = hex_to_bytes(params['shared_key'])
+    link_id = hex_to_bytes(params['link_id'])
+    mode = params.get('mode', 'AES_256_CBC')
+
+    # Salt is the link ID (from Link.get_salt())
+    salt = link_id
+
+    # Context is None (from Link.get_context())
+    context = None
+
+    # Derived key length depends on mode
+    if mode == 'AES_256_CBC':
+        length = 64
+    else:
+        length = 32
+
+    derived = HKDF.hkdf(
+        length=length,
+        derive_from=shared_key,
+        salt=salt,
+        context=context
+    )
+
+    return {
+        'derived_key': bytes_to_hex(derived),
+        'encryption_key': bytes_to_hex(derived[:32]) if length >= 64 else bytes_to_hex(derived[:16]),
+        'signing_key': bytes_to_hex(derived[32:]) if length >= 64 else bytes_to_hex(derived[16:])
+    }
+
+
+def cmd_link_encrypt(params):
+    """Encrypt data for transmission over a link using Token encryption."""
+    derived_key = hex_to_bytes(params['derived_key'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
+
+    token_obj = Token.Token(derived_key)
+
+    if iv:
+        # Use provided IV for reproducibility
+        ciphertext = token_obj.mode.encrypt(
+            plaintext=PKCS7.pad(plaintext),
+            key=token_obj._encryption_key,
+            iv=iv
+        )
+        signed_parts = iv + ciphertext
+        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
+        token_bytes = signed_parts + hmac_val
+    else:
+        token_bytes = token_obj.encrypt(plaintext)
+
+    return {
+        'ciphertext': bytes_to_hex(token_bytes)
+    }
+
+
+def cmd_link_decrypt(params):
+    """Decrypt data received over a link."""
+    derived_key = hex_to_bytes(params['derived_key'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+
+    token_obj = Token.Token(derived_key)
+    plaintext = token_obj.decrypt(ciphertext)
+
+    return {
+        'plaintext': bytes_to_hex(plaintext)
+    }
+
+
+def cmd_link_prove(params):
+    """Generate link proof signature.
+
+    The proof signs: link_id + receiver_pub + receiver_sig_pub + signalling_bytes
+    """
+    identity_private = hex_to_bytes(params['identity_private'])  # 64 bytes: X25519 + Ed25519
+    link_id = hex_to_bytes(params['link_id'])
+    receiver_pub = hex_to_bytes(params['receiver_pub'])  # X25519 public
+    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])  # Ed25519 public
+    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
+
+    # Build signed data
+    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
+
+    # Sign with Ed25519 private key (second 32 bytes of identity)
+    ed25519_prv = identity_private[32:64]
+
+    from pure25519.ed25519_oop import SigningKey
+    sk = SigningKey(ed25519_prv)
+    signature = sk.sign(signed_data)
+
+    return {
+        'signature': bytes_to_hex(signature),
+        'signed_data': bytes_to_hex(signed_data)
+    }
+
+
+def cmd_link_verify_proof(params):
+    """Verify link proof signature."""
+    identity_public = hex_to_bytes(params['identity_public'])  # 64 bytes: X25519 + Ed25519
+    link_id = hex_to_bytes(params['link_id'])
+    receiver_pub = hex_to_bytes(params['receiver_pub'])
+    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])
+    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
+    signature = hex_to_bytes(params['signature'])
+
+    # Build signed data
+    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
+
+    # Verify with Ed25519 public key (second 32 bytes of identity)
+    ed25519_pub = identity_public[32:64]
+
+    from pure25519.ed25519_oop import VerifyingKey
+    try:
+        vk = VerifyingKey(ed25519_pub)
+        vk.verify(signature, signed_data)
+        return {'valid': True}
+    except Exception:
+        return {'valid': False}
+
+
+def cmd_link_signalling_bytes(params):
+    """Encode MTU and mode into signalling bytes.
+
+    Format: 3 bytes
+    - Bits 21-23: mode (3 bits)
+    - Bits 0-20: MTU (21 bits)
+    """
+    mtu = int(params['mtu'])
+    mode = int(params.get('mode', 1))  # Default: AES_256_CBC = 0x01
+
+    MTU_BYTEMASK = 0x1FFFFF  # 21 bits
+    MODE_BYTEMASK = 0xE0  # Top 3 bits of first byte
+
+    value = (mtu & MTU_BYTEMASK) + (((mode << 5) & MODE_BYTEMASK) << 16)
+
+    signalling = bytes([
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF
+    ])
+
+    return {
+        'signalling_bytes': bytes_to_hex(signalling),
+        'decoded_mtu': mtu & MTU_BYTEMASK,
+        'decoded_mode': mode
+    }
+
+
+def cmd_link_parse_signalling(params):
+    """Parse signalling bytes into MTU and mode."""
+    signalling = hex_to_bytes(params['signalling_bytes'])
+
+    if len(signalling) != 3:
+        raise ValueError(f"Signalling bytes must be 3 bytes, got {len(signalling)}")
+
+    MTU_BYTEMASK = 0x1FFFFF
+    MODE_BYTEMASK = 0xE0
+
+    value = (signalling[0] << 16) | (signalling[1] << 8) | signalling[2]
+    mtu = value & MTU_BYTEMASK
+    mode = (signalling[0] & MODE_BYTEMASK) >> 5
+
+    return {
+        'mtu': mtu,
+        'mode': mode
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -866,6 +1092,15 @@ COMMANDS = {
     'hdlc_frame': cmd_hdlc_frame,
     'kiss_escape': cmd_kiss_escape,
     'kiss_frame': cmd_kiss_frame,
+    # Link operations
+    'link_id_from_packet': cmd_link_id_from_packet,
+    'link_derive_key': cmd_link_derive_key,
+    'link_encrypt': cmd_link_encrypt,
+    'link_decrypt': cmd_link_decrypt,
+    'link_prove': cmd_link_prove,
+    'link_verify_proof': cmd_link_verify_proof,
+    'link_signalling_bytes': cmd_link_signalling_bytes,
+    'link_parse_signalling': cmd_link_parse_signalling,
 }
 
 
