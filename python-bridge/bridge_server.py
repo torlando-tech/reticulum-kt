@@ -27,6 +27,10 @@ sys.path.insert(0, rns_path)
 
 import hashlib
 
+# Import umsgpack from RNS vendor
+sys.path.insert(0, os.path.join(rns_path, 'RNS', 'vendor'))
+import umsgpack
+
 # Import cryptography modules directly from the Cryptography directory
 # This bypasses RNS/__init__.py which would load all interfaces
 import importlib.util
@@ -1055,6 +1059,1368 @@ def cmd_link_parse_signalling(params):
     }
 
 
+# Announce operations
+
+def cmd_random_hash(params):
+    """Generate random_hash (5 random bytes + 5 timestamp bytes).
+
+    Format matches Python RNS:
+    random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
+    """
+    import time
+    timestamp = params.get('timestamp')
+    random_bytes = hex_to_bytes(params['random_bytes']) if params.get('random_bytes') else None
+
+    # Generate random bytes if not provided
+    if random_bytes is None:
+        random_bytes = os.urandom(5)
+    elif len(random_bytes) != 5:
+        raise ValueError(f"random_bytes must be 5 bytes, got {len(random_bytes)}")
+
+    # Use provided timestamp or current time
+    if timestamp is not None:
+        timestamp = int(timestamp)
+    else:
+        timestamp = int(time.time())
+
+    # Combine: 5 random bytes + 5 timestamp bytes (big-endian)
+    random_hash = random_bytes + timestamp.to_bytes(5, "big")
+
+    return {
+        'random_hash': bytes_to_hex(random_hash),
+        'random_bytes': bytes_to_hex(random_bytes),
+        'timestamp': timestamp,
+        'timestamp_bytes': bytes_to_hex(timestamp.to_bytes(5, "big"))
+    }
+
+
+def cmd_announce_pack(params):
+    """Pack announce payload.
+
+    Without ratchet (148 bytes min):
+      public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data (var)
+
+    With ratchet (180 bytes min):
+      public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data (var)
+    """
+    public_key = hex_to_bytes(params['public_key'])
+    name_hash = hex_to_bytes(params['name_hash'])
+    random_hash = hex_to_bytes(params['random_hash'])
+    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
+    signature = hex_to_bytes(params['signature'])
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
+
+    # Validate sizes
+    if len(public_key) != 64:
+        raise ValueError(f"public_key must be 64 bytes, got {len(public_key)}")
+    if len(name_hash) != 10:
+        raise ValueError(f"name_hash must be 10 bytes, got {len(name_hash)}")
+    if len(random_hash) != 10:
+        raise ValueError(f"random_hash must be 10 bytes, got {len(random_hash)}")
+    if ratchet and len(ratchet) != 32:
+        raise ValueError(f"ratchet must be 32 bytes, got {len(ratchet)}")
+    if len(signature) != 64:
+        raise ValueError(f"signature must be 64 bytes, got {len(signature)}")
+
+    # Pack announce data
+    announce_data = public_key + name_hash + random_hash + ratchet + signature + app_data
+
+    return {
+        'announce_data': bytes_to_hex(announce_data),
+        'size': len(announce_data),
+        'has_ratchet': len(ratchet) > 0
+    }
+
+
+def cmd_announce_unpack(params):
+    """Unpack announce payload.
+
+    Returns all components of the announce.
+    """
+    announce_data = hex_to_bytes(params['announce_data'])
+    has_ratchet = params.get('has_ratchet', False)
+
+    # Constants
+    KEYSIZE = 64
+    NAME_HASH_LEN = 10
+    RANDOM_HASH_LEN = 10
+    RATCHET_SIZE = 32
+    SIG_LEN = 64
+
+    # Unpack based on whether ratchet is present
+    if has_ratchet:
+        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + RATCHET_SIZE + SIG_LEN:
+            raise ValueError(f"announce_data too short for ratchet announce: {len(announce_data)} bytes")
+
+        public_key = announce_data[0:KEYSIZE]
+        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
+        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
+        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
+        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
+    else:
+        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + SIG_LEN:
+            raise ValueError(f"announce_data too short for non-ratchet announce: {len(announce_data)} bytes")
+
+        public_key = announce_data[0:KEYSIZE]
+        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
+        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        ratchet = b""
+        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
+        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
+
+    return {
+        'public_key': bytes_to_hex(public_key),
+        'name_hash': bytes_to_hex(name_hash),
+        'random_hash': bytes_to_hex(random_hash),
+        'ratchet': bytes_to_hex(ratchet) if ratchet else '',
+        'signature': bytes_to_hex(signature),
+        'app_data': bytes_to_hex(app_data) if app_data else '',
+        'has_ratchet': len(ratchet) > 0
+    }
+
+
+def cmd_announce_sign(params):
+    """Sign announce data.
+
+    Signed data format:
+      destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+    """
+    private_key = hex_to_bytes(params['private_key'])
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    public_key = hex_to_bytes(params['public_key'])
+    name_hash = hex_to_bytes(params['name_hash'])
+    random_hash = hex_to_bytes(params['random_hash'])
+    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
+
+    # Build signed data (matches Python RNS Destination.announce())
+    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+
+    # Sign with Ed25519 private key (second 32 bytes)
+    ed25519_prv = private_key[32:64]
+
+    from pure25519.ed25519_oop import SigningKey
+    sk = SigningKey(ed25519_prv)
+    signature = sk.sign(signed_data)
+
+    return {
+        'signature': bytes_to_hex(signature),
+        'signed_data': bytes_to_hex(signed_data)
+    }
+
+
+def cmd_announce_verify(params):
+    """Verify announce signature.
+
+    Validates signature and optionally validates destination hash.
+    """
+    announce_data = hex_to_bytes(params['announce_data'])
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    has_ratchet = params.get('has_ratchet', False)
+    validate_dest_hash = params.get('validate_dest_hash', True)
+
+    # Constants
+    KEYSIZE = 64
+    NAME_HASH_LEN = 10
+    RANDOM_HASH_LEN = 10
+    RATCHET_SIZE = 32
+    SIG_LEN = 64
+
+    # Unpack announce data
+    if has_ratchet:
+        public_key = announce_data[0:KEYSIZE]
+        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
+        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
+        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
+        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
+    else:
+        public_key = announce_data[0:KEYSIZE]
+        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
+        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        ratchet = b""
+        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
+        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
+
+    # Build signed data
+    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+
+    # Verify signature
+    ed25519_pub = public_key[32:64]
+
+    from pure25519.ed25519_oop import VerifyingKey
+    try:
+        vk = VerifyingKey(ed25519_pub)
+        vk.verify(signature, signed_data)
+        signature_valid = True
+    except Exception:
+        signature_valid = False
+
+    # Optionally validate destination hash
+    dest_hash_valid = True
+    expected_dest_hash = b""
+    if validate_dest_hash:
+        # Compute identity hash from public key
+        identity_hash = hashlib.sha256(public_key).digest()[:16]
+
+        # Compute expected destination hash
+        hash_material = name_hash + identity_hash
+        expected_dest_hash = hashlib.sha256(hash_material).digest()[:16]
+
+        dest_hash_valid = (destination_hash == expected_dest_hash)
+
+    return {
+        'valid': signature_valid and dest_hash_valid,
+        'signature_valid': signature_valid,
+        'dest_hash_valid': dest_hash_valid,
+        'expected_dest_hash': bytes_to_hex(expected_dest_hash) if validate_dest_hash else ''
+    }
+
+
+# Ratchet operations
+
+def cmd_ratchet_id(params):
+    """Compute ratchet ID from ratchet public key.
+
+    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
+    """
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+
+    # Compute full hash
+    full_hash = hashlib.sha256(ratchet_public).digest()
+
+    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
+    ratchet_id = full_hash[:10]
+
+    return {
+        'ratchet_id': bytes_to_hex(ratchet_id),
+        'full_hash': bytes_to_hex(full_hash)
+    }
+
+
+def cmd_ratchet_public_from_private(params):
+    """Derive public key from ratchet private key."""
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+
+    # Create X25519 key pair from private key
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ratchet_pub = ratchet_prv.public_key()
+    ratchet_pub_bytes = ratchet_pub.public_bytes()
+
+    return {
+        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
+    }
+
+
+def cmd_ratchet_derive_key(params):
+    """Derive encryption key using ratchet.
+
+    This performs ECDH with ephemeral key and ratchet public key,
+    then derives a key using HKDF with identity hash as salt.
+    """
+    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+
+    # Create keys
+    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
+    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
+
+    # ECDH exchange
+    shared_key = ephemeral_prv.exchange(ratchet_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    return {
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key)
+    }
+
+
+def cmd_ratchet_encrypt(params):
+    """Encrypt plaintext using ratchet.
+
+    Same as identity_encrypt but uses ratchet public key instead of identity public key.
+    """
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
+    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
+
+    # Create ratchet public key
+    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
+
+    # Generate or use provided ephemeral key
+    if ephemeral_private:
+        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
+    else:
+        ephemeral_prv = X25519.X25519PrivateKey.generate()
+
+    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
+
+    # ECDH exchange with ratchet
+    shared_key = ephemeral_prv.exchange(ratchet_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token encryption
+    token_obj = Token.Token(derived_key)
+
+    if iv:
+        # Use provided IV for reproducibility
+        ciphertext = token_obj.mode.encrypt(
+            plaintext=PKCS7.pad(plaintext),
+            key=token_obj._encryption_key,
+            iv=iv
+        )
+        signed_parts = iv + ciphertext
+        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
+        token_bytes = signed_parts + hmac_val
+    else:
+        token_bytes = token_obj.encrypt(plaintext)
+
+    # Return ephemeral_pub + token
+    result = ephemeral_pub_bytes + token_bytes
+
+    return {
+        'ciphertext': bytes_to_hex(result),
+        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key)
+    }
+
+
+def cmd_ratchet_decrypt(params):
+    """Decrypt ciphertext using ratchet.
+
+    Tries to decrypt using provided ratchet private keys.
+    """
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+
+    # Extract ephemeral public key (first 32 bytes)
+    if len(ciphertext) <= 32:
+        return {
+            'success': False,
+            'plaintext': None,
+            'error': 'Ciphertext too short'
+        }
+
+    ephemeral_pub_bytes = ciphertext[:32]
+    token_data = ciphertext[32:]
+
+    # Create keys
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
+
+    # ECDH exchange
+    shared_key = ratchet_prv.exchange(ephemeral_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token decryption
+    try:
+        token_obj = Token.Token(derived_key)
+        plaintext = token_obj.decrypt(token_data)
+
+        if plaintext is None:
+            return {
+                'success': False,
+                'plaintext': None,
+                'shared_key': bytes_to_hex(shared_key),
+                'derived_key': bytes_to_hex(derived_key)
+            }
+
+        return {
+            'success': True,
+            'plaintext': bytes_to_hex(plaintext),
+            'shared_key': bytes_to_hex(shared_key),
+            'derived_key': bytes_to_hex(derived_key)
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'plaintext': None,
+            'error': str(e),
+            'shared_key': bytes_to_hex(shared_key),
+            'derived_key': bytes_to_hex(derived_key)
+        }
+
+
+def cmd_ratchet_storage_format(params):
+    """Pack ratchet storage format using msgpack.
+
+    Format: {"ratchet": ratchet_bytes, "received": timestamp}
+    """
+    import time
+
+    ratchet = hex_to_bytes(params['ratchet'])
+    received = float(params.get('received', time.time()))
+
+    # Pack using msgpack
+    ratchet_data = {
+        "ratchet": ratchet,
+        "received": received
+    }
+
+    packed = umsgpack.packb(ratchet_data)
+
+    return {
+        'packed': bytes_to_hex(packed),
+        'ratchet': bytes_to_hex(ratchet),
+        'received': received
+    }
+
+
+def cmd_ratchet_extract_from_announce(params):
+    """Extract ratchet from announce data.
+
+    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
+    """
+    announce_data = hex_to_bytes(params['announce_data'])
+
+    # Parse announce structure
+    # public_key: 64 bytes
+    # name_hash: 10 bytes
+    # random_hash: 10 bytes
+    # ratchet: 32 bytes (or 0 if not present)
+    # signature: 64 bytes
+
+    if len(announce_data) < 64 + 10 + 10 + 64:
+        return {
+            'has_ratchet': False,
+            'ratchet': None,
+            'error': 'Announce too short'
+        }
+
+    offset = 0
+    public_key = announce_data[offset:offset+64]
+    offset += 64
+
+    name_hash = announce_data[offset:offset+10]
+    offset += 10
+
+    random_hash = announce_data[offset:offset+10]
+    offset += 10
+
+    # Check if there's space for ratchet + signature
+    remaining = len(announce_data) - offset
+
+    if remaining >= 32 + 64:
+        # Ratchet is present
+        ratchet = announce_data[offset:offset+32]
+        offset += 32
+        signature = announce_data[offset:offset+64]
+        offset += 64
+
+        # Check if ratchet is all zeros (no ratchet)
+        if ratchet == b'\x00' * 32:
+            has_ratchet = False
+            ratchet = None
+        else:
+            has_ratchet = True
+    elif remaining == 64:
+        # No ratchet, just signature
+        has_ratchet = False
+        ratchet = None
+        signature = announce_data[offset:offset+64]
+        offset += 64
+    else:
+        return {
+            'has_ratchet': False,
+            'ratchet': None,
+            'error': 'Invalid announce structure'
+        }
+
+    # Any remaining data is app_data
+    app_data = announce_data[offset:] if offset < len(announce_data) else b''
+
+    result = {
+        'has_ratchet': has_ratchet,
+        'public_key': bytes_to_hex(public_key),
+        'name_hash': bytes_to_hex(name_hash),
+        'random_hash': bytes_to_hex(random_hash),
+        'signature': bytes_to_hex(signature)
+    }
+
+    if has_ratchet:
+        result['ratchet'] = bytes_to_hex(ratchet)
+        # Compute ratchet ID
+        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
+        result['ratchet_id'] = bytes_to_hex(ratchet_id)
+    else:
+        result['ratchet'] = None
+
+    if app_data:
+        result['app_data'] = bytes_to_hex(app_data)
+
+    return result
+
+# Ratchet operations
+
+def cmd_ratchet_id(params):
+    """Compute ratchet ID from ratchet public key.
+
+    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
+    """
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+
+    # Compute full hash
+    full_hash = hashlib.sha256(ratchet_public).digest()
+
+    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
+    ratchet_id = full_hash[:10]
+
+    return {
+        'ratchet_id': bytes_to_hex(ratchet_id),
+        'full_hash': bytes_to_hex(full_hash)
+    }
+
+
+def cmd_ratchet_public_from_private(params):
+    """Derive public key from ratchet private key."""
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+
+    # Create X25519 key pair from private key
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ratchet_pub = ratchet_prv.public_key()
+    ratchet_pub_bytes = ratchet_pub.public_bytes()
+
+    return {
+        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
+    }
+
+
+def cmd_ratchet_derive_key(params):
+    """Derive encryption key using ratchet.
+
+    This performs ECDH with ephemeral key and ratchet public key,
+    then derives a key using HKDF with identity hash as salt.
+    """
+    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+
+    # Create keys
+    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
+    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
+
+    # ECDH exchange
+    shared_key = ephemeral_prv.exchange(ratchet_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    return {
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key)
+    }
+
+
+def cmd_ratchet_encrypt(params):
+    """Encrypt plaintext using ratchet.
+
+    Same as identity_encrypt but uses ratchet public key instead of identity public key.
+    """
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
+    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
+
+    # Create ratchet public key
+    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
+
+    # Generate or use provided ephemeral key
+    if ephemeral_private:
+        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
+    else:
+        ephemeral_prv = X25519.X25519PrivateKey.generate()
+
+    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
+
+    # ECDH exchange with ratchet
+    shared_key = ephemeral_prv.exchange(ratchet_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token encryption
+    token_obj = Token.Token(derived_key)
+
+    if iv:
+        # Use provided IV for reproducibility
+        ciphertext = token_obj.mode.encrypt(
+            plaintext=PKCS7.pad(plaintext),
+            key=token_obj._encryption_key,
+            iv=iv
+        )
+        signed_parts = iv + ciphertext
+        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
+        token_bytes = signed_parts + hmac_val
+    else:
+        token_bytes = token_obj.encrypt(plaintext)
+
+    # Return ephemeral_pub + token
+    result = ephemeral_pub_bytes + token_bytes
+
+    return {
+        'ciphertext': bytes_to_hex(result),
+        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key)
+    }
+
+
+def cmd_ratchet_decrypt(params):
+    """Decrypt ciphertext using ratchet.
+
+    Tries to decrypt using provided ratchet private keys.
+    """
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    identity_hash = hex_to_bytes(params['identity_hash'])
+
+    # Extract ephemeral public key (first 32 bytes)
+    if len(ciphertext) <= 32:
+        return {
+            'success': False,
+            'plaintext': None,
+            'error': 'Ciphertext too short'
+        }
+
+    ephemeral_pub_bytes = ciphertext[:32]
+    token_data = ciphertext[32:]
+
+    # Create keys
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
+
+    # ECDH exchange
+    shared_key = ratchet_prv.exchange(ephemeral_pub)
+
+    # HKDF key derivation with identity hash as salt
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token decryption
+    try:
+        token_obj = Token.Token(derived_key)
+        plaintext = token_obj.decrypt(token_data)
+
+        if plaintext is None:
+            return {
+                'success': False,
+                'plaintext': None,
+                'shared_key': bytes_to_hex(shared_key),
+                'derived_key': bytes_to_hex(derived_key)
+            }
+
+        return {
+            'success': True,
+            'plaintext': bytes_to_hex(plaintext),
+            'shared_key': bytes_to_hex(shared_key),
+            'derived_key': bytes_to_hex(derived_key)
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'plaintext': None,
+            'error': str(e),
+            'shared_key': bytes_to_hex(shared_key),
+            'derived_key': bytes_to_hex(derived_key)
+        }
+
+
+def cmd_ratchet_storage_format(params):
+    """Pack ratchet storage format using msgpack.
+
+    Format: {"ratchet": ratchet_bytes, "received": timestamp}
+    """
+    import time
+
+    ratchet = hex_to_bytes(params['ratchet'])
+    received = float(params.get('received', time.time()))
+
+    # Pack using msgpack
+    ratchet_data = {
+        "ratchet": ratchet,
+        "received": received
+    }
+
+    packed = umsgpack.packb(ratchet_data)
+
+    return {
+        'packed': bytes_to_hex(packed),
+        'ratchet': bytes_to_hex(ratchet),
+        'received': received
+    }
+
+
+def cmd_ratchet_extract_from_announce(params):
+    """Extract ratchet from announce data.
+
+    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
+    """
+    announce_data = hex_to_bytes(params['announce_data'])
+
+    # Parse announce structure
+    # public_key: 64 bytes
+    # name_hash: 10 bytes
+    # random_hash: 10 bytes
+    # ratchet: 32 bytes (or 0 if not present)
+    # signature: 64 bytes
+
+    if len(announce_data) < 64 + 10 + 10 + 64:
+        return {
+            'has_ratchet': False,
+            'ratchet': None,
+            'error': 'Announce too short'
+        }
+
+    offset = 0
+    public_key = announce_data[offset:offset+64]
+    offset += 64
+
+    name_hash = announce_data[offset:offset+10]
+    offset += 10
+
+    random_hash = announce_data[offset:offset+10]
+    offset += 10
+
+    # Check if there's space for ratchet + signature
+    remaining = len(announce_data) - offset
+
+    if remaining >= 32 + 64:
+        # Ratchet is present
+        ratchet = announce_data[offset:offset+32]
+        offset += 32
+        signature = announce_data[offset:offset+64]
+        offset += 64
+
+        # Check if ratchet is all zeros (no ratchet)
+        if ratchet == b'\x00' * 32:
+            has_ratchet = False
+            ratchet = None
+        else:
+            has_ratchet = True
+    elif remaining == 64:
+        # No ratchet, just signature
+        has_ratchet = False
+        ratchet = None
+        signature = announce_data[offset:offset+64]
+        offset += 64
+    else:
+        return {
+            'has_ratchet': False,
+            'ratchet': None,
+            'error': 'Invalid announce structure'
+        }
+
+    # Any remaining data is app_data
+    app_data = announce_data[offset:] if offset < len(announce_data) else b''
+
+    result = {
+        'has_ratchet': has_ratchet,
+        'public_key': bytes_to_hex(public_key),
+        'name_hash': bytes_to_hex(name_hash),
+        'random_hash': bytes_to_hex(random_hash),
+        'signature': bytes_to_hex(signature)
+    }
+
+    if has_ratchet:
+        result['ratchet'] = bytes_to_hex(ratchet)
+        # Compute ratchet ID
+        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
+        result['ratchet_id'] = bytes_to_hex(ratchet_id)
+    else:
+        result['ratchet'] = None
+
+    if app_data:
+        result['app_data'] = bytes_to_hex(app_data)
+
+    return result
+
+
+# Channel operations
+
+def cmd_envelope_pack(params):
+    """Pack a channel envelope.
+
+    Format: [msgtype:2][sequence:2][length:2][data:N]
+    All fields are big-endian.
+    """
+    import struct
+
+    msgtype = int(params['msgtype'])
+    sequence = int(params['sequence'])
+    data = hex_to_bytes(params['data'])
+    length = len(data)
+
+    # Pack header: msgtype (2), sequence (2), length (2)
+    header = struct.pack(">HHH", msgtype, sequence, length)
+    envelope = header + data
+
+    return {
+        'envelope': bytes_to_hex(envelope),
+        'msgtype': msgtype,
+        'sequence': sequence,
+        'length': length
+    }
+
+
+def cmd_envelope_unpack(params):
+    """Unpack a channel envelope.
+
+    Extracts msgtype, sequence, length, and data from envelope bytes.
+    """
+    import struct
+
+    envelope = hex_to_bytes(params['envelope'])
+
+    if len(envelope) < 6:
+        raise ValueError(f"Envelope too short: {len(envelope)} bytes")
+
+    # Unpack header
+    msgtype, sequence, length = struct.unpack(">HHH", envelope[:6])
+    data = envelope[6:]
+
+    return {
+        'msgtype': msgtype,
+        'sequence': sequence,
+        'length': length,
+        'data': bytes_to_hex(data)
+    }
+
+
+def cmd_stream_msg_pack(params):
+    """Pack a StreamDataMessage.
+
+    Python format: [header:2][data:N]
+    Header bits:
+      Bit 15: EOF flag (0x8000)
+      Bit 14: compressed flag (0x4000)
+      Bits 13-0: stream_id (0-16383)
+    """
+    import struct
+
+    stream_id = int(params['stream_id'])
+    data = hex_to_bytes(params.get('data', ''))
+    eof = bool(params.get('eof', False))
+    compressed = bool(params.get('compressed', False))
+
+    # Validate stream_id
+    if stream_id < 0 or stream_id > 0x3FFF:  # 16383
+        raise ValueError(f"stream_id must be 0-16383, got {stream_id}")
+
+    # Build header value
+    header_val = (stream_id & 0x3FFF)
+    if eof:
+        header_val |= 0x8000
+    if compressed:
+        header_val |= 0x4000
+
+    # Pack as big-endian 2-byte header
+    header = struct.pack(">H", header_val)
+    message = header + data
+
+    return {
+        'message': bytes_to_hex(message),
+        'header_val': header_val,
+        'stream_id': stream_id,
+        'eof': eof,
+        'compressed': compressed
+    }
+
+
+def cmd_stream_msg_unpack(params):
+    """Unpack a StreamDataMessage.
+
+    Extracts stream_id, flags, and data from message bytes.
+    """
+    import struct
+
+    message = hex_to_bytes(params['message'])
+
+    if len(message) < 2:
+        raise ValueError(f"Message too short: {len(message)} bytes")
+
+    # Unpack header
+    header_val = struct.unpack(">H", message[:2])[0]
+
+    # Extract fields
+    stream_id = header_val & 0x3FFF
+    eof = (header_val & 0x8000) != 0
+    compressed = (header_val & 0x4000) != 0
+    data = message[2:]
+
+    return {
+        'stream_id': stream_id,
+        'eof': eof,
+        'compressed': compressed,
+        'data': bytes_to_hex(data),
+        'header_val': header_val
+    }
+
+
+# Link request/response operations
+
+def cmd_link_rtt_pack(params):
+    """Pack RTT value for link using umsgpack.
+
+    Format: umsgpack.packb(rtt_float)
+    """
+    rtt = float(params['rtt'])
+    packed = umsgpack.packb(rtt)
+
+    return {
+        'packed': bytes_to_hex(packed)
+    }
+
+
+def cmd_link_rtt_unpack(params):
+    """Unpack RTT value from msgpack bytes."""
+    packed = hex_to_bytes(params['packed'])
+    rtt = umsgpack.unpackb(packed)
+
+    return {
+        'rtt': rtt
+    }
+
+
+def cmd_link_request_pack(params):
+    """Pack link request data.
+
+    Format: [timestamp, path_hash, data]
+    - timestamp: float (time.time())
+    - path_hash: bytes (16 bytes, truncated hash of path)
+    - data: any (request payload)
+    """
+    timestamp = float(params['timestamp'])
+    path_hash = hex_to_bytes(params['path_hash'])
+
+    # data can be None, bytes, or other types
+    if 'data' in params and params['data'] is not None:
+        if isinstance(params['data'], str):
+            # Assume hex-encoded bytes
+            data = hex_to_bytes(params['data'])
+        else:
+            data = params['data']
+    else:
+        data = None
+
+    unpacked_request = [timestamp, path_hash, data]
+    packed = umsgpack.packb(unpacked_request)
+
+    return {
+        'packed': bytes_to_hex(packed)
+    }
+
+
+def cmd_link_request_unpack(params):
+    """Unpack link request data.
+
+    Returns timestamp, path_hash, and data.
+    """
+    packed = hex_to_bytes(params['packed'])
+    unpacked = umsgpack.unpackb(packed)
+
+    timestamp = unpacked[0]
+    path_hash = unpacked[1]
+    data = unpacked[2]
+
+    return {
+        'timestamp': timestamp,
+        'path_hash': bytes_to_hex(path_hash),
+        'data': bytes_to_hex(data) if data is not None and isinstance(data, bytes) else data
+    }
+
+
+def cmd_link_response_pack(params):
+    """Pack link response data.
+
+    Format: [request_id, response_data]
+    - request_id: bytes (16 bytes, truncated hash of request packet)
+    - response_data: any (response payload)
+    """
+    request_id = hex_to_bytes(params['request_id'])
+
+    # response_data can be None, bytes, or other types
+    if 'response_data' in params and params['response_data'] is not None:
+        if isinstance(params['response_data'], str):
+            # Assume hex-encoded bytes
+            response_data = hex_to_bytes(params['response_data'])
+        else:
+            response_data = params['response_data']
+    else:
+        response_data = None
+
+    packed_response = umsgpack.packb([request_id, response_data])
+
+    return {
+        'packed': bytes_to_hex(packed_response)
+    }
+
+
+def cmd_link_response_unpack(params):
+    """Unpack link response data.
+
+    Returns request_id and response_data.
+    """
+    packed = hex_to_bytes(params['packed'])
+    unpacked = umsgpack.unpackb(packed)
+
+    request_id = unpacked[0]
+    response_data = unpacked[1]
+
+    return {
+        'request_id': bytes_to_hex(request_id),
+        'response_data': bytes_to_hex(response_data) if response_data is not None and isinstance(response_data, bytes) else response_data
+    }
+
+
+
+# Transport operations
+
+def cmd_path_entry_serialize(params):
+    """Serialize a path table entry to msgpack format.
+
+    Format: [destination_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
+    """
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    timestamp = float(params['timestamp'])
+    received_from = hex_to_bytes(params['received_from'])
+    hops = int(params['hops'])
+    expires = float(params['expires'])
+    random_blobs = [hex_to_bytes(blob) for blob in params['random_blobs']]
+    interface_hash = hex_to_bytes(params['interface_hash'])
+    packet_hash = hex_to_bytes(params['packet_hash'])
+
+    entry = [
+        destination_hash,
+        timestamp,
+        received_from,
+        hops,
+        expires,
+        random_blobs,
+        interface_hash,
+        packet_hash
+    ]
+
+    serialized = umsgpack.packb(entry)
+
+    return {
+        'serialized': bytes_to_hex(serialized)
+    }
+
+
+def cmd_path_entry_deserialize(params):
+    """Deserialize a path table entry from msgpack format."""
+    serialized = hex_to_bytes(params['serialized'])
+
+    entry = umsgpack.unpackb(serialized)
+
+    return {
+        'destination_hash': bytes_to_hex(entry[0]),
+        'timestamp': entry[1],
+        'received_from': bytes_to_hex(entry[2]),
+        'hops': entry[3],
+        'expires': entry[4],
+        'random_blobs': [bytes_to_hex(blob) for blob in entry[5]],
+        'interface_hash': bytes_to_hex(entry[6]),
+        'packet_hash': bytes_to_hex(entry[7])
+    }
+
+
+def cmd_path_request_pack(params):
+    """Pack path request data.
+
+    Format: [destination_hash:10-16][transport_instance:10-16?][tag:10?]
+    - If transport_enabled: destination_hash + transport_instance + tag
+    - Otherwise: destination_hash + tag
+    """
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    transport_instance = hex_to_bytes(params['transport_instance']) if params.get('transport_instance') else None
+    tag = hex_to_bytes(params['tag']) if params.get('tag') else None
+
+    if transport_instance:
+        # Transport enabled: dest + transport + tag
+        data = destination_hash + transport_instance
+        if tag:
+            data += tag
+    else:
+        # Transport disabled: dest + tag
+        data = destination_hash
+        if tag:
+            data += tag
+
+    return {
+        'data': bytes_to_hex(data),
+        'has_transport_instance': transport_instance is not None,
+        'has_tag': tag is not None
+    }
+
+
+def cmd_path_request_unpack(params):
+    """Unpack path request data.
+
+    Extracts destination_hash, and optionally transport_instance and tag.
+    """
+    data = hex_to_bytes(params['data'])
+
+    # Destination hash is first 10-16 bytes (we'll use 16 for truncated hash)
+    destination_hash = data[:16]
+    remaining = data[16:]
+
+    transport_instance = None
+    tag = None
+
+    if len(remaining) >= 16:
+        # Could be transport instance (16 bytes)
+        transport_instance = remaining[:16]
+        remaining = remaining[16:]
+
+        if len(remaining) >= 10:
+            # Remaining could be tag (10 bytes)
+            tag = remaining[:10]
+    elif len(remaining) >= 10:
+        # No transport instance, but has tag
+        tag = remaining[:10]
+
+    result = {
+        'destination_hash': bytes_to_hex(destination_hash)
+    }
+
+    if transport_instance:
+        result['transport_instance'] = bytes_to_hex(transport_instance)
+    if tag:
+        result['tag'] = bytes_to_hex(tag)
+
+    return result
+
+
+def cmd_packet_hashlist_pack(params):
+    """Pack a list of packet hashes for storage.
+
+    Uses umsgpack to serialize a list of hashes.
+    """
+    hashes = [hex_to_bytes(h) for h in params['hashes']]
+
+    serialized = umsgpack.packb(hashes)
+
+    return {
+        'serialized': bytes_to_hex(serialized),
+        'count': len(hashes)
+    }
+
+
+def cmd_packet_hashlist_unpack(params):
+    """Unpack a list of packet hashes from storage."""
+    serialized = hex_to_bytes(params['serialized'])
+
+    hashes = umsgpack.unpackb(serialized)
+
+    return {
+        'hashes': [bytes_to_hex(h) for h in hashes],
+        'count': len(hashes)
+    }
+
+
+# Resource operations
+
+def cmd_resource_adv_pack(params):
+    """Pack a ResourceAdvertisement to msgpack bytes."""
+    transfer_size = int(params['transfer_size'])
+    data_size = int(params['data_size'])
+    num_parts = int(params['num_parts'])
+    resource_hash = hex_to_bytes(params['resource_hash'])
+    random_hash = hex_to_bytes(params['random_hash'])
+    original_hash = hex_to_bytes(params['original_hash']) if params.get('original_hash') else None
+    segment_index = int(params['segment_index'])
+    total_segments = int(params['total_segments'])
+    request_id = hex_to_bytes(params['request_id']) if params.get('request_id') else None
+    flags = int(params['flags'])
+    hashmap = hex_to_bytes(params.get('hashmap', ''))
+    segment = int(params.get('segment', 0))
+
+    MAPHASH_LEN = 4
+    HASHMAP_MAX_LEN = 56
+
+    hashmap_start = segment * HASHMAP_MAX_LEN
+    hashmap_end = min((segment + 1) * HASHMAP_MAX_LEN, num_parts)
+
+    hashmap_slice = b""
+    for i in range(hashmap_start, hashmap_end):
+        start_byte = i * MAPHASH_LEN
+        end_byte = (i + 1) * MAPHASH_LEN
+        if end_byte <= len(hashmap):
+            hashmap_slice += hashmap[start_byte:end_byte]
+
+    dictionary = {
+        "t": transfer_size,
+        "d": data_size,
+        "n": num_parts,
+        "h": resource_hash,
+        "r": random_hash,
+        "o": original_hash,
+        "i": segment_index,
+        "l": total_segments,
+        "q": request_id,
+        "f": flags,
+        "m": hashmap_slice
+    }
+
+    packed = umsgpack.packb(dictionary)
+
+    return {
+        'packed': bytes_to_hex(packed),
+        'size': len(packed)
+    }
+
+
+def cmd_resource_adv_unpack(params):
+    """Unpack a ResourceAdvertisement from msgpack bytes."""
+    packed = hex_to_bytes(params['packed'])
+    dictionary = umsgpack.unpackb(packed)
+
+    flags = dictionary["f"]
+    encrypted = (flags & 0x01) == 0x01
+    compressed = ((flags >> 1) & 0x01) == 0x01
+    split = ((flags >> 2) & 0x01) == 0x01
+    is_request = ((flags >> 3) & 0x01) == 0x01
+    is_response = ((flags >> 4) & 0x01) == 0x01
+    has_metadata = ((flags >> 5) & 0x01) == 0x01
+
+    return {
+        'transfer_size': dictionary["t"],
+        'data_size': dictionary["d"],
+        'num_parts': dictionary["n"],
+        'resource_hash': bytes_to_hex(dictionary["h"]),
+        'random_hash': bytes_to_hex(dictionary["r"]),
+        'original_hash': bytes_to_hex(dictionary["o"]) if dictionary["o"] is not None else None,
+        'segment_index': dictionary["i"],
+        'total_segments': dictionary["l"],
+        'request_id': bytes_to_hex(dictionary["q"]) if dictionary["q"] is not None else None,
+        'flags': flags,
+        'hashmap': bytes_to_hex(dictionary["m"]),
+        'encrypted': encrypted,
+        'compressed': compressed,
+        'split': split,
+        'is_request': is_request,
+        'is_response': is_response,
+        'has_metadata': has_metadata
+    }
+
+
+def cmd_resource_hash(params):
+    """Compute resource hash from data."""
+    data = hex_to_bytes(params['data'])
+    random_hash = hex_to_bytes(params['random_hash'])
+
+    hash_material = random_hash + data
+    full_hash = hashlib.sha256(hash_material).digest()
+    truncated = full_hash[:16]
+
+    return {
+        'hash': bytes_to_hex(truncated),
+        'full_hash': bytes_to_hex(full_hash)
+    }
+
+
+def cmd_resource_flags(params):
+    """Encode or decode resource flags byte."""
+    mode = params.get('mode', 'encode')
+
+    if mode == 'encode':
+        encrypted = bool(params.get('encrypted', False))
+        compressed = bool(params.get('compressed', False))
+        split = bool(params.get('split', False))
+        is_request = bool(params.get('is_request', False))
+        is_response = bool(params.get('is_response', False))
+        has_metadata = bool(params.get('has_metadata', False))
+
+        flags = 0x00
+        if encrypted: flags |= 0x01
+        if compressed: flags |= 0x02
+        if split: flags |= 0x04
+        if is_request: flags |= 0x08
+        if is_response: flags |= 0x10
+        if has_metadata: flags |= 0x20
+
+        return {
+            'flags': flags
+        }
+    else:
+        flags = int(params['flags'])
+        return {
+            'encrypted': (flags & 0x01) == 0x01,
+            'compressed': ((flags >> 1) & 0x01) == 0x01,
+            'split': ((flags >> 2) & 0x01) == 0x01,
+            'is_request': ((flags >> 3) & 0x01) == 0x01,
+            'is_response': ((flags >> 4) & 0x01) == 0x01,
+            'has_metadata': ((flags >> 5) & 0x01) == 0x01
+        }
+
+
+def cmd_hashmap_pack(params):
+    """Pack a hashmap segment from part hashes."""
+    parts = params.get('parts', [])
+    start_index = int(params.get('start_index', 0))
+    count = int(params.get('count', len(parts)))
+
+    part_data_list = []
+    if isinstance(parts, list):
+        part_data_list = [hex_to_bytes(p) for p in parts]
+    else:
+        part_data_list = [hex_to_bytes(parts)]
+
+    hashmap = b""
+    for i in range(start_index, min(start_index + count, len(part_data_list))):
+        part_data = part_data_list[i]
+        part_hash = hashlib.sha256(part_data).digest()[:4]
+        hashmap += part_hash
+
+    return {
+        'hashmap': bytes_to_hex(hashmap),
+        'num_hashes': (len(hashmap) // 4)
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -1101,6 +2467,44 @@ COMMANDS = {
     'link_verify_proof': cmd_link_verify_proof,
     'link_signalling_bytes': cmd_link_signalling_bytes,
     'link_parse_signalling': cmd_link_parse_signalling,
+    'link_rtt_pack': cmd_link_rtt_pack,
+    'link_rtt_unpack': cmd_link_rtt_unpack,
+    'link_request_pack': cmd_link_request_pack,
+    'link_request_unpack': cmd_link_request_unpack,
+    'link_response_pack': cmd_link_response_pack,
+    'link_response_unpack': cmd_link_response_unpack,
+    # Ratchet operations
+    'ratchet_id': cmd_ratchet_id,
+    'ratchet_public_from_private': cmd_ratchet_public_from_private,
+    'ratchet_derive_key': cmd_ratchet_derive_key,
+    'ratchet_encrypt': cmd_ratchet_encrypt,
+    'ratchet_decrypt': cmd_ratchet_decrypt,
+    'ratchet_storage_format': cmd_ratchet_storage_format,
+    'ratchet_extract_from_announce': cmd_ratchet_extract_from_announce,
+    # Announce operations
+    'random_hash': cmd_random_hash,
+    'announce_pack': cmd_announce_pack,
+    'announce_unpack': cmd_announce_unpack,
+    'announce_sign': cmd_announce_sign,
+    'announce_verify': cmd_announce_verify,
+    # Channel operations
+    'envelope_pack': cmd_envelope_pack,
+    'envelope_unpack': cmd_envelope_unpack,
+    'stream_msg_pack': cmd_stream_msg_pack,
+    'stream_msg_unpack': cmd_stream_msg_unpack,
+    # Transport operations
+    'path_entry_serialize': cmd_path_entry_serialize,
+    'path_entry_deserialize': cmd_path_entry_deserialize,
+    'path_request_pack': cmd_path_request_pack,
+    'path_request_unpack': cmd_path_request_unpack,
+    'packet_hashlist_pack': cmd_packet_hashlist_pack,
+    'packet_hashlist_unpack': cmd_packet_hashlist_unpack,
+    # Resource operations
+    'resource_adv_pack': cmd_resource_adv_pack,
+    'resource_adv_unpack': cmd_resource_adv_unpack,
+    'resource_hash': cmd_resource_hash,
+    'resource_flags': cmd_resource_flags,
+    'hashmap_pack': cmd_hashmap_pack,
 }
 
 

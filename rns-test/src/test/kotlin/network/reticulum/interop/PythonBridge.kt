@@ -7,6 +7,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
 import kotlinx.serialization.encodeToString
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -101,14 +102,28 @@ class PythonBridge private constructor(
      * @param params Command parameters (values should be hex-encoded for byte arrays)
      * @return Response from Python
      */
-    fun execute(command: String, params: Map<String, String> = emptyMap()): BridgeResponse {
+    fun execute(command: String, params: Map<String, Any> = emptyMap()): BridgeResponse {
         val id = "req-${requestId.incrementAndGet()}"
 
         val request = buildString {
             append("{\"id\":\"$id\",\"command\":\"$command\",\"params\":{")
             params.entries.forEachIndexed { index, (key, value) ->
                 if (index > 0) append(",")
-                append("\"$key\":\"$value\"")
+                append("\"$key\":")
+                when (value) {
+                    is String -> append("\"$value\"")
+                    is List<*> -> {
+                        append("[")
+                        value.forEachIndexed { i, item ->
+                            if (i > 0) append(",")
+                            append("\"$item\"")
+                        }
+                        append("]")
+                    }
+                    is Number -> append(value)
+                    is Boolean -> append(value)
+                    else -> append("\"$value\"")
+                }
             }
             append("}}")
         }
@@ -141,7 +156,7 @@ class PythonBridge private constructor(
      *
      * @throws AssertionError if the command fails
      */
-    fun executeSuccess(command: String, params: Map<String, String> = emptyMap()): JsonObject {
+    fun executeSuccess(command: String, params: Map<String, Any> = emptyMap()): JsonObject {
         val response = execute(command, params)
         return when (response) {
             is BridgeResponse.Success -> response.result
@@ -196,6 +211,47 @@ fun JsonObject.getBoolean(key: String): Boolean =
         ?: throw IllegalStateException("Missing field: $key")
 
 /**
+ * Extension to get an int field from JsonObject.
+ */
+fun JsonObject.getInt(key: String): Int =
+    this[key]?.jsonPrimitive?.int
+        ?: throw IllegalStateException("Missing field: $key")
+
+/**
+ * Extension to get a double field from JsonObject.
+ */
+fun JsonObject.getDouble(key: String): Double =
+    this[key]?.jsonPrimitive?.content?.toDouble()
+        ?: throw IllegalStateException("Missing field: $key")
+
+/**
+ * Extension to get a float field from JsonObject.
+ */
+fun JsonObject.getFloat(key: String): Float =
+    this[key]?.jsonPrimitive?.content?.toFloat()
+        ?: throw IllegalStateException("Missing field: $key")
+
+/**
+ * Extension to get a list field from JsonObject.
+ */
+inline fun <reified T> JsonObject.getList(key: String): List<T> {
+    val jsonArray = this[key]?.let { element ->
+        if (element is kotlinx.serialization.json.JsonArray) element
+        else throw IllegalStateException("Field $key is not an array")
+    } ?: throw IllegalStateException("Missing field: $key")
+
+    return jsonArray.map { element ->
+        when (T::class) {
+            String::class -> element.jsonPrimitive.content as T
+            Int::class -> element.jsonPrimitive.int as T
+            Double::class -> element.jsonPrimitive.content.toDouble() as T
+            Boolean::class -> element.jsonPrimitive.boolean as T
+            else -> throw IllegalStateException("Unsupported list element type: ${T::class}")
+        }
+    }
+}
+
+/**
  * Extension to get a hex-encoded byte array from JsonObject.
  */
 fun JsonObject.getBytes(key: String): ByteArray =
@@ -209,6 +265,15 @@ fun String.hexToByteArray(): ByteArray {
     return chunked(2)
         .map { it.toInt(16).toByte() }
         .toByteArray()
+}
+
+/**
+ * Compute truncated hash (first 16 bytes of SHA-256).
+ */
+fun truncatedHash(data: ByteArray): ByteArray {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    val fullHash = digest.digest(data)
+    return fullHash.copyOfRange(0, 16)
 }
 
 /**

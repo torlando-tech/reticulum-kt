@@ -40,17 +40,21 @@ abstract class InteropTestBase {
     /**
      * Execute a Python command and return the result.
      */
-    protected fun python(command: String, vararg params: Pair<String, Any>): JsonObject {
-        val paramMap = params.associate { (key, value) ->
-            key to when (value) {
-                is ByteArray -> value.toHex()
-                is String -> value
-                is Int -> value.toString()
-                is Long -> value.toString()
-                is Boolean -> value.toString()
-                else -> value.toString()
+    protected fun python(command: String, vararg params: Pair<String, Any?>): JsonObject {
+        val paramMap = params.mapNotNull { (key, value) ->
+            when (value) {
+                null -> null  // Skip null values
+                is ByteArray -> key to value.toHex()
+                is List<*> -> key to value  // Keep lists as-is
+                is String -> key to value
+                is Int -> key to value
+                is Long -> key to value
+                is Double -> key to value
+                is Float -> key to value
+                is Boolean -> key to value
+                else -> key to value.toString()
             }
-        }
+        }.toMap()
         return bridge.executeSuccess(command, paramMap)
     }
 

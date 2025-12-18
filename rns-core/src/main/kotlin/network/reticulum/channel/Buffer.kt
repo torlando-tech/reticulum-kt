@@ -21,24 +21,32 @@ class StreamDataMessage : MessageBase() {
     var compressed: Boolean = false
 
     override fun pack(): ByteArray {
-        // Format: [streamId:2][flags:1][data:N]
-        val flags = (if (eof) 0x01 else 0) or (if (compressed) 0x02 else 0)
+        // Python format: [header:2][data:N]
+        // Header bits:
+        //   Bit 15: EOF flag (0x8000)
+        //   Bit 14: compressed flag (0x4000)
+        //   Bits 13-0: stream_id (0-16383)
+        var headerVal = streamId and 0x3FFF
+        if (eof) headerVal = headerVal or 0x8000
+        if (compressed) headerVal = headerVal or 0x4000
+
         val header = byteArrayOf(
-            ((streamId shr 8) and 0xFF).toByte(),
-            (streamId and 0xFF).toByte(),
-            flags.toByte()
+            ((headerVal shr 8) and 0xFF).toByte(),
+            (headerVal and 0xFF).toByte()
         )
         return header + data
     }
 
     override fun unpack(raw: ByteArray) {
-        if (raw.size < 3) return
+        if (raw.size < 2) return
 
-        streamId = ((raw[0].toInt() and 0xFF) shl 8) or (raw[1].toInt() and 0xFF)
-        val flags = raw[2].toInt() and 0xFF
-        eof = (flags and 0x01) != 0
-        compressed = (flags and 0x02) != 0
-        data = if (raw.size > 3) raw.copyOfRange(3, raw.size) else ByteArray(0)
+        // Parse header
+        val headerVal = ((raw[0].toInt() and 0xFF) shl 8) or (raw[1].toInt() and 0xFF)
+
+        streamId = headerVal and 0x3FFF
+        eof = (headerVal and 0x8000) != 0
+        compressed = (headerVal and 0x4000) != 0
+        data = if (raw.size > 2) raw.copyOfRange(2, raw.size) else ByteArray(0)
     }
 }
 
@@ -182,7 +190,7 @@ class ChannelOutputStream(
 ) : OutputStream(), Closeable {
 
     private val closed = AtomicBoolean(false)
-    private val chunkSize = channel.mdu - 3  // Subtract stream header
+    private val chunkSize = channel.mdu - 2  // Subtract stream header (2 bytes)
 
     init {
         // Register stream data message type if not already registered
