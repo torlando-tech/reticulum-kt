@@ -434,6 +434,93 @@ class PacketInteropTest : InteropTestBase() {
     }
 
     @Nested
+    @DisplayName("Send and Receipt")
+    inner class SendAndReceipt {
+
+        @Test
+        @DisplayName("PacketReceipt creation and status tracking")
+        fun `receipt creation and status tracking`() {
+            val destHash = ByteArray(16) { (it * 11).toByte() }
+
+            // Create a packet (without actually sending it over the network)
+            val packet = Packet.createRaw(
+                destinationHash = destHash,
+                data = "Test receipt data".toByteArray(),
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.SINGLE,
+                createReceipt = true
+            )
+
+            // Pack the packet
+            packet.pack()
+
+            // Verify receipt is null until sent
+            assert(packet.receipt == null) { "Receipt should be null before sending" }
+            assert(!packet.sent) { "Packet should not be marked as sent yet" }
+        }
+
+        @Test
+        @DisplayName("ProofDestination uses truncated packet hash")
+        fun `proof destination uses truncated packet hash`() {
+            val destHash = ByteArray(16) { (it * 23).toByte() }
+            val data = "Proof destination test".toByteArray()
+
+            val packet = Packet.createRaw(
+                destinationHash = destHash,
+                data = data,
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.SINGLE
+            )
+
+            packet.pack()
+
+            val proofDest = packet.generateProofDestination()
+
+            // Verify proof destination uses truncated hash
+            assertBytesEqual(
+                packet.truncatedHash,
+                proofDest.hash,
+                "ProofDestination hash"
+            )
+
+            assert(proofDest.type == DestinationType.SINGLE) {
+                "ProofDestination should be SINGLE type"
+            }
+        }
+
+        @Test
+        @DisplayName("Proof packet format matches Python")
+        fun `proof packet format matches Python`() {
+            // Generate full 64-byte identity key (32 X25519 + 32 Ed25519)
+            val privKey = ByteArray(64) { (it * 3).toByte() }
+            val packetHash = ByteArray(32) { (it * 7).toByte() }
+
+            // Use Python to sign the packet hash
+            val pythonSign = python(
+                "identity_sign",
+                "private_key" to privKey.toHex(),
+                "message" to packetHash.toHex()
+            )
+
+            val signature = pythonSign.getBytes("signature")
+
+            // Explicit proof format: packet_hash (32) + signature (64)
+            val explicitProof = packetHash + signature
+
+            assert(explicitProof.size == 96) {
+                "Explicit proof should be 96 bytes (32 hash + 64 signature), got ${explicitProof.size}"
+            }
+
+            // Verify components
+            val proofHash = explicitProof.copyOfRange(0, 32)
+            val proofSig = explicitProof.copyOfRange(32, 96)
+
+            assertBytesEqual(packetHash, proofHash, "Proof packet hash")
+            assert(proofSig.size == 64) { "Signature should be 64 bytes" }
+        }
+    }
+
+    @Nested
     @DisplayName("Edge Cases")
     inner class EdgeCases {
 

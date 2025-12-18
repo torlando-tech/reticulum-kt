@@ -587,6 +587,30 @@ class Link private constructor(
     }
 
     /**
+     * Generate and send a proof for a packet over this link.
+     *
+     * @param packet The packet to prove
+     */
+    fun provePacket(packet: Packet) {
+        // Sign the packet hash
+        val signature = sign(packet.packetHash)
+
+        // Always use explicit proofs for links (for now)
+        val proofData = packet.packetHash + signature
+
+        // Create proof packet addressed to this link
+        val proof = Packet.createRaw(
+            destinationHash = linkId,
+            data = proofData,
+            packetType = PacketType.PROOF,
+            destinationType = DestinationType.LINK
+        )
+
+        proof.send()
+        hadOutbound(isData = false)
+    }
+
+    /**
      * Send data over the link.
      */
     fun send(data: ByteArray): Boolean {
@@ -805,6 +829,366 @@ class Link private constructor(
 
         Transport.outbound(packet)
         hadOutbound(isKeepalive = true)
+    }
+
+    /**
+     * Receive and process an incoming packet on this link.
+     *
+     * This is the main packet processing method that handles all link traffic including:
+     * - Regular data packets
+     * - Keepalives
+     * - Link identification
+     * - RTT measurements
+     * - Resource advertisements and transfers
+     * - Requests and responses
+     * - Channel data
+     * - Link close packets
+     *
+     * @param packet The incoming packet to process
+     */
+    fun receive(packet: Packet) {
+        // Skip closed links, and skip initiator keepalive responses
+        if (status == LinkConstants.CLOSED) return
+        if (initiator && packet.context == PacketContext.KEEPALIVE &&
+            packet.data.contentEquals(byteArrayOf(0xFF.toByte()))) {
+            return
+        }
+
+        // Record inbound activity
+        lastInbound = System.currentTimeMillis()
+        if (packet.context != PacketContext.KEEPALIVE) {
+            lastData = lastInbound
+        }
+
+        // Update counters
+        rx.incrementAndGet()
+        rxBytes.addAndGet(packet.data.size.toLong())
+
+        // Revive stale link
+        if (status == LinkConstants.STALE) {
+            status = LinkConstants.ACTIVE
+            log("Link ${linkId.toHexString()} revived from stale state")
+        }
+
+        // Process based on packet type
+        when (packet.packetType) {
+            PacketType.DATA -> processDataPacket(packet)
+            PacketType.PROOF -> processProofPacket(packet)
+            else -> {
+                log("Ignoring packet with unexpected type: ${packet.packetType}")
+            }
+        }
+    }
+
+    /**
+     * Process DATA type packets with various contexts.
+     */
+    private fun processDataPacket(packet: Packet) {
+        when (packet.context) {
+            PacketContext.NONE -> processRegularData(packet)
+            PacketContext.LINKIDENTIFY -> processLinkIdentify(packet)
+            PacketContext.REQUEST -> processRequest(packet)
+            PacketContext.RESPONSE -> processResponse(packet)
+            PacketContext.LRRTT -> processLrrtt(packet)
+            PacketContext.LINKCLOSE -> processLinkClose(packet)
+            PacketContext.RESOURCE_ADV -> processResourceAdv(packet)
+            PacketContext.RESOURCE_REQ -> processResourceReq(packet)
+            PacketContext.RESOURCE_HMU -> processResourceHmu(packet)
+            PacketContext.RESOURCE_ICL -> processResourceIcl(packet)
+            PacketContext.RESOURCE_RCL -> processResourceRcl(packet)
+            PacketContext.RESOURCE -> processResource(packet)
+            PacketContext.KEEPALIVE -> processKeepalive(packet)
+            PacketContext.CHANNEL -> processChannel(packet)
+            PacketContext.COMMAND -> processCommand(packet)
+            PacketContext.COMMAND_STATUS -> processCommandStatus(packet)
+            else -> {
+                log("Unhandled packet context: ${packet.context}")
+            }
+        }
+    }
+
+    /**
+     * Process regular data packets (context = NONE).
+     */
+    private fun processRegularData(packet: Packet) {
+        val plaintext = decrypt(packet.data) ?: return
+
+        // Invoke packet callback
+        callbacks.packet?.let { callback ->
+            thread(isDaemon = true) {
+                try {
+                    callback(plaintext, packet)
+                } catch (e: Exception) {
+                    log("Error in packet callback: ${e.message}")
+                }
+            }
+        }
+
+        // TODO: Handle proof strategies (PROVE_ALL, PROVE_APP)
+        // This requires Destination proof strategy implementation
+    }
+
+    /**
+     * Process link identification packets.
+     */
+    private fun processLinkIdentify(packet: Packet) {
+        val plaintext = decrypt(packet.data) ?: return
+
+        // Only receivers process identity packets, and format is:
+        // public_key (32 bytes) + signature (64 bytes)
+        if (!initiator && plaintext.size == RnsConstants.KEY_SIZE + RnsConstants.SIGNATURE_SIZE) {
+            try {
+                val publicKey = plaintext.copyOfRange(0, RnsConstants.KEY_SIZE)
+                val signedData = linkId + publicKey
+                val signature = plaintext.copyOfRange(
+                    RnsConstants.KEY_SIZE,
+                    RnsConstants.KEY_SIZE + RnsConstants.SIGNATURE_SIZE
+                )
+
+                // Load and validate the identity
+                val identity = Identity.fromPublicKey(publicKey)
+                if (identity.validate(signature, signedData)) {
+                    remoteIdentity = identity
+                    log("Remote peer identified: ${identity.hexHash}")
+
+                    // Invoke callback
+                    callbacks.remoteIdentified?.let { callback ->
+                        thread(isDaemon = true) {
+                            try {
+                                callback(this, identity)
+                            } catch (e: Exception) {
+                                log("Error in remote identified callback: ${e.message}")
+                            }
+                        }
+                    }
+                } else {
+                    log("Invalid signature in link identify packet")
+                }
+            } catch (e: Exception) {
+                log("Error processing link identify: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Process request packets.
+     */
+    private fun processRequest(packet: Packet) {
+        // TODO: Implement request handling
+        // This requires:
+        // - Unpacking msgpack request data
+        // - Looking up request handlers in destination
+        // - Generating and sending responses
+        log("Request handling not yet implemented")
+    }
+
+    /**
+     * Process response packets.
+     */
+    private fun processResponse(packet: Packet) {
+        // TODO: Implement response handling
+        // This requires:
+        // - Unpacking msgpack response data
+        // - Matching with pending requests
+        // - Invoking request callbacks
+        log("Response handling not yet implemented")
+    }
+
+    /**
+     * Process LRRTT (Link RTT) packets.
+     */
+    private fun processLrrtt(packet: Packet) {
+        // Only receivers process RTT packets
+        if (!initiator) {
+            rttPacket(packet)
+        }
+    }
+
+    /**
+     * Process RTT measurement packet.
+     */
+    private fun rttPacket(packet: Packet) {
+        try {
+            val measuredRtt = System.currentTimeMillis() - requestTime
+            val plaintext = decrypt(packet.data) ?: return
+
+            // TODO: Unpack msgpack RTT value from plaintext
+            // For now, use measured RTT
+            rtt = measuredRtt
+            status = LinkConstants.ACTIVE
+            activatedAt = System.currentTimeMillis()
+
+            log("Link RTT measured: ${rtt}ms")
+            updateKeepalive()
+
+            // Notify callback
+            callbacks.linkEstablished?.let { callback ->
+                thread(isDaemon = true) {
+                    try {
+                        callback(this)
+                    } catch (e: Exception) {
+                        log("Error in link established callback: ${e.message}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            log("Error processing RTT packet: ${e.message}")
+            teardown(LinkConstants.TIMEOUT)
+        }
+    }
+
+    /**
+     * Process link close packets.
+     */
+    private fun processLinkClose(packet: Packet) {
+        try {
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Verify the close is for this link
+            if (plaintext.contentEquals(linkId)) {
+                log("Received link close packet")
+                val closeReason = if (initiator) {
+                    LinkConstants.DESTINATION_CLOSED
+                } else {
+                    LinkConstants.INITIATOR_CLOSED
+                }
+                teardown(closeReason)
+            }
+        } catch (e: Exception) {
+            log("Error processing link close: ${e.message}")
+        }
+    }
+
+    /**
+     * Process resource advertisement packets.
+     */
+    private fun processResourceAdv(packet: Packet) {
+        // TODO: Implement resource advertisement handling
+        // This requires:
+        // - Decrypting advertisement
+        // - Checking if it's a request response or general advertisement
+        // - Accepting/rejecting based on resource strategy
+        // - Creating Resource instances
+        log("Resource advertisement handling not yet implemented")
+    }
+
+    /**
+     * Process resource request packets.
+     */
+    private fun processResourceReq(packet: Packet) {
+        // TODO: Implement resource request handling
+        // This requires:
+        // - Decrypting request
+        // - Extracting resource hash
+        // - Finding matching outgoing resource
+        // - Processing the request
+        log("Resource request handling not yet implemented")
+    }
+
+    /**
+     * Process resource hashmap update packets.
+     */
+    private fun processResourceHmu(packet: Packet) {
+        // TODO: Implement resource hashmap update handling
+        log("Resource HMU handling not yet implemented")
+    }
+
+    /**
+     * Process resource initiator cancel packets.
+     */
+    private fun processResourceIcl(packet: Packet) {
+        // TODO: Implement resource initiator cancel handling
+        log("Resource ICL handling not yet implemented")
+    }
+
+    /**
+     * Process resource receiver cancel packets.
+     */
+    private fun processResourceRcl(packet: Packet) {
+        // TODO: Implement resource receiver cancel handling
+        log("Resource RCL handling not yet implemented")
+    }
+
+    /**
+     * Process resource data packets.
+     */
+    private fun processResource(packet: Packet) {
+        // TODO: Implement resource data handling
+        // This requires:
+        // - Finding matching incoming resource
+        // - Passing packet to resource for processing
+        log("Resource data handling not yet implemented")
+    }
+
+    /**
+     * Process keepalive packets.
+     */
+    private fun processKeepalive(packet: Packet) {
+        // Receivers respond to keepalive requests
+        if (!initiator && packet.data.contentEquals(byteArrayOf(0xFF.toByte()))) {
+            val keepaliveResponse = Packet.createRaw(
+                destinationHash = linkId,
+                data = byteArrayOf(0xFE.toByte()),
+                packetType = PacketType.DATA,
+                context = PacketContext.KEEPALIVE,
+                destinationType = DestinationType.LINK
+            )
+            Transport.outbound(keepaliveResponse)
+            hadOutbound(isKeepalive = true)
+        }
+        // Keepalives update last_inbound which is already handled in receive()
+    }
+
+    /**
+     * Process channel packets.
+     */
+    private fun processChannel(packet: Packet) {
+        // TODO: Implement channel handling
+        // This requires:
+        // - Checking if channel is open
+        // - Proving packet receipt
+        // - Decrypting and passing to channel
+        log("Channel handling not yet implemented")
+    }
+
+    /**
+     * Process command packets.
+     */
+    private fun processCommand(packet: Packet) {
+        // TODO: Implement command handling
+        log("Command handling not yet implemented")
+    }
+
+    /**
+     * Process command status packets.
+     */
+    private fun processCommandStatus(packet: Packet) {
+        // TODO: Implement command status handling
+        log("Command status handling not yet implemented")
+    }
+
+    /**
+     * Process PROOF type packets.
+     */
+    private fun processProofPacket(packet: Packet) {
+        when (packet.context) {
+            PacketContext.RESOURCE_PRF -> processResourceProof(packet)
+            else -> {
+                log("Unhandled proof context: ${packet.context}")
+            }
+        }
+    }
+
+    /**
+     * Process resource proof packets.
+     */
+    private fun processResourceProof(packet: Packet) {
+        // TODO: Implement resource proof handling
+        // This requires:
+        // - Extracting resource hash
+        // - Finding matching outgoing resource
+        // - Validating the proof
+        log("Resource proof handling not yet implemented")
     }
 
     override fun toString(): String = "Link[${linkId.toHexString().take(12)}]"

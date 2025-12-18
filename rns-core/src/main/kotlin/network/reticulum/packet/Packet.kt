@@ -10,6 +10,8 @@ import network.reticulum.common.TransportType
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
+import network.reticulum.link.Link
+import network.reticulum.transport.Transport
 
 /**
  * Represents a packet in the Reticulum network.
@@ -53,8 +55,27 @@ class Packet private constructor(
     /** The transport ID for HEADER_2 packets (16 bytes), null for HEADER_1. */
     val transportId: ByteArray?,
     /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
-    val data: ByteArray
+    val data: ByteArray,
+    /** Whether to create a receipt when sending this packet. */
+    val createReceipt: Boolean = true
 ) {
+    /** The destination this packet is addressed to (null if created from raw). */
+    internal var destination: Destination? = null
+
+    /** The link this packet is associated with (null if not a link packet). */
+    internal var link: Link? = null
+
+    /** Whether this packet has been sent. */
+    var sent: Boolean = false
+        private set
+
+    /** The timestamp when the packet was sent. */
+    var sentAt: Long? = null
+        private set
+
+    /** The receipt for tracking delivery (null if createReceipt=false). */
+    var receipt: PacketReceipt? = null
+        private set
     /**
      * The raw packed bytes of this packet.
      * Populated after pack() is called.
@@ -181,7 +202,8 @@ class Packet private constructor(
             transportType: TransportType = TransportType.BROADCAST,
             headerType: HeaderType = HeaderType.HEADER_1,
             transportId: ByteArray? = null,
-            contextFlag: ContextFlag = ContextFlag.UNSET
+            contextFlag: ContextFlag = ContextFlag.UNSET,
+            createReceipt: Boolean = true
         ): Packet {
             // Determine if we need to encrypt
             val packetData = when {
@@ -204,8 +226,11 @@ class Packet private constructor(
                 hops = 0,
                 destinationHash = destination.hash.copyOf(),
                 transportId = transportId?.copyOf(),
-                data = packetData
-            )
+                data = packetData,
+                createReceipt = createReceipt
+            ).also {
+                it.destination = destination
+            }
         }
 
         /**
@@ -220,7 +245,8 @@ class Packet private constructor(
             transportType: TransportType = TransportType.BROADCAST,
             headerType: HeaderType = HeaderType.HEADER_1,
             transportId: ByteArray? = null,
-            contextFlag: ContextFlag = ContextFlag.UNSET
+            contextFlag: ContextFlag = ContextFlag.UNSET,
+            createReceipt: Boolean = true
         ): Packet {
             require(destinationHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
                 "Destination hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
@@ -236,7 +262,8 @@ class Packet private constructor(
                 hops = 0,
                 destinationHash = destinationHash.copyOf(),
                 transportId = transportId?.copyOf(),
-                data = data
+                data = data,
+                createReceipt = createReceipt
             )
         }
 
@@ -322,44 +349,146 @@ class Packet private constructor(
         /**
          * Create an announce packet for a destination.
          *
-         * Announce data format:
-         * [public_key: 64] [name_hash: 10] [random_hash: 10] [signature: 64] [app_data: variable]
+         * This method delegates to Destination.announce() to ensure consistency
+         * with the full announce implementation including ratchet support.
          *
          * @param destination The destination to announce
          * @param appData Optional application data to include
+         * @param pathResponse Whether this is a path response
          * @return The announce packet, or null if the destination cannot create announces
          */
         fun createAnnounce(
             destination: Destination,
-            appData: ByteArray? = null
+            appData: ByteArray? = null,
+            pathResponse: Boolean = false
         ): Packet? {
-            val identity = destination.identity ?: return null
-            if (!identity.hasPrivateKey) return null
-
-            // Build announce data
-            val publicKey = identity.getPublicKey()
-            val nameHash = destination.nameHash
-            val randomHash = Hashes.getRandomHash().copyOf(RnsConstants.NAME_HASH_BYTES)
-
-            // Data to sign: public_key + name_hash + random_hash
-            val signableData = publicKey + nameHash + randomHash
-            val signature = identity.sign(signableData) ?: return null
-
-            // Complete announce data
-            val announceData = if (appData != null) {
-                signableData + signature + appData
-            } else {
-                signableData + signature
+            return try {
+                destination.announce(appData = appData, pathResponse = pathResponse, send = false)
+            } catch (e: Exception) {
+                null
             }
-
-            return createRaw(
-                destinationHash = destination.hash,
-                data = announceData,
-                packetType = PacketType.ANNOUNCE,
-                destinationType = destination.type,
-                transportType = TransportType.BROADCAST
-            )
         }
+    }
+
+    /**
+     * Send this packet.
+     *
+     * @return The PacketReceipt if createReceipt=true, null if createReceipt=false, or null if send failed
+     */
+    fun send(): PacketReceipt? {
+        if (sent) {
+            throw IllegalStateException("Packet was already sent")
+        }
+
+        // For link destinations, check if link is active
+        val dest = destination
+        if (dest != null && dest.type == DestinationType.LINK) {
+            // Would check link.status == Link.CLOSED in full implementation
+            // For now, allow sending
+        }
+
+        // Pack the packet if not already packed
+        if (raw == null) {
+            pack()
+        }
+
+        // Create receipt if requested
+        if (createReceipt) {
+            receipt = PacketReceipt(this)
+        }
+
+        // Send via Transport
+        val success = Transport.outbound(this)
+
+        if (success) {
+            sent = true
+            sentAt = System.currentTimeMillis()
+            return receipt
+        } else {
+            // Send failed
+            sent = false
+            receipt = null
+            return null
+        }
+    }
+
+    /**
+     * Re-send this packet.
+     *
+     * @return The PacketReceipt if createReceipt=true, null if createReceipt=false, or null if send failed
+     */
+    fun resend(): PacketReceipt? {
+        if (!sent) {
+            throw IllegalStateException("Packet was not sent yet")
+        }
+
+        // Re-pack to get new ciphertext for encrypted destinations
+        pack()
+
+        // Create new receipt if requested
+        if (createReceipt) {
+            receipt = PacketReceipt(this)
+        }
+
+        // Send via Transport
+        val success = Transport.outbound(this)
+
+        if (success) {
+            sentAt = System.currentTimeMillis()
+            return receipt
+        } else {
+            // Send failed
+            receipt = null
+            return null
+        }
+    }
+
+    /**
+     * Generate a proof for this packet.
+     *
+     * @param destination Optional destination to send the proof to (used for generating ProofDestination)
+     */
+    fun prove(destination: Destination? = null) {
+        val dest = this.destination
+        val link = this.link
+
+        when {
+            // Proof for destination
+            dest != null && dest.identity?.hasPrivateKey == true -> {
+                dest.identity.prove(this, destination)
+            }
+            // Proof for link
+            link != null -> {
+                // TODO: Implement link.provePacket(this)
+                throw IllegalStateException("Link proofs not yet implemented")
+            }
+            else -> {
+                // Cannot prove packet
+                throw IllegalStateException("Could not prove packet associated with neither a destination nor a link")
+            }
+        }
+    }
+
+    /**
+     * Generate a proof destination that allows Reticulum to direct the proof
+     * back to the proved packet's sender.
+     */
+    fun generateProofDestination(): ProofDestination {
+        return ProofDestination(this)
+    }
+
+    /**
+     * Validate a proof packet against this packet's receipt.
+     */
+    fun validateProofPacket(proofPacket: Packet): Boolean {
+        return receipt?.validateProofPacket(proofPacket) ?: false
+    }
+
+    /**
+     * Validate a raw proof against this packet's receipt.
+     */
+    fun validateProof(proof: ByteArray): Boolean {
+        return receipt?.validateProof(proof) ?: false
     }
 
     override fun toString(): String =
@@ -372,6 +501,23 @@ class Packet private constructor(
     }
 
     override fun hashCode(): Int = packetHash.contentHashCode()
+}
+
+/**
+ * A special destination that allows proofs to be sent back to the packet sender.
+ * This uses the packet hash as the destination hash.
+ */
+class ProofDestination(packet: Packet) {
+    /** The destination hash (truncated packet hash). */
+    val hash: ByteArray = packet.truncatedHash
+
+    /** The destination type (always SINGLE). */
+    val type: DestinationType = DestinationType.SINGLE
+
+    /**
+     * Encrypt data (no-op for proof destinations).
+     */
+    fun encrypt(plaintext: ByteArray): ByteArray = plaintext
 }
 
 /**

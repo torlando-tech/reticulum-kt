@@ -430,6 +430,141 @@ class Destination private constructor(
         }
     }
 
+    /**
+     * Create and send an announce packet for this destination.
+     *
+     * Announces broadcast the destination's public keys and optional application data
+     * to the network. Only SINGLE/IN destinations can announce.
+     *
+     * @param appData Optional application-specific data to include in the announce
+     * @param pathResponse Whether this is a path response (used internally by Transport)
+     * @param send If true, send the packet immediately; if false, return the packet
+     * @return The announce Packet if send=false, null otherwise
+     * @throws IllegalStateException if destination cannot announce
+     */
+    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, send: Boolean = true): network.reticulum.packet.Packet? {
+        require(type == DestinationType.SINGLE) { "Only SINGLE destination types can be announced" }
+        require(direction == DestinationDirection.IN) { "Only IN destination types can be announced" }
+
+        val id = identity ?: throw IllegalStateException("Cannot announce destination without identity")
+        require(id.hasPrivateKey) { "Cannot announce destination without private key" }
+
+        // Generate random hash component (5 random bytes + 5 timestamp bytes)
+        val randomPart = Hashes.getRandomHash().copyOf(5)
+        val timestamp = System.currentTimeMillis() / 1000 // Convert to seconds
+        val timestampBytes = ByteArray(5) { i ->
+            ((timestamp shr (8 * (4 - i))) and 0xFF).toByte()
+        }
+        val randomHash = randomPart + timestampBytes
+
+        // Check if we should include a ratchet
+        val ratchet: ByteArray
+        val hasRatchet: Boolean
+
+        if (ratchets.isNotEmpty()) {
+            // Use the first (most recent) ratchet
+            val ratchetPrivate = ratchets[0]
+            // Get public key from private key
+            val ratchetPub = network.reticulum.crypto.defaultCryptoProvider().x25519PublicFromPrivate(ratchetPrivate)
+            ratchet = ratchetPub
+            hasRatchet = true
+
+            // Store ratchet for this destination
+            setRatchetForDestination(hash, ratchet)
+        } else {
+            ratchet = byteArrayOf()
+            hasRatchet = false
+        }
+
+        // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+        val publicKey = id.getPublicKey()
+        val signedData = hash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
+
+        // Sign the data
+        val signature = id.sign(signedData)
+
+        // Build announce data: public_key + name_hash + random_hash + [ratchet] + signature + [app_data]
+        val announceData = if (hasRatchet) {
+            publicKey + nameHash + randomHash + ratchet + signature + (appData ?: byteArrayOf())
+        } else {
+            publicKey + nameHash + randomHash + signature + (appData ?: byteArrayOf())
+        }
+
+        // Determine context and context flag
+        val context = if (pathResponse) {
+            network.reticulum.common.PacketContext.PATH_RESPONSE
+        } else {
+            network.reticulum.common.PacketContext.NONE
+        }
+
+        val contextFlag = if (hasRatchet) {
+            network.reticulum.common.ContextFlag.SET
+        } else {
+            network.reticulum.common.ContextFlag.UNSET
+        }
+
+        // Create announce packet
+        val announcePacket = network.reticulum.packet.Packet.createRaw(
+            destinationHash = hash,
+            data = announceData,
+            packetType = network.reticulum.common.PacketType.ANNOUNCE,
+            destinationType = type,
+            context = context,
+            transportType = network.reticulum.common.TransportType.BROADCAST,
+            contextFlag = contextFlag
+        )
+
+        if (send) {
+            // Send via Transport
+            network.reticulum.transport.Transport.outbound(announcePacket)
+            return null
+        } else {
+            return announcePacket
+        }
+    }
+
+    /**
+     * Process an incoming packet for this destination.
+     *
+     * This method handles decryption and routing of packets to the appropriate
+     * callbacks based on packet type.
+     *
+     * @param packet The incoming packet
+     * @return true if the packet was processed successfully
+     */
+    fun receive(packet: network.reticulum.packet.Packet): Boolean {
+        return try {
+            when (packet.packetType) {
+                network.reticulum.common.PacketType.LINKREQUEST -> {
+                    // Link requests are not encrypted
+                    val plaintext = packet.data
+                    // TODO: Handle incoming link request
+                    // For now, just invoke callback if set
+                    linkRequestCallback?.invoke(packet.destinationHash) ?: false
+                }
+
+                network.reticulum.common.PacketType.DATA -> {
+                    // Decrypt the packet data
+                    val plaintext = decrypt(packet.data)
+                    if (plaintext == null) {
+                        false
+                    } else {
+                        // Invoke packet callback if set
+                        packetCallback?.invoke(plaintext, packet)
+                        true
+                    }
+                }
+
+                else -> {
+                    // Other packet types (ANNOUNCE, PROOF) are not delivered to destinations
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     override fun toString(): String = "<$name:$hexHash>"
 
     override fun equals(other: Any?): Boolean {

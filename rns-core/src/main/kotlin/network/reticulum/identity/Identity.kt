@@ -253,6 +253,138 @@ class Identity private constructor(
          * Get the number of known destinations.
          */
         fun knownDestinationCount(): Int = knownDestinations.size
+
+        /**
+         * Validate an announce packet and extract the announced identity.
+         *
+         * This method verifies the signature of an announce packet and, if valid,
+         * stores the identity for later recall. It matches the Python RNS
+         * Identity.validate_announce() method.
+         *
+         * Announce packet data format (without ratchet):
+         *   public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data (var)
+         *
+         * Announce packet data format (with ratchet):
+         *   public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data (var)
+         *
+         * Signed data format:
+         *   destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+         *
+         * @param packet The announce packet to validate
+         * @param onlyValidateSignature If true, only validate signature without storing
+         * @return The announced Identity if valid, null otherwise
+         */
+        fun validateAnnounce(packet: network.reticulum.packet.Packet, onlyValidateSignature: Boolean = false): Identity? {
+            return try {
+                if (packet.packetType != network.reticulum.common.PacketType.ANNOUNCE) {
+                    return null
+                }
+
+                val keySize = RnsConstants.FULL_KEY_SIZE
+                val ratchetSize = RnsConstants.KEY_SIZE
+                val nameHashLen = RnsConstants.NAME_HASH_BYTES
+                val sigLen = RnsConstants.SIGNATURE_SIZE
+                val destinationHash = packet.destinationHash
+
+                val data = packet.data
+                if (data.size < keySize + nameHashLen + 10 + sigLen) {
+                    return null // Packet too small
+                }
+
+                // Extract public key
+                val publicKey = data.copyOfRange(0, keySize)
+
+                // Check context flag to determine if ratchet is present
+                val hasRatchet = packet.contextFlag == network.reticulum.common.ContextFlag.SET
+
+                val nameHash: ByteArray
+                val randomHash: ByteArray
+                val ratchet: ByteArray
+                val signature: ByteArray
+                val appData: ByteArray?
+
+                if (hasRatchet) {
+                    // With ratchet: public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data
+                    if (data.size < keySize + nameHashLen + 10 + ratchetSize + sigLen) {
+                        return null // Too small for ratchet announce
+                    }
+
+                    nameHash = data.copyOfRange(keySize, keySize + nameHashLen)
+                    randomHash = data.copyOfRange(keySize + nameHashLen, keySize + nameHashLen + 10)
+                    ratchet = data.copyOfRange(keySize + nameHashLen + 10, keySize + nameHashLen + 10 + ratchetSize)
+                    signature = data.copyOfRange(
+                        keySize + nameHashLen + 10 + ratchetSize,
+                        keySize + nameHashLen + 10 + ratchetSize + sigLen
+                    )
+
+                    appData = if (data.size > keySize + nameHashLen + 10 + ratchetSize + sigLen) {
+                        data.copyOfRange(keySize + nameHashLen + 10 + ratchetSize + sigLen, data.size)
+                    } else {
+                        null
+                    }
+                } else {
+                    // Without ratchet: public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data
+                    nameHash = data.copyOfRange(keySize, keySize + nameHashLen)
+                    randomHash = data.copyOfRange(keySize + nameHashLen, keySize + nameHashLen + 10)
+                    ratchet = byteArrayOf()
+                    signature = data.copyOfRange(keySize + nameHashLen + 10, keySize + nameHashLen + 10 + sigLen)
+
+                    appData = if (data.size > keySize + nameHashLen + 10 + sigLen) {
+                        data.copyOfRange(keySize + nameHashLen + 10 + sigLen, data.size)
+                    } else {
+                        null
+                    }
+                }
+
+                // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+                val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
+
+                // Create identity from public key and validate signature
+                val announcedIdentity = fromPublicKey(publicKey)
+
+                if (!announcedIdentity.validate(signature, signedData)) {
+                    return null // Invalid signature
+                }
+
+                if (onlyValidateSignature) {
+                    return announcedIdentity
+                }
+
+                // Verify destination hash matches the announced identity
+                val hashMaterial = nameHash + announcedIdentity.hash
+                val expectedHash = Hashes.truncatedHash(hashMaterial)
+
+                if (!destinationHash.contentEquals(expectedHash)) {
+                    return null // Destination hash mismatch
+                }
+
+                // Check if we already know this destination and verify the public key hasn't changed
+                val existingData = knownDestinations[destinationHash.toKey()]
+                if (existingData != null) {
+                    if (!publicKey.contentEquals(existingData.publicKey)) {
+                        // Hash collision or attack - reject
+                        return null
+                    }
+                }
+
+                // Store the announced identity
+                remember(
+                    packetHash = packet.packetHash,
+                    destHash = destinationHash,
+                    publicKey = publicKey,
+                    appData = appData
+                )
+
+                // Store ratchet if present
+                if (hasRatchet && ratchet.isNotEmpty()) {
+                    network.reticulum.destination.Destination.setRatchetForDestination(destinationHash, ratchet)
+                }
+
+                announcedIdentity
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 
     /**
@@ -416,6 +548,34 @@ class Identity private constructor(
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * Generate and send a proof for a packet.
+     *
+     * @param packet The packet to prove
+     * @param destination Optional destination to send the proof to (if null, uses packet's truncated hash)
+     */
+    fun prove(packet: network.reticulum.packet.Packet, destination: network.reticulum.destination.Destination? = null) {
+        require(hasPrivateKey) { "Cannot prove packet without private key" }
+
+        // Sign the packet hash
+        val signature = sign(packet.packetHash)
+
+        // For now, always use explicit proofs (implicit proofs require Reticulum.shouldUseImplicitProof())
+        val proofData = packet.packetHash + signature
+
+        // Determine destination hash for proof
+        val destinationHash = destination?.hash ?: packet.truncatedHash
+
+        // Create and send proof packet
+        val proof = network.reticulum.packet.Packet.createRaw(
+            destinationHash = destinationHash,
+            data = proofData,
+            packetType = network.reticulum.common.PacketType.PROOF
+        )
+
+        proof.send()
     }
 
     /**
