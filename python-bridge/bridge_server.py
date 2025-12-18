@@ -20,6 +20,8 @@ import traceback
 
 # Add RNS Cryptography to path directly (bypass RNS __init__.py)
 rns_path = os.environ.get('PYTHON_RNS_PATH', '../../../Reticulum')
+# Convert to absolute path
+rns_path = os.path.abspath(rns_path)
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'Cryptography'))
 sys.path.insert(0, rns_path)
 
@@ -114,6 +116,19 @@ exec(compile(token_code, 'Token.py', 'exec'), token_module.__dict__)
 sys.modules['RNS_Token'] = token_module
 Token = token_module
 
+# Pre-register a fake RNS.Cryptography.Hashes module to satisfy eddsa.py import
+# This prevents triggering the full RNS import chain
+fake_rns = type(sys)('RNS')
+fake_crypto = type(sys)('RNS.Cryptography')
+fake_hashes = type(sys)('RNS.Cryptography.Hashes')
+fake_hashes.sha512 = lambda data: hashlib.sha512(data).digest()
+sys.modules['RNS'] = fake_rns
+sys.modules['RNS.Cryptography'] = fake_crypto
+sys.modules['RNS.Cryptography.Hashes'] = fake_hashes
+fake_rns.Cryptography = fake_crypto
+fake_crypto.Hashes = fake_hashes
+
+
 
 def hex_to_bytes(hex_str):
     """Convert hex string to bytes."""
@@ -166,8 +181,8 @@ def cmd_ed25519_generate(params):
     """Generate Ed25519 keypair from seed."""
     seed = hex_to_bytes(params['seed'])
 
-    # Use the pure25519 implementation
-    from RNS.Cryptography.pure25519.ed25519_oop import SigningKey
+    # Use the pure25519 implementation (from Cryptography path)
+    from pure25519.ed25519_oop import SigningKey
     sk = SigningKey(seed)
 
     return {
@@ -181,7 +196,7 @@ def cmd_ed25519_sign(params):
     private_key = hex_to_bytes(params['private_key'])
     message = hex_to_bytes(params['message'])
 
-    from RNS.Cryptography.pure25519.ed25519_oop import SigningKey
+    from pure25519.ed25519_oop import SigningKey
     sk = SigningKey(private_key)
     signature = sk.sign(message)
 
@@ -196,7 +211,7 @@ def cmd_ed25519_verify(params):
     message = hex_to_bytes(params['message'])
     signature = hex_to_bytes(params['signature'])
 
-    from RNS.Cryptography.pure25519.ed25519_oop import VerifyingKey
+    from pure25519.ed25519_oop import VerifyingKey
     try:
         vk = VerifyingKey(public_key)
         vk.verify(signature, message)
@@ -358,22 +373,179 @@ def cmd_token_verify_hmac(params):
     }
 
 
-def cmd_identity_create(params):
-    """Create an Identity from private key bytes."""
-    private_key = hex_to_bytes(params['private_key']) if params.get('private_key') else None
+def cmd_identity_from_private_key(params):
+    """Create identity from 64-byte private key (X25519 + Ed25519)."""
+    private_key = hex_to_bytes(params['private_key'])
 
-    if private_key:
-        identity = RNS.Identity(create_keys=False)
-        identity.load_private_key(private_key)
-    else:
-        identity = RNS.Identity()
+    # Split private key: X25519 (32) + Ed25519 (32)
+    x25519_prv_bytes = private_key[:32]
+    ed25519_prv_bytes = private_key[32:]
+
+    # Derive public keys
+    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
+    x25519_pub = x25519_prv.public_key()
+    x25519_pub_bytes = x25519_pub.public_bytes()
+
+    from pure25519.ed25519_oop import SigningKey
+    ed25519_sk = SigningKey(ed25519_prv_bytes)
+    ed25519_pub_bytes = ed25519_sk.vk_s
+
+    # Full public key
+    public_key = x25519_pub_bytes + ed25519_pub_bytes
+
+    # Identity hash = truncated_hash(public_key)
+    identity_hash = hashlib.sha256(public_key).digest()[:16]
 
     return {
-        'public_key': bytes_to_hex(identity.get_public_key()),
-        'private_key': bytes_to_hex(identity.get_private_key()) if identity.prv else None,
-        'hash': bytes_to_hex(identity.hash),
-        'hexhash': identity.hexhash
+        'public_key': bytes_to_hex(public_key),
+        'hash': bytes_to_hex(identity_hash),
+        'hexhash': identity_hash.hex()
     }
+
+
+def cmd_identity_encrypt(params):
+    """Encrypt plaintext for an identity using ephemeral ECDH."""
+    public_key = hex_to_bytes(params['public_key'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
+    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
+
+    # Extract X25519 public key (first 32 bytes)
+    x25519_pub_bytes = public_key[:32]
+    x25519_pub = X25519.X25519PublicKey.from_public_bytes(x25519_pub_bytes)
+
+    # Generate or use provided ephemeral key
+    if ephemeral_private:
+        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
+    else:
+        ephemeral_prv = X25519.X25519PrivateKey.generate()
+
+    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
+
+    # ECDH exchange
+    shared_key = ephemeral_prv.exchange(x25519_pub)
+
+    # Identity hash for salt
+    identity_hash = hashlib.sha256(public_key).digest()[:16]
+
+    # HKDF key derivation
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token encryption
+    token_obj = Token.Token(derived_key)
+
+    if iv:
+        # Use provided IV for reproducibility
+        ciphertext = token_obj.mode.encrypt(
+            plaintext=PKCS7.pad(plaintext),
+            key=token_obj._encryption_key,
+            iv=iv
+        )
+        signed_parts = iv + ciphertext
+        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
+        token_bytes = signed_parts + hmac_val
+    else:
+        token_bytes = token_obj.encrypt(plaintext)
+
+    # Return ephemeral_pub + token
+    result = ephemeral_pub_bytes + token_bytes
+
+    return {
+        'ciphertext': bytes_to_hex(result),
+        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key),
+        'identity_hash': bytes_to_hex(identity_hash)
+    }
+
+
+def cmd_identity_decrypt(params):
+    """Decrypt ciphertext encrypted for an identity."""
+    private_key = hex_to_bytes(params['private_key'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+
+    # Split private key: X25519 (32) + Ed25519 (32)
+    x25519_prv_bytes = private_key[:32]
+    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
+
+    # Derive public key for identity hash
+    x25519_pub_bytes = x25519_prv.public_key().public_bytes()
+
+    # Get Ed25519 public key too for full identity hash
+    ed25519_prv_bytes = private_key[32:]
+    from pure25519.ed25519_oop import SigningKey
+    ed25519_sk = SigningKey(ed25519_prv_bytes)
+    ed25519_pub_bytes = ed25519_sk.vk_s
+
+    full_public_key = x25519_pub_bytes + ed25519_pub_bytes
+    identity_hash = hashlib.sha256(full_public_key).digest()[:16]
+
+    # Extract ephemeral public key and token
+    peer_pub_bytes = ciphertext[:32]
+    token_bytes = ciphertext[32:]
+
+    peer_pub = X25519.X25519PublicKey.from_public_bytes(peer_pub_bytes)
+
+    # ECDH exchange
+    shared_key = x25519_prv.exchange(peer_pub)
+
+    # HKDF key derivation
+    derived_key = HKDF.hkdf(
+        length=64,
+        derive_from=shared_key,
+        salt=identity_hash,
+        context=None
+    )
+
+    # Token decryption
+    token_obj = Token.Token(derived_key)
+    plaintext = token_obj.decrypt(token_bytes)
+
+    return {
+        'plaintext': bytes_to_hex(plaintext),
+        'shared_key': bytes_to_hex(shared_key),
+        'derived_key': bytes_to_hex(derived_key)
+    }
+
+
+def cmd_identity_sign(params):
+    """Sign a message with an identity's Ed25519 key."""
+    private_key = hex_to_bytes(params['private_key'])
+    message = hex_to_bytes(params['message'])
+
+    # Ed25519 private key is second 32 bytes
+    ed25519_prv_bytes = private_key[32:]
+
+    from pure25519.ed25519_oop import SigningKey
+    sk = SigningKey(ed25519_prv_bytes)
+    signature = sk.sign(message)
+
+    return {
+        'signature': bytes_to_hex(signature)
+    }
+
+
+def cmd_identity_verify(params):
+    """Verify a signature with an identity's public key."""
+    public_key = hex_to_bytes(params['public_key'])
+    message = hex_to_bytes(params['message'])
+    signature = hex_to_bytes(params['signature'])
+
+    # Ed25519 public key is second 32 bytes
+    ed25519_pub_bytes = public_key[32:]
+
+    from pure25519.ed25519_oop import VerifyingKey
+    try:
+        vk = VerifyingKey(ed25519_pub_bytes)
+        vk.verify(signature, message)
+        return {'valid': True}
+    except Exception:
+        return {'valid': False}
 
 
 def cmd_identity_hash(params):
@@ -456,7 +628,11 @@ COMMANDS = {
     'token_encrypt': cmd_token_encrypt,
     'token_decrypt': cmd_token_decrypt,
     'token_verify_hmac': cmd_token_verify_hmac,
-    'identity_create': cmd_identity_create,
+    'identity_from_private_key': cmd_identity_from_private_key,
+    'identity_encrypt': cmd_identity_encrypt,
+    'identity_decrypt': cmd_identity_decrypt,
+    'identity_sign': cmd_identity_sign,
+    'identity_verify': cmd_identity_verify,
     'identity_hash': cmd_identity_hash,
     'destination_hash': cmd_destination_hash,
     'truncated_hash': cmd_truncated_hash,

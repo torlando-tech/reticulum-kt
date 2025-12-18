@@ -28,5 +28,15 @@ dependencies {
 
 tasks.test {
     // Set environment variable for Python RNS path
-    environment("PYTHON_RNS_PATH", System.getenv("PYTHON_RNS_PATH") ?: "${rootProject.projectDir}/../Reticulum")
+    // Try env var first, then common absolute paths, then relative path
+    val rnsPath = System.getenv("PYTHON_RNS_PATH")
+        ?: listOf(
+            File(System.getProperty("user.home"), "repos/Reticulum"),
+            File("${rootProject.projectDir}/../../../Reticulum"),
+            File("${rootProject.projectDir}/../Reticulum")
+        ).find { it.exists() && File(it, "RNS").exists() }?.absolutePath
+        ?: "${rootProject.projectDir}/../../../Reticulum"
+
+    environment("PYTHON_RNS_PATH", rnsPath)
+    useJUnitPlatform()
 }

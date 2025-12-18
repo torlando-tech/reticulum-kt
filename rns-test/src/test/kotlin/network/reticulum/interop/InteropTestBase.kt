@@ -105,12 +105,17 @@ abstract class InteropTestBase {
      * Find the Reticulum repository path.
      */
     private fun findReticulumPath(): String? {
-        // Try common locations
+        val userHome = System.getProperty("user.home")
+
+        // Try common locations (including absolute paths)
         val candidates = listOf(
+            // Absolute paths first (most reliable)
+            File(userHome, "repos/Reticulum"),
+            File(userHome, "repos/public/Reticulum"),
+            // Relative paths from project
             File("../../../Reticulum"),
             File("../../Reticulum"),
-            File("../Reticulum"),
-            File(System.getProperty("user.home"), "repos/Reticulum")
+            File("../Reticulum")
         )
 
         return candidates.find { it.exists() && File(it, "RNS").exists() }?.absolutePath
