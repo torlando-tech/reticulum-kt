@@ -25,7 +25,12 @@ object RnsConstants {
     // Key sizes (in bytes)
     const val KEY_SIZE = 32                          // Single key (X25519 or Ed25519)
     const val FULL_KEY_SIZE = 64                     // Combined public key (X25519 + Ed25519)
+    const val IDENTITY_PUBLIC_KEY_SIZE = 64          // X25519 (32) + Ed25519 (32) public keys
     const val SIGNATURE_SIZE = 64                    // Ed25519 signature
+
+    // Announce format sizes
+    const val ANNOUNCE_MIN_SIZE = 64 + 10 + 10 + 64  // public_key + name_hash + random_hash + signature = 148
+    const val RANDOM_HASH_SIZE = 10                  // Random hash in announce
 
     // Cryptographic overhead
     const val TOKEN_OVERHEAD = 48                    // 16 IV + 32 HMAC
