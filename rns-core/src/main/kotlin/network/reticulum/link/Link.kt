@@ -298,6 +298,10 @@ class Link private constructor(
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
 
+    // Resource tracking
+    private val outgoingResources = mutableListOf<network.reticulum.resource.Resource>()
+    private val incomingResources = mutableListOf<network.reticulum.resource.Resource>()
+
     /**
      * Initialize as link initiator (outgoing link).
      */
@@ -1183,12 +1187,80 @@ class Link private constructor(
      * Process resource proof packets.
      */
     private fun processResourceProof(packet: Packet) {
-        // TODO: Implement resource proof handling
-        // This requires:
-        // - Extracting resource hash
-        // - Finding matching outgoing resource
-        // - Validating the proof
-        log("Resource proof handling not yet implemented")
+        try {
+            val data = packet.data
+            if (data.isEmpty()) {
+                log("Invalid proof packet: no data")
+                return
+            }
+
+            // Proof format: [resource_hash (16 bytes)][proof (32 bytes)]
+            if (data.size != RnsConstants.TRUNCATED_HASH_BYTES + RnsConstants.FULL_HASH_BYTES) {
+                log("Invalid proof packet size: ${data.size}")
+                return
+            }
+
+            // Extract resource hash
+            val resourceHash = data.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+
+            // Find matching outgoing resource
+            val resource = synchronized(outgoingResources) {
+                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+            }
+
+            if (resource == null) {
+                log("Received proof for unknown resource: ${resourceHash.toHexString()}")
+                return
+            }
+
+            // Validate the proof
+            if (resource.validateProof(data)) {
+                log("Proof validated for resource ${resourceHash.toHexString()}")
+                // Resource validation handles completion logic
+            } else {
+                log("Proof validation failed for resource ${resourceHash.toHexString()}")
+            }
+
+        } catch (e: Exception) {
+            log("Error processing resource proof: ${e.message}")
+        }
+    }
+
+    /**
+     * Register an outgoing resource with this link.
+     */
+    fun registerOutgoingResource(resource: network.reticulum.resource.Resource) {
+        synchronized(outgoingResources) {
+            if (!outgoingResources.contains(resource)) {
+                outgoingResources.add(resource)
+                log("Registered outgoing resource ${resource.hash.toHexString()}")
+            }
+        }
+    }
+
+    /**
+     * Register an incoming resource with this link.
+     */
+    fun registerIncomingResource(resource: network.reticulum.resource.Resource) {
+        synchronized(incomingResources) {
+            if (!incomingResources.contains(resource)) {
+                incomingResources.add(resource)
+                log("Registered incoming resource ${resource.hash.toHexString()}")
+            }
+        }
+    }
+
+    /**
+     * Remove a resource from tracking when it's complete or cancelled.
+     */
+    fun resourceConcluded(resource: network.reticulum.resource.Resource) {
+        synchronized(outgoingResources) {
+            outgoingResources.remove(resource)
+        }
+        synchronized(incomingResources) {
+            incomingResources.remove(resource)
+        }
+        log("Resource ${resource.hash.toHexString()} concluded")
     }
 
     override fun toString(): String = "Link[${linkId.toHexString().take(12)}]"

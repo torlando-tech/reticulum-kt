@@ -177,6 +177,8 @@ class Resource private constructor(
     private var receivedCount: Int = 0
     private var outstandingParts: Int = 0
     private var consecutiveCompletedHeight: Int = -1
+    private var sentParts: Int = 0
+    private val sentPartsSet = mutableSetOf<Int>()
 
     // Segmenting
     var segmentIndex: Int = 1
@@ -226,6 +228,14 @@ class Resource private constructor(
     private var compressedData: ByteArray? = null
     private var assembledData: ByteArray? = null
     private var metadata: ByteArray? = null
+
+    // Multi-segment support
+    private var inputFile: java.io.RandomAccessFile? = null
+    private var preparingNextSegment: Boolean = false
+    private var nextSegment: Resource? = null
+
+    // Proof tracking
+    private var expectedProof: ByteArray? = null
 
     /**
      * Initialize resource for sending.
@@ -284,6 +294,9 @@ class Resource private constructor(
         )
         originalHash = hash.copyOf()
 
+        // Calculate expected proof (full hash of data + hash)
+        expectedProof = Hashes.fullHash(transferData + hash)
+
         // Check for segmentation
         if (totalSize > ResourceConstants.MAX_EFFICIENT_SIZE) {
             totalSegments = ((totalSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
@@ -325,6 +338,9 @@ class Resource private constructor(
         lastActivity = System.currentTimeMillis()
         startedTransferring = lastActivity
 
+        // Register with link
+        link.registerIncomingResource(this)
+
         startWatchdog()
         log("Resource ${hash.toHexString()} accepted: $size bytes in ${parts.size} parts")
     }
@@ -334,6 +350,9 @@ class Resource private constructor(
      */
     fun advertise() {
         if (status != ResourceConstants.QUEUED) return
+
+        // Register with link
+        link.registerOutgoingResource(this)
 
         status = ResourceConstants.ADVERTISED
         val adv = ResourceAdvertisement.fromResource(this)
@@ -383,6 +402,11 @@ class Resource private constructor(
 
         link.send(packet.raw ?: ByteArray(0))
         lastActivity = System.currentTimeMillis()
+
+        // Track sent parts
+        if (sentPartsSet.add(index)) {
+            sentParts++
+        }
     }
 
     /**
@@ -474,6 +498,7 @@ class Resource private constructor(
         }
 
         // Parse requested part indices
+        var sentCount = 0
         var i = 0
         while (i + 1 < data.size) {
             val index = ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
@@ -481,12 +506,191 @@ class Resource private constructor(
                 val part = parts[index]
                 if (part != null) {
                     sendPart(index, part)
+                    sentCount++
                 }
             }
             i += 2
         }
 
         lastActivity = System.currentTimeMillis()
+
+        // Check if all parts have been sent
+        if (sentParts >= parts.size) {
+            status = ResourceConstants.AWAITING_PROOF
+            log("All parts sent, awaiting proof for ${hash.toHexString()}")
+        }
+    }
+
+    /**
+     * Send proof of complete receipt to sender.
+     * Called by receiver after successfully assembling all parts.
+     */
+    private fun prove() {
+        if (status == ResourceConstants.FAILED) return
+
+        try {
+            // Calculate proof: hash of (assembled data + resource hash)
+            val proofData = assembledData ?: uncompressedData
+            if (proofData == null) {
+                log("Cannot prove resource: no assembled data")
+                return
+            }
+
+            val proof = Hashes.fullHash(proofData + hash)
+            val proofPayload = hash + proof
+
+            // Create proof packet
+            val packet = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = proofPayload,
+                context = PacketContext.RESOURCE_PRF
+            )
+
+            link.send(packet.raw ?: ByteArray(0))
+            log("Sent proof for resource ${hash.toHexString()}")
+
+        } catch (e: Exception) {
+            log("Could not send proof packet: ${e.message}")
+            cancel()
+        }
+    }
+
+    /**
+     * Validate proof received from receiver.
+     * Called by sender when proof packet arrives.
+     */
+    fun validateProof(proofData: ByteArray): Boolean {
+        if (status == ResourceConstants.FAILED) return false
+
+        try {
+            // Proof format: [resource_hash (16 bytes)][proof (32 bytes)]
+            if (proofData.size != RnsConstants.TRUNCATED_HASH_BYTES + RnsConstants.FULL_HASH_BYTES) {
+                log("Invalid proof length: ${proofData.size}")
+                return false
+            }
+
+            val receivedHash = proofData.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+            val receivedProof = proofData.copyOfRange(RnsConstants.TRUNCATED_HASH_BYTES, proofData.size)
+
+            // Verify the proof matches expected
+            val expected = expectedProof
+            if (expected == null) {
+                log("No expected proof available")
+                return false
+            }
+
+            if (!receivedProof.contentEquals(expected)) {
+                log("Proof validation failed: mismatch")
+                return false
+            }
+
+            // Mark resource as complete
+            status = ResourceConstants.COMPLETE
+            stopWatchdog()
+            link.resourceConcluded(this)
+            log("Resource ${hash.toHexString()} proof validated successfully")
+
+            // Handle multi-segment resources
+            if (segmentIndex < totalSegments) {
+                // Prepare and advertise next segment
+                if (!preparingNextSegment) {
+                    log("Preparing next segment ${segmentIndex + 1}/$totalSegments")
+                    prepareNextSegment()
+                }
+
+                // Wait for next segment to be ready
+                while (nextSegment == null) {
+                    Thread.sleep(50)
+                }
+
+                // Advertise the next segment
+                nextSegment?.advertise()
+
+                // Clean up this segment's data
+                uncompressedData = null
+                compressedData = null
+                assembledData = null
+                parts = arrayOf()
+            } else {
+                // All segments complete, invoke callback
+                callbacks.completed?.invoke(this)
+
+                // Close input file if present
+                inputFile?.close()
+                inputFile = null
+            }
+
+            return true
+
+        } catch (e: Exception) {
+            log("Error validating proof: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Prepare the next segment for a multi-segment transfer.
+     * This creates a new Resource for the next segment of data.
+     */
+    private fun prepareNextSegment() {
+        if (preparingNextSegment) return
+        if (segmentIndex >= totalSegments) return
+
+        preparingNextSegment = true
+        log("Preparing segment ${segmentIndex + 1} of $totalSegments")
+
+        thread(name = "segment-prep-${hash.toHexString().take(8)}") {
+            try {
+                val file = inputFile
+                if (file == null) {
+                    log("Cannot prepare next segment: no input file")
+                    return@thread
+                }
+
+                // Calculate segment data range
+                val firstSegmentSize = ResourceConstants.MAX_EFFICIENT_SIZE -
+                    (if (hasMetadata) metadata?.size ?: 0 else 0)
+                val segmentSize = ResourceConstants.MAX_EFFICIENT_SIZE
+
+                val dataStart = if (segmentIndex == 1) {
+                    0L
+                } else {
+                    firstSegmentSize + ((segmentIndex - 1L) * segmentSize)
+                }
+
+                // Read next segment data
+                file.seek(dataStart)
+                val readSize = min(segmentSize.toLong(), file.length() - dataStart).toInt()
+                val segmentData = ByteArray(readSize)
+                file.readFully(segmentData)
+
+                // Create next segment resource (without metadata)
+                nextSegment = Resource(link, initiator = true).apply {
+                    this.callbacks.completed = this@Resource.callbacks.completed
+                    this.callbacks.progress = this@Resource.callbacks.progress
+                    this.callbacks.failed = this@Resource.callbacks.failed
+
+                    initializeForSending(
+                        data = segmentData,
+                        metadata = null,
+                        autoCompress = compressed
+                    )
+
+                    // Update segment tracking
+                    this.segmentIndex = this@Resource.segmentIndex + 1
+                    this.totalSegments = this@Resource.totalSegments
+                    this.split = true
+                    this.originalHash = this@Resource.originalHash
+                    this.inputFile = this@Resource.inputFile
+                }
+
+                log("Next segment prepared: ${nextSegment?.hash?.toHexString()}")
+
+            } catch (e: Exception) {
+                log("Error preparing next segment: ${e.message}")
+                preparingNextSegment = false
+            }
+        }
     }
 
     /**
@@ -534,7 +738,11 @@ class Resource private constructor(
 
             status = ResourceConstants.COMPLETE
             stopWatchdog()
+            link.resourceConcluded(this)
             log("Resource ${hash.toHexString()} assembled: ${assembled.size} bytes")
+
+            // Send proof to sender
+            prove()
 
             callbacks.completed?.invoke(this)
 
@@ -551,6 +759,7 @@ class Resource private constructor(
     fun cancel() {
         stopWatchdog()
         status = ResourceConstants.FAILED
+        link.resourceConcluded(this)
         log("Resource ${hash.toHexString()} cancelled")
     }
 
