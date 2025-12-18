@@ -1,0 +1,344 @@
+package network.reticulum.packet
+
+import network.reticulum.common.ContextFlag
+import network.reticulum.common.DestinationType
+import network.reticulum.common.HeaderType
+import network.reticulum.common.PacketContext
+import network.reticulum.common.PacketType
+import network.reticulum.common.RnsConstants
+import network.reticulum.common.TransportType
+import network.reticulum.common.toHexString
+import network.reticulum.crypto.Hashes
+import network.reticulum.destination.Destination
+
+/**
+ * Represents a packet in the Reticulum network.
+ *
+ * Wire format for HEADER_1:
+ * ```
+ * [flags: 1] [hops: 1] [dest_hash: 16] [context: 1] [data: variable]
+ * ```
+ *
+ * Wire format for HEADER_2 (transport):
+ * ```
+ * [flags: 1] [hops: 1] [transport_id: 16] [dest_hash: 16] [context: 1] [data: variable]
+ * ```
+ *
+ * Flags byte layout:
+ * ```
+ * [7:6] header_type
+ * [5]   context_flag
+ * [4]   transport_type bit 0
+ * [3:2] destination_type
+ * [1:0] packet_type
+ * ```
+ */
+class Packet private constructor(
+    /** The packet type (DATA, ANNOUNCE, LINKREQUEST, PROOF). */
+    val packetType: PacketType,
+    /** The header type (HEADER_1 or HEADER_2). */
+    val headerType: HeaderType,
+    /** The transport type. */
+    val transportType: TransportType,
+    /** The destination type. */
+    val destinationType: DestinationType,
+    /** The context flag. */
+    val contextFlag: ContextFlag,
+    /** The packet context. */
+    val context: PacketContext,
+    /** Number of hops this packet has traveled. */
+    var hops: Int,
+    /** The destination hash (16 bytes). */
+    val destinationHash: ByteArray,
+    /** The transport ID for HEADER_2 packets (16 bytes), null for HEADER_1. */
+    val transportId: ByteArray?,
+    /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
+    val data: ByteArray
+) {
+    /**
+     * The raw packed bytes of this packet.
+     * Populated after pack() is called.
+     */
+    var raw: ByteArray? = null
+        private set
+
+    /**
+     * The full hash of the packet's hashable portion.
+     */
+    val packetHash: ByteArray by lazy {
+        val hashable = getHashablePart()
+        Hashes.fullHash(hashable)
+    }
+
+    /**
+     * The truncated hash of the packet.
+     */
+    val truncatedHash: ByteArray by lazy {
+        Hashes.truncatedHash(getHashablePart())
+    }
+
+    /**
+     * The hex-encoded packet hash.
+     */
+    val hexHash: String by lazy { packetHash.toHexString() }
+
+    /**
+     * Get the packed flags byte.
+     */
+    fun getPackedFlags(): Int {
+        return (headerType.value shl 6) or
+               (contextFlag.value shl 5) or
+               (transportType.value shl 4) or
+               (destinationType.value shl 2) or
+               packetType.value
+    }
+
+    /**
+     * Pack the packet into raw bytes.
+     */
+    fun pack(): ByteArray {
+        val result = mutableListOf<Byte>()
+
+        // Flags byte
+        result.add(getPackedFlags().toByte())
+
+        // Hops byte
+        result.add(hops.toByte())
+
+        // Header content depends on type
+        when (headerType) {
+            HeaderType.HEADER_1 -> {
+                // Destination hash
+                result.addAll(destinationHash.toList())
+            }
+            HeaderType.HEADER_2 -> {
+                // Transport ID first
+                val tid = transportId ?: throw IllegalStateException(
+                    "HEADER_2 packets require a transport ID"
+                )
+                result.addAll(tid.toList())
+                // Then destination hash
+                result.addAll(destinationHash.toList())
+            }
+        }
+
+        // Context byte
+        result.add(context.value.toByte())
+
+        // Data
+        result.addAll(data.toList())
+
+        val packed = result.toByteArray()
+        raw = packed
+
+        // Validate MTU
+        if (packed.size > RnsConstants.MTU) {
+            throw IllegalStateException(
+                "Packet size of ${packed.size} exceeds MTU of ${RnsConstants.MTU} bytes"
+            )
+        }
+
+        return packed
+    }
+
+    /**
+     * Get the hashable portion of the packet.
+     *
+     * For packet hash calculation, the transport_id is excluded for HEADER_2 packets,
+     * and only the lower 4 bits of the flags byte are used (masking header_type and context_flag).
+     */
+    fun getHashablePart(): ByteArray {
+        val packed = raw ?: pack()
+
+        // Mask the flags byte to only keep lower 4 bits
+        val maskedFlags = (packed[0].toInt() and 0b00001111).toByte()
+
+        return when (headerType) {
+            HeaderType.HEADER_1 -> {
+                // [masked_flags] + [hops onwards]
+                byteArrayOf(maskedFlags) + packed.copyOfRange(2, packed.size)
+            }
+            HeaderType.HEADER_2 -> {
+                // Skip transport_id (16 bytes after hops)
+                // [masked_flags] + [after transport_id]
+                byteArrayOf(maskedFlags) + packed.copyOfRange(
+                    2 + RnsConstants.TRUNCATED_HASH_BYTES,
+                    packed.size
+                )
+            }
+        }
+    }
+
+    companion object {
+        /**
+         * Create a new packet for a destination.
+         */
+        fun create(
+            destination: Destination,
+            data: ByteArray,
+            packetType: PacketType = PacketType.DATA,
+            context: PacketContext = PacketContext.NONE,
+            transportType: TransportType = TransportType.BROADCAST,
+            headerType: HeaderType = HeaderType.HEADER_1,
+            transportId: ByteArray? = null,
+            contextFlag: ContextFlag = ContextFlag.UNSET
+        ): Packet {
+            // Determine if we need to encrypt
+            val packetData = when {
+                packetType == PacketType.ANNOUNCE -> data // Announces are not encrypted
+                packetType == PacketType.LINKREQUEST -> data // Link requests are not encrypted
+                context == PacketContext.RESOURCE -> data // Resources handle their own encryption
+                context == PacketContext.CACHE_REQUEST -> data // Cache requests are not encrypted
+                context == PacketContext.KEEPALIVE -> data // Keepalives are not encrypted
+                packetType == PacketType.PROOF && context == PacketContext.RESOURCE_PRF -> data // Resource proofs
+                else -> destination.encrypt(data) // Normal encryption
+            }
+
+            return Packet(
+                packetType = packetType,
+                headerType = headerType,
+                transportType = transportType,
+                destinationType = destination.type,
+                contextFlag = contextFlag,
+                context = context,
+                hops = 0,
+                destinationHash = destination.hash.copyOf(),
+                transportId = transportId?.copyOf(),
+                data = packetData
+            )
+        }
+
+        /**
+         * Create a raw packet from destination hash and data without a Destination object.
+         */
+        fun createRaw(
+            destinationHash: ByteArray,
+            data: ByteArray,
+            packetType: PacketType = PacketType.DATA,
+            destinationType: DestinationType = DestinationType.SINGLE,
+            context: PacketContext = PacketContext.NONE,
+            transportType: TransportType = TransportType.BROADCAST,
+            headerType: HeaderType = HeaderType.HEADER_1,
+            transportId: ByteArray? = null,
+            contextFlag: ContextFlag = ContextFlag.UNSET
+        ): Packet {
+            require(destinationHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+                "Destination hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+            }
+
+            return Packet(
+                packetType = packetType,
+                headerType = headerType,
+                transportType = transportType,
+                destinationType = destinationType,
+                contextFlag = contextFlag,
+                context = context,
+                hops = 0,
+                destinationHash = destinationHash.copyOf(),
+                transportId = transportId?.copyOf(),
+                data = data
+            )
+        }
+
+        /**
+         * Unpack raw bytes into a Packet.
+         *
+         * @param raw The raw packet bytes
+         * @return The unpacked Packet, or null if the packet is malformed
+         */
+        fun unpack(raw: ByteArray): Packet? {
+            return try {
+                if (raw.size < RnsConstants.HEADER_MIN_SIZE) {
+                    return null
+                }
+
+                val flags = raw[0].toInt() and 0xFF
+                val hops = raw[1].toInt() and 0xFF
+
+                // Parse flags
+                val headerType = HeaderType.fromValue((flags and 0b01000000) shr 6)
+                val contextFlag = ContextFlag.fromValue((flags and 0b00100000) shr 5)
+                val transportType = TransportType.fromValue((flags and 0b00010000) shr 4)
+                val destinationType = DestinationType.fromValue((flags and 0b00001100) shr 2)
+                val packetType = PacketType.fromValue(flags and 0b00000011)
+
+                val dstLen = RnsConstants.TRUNCATED_HASH_BYTES
+
+                val transportId: ByteArray?
+                val destinationHash: ByteArray
+                val context: PacketContext
+                val data: ByteArray
+
+                when (headerType) {
+                    HeaderType.HEADER_1 -> {
+                        transportId = null
+                        destinationHash = raw.copyOfRange(2, 2 + dstLen)
+                        context = PacketContext.fromValue(raw[2 + dstLen].toInt() and 0xFF)
+                        data = raw.copyOfRange(3 + dstLen, raw.size)
+                    }
+                    HeaderType.HEADER_2 -> {
+                        if (raw.size < RnsConstants.HEADER_MAX_SIZE) {
+                            return null
+                        }
+                        transportId = raw.copyOfRange(2, 2 + dstLen)
+                        destinationHash = raw.copyOfRange(2 + dstLen, 2 + 2 * dstLen)
+                        context = PacketContext.fromValue(raw[2 + 2 * dstLen].toInt() and 0xFF)
+                        data = raw.copyOfRange(3 + 2 * dstLen, raw.size)
+                    }
+                }
+
+                Packet(
+                    packetType = packetType,
+                    headerType = headerType,
+                    transportType = transportType,
+                    destinationType = destinationType,
+                    contextFlag = contextFlag,
+                    context = context,
+                    hops = hops,
+                    destinationHash = destinationHash,
+                    transportId = transportId,
+                    data = data
+                ).also {
+                    it.raw = raw.copyOf()
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /**
+         * Extract just the flags from a raw packet.
+         */
+        fun parseFlags(flags: Int): PacketFlags {
+            return PacketFlags(
+                headerType = HeaderType.fromValue((flags and 0b01000000) shr 6),
+                contextFlag = ContextFlag.fromValue((flags and 0b00100000) shr 5),
+                transportType = TransportType.fromValue((flags and 0b00010000) shr 4),
+                destinationType = DestinationType.fromValue((flags and 0b00001100) shr 2),
+                packetType = PacketType.fromValue(flags and 0b00000011)
+            )
+        }
+    }
+
+    override fun toString(): String =
+        "Packet(type=$packetType, dest=${destinationHash.toHexString()}, size=${data.size})"
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is Packet) return false
+        return packetHash.contentEquals(other.packetHash)
+    }
+
+    override fun hashCode(): Int = packetHash.contentHashCode()
+}
+
+/**
+ * Parsed flags from a packet.
+ */
+data class PacketFlags(
+    val headerType: HeaderType,
+    val contextFlag: ContextFlag,
+    val transportType: TransportType,
+    val destinationType: DestinationType,
+    val packetType: PacketType
+)

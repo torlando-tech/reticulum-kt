@@ -566,7 +566,15 @@ def cmd_destination_hash(params):
     """Compute destination hash."""
     identity_hash = hex_to_bytes(params['identity_hash'])
     app_name = params['app_name']
-    aspects = params.get('aspects', [])
+    aspects_param = params.get('aspects', '')
+
+    # Parse aspects - can be comma-separated string or already a list
+    if isinstance(aspects_param, list):
+        aspects = aspects_param
+    elif aspects_param:
+        aspects = aspects_param.split(',')
+    else:
+        aspects = []
 
     # Build full name
     name_parts = [app_name] + aspects
@@ -609,6 +617,149 @@ def cmd_name_hash(params):
     }
 
 
+def cmd_packet_flags(params):
+    """Compute packet flags byte from components."""
+    header_type = int(params['header_type'])
+    context_flag = int(params['context_flag'])
+    transport_type = int(params['transport_type'])
+    destination_type = int(params['destination_type'])
+    packet_type = int(params['packet_type'])
+
+    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+
+    return {
+        'flags': flags,
+        'flags_hex': f'{flags:02x}'
+    }
+
+
+def cmd_packet_parse_flags(params):
+    """Parse packet flags byte into components."""
+    flags = int(params['flags'])
+
+    header_type = (flags & 0b01000000) >> 6
+    context_flag = (flags & 0b00100000) >> 5
+    transport_type = (flags & 0b00010000) >> 4
+    destination_type = (flags & 0b00001100) >> 2
+    packet_type = (flags & 0b00000011)
+
+    return {
+        'header_type': header_type,
+        'context_flag': context_flag,
+        'transport_type': transport_type,
+        'destination_type': destination_type,
+        'packet_type': packet_type
+    }
+
+
+def cmd_packet_pack(params):
+    """Pack a packet into raw bytes."""
+    import struct
+
+    header_type = int(params['header_type'])
+    context_flag = int(params['context_flag'])
+    transport_type = int(params['transport_type'])
+    destination_type = int(params['destination_type'])
+    packet_type = int(params['packet_type'])
+    hops = int(params.get('hops', 0))
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    transport_id = hex_to_bytes(params['transport_id']) if params.get('transport_id') else None
+    context = int(params.get('context', 0))
+    data = hex_to_bytes(params['data'])
+
+    # Compute flags
+    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+
+    # Build header
+    header = struct.pack("!B", flags) + struct.pack("!B", hops)
+
+    if header_type == 1:  # HEADER_2
+        if transport_id is None:
+            raise ValueError("HEADER_2 requires transport_id")
+        header += transport_id + destination_hash
+    else:  # HEADER_1
+        header += destination_hash
+
+    header += bytes([context])
+
+    raw = header + data
+
+    return {
+        'raw': bytes_to_hex(raw),
+        'header': bytes_to_hex(header),
+        'size': len(raw)
+    }
+
+
+def cmd_packet_unpack(params):
+    """Unpack raw packet bytes into components."""
+    raw = hex_to_bytes(params['raw'])
+
+    flags = raw[0]
+    hops = raw[1]
+
+    header_type = (flags & 0b01000000) >> 6
+    context_flag = (flags & 0b00100000) >> 5
+    transport_type = (flags & 0b00010000) >> 4
+    destination_type = (flags & 0b00001100) >> 2
+    packet_type = (flags & 0b00000011)
+
+    DST_LEN = 16  # TRUNCATED_HASHLENGTH // 8
+
+    if header_type == 1:  # HEADER_2
+        transport_id = raw[2:2+DST_LEN]
+        destination_hash = raw[2+DST_LEN:2+2*DST_LEN]
+        context = raw[2+2*DST_LEN]
+        data = raw[3+2*DST_LEN:]
+    else:  # HEADER_1
+        transport_id = None
+        destination_hash = raw[2:2+DST_LEN]
+        context = raw[2+DST_LEN]
+        data = raw[3+DST_LEN:]
+
+    return {
+        'flags': flags,
+        'hops': hops,
+        'header_type': header_type,
+        'context_flag': context_flag,
+        'transport_type': transport_type,
+        'destination_type': destination_type,
+        'packet_type': packet_type,
+        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
+        'destination_hash': bytes_to_hex(destination_hash),
+        'context': context,
+        'data': bytes_to_hex(data)
+    }
+
+
+def cmd_packet_hash(params):
+    """Compute packet hash from raw bytes."""
+    raw = hex_to_bytes(params['raw'])
+
+    flags = raw[0]
+    header_type = (flags & 0b01000000) >> 6
+
+    DST_LEN = 16
+
+    # Mask flags to only keep lower 4 bits
+    masked_flags = bytes([flags & 0b00001111])
+
+    if header_type == 1:  # HEADER_2
+        # Skip transport_id (16 bytes after hops)
+        hashable_part = masked_flags + raw[2+DST_LEN:]
+    else:  # HEADER_1
+        hashable_part = masked_flags + raw[2:]
+
+    full_hash = hashlib.sha256(hashable_part).digest()
+    truncated = full_hash[:16]
+
+    return {
+        'hash': bytes_to_hex(full_hash),
+        'truncated_hash': bytes_to_hex(truncated),
+        'hashable_part': bytes_to_hex(hashable_part)
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -637,6 +788,11 @@ COMMANDS = {
     'destination_hash': cmd_destination_hash,
     'truncated_hash': cmd_truncated_hash,
     'name_hash': cmd_name_hash,
+    'packet_flags': cmd_packet_flags,
+    'packet_parse_flags': cmd_packet_parse_flags,
+    'packet_pack': cmd_packet_pack,
+    'packet_unpack': cmd_packet_unpack,
+    'packet_hash': cmd_packet_hash,
 }
 
 
