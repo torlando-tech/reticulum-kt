@@ -123,6 +123,27 @@ class Destination private constructor(
     var linkRequestCallback: ((linkId: ByteArray) -> Boolean)? = null
 
     /**
+     * Callback for link established events.
+     */
+    private var linkEstablishedCallback: ((Any) -> Unit)? = null
+
+    /**
+     * Default app_data to include in announces.
+     * Can be ByteArray or () -> ByteArray.
+     */
+    private var defaultAppData: Any? = null
+
+    /**
+     * Proof strategy for this destination.
+     */
+    private var proofStrategy: Int = PROVE_NONE
+
+    /**
+     * Callback for proof requests (used with PROVE_APP strategy).
+     */
+    private var proofRequestedCallback: ((Any) -> Boolean)? = null
+
+    /**
      * Symmetric key for GROUP destinations (null for other types).
      */
     private var groupKey: ByteArray? = null
@@ -653,6 +674,21 @@ class Destination private constructor(
         const val RATCHET_COUNT = 512
 
         /**
+         * Proof strategy: Never send proofs.
+         */
+        const val PROVE_NONE = 0x00
+
+        /**
+         * Proof strategy: Let the application decide via callback.
+         */
+        const val PROVE_APP = 0x01
+
+        /**
+         * Proof strategy: Always send proofs when requested.
+         */
+        const val PROVE_ALL = 0x02
+
+        /**
          * Storage for ratchet public keys: destination_hash -> ratchet_public_key
          */
         private val ratchetStorage = ConcurrentHashMap<ByteArrayKey, ByteArray>()
@@ -804,6 +840,103 @@ class Destination private constructor(
                 Pair(parts[0], parts.drop(1))
             }
         }
+
+        // ===== Static Utility Methods =====
+
+        /**
+         * Expand a destination name to its full human-readable form.
+         *
+         * This builds the full destination name from an app name, aspects, and
+         * optionally an identity. The format is:
+         *   "app_name.aspect1.aspect2...[.identity_hexhash]"
+         *
+         * @param identity The identity to include (optional)
+         * @param appName The application name
+         * @param aspects Additional aspects for the destination
+         * @return The full destination name
+         * @throws IllegalArgumentException if app name or aspects contain dots
+         */
+        fun expandName(identity: Identity?, appName: String, vararg aspects: String): String {
+            require(!appName.contains('.')) { "Dots can't be used in app names" }
+
+            val sb = StringBuilder(appName)
+            aspects.forEach { aspect ->
+                require(!aspect.contains('.')) { "Dots can't be used in aspects" }
+                sb.append('.').append(aspect)
+            }
+
+            if (identity != null) {
+                sb.append('.').append(identity.hexHash)
+            }
+
+            return sb.toString()
+        }
+
+        /**
+         * Compute a destination hash from identity, app name, and aspects.
+         *
+         * The hash is computed as:
+         *   truncated_hash(name_hash || identity_hash)
+         *
+         * Where name_hash is the first 10 bytes of SHA-256(app_name.aspect1.aspect2...)
+         *
+         * @param identity The identity (can be null for PLAIN destinations)
+         * @param appName The application name
+         * @param aspects Additional aspects
+         * @return The 16-byte destination hash
+         * @throws IllegalArgumentException if app name or aspects contain dots
+         */
+        fun hash(identity: Identity?, appName: String, vararg aspects: String): ByteArray {
+            // Compute name hash (without identity)
+            val nameHash = computeNameHash(appName, aspects.toList())
+
+            // Combine with identity hash if present
+            val hashMaterial = if (identity != null) {
+                nameHash + identity.hash
+            } else {
+                nameHash
+            }
+
+            // Return truncated hash (16 bytes)
+            return Hashes.truncatedHash(hashMaterial)
+        }
+
+        /**
+         * Compute a destination hash from a full name and identity.
+         *
+         * This parses the full name into app name and aspects, then computes
+         * the hash using the standard algorithm.
+         *
+         * @param fullName The full destination name (without identity hex hash)
+         * @param identity The identity (can be null)
+         * @return The 16-byte destination hash
+         * @throws IllegalArgumentException if full name is invalid
+         */
+        fun hashFromNameAndIdentity(fullName: String, identity: Identity?): ByteArray {
+            val parsed = appAndAspectsFromName(fullName)
+                ?: throw IllegalArgumentException("Invalid full name: $fullName")
+            return hash(identity, parsed.first, *parsed.second.toTypedArray())
+        }
+
+        /**
+         * Parse a full destination name into app name and aspects.
+         *
+         * The input should be in the format "app_name.aspect1.aspect2..."
+         * (without the identity hex hash).
+         *
+         * @param fullName The full destination name
+         * @return A Pair of (appName, list of aspects), or null if invalid
+         */
+        fun appAndAspectsFromName(fullName: String): Pair<String, List<String>>? {
+            if (fullName.isEmpty()) return null
+
+            val parts = fullName.split('.')
+            return if (parts.isEmpty()) {
+                null
+            } else {
+                Pair(parts[0], parts.drop(1))
+            }
+        }
     }
 
     /**
@@ -897,6 +1030,129 @@ class Destination private constructor(
         }
     }
 
+    // ===== Default App Data Methods =====
+
+    /**
+     * Set default app_data to include in announces.
+     *
+     * If set, the default app_data will be included in every announce sent by
+     * this destination, unless other app_data is specified in the announce() method.
+     *
+     * @param appData The default app_data as ByteArray
+     */
+    fun setDefaultAppData(appData: ByteArray?) {
+        defaultAppData = appData
+    }
+
+    /**
+     * Set default app_data to include in announces using a callback.
+     *
+     * The callback will be invoked each time an announce is sent to get the
+     * current app_data.
+     *
+     * @param appDataCallback A function that returns ByteArray for app_data
+     */
+    fun setDefaultAppData(appDataCallback: (() -> ByteArray)?) {
+        defaultAppData = appDataCallback
+    }
+
+    /**
+     * Clear any default app_data previously set.
+     */
+    fun clearDefaultAppData() {
+        defaultAppData = null
+    }
+
+    /**
+     * Get the current default app_data.
+     *
+     * If a callback was set, this will invoke it and return the result.
+     *
+     * @return The app_data ByteArray, or null if not set
+     */
+    fun getDefaultAppData(): ByteArray? {
+        return when (val data = defaultAppData) {
+            is ByteArray -> data
+            is Function0<*> -> {
+                @Suppress("UNCHECKED_CAST")
+                (data as? (() -> ByteArray))?.invoke()
+            }
+            else -> null
+        }
+    }
+
+    // ===== Proof Strategy Methods =====
+
+    /**
+     * Set the proof strategy for this destination.
+     *
+     * The proof strategy determines whether this destination will send proofs
+     * when requested by incoming packets.
+     *
+     * @param strategy One of PROVE_NONE, PROVE_APP, or PROVE_ALL
+     * @return true if the strategy was set successfully
+     */
+    fun setProofStrategy(strategy: Int): Boolean {
+        if (strategy !in listOf(PROVE_NONE, PROVE_APP, PROVE_ALL)) {
+            return false
+        }
+        proofStrategy = strategy
+        return true
+    }
+
+    /**
+     * Get the current proof strategy.
+     *
+     * @return The current proof strategy (PROVE_NONE, PROVE_APP, or PROVE_ALL)
+     */
+    fun getProofStrategy(): Int = proofStrategy
+
+    /**
+     * Set the callback for proof requests.
+     *
+     * When the proof strategy is PROVE_APP, this callback will be called to
+     * determine whether a proof should be sent for a specific packet.
+     *
+     * @param callback A function that receives a packet and returns true to send
+     *                 a proof or false to not send one
+     */
+    fun setProofRequestedCallback(callback: ((Any) -> Boolean)?) {
+        proofRequestedCallback = callback
+    }
+
+    // ===== Callback Setters =====
+
+    /**
+     * Register a callback for link established events.
+     *
+     * @param callback A function to be called when a link is established.
+     *                 Receives the Link object
+     */
+    fun setLinkEstablishedCallback(callback: ((Any) -> Unit)?) {
+        linkEstablishedCallback = callback
+    }
+
+    /**
+     * Check whether this destination accepts incoming link requests.
+     *
+     * @return true if the destination accepts links
+     */
+    fun acceptsLinks(): Boolean = acceptLinkRequests
+
+    // ===== Ratchet Configuration Setters =====
+
+    /**
+     * Enable or disable ratchet enforcement.
+     *
+     * When enabled, this destination will only accept packets encrypted with
+     * ratchet keys, not the base identity key.
+     *
+     * @param enforce true to enable enforcement, false to disable
+     */
+    fun enforceRatchets(enforce: Boolean) {
+        enforceRatchets = enforce
+    }
+
     /**
      * Create and send an announce packet for this destination.
      *
@@ -924,6 +1180,9 @@ class Destination private constructor(
         }
         val randomHash = randomPart + timestampBytes
 
+        // Use provided app_data or fall back to default app_data
+        val actualAppData = appData ?: getDefaultAppData()
+
         // Check if we should include a ratchet
         val ratchet: ByteArray
         val hasRatchet: Boolean
@@ -948,16 +1207,16 @@ class Destination private constructor(
 
         // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
         val publicKey = id.getPublicKey()
-        val signedData = hash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
+        val signedData = hash + publicKey + nameHash + randomHash + ratchet + (actualAppData ?: byteArrayOf())
 
         // Sign the data
         val signature = id.sign(signedData)
 
         // Build announce data: public_key + name_hash + random_hash + [ratchet] + signature + [app_data]
         val announceData = if (hasRatchet) {
-            publicKey + nameHash + randomHash + ratchet + signature + (appData ?: byteArrayOf())
+            publicKey + nameHash + randomHash + ratchet + signature + (actualAppData ?: byteArrayOf())
         } else {
-            publicKey + nameHash + randomHash + signature + (appData ?: byteArrayOf())
+            publicKey + nameHash + randomHash + signature + (actualAppData ?: byteArrayOf())
         }
 
         // Determine context and context flag

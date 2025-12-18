@@ -272,12 +272,10 @@ class Link private constructor(
     val rxBytes = AtomicLong(0)
 
     // Physical stats
-    var rssi: Int? = null
-        private set
-    var snr: Float? = null
-        private set
-    var q: Float? = null
-        private set
+    private var trackPhyStats: Boolean = false
+    private var phyRssi: Int? = null
+    private var phySnr: Float? = null
+    private var phyQ: Float? = null
 
     // Timeout factors
     var trafficTimeoutFactor: Int = LinkConstants.TRAFFIC_TIMEOUT_FACTOR
@@ -314,6 +312,8 @@ class Link private constructor(
     // Resource performance tracking
     private var lastResourceWindow: Int? = null
     private var lastResourceEifr: Float? = null
+    private var establishmentRate: Float? = null
+    private var expectedRate: Float? = null
 
     // Request/response tracking
     internal val pendingRequests = mutableListOf<RequestReceipt>()
@@ -513,6 +513,12 @@ class Link private constructor(
             mdu = LinkConstants.calculateMdu(mtu)
             status = LinkConstants.ACTIVE
             activatedAt = System.currentTimeMillis()
+
+            // Calculate establishment rate (bytes per ms)
+            val linkRtt = rtt
+            if (linkRtt != null && linkRtt > 0 && establishmentCost > 0) {
+                establishmentRate = establishmentCost.toFloat() / linkRtt.toFloat()
+            }
 
             Transport.activateLink(this)
 
@@ -1361,6 +1367,12 @@ class Link private constructor(
             status = LinkConstants.ACTIVE
             activatedAt = System.currentTimeMillis()
 
+            // Calculate establishment rate (bytes per ms)
+            val linkRtt = rtt
+            if (linkRtt != null && linkRtt > 0 && establishmentCost > 0) {
+                establishmentRate = establishmentCost.toFloat() / linkRtt.toFloat()
+            }
+
             log("Link RTT measured: ${rtt}ms")
             updateKeepalive()
 
@@ -1851,12 +1863,28 @@ class Link private constructor(
             // lastResourceWindow = resource.window
             // lastResourceEifr = resource.eifr
 
+            // Calculate expected rate from resource transfer
+            // TODO: Get resource.startedTransferring property when Resource is fully implemented
+            // For now, we skip this calculation
+            // val transferTime = (concludedAt - resource.startedTransferring) / 1000.0f
+            // if (transferTime > 0.0001f) {
+            //     expectedRate = (resource.size * 8) / transferTime
+            // }
+
             synchronized(incomingResources) {
                 incomingResources.remove(resource)
             }
         }
 
         if (wasOutgoing) {
+            // Calculate expected rate from resource transfer
+            // TODO: Get resource.startedTransferring property when Resource is fully implemented
+            // For now, we skip this calculation
+            // val transferTime = (concludedAt - resource.startedTransferring) / 1000.0f
+            // if (transferTime > 0.0001f) {
+            //     expectedRate = (resource.size * 8) / transferTime
+            // }
+
             synchronized(outgoingResources) {
                 outgoingResources.remove(resource)
             }
@@ -2058,6 +2086,229 @@ class Link private constructor(
         // 2. Unpack the response data
         // 3. Call handleResponse with the unpacked data
         log("Response resource concluded (not yet fully implemented)")
+    }
+
+    /**
+     * Enable or disable physical layer statistics tracking.
+     *
+     * @param track Whether to track physical layer statistics
+     */
+    fun trackPhyStats(track: Boolean) {
+        this.trackPhyStats = track
+    }
+
+    /**
+     * Get the RSSI (Received Signal Strength Indication) value.
+     *
+     * @return RSSI value if tracking is enabled and available, null otherwise
+     */
+    fun getRssi(): Int? {
+        return if (trackPhyStats) phyRssi else null
+    }
+
+    /**
+     * Get the SNR (Signal-to-Noise Ratio) value.
+     *
+     * @return SNR value if tracking is enabled and available, null otherwise
+     */
+    fun getSnr(): Float? {
+        return if (trackPhyStats) phySnr else null
+    }
+
+    /**
+     * Get the Q (link quality) value.
+     *
+     * @return Q value if tracking is enabled and available, null otherwise
+     */
+    fun getQ(): Float? {
+        return if (trackPhyStats) phyQ else null
+    }
+
+    /**
+     * Update physical layer statistics from interface.
+     * This is typically called by the interface when a packet is received.
+     *
+     * @param rssi RSSI value
+     * @param snr SNR value
+     * @param q Link quality value
+     */
+    fun updatePhyStats(rssi: Int? = null, snr: Float? = null, q: Float? = null) {
+        if (trackPhyStats) {
+            rssi?.let { phyRssi = it }
+            snr?.let { phySnr = it }
+            q?.let { phyQ = it }
+        }
+    }
+
+    /**
+     * Get the MTU for this link.
+     *
+     * @return MTU if link is active, null otherwise
+     */
+    fun getMtu(): Int? {
+        return if (status == LinkConstants.ACTIVE) mtu else null
+    }
+
+    /**
+     * Get the MDU (Maximum Data Unit) for this link.
+     *
+     * @return MDU if link is active, null otherwise
+     */
+    fun getMdu(): Int? {
+        return if (status == LinkConstants.ACTIVE) mdu else null
+    }
+
+    /**
+     * Check if a resource is in the incoming resources list.
+     *
+     * @param resource The resource to check
+     * @return true if the resource is in the list, false otherwise
+     */
+    fun hasIncomingResource(resource: network.reticulum.resource.Resource): Boolean {
+        synchronized(incomingResources) {
+            return incomingResources.any { it.hash.contentEquals(resource.hash) }
+        }
+    }
+
+    /**
+     * Check if a resource is in the outgoing resources list.
+     *
+     * @param resource The resource to check
+     * @return true if the resource is in the list, false otherwise
+     */
+    fun hasOutgoingResource(resource: network.reticulum.resource.Resource): Boolean {
+        synchronized(outgoingResources) {
+            return outgoingResources.any { it.hash.contentEquals(resource.hash) }
+        }
+    }
+
+    /**
+     * Check if the link is ready for a new outgoing resource.
+     *
+     * @return true if no outgoing resources are active, false otherwise
+     */
+    fun readyForNewResource(): Boolean {
+        synchronized(outgoingResources) {
+            return outgoingResources.isEmpty()
+        }
+    }
+
+    /**
+     * Cancel an outgoing resource transfer.
+     *
+     * @param resource The resource to cancel
+     * @return true if removed, false if not found
+     */
+    fun cancelOutgoingResource(resource: network.reticulum.resource.Resource): Boolean {
+        synchronized(outgoingResources) {
+            val removed = outgoingResources.remove(resource)
+            if (!removed) {
+                log("Attempt to cancel a non-existing outgoing resource")
+            }
+            return removed
+        }
+    }
+
+    /**
+     * Cancel an incoming resource transfer.
+     *
+     * @param resource The resource to cancel
+     * @return true if removed, false if not found
+     */
+    fun cancelIncomingResource(resource: network.reticulum.resource.Resource): Boolean {
+        synchronized(incomingResources) {
+            val removed = incomingResources.remove(resource)
+            if (!removed) {
+                log("Attempt to cancel a non-existing incoming resource")
+            }
+            return removed
+        }
+    }
+
+    /**
+     * Get the window size from the last concluded resource.
+     *
+     * @return Window size if available, null otherwise
+     */
+    fun getLastResourceWindow(): Int? = lastResourceWindow
+
+    /**
+     * Get the EIFR (Effective Information Flow Rate) from the last concluded resource.
+     *
+     * @return EIFR if available, null otherwise
+     */
+    fun getLastResourceEifr(): Float? = lastResourceEifr
+
+    /**
+     * Set the link established callback.
+     *
+     * @param callback Function to call when link is established
+     */
+    fun setLinkEstablishedCallback(callback: ((Link) -> Unit)?) {
+        callbacks.linkEstablished = callback
+    }
+
+    /**
+     * Set the link closed callback.
+     *
+     * @param callback Function to call when link is closed
+     */
+    fun setLinkClosedCallback(callback: ((Link) -> Unit)?) {
+        callbacks.linkClosed = callback
+    }
+
+    /**
+     * Set the packet callback.
+     *
+     * @param callback Function to call when a packet is received
+     */
+    fun setPacketCallback(callback: ((ByteArray, Packet) -> Unit)?) {
+        callbacks.packet = callback
+    }
+
+    /**
+     * Set the remote identified callback.
+     *
+     * @param callback Function to call when remote peer identifies
+     */
+    fun setRemoteIdentifiedCallback(callback: ((Link, Identity) -> Unit)?) {
+        callbacks.remoteIdentified = callback
+    }
+
+    /**
+     * Set the resource started callback.
+     *
+     * @param callback Function to call when a resource transfer starts
+     */
+    fun setResourceStartedCallback(callback: ((Any) -> Unit)?) {
+        callbacks.resourceStarted = callback
+    }
+
+    /**
+     * Set the resource concluded callback.
+     *
+     * @param callback Function to call when a resource transfer concludes
+     */
+    fun setResourceConcludedCallback(callback: ((Any) -> Unit)?) {
+        callbacks.resourceConcluded = callback
+    }
+
+    /**
+     * Get the establishment rate (data rate during link establishment).
+     *
+     * @return Establishment rate in bits per second if available, null otherwise
+     */
+    fun getEstablishmentRate(): Float? {
+        return establishmentRate?.let { it * 8 }  // Convert bytes/ms to bits/second
+    }
+
+    /**
+     * Get the expected data rate for this link.
+     *
+     * @return Expected rate in bits per second if available, null otherwise
+     */
+    fun getExpectedRate(): Float? {
+        return if (status == LinkConstants.ACTIVE) expectedRate else null
     }
 
     override fun toString(): String = "Link[${linkId.toHexString().take(12)}]"
