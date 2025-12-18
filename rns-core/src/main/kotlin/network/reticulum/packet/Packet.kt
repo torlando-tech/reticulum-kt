@@ -318,6 +318,48 @@ class Packet private constructor(
                 packetType = PacketType.fromValue(flags and 0b00000011)
             )
         }
+
+        /**
+         * Create an announce packet for a destination.
+         *
+         * Announce data format:
+         * [public_key: 64] [name_hash: 10] [random_hash: 10] [signature: 64] [app_data: variable]
+         *
+         * @param destination The destination to announce
+         * @param appData Optional application data to include
+         * @return The announce packet, or null if the destination cannot create announces
+         */
+        fun createAnnounce(
+            destination: Destination,
+            appData: ByteArray? = null
+        ): Packet? {
+            val identity = destination.identity ?: return null
+            if (!identity.hasPrivateKey) return null
+
+            // Build announce data
+            val publicKey = identity.getPublicKey()
+            val nameHash = destination.nameHash
+            val randomHash = Hashes.getRandomHash().copyOf(RnsConstants.NAME_HASH_BYTES)
+
+            // Data to sign: public_key + name_hash + random_hash
+            val signableData = publicKey + nameHash + randomHash
+            val signature = identity.sign(signableData) ?: return null
+
+            // Complete announce data
+            val announceData = if (appData != null) {
+                signableData + signature + appData
+            } else {
+                signableData + signature
+            }
+
+            return createRaw(
+                destinationHash = destination.hash,
+                data = announceData,
+                packetType = PacketType.ANNOUNCE,
+                destinationType = destination.type,
+                transportType = TransportType.BROADCAST
+            )
+        }
     }
 
     override fun toString(): String =

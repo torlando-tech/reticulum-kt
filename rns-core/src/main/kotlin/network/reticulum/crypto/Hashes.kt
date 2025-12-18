@@ -1,12 +1,14 @@
 package network.reticulum.crypto
 
 import network.reticulum.common.RnsConstants
+import java.security.SecureRandom
 
 /**
  * Hash utility functions matching Python Reticulum's hash operations.
  */
 object Hashes {
     private val crypto: CryptoProvider by lazy { defaultCryptoProvider() }
+    private val secureRandom = SecureRandom()
 
     /**
      * Compute full SHA-256 hash (32 bytes).
@@ -32,4 +34,14 @@ object Hashes {
      */
     fun nameHash(data: ByteArray): ByteArray =
         crypto.sha256(data).copyOf(RnsConstants.NAME_HASH_BYTES)
+
+    /**
+     * Generate a random hash (16 bytes of cryptographically secure random data).
+     * Used for path request tags and other unique identifiers.
+     */
+    fun getRandomHash(): ByteArray {
+        val bytes = ByteArray(RnsConstants.TRUNCATED_HASH_BYTES)
+        secureRandom.nextBytes(bytes)
+        return bytes
+    }
 }

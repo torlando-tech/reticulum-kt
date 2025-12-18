@@ -1,12 +1,14 @@
 package network.reticulum.transport
 
 import network.reticulum.common.ContextFlag
+import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.HeaderType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.TransportType
+import network.reticulum.common.concatBytes
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
@@ -106,6 +108,12 @@ object Transport {
     /** Control destination hashes (path requests, etc.). */
     private val controlHashes = ConcurrentHashMap.newKeySet<ByteArrayKey>()
 
+    /** Rate limiting: destination_hash -> list of announce timestamps. */
+    private val announceRateTable = ConcurrentHashMap<ByteArrayKey, MutableList<Long>>()
+
+    /** Queued announces waiting for retransmission. */
+    private val queuedAnnounces = CopyOnWriteArrayList<QueuedAnnounce>()
+
     // ===== Traffic Stats =====
 
     var trafficRxBytes: Long = 0
@@ -136,12 +144,31 @@ object Transport {
         tablesLastCulled = startTime
         hashlistLastCleaned = startTime
 
+        // Initialize path request destination
+        initializeControlDestinations()
+
         // Start background job thread
         thread(name = "Transport-jobs", isDaemon = true) {
             jobLoop()
         }
 
         log("Transport started (transport=${if (enableTransport) "enabled" else "disabled"})")
+    }
+
+    /**
+     * Initialize control destinations (path request, etc.).
+     */
+    private fun initializeControlDestinations() {
+        // Create path request destination
+        pathRequestDestination = Destination.create(
+            identity = null,
+            direction = DestinationDirection.IN,
+            type = DestinationType.PLAIN,
+            appName = TransportConstants.APP_NAME,
+            aspects = arrayOf("path", "request")
+        )
+        controlHashes.add(pathRequestDestination!!.hash.toKey())
+        log("Path request destination: ${pathRequestDestination!!.hexHash}")
     }
 
     /**
@@ -274,6 +301,194 @@ object Transport {
         // For now, just expire it
         // TODO: Track path state separately
         expirePath(destinationHash)
+    }
+
+    // ===== Path Requests =====
+
+    /** Pending path requests: destination_hash -> request timestamp. */
+    private val pathRequests = ConcurrentHashMap<ByteArrayKey, Long>()
+
+    /** Discovery path request tags to avoid duplicates. */
+    private val discoveryPrTags = CopyOnWriteArrayList<ByteArrayKey>()
+
+    /** Path request destination for sending requests. */
+    private var pathRequestDestination: Destination? = null
+
+    /**
+     * Request a path to a destination from the network.
+     *
+     * This broadcasts a path request packet. If another node on the network
+     * knows a path, it will respond with an announce.
+     *
+     * @param destinationHash The destination to find a path to
+     * @param onInterface Optional specific interface to send request on
+     * @param callback Optional callback when path is found
+     */
+    fun requestPath(
+        destinationHash: ByteArray,
+        onInterface: InterfaceRef? = null,
+        callback: ((Boolean) -> Unit)? = null
+    ) {
+        if (!started.get()) {
+            callback?.invoke(false)
+            return
+        }
+
+        // Check if we already have a path
+        if (hasPath(destinationHash)) {
+            callback?.invoke(true)
+            return
+        }
+
+        // Check if request was made too recently
+        val lastRequest = pathRequests[destinationHash.toKey()]
+        val now = System.currentTimeMillis()
+        if (lastRequest != null && now - lastRequest < TransportConstants.PATH_REQUEST_MI) {
+            log("Skipping path request for ${destinationHash.toHexString()} (too recent)")
+            callback?.invoke(false)
+            return
+        }
+
+        // Generate request tag
+        val requestTag = Hashes.getRandomHash()
+
+        // Build path request data
+        val pathRequestData = if (transportEnabled && identity != null) {
+            // Transport mode: include our transport ID
+            concatBytes(destinationHash, identity!!.hash, requestTag)
+        } else {
+            // Client mode: just destination and tag
+            concatBytes(destinationHash, requestTag)
+        }
+
+        // Ensure path request destination exists (created during start)
+        val prDest = pathRequestDestination
+        if (prDest == null) {
+            log("Path request destination not initialized")
+            callback?.invoke(false)
+            return
+        }
+
+        // Create and send the packet
+        val packet = Packet.createRaw(
+            destinationHash = prDest.hash,
+            data = pathRequestData,
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.PLAIN,
+            transportType = TransportType.BROADCAST
+        )
+
+        // Send on specific interface or all
+        val sent = if (onInterface != null) {
+            try {
+                onInterface.send(packet.pack())
+                true
+            } catch (e: Exception) {
+                log("Failed to send path request: ${e.message}")
+                false
+            }
+        } else {
+            outbound(packet)
+        }
+
+        if (sent) {
+            pathRequests[destinationHash.toKey()] = now
+            log("Sent path request for ${destinationHash.toHexString()}")
+
+            // Set up timeout callback if provided
+            if (callback != null) {
+                thread(name = "PathRequest-timeout", isDaemon = true) {
+                    Thread.sleep(TransportConstants.PATH_REQUEST_TIMEOUT)
+                    val found = hasPath(destinationHash)
+                    callback(found)
+                }
+            }
+        } else {
+            callback?.invoke(false)
+        }
+    }
+
+    /**
+     * Handle an incoming path request packet.
+     */
+    private fun handlePathRequest(
+        data: ByteArray,
+        @Suppress("UNUSED_PARAMETER") packet: Packet,
+        receivingInterface: InterfaceRef
+    ) {
+        if (data.size < RnsConstants.TRUNCATED_HASH_BYTES) return
+
+        val destinationHash = data.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+
+        // Extract requesting transport ID if present
+        val requestingTransportId = if (data.size > RnsConstants.TRUNCATED_HASH_BYTES * 2) {
+            data.copyOfRange(RnsConstants.TRUNCATED_HASH_BYTES, RnsConstants.TRUNCATED_HASH_BYTES * 2)
+        } else null
+
+        // Extract tag
+        val tagOffset = if (requestingTransportId != null) {
+            RnsConstants.TRUNCATED_HASH_BYTES * 2
+        } else {
+            RnsConstants.TRUNCATED_HASH_BYTES
+        }
+
+        if (data.size <= tagOffset) {
+            log("Ignoring tagless path request")
+            return
+        }
+
+        val tagBytes = data.copyOfRange(tagOffset, minOf(tagOffset + RnsConstants.TRUNCATED_HASH_BYTES, data.size))
+        val uniqueTag = concatBytes(destinationHash, tagBytes).toKey()
+
+        // Check for duplicate
+        if (discoveryPrTags.contains(uniqueTag)) {
+            log("Ignoring duplicate path request for ${destinationHash.toHexString()}")
+            return
+        }
+
+        discoveryPrTags.add(uniqueTag)
+
+        // Trim tags list if too large
+        while (discoveryPrTags.size > 32000) {
+            discoveryPrTags.removeAt(0)
+        }
+
+        // Check if we know the path
+        processPathRequest(destinationHash, receivingInterface, requestingTransportId, tagBytes)
+    }
+
+    /**
+     * Process a path request - check if we know the destination and can announce it.
+     */
+    private fun processPathRequest(
+        destinationHash: ByteArray,
+        @Suppress("UNUSED_PARAMETER") receivingInterface: InterfaceRef,
+        @Suppress("UNUSED_PARAMETER") requestingTransportId: ByteArray?,
+        @Suppress("UNUSED_PARAMETER") tag: ByteArray
+    ) {
+        // Check if this is a local destination
+        val localDest = findDestination(destinationHash)
+        if (localDest != null) {
+            log("Responding to path request with local destination ${destinationHash.toHexString()}")
+
+            // Create and send an announce
+            val announcePacket = Packet.createAnnounce(localDest)
+            if (announcePacket != null) {
+                outbound(announcePacket)
+                log("Sent announce in response to path request")
+            } else {
+                log("Cannot create announce for ${destinationHash.toHexString()} (no private key)")
+            }
+            return
+        }
+
+        // Check if we know a path (transport nodes can forward cached announces)
+        val pathEntry = pathTable[destinationHash.toKey()]
+        if (pathEntry != null && !pathEntry.isExpired()) {
+            // Note: To forward cached announces, we would need to store the raw announce data
+            // in the path table or a separate announce cache. For now, just log that we know the path.
+            log("We know path to ${destinationHash.toHexString()} (${pathEntry.hops} hops), announce forwarding requires caching")
+        }
     }
 
     // ===== Packet Processing =====
@@ -468,11 +683,79 @@ object Transport {
 
         // Retransmit if transport is enabled and under hop limit
         if (transportEnabled && packet.hops < TransportConstants.PATHFINDER_M) {
-            // TODO: Queue for retransmission with rate limiting
+            queueAnnounceRetransmit(destHash, packet, interfaceRef)
         }
     }
 
+    /**
+     * Queue an announce for retransmission after rate limiting checks.
+     */
+    private fun queueAnnounceRetransmit(
+        destinationHash: ByteArray,
+        packet: Packet,
+        receivingInterface: InterfaceRef
+    ) {
+        val destKey = destinationHash.toKey()
+        val now = System.currentTimeMillis()
+
+        // Check rate limiting
+        val rateTimestamps = announceRateTable.getOrPut(destKey) { mutableListOf() }
+
+        // Clean old timestamps (older than 30 seconds)
+        val cutoff = now - 30_000
+        rateTimestamps.removeAll { it < cutoff }
+
+        if (rateTimestamps.size >= TransportConstants.MAX_RATE_TIMESTAMPS) {
+            log("Rate limiting announce for ${destinationHash.toHexString()}")
+            return
+        }
+
+        rateTimestamps.add(now)
+
+        // Calculate random delay for retransmission
+        val graceMs = TransportConstants.PATH_REQUEST_GRACE
+        val randomMs = (Math.random() * TransportConstants.PATHFINDER_RW * 1000).toLong()
+        val retransmitTime = now + graceMs + randomMs
+
+        // Create queued announce
+        val queuedAnnounce = QueuedAnnounce(
+            destinationHash = destinationHash.copyOf(),
+            time = retransmitTime,
+            hops = packet.hops,
+            emitted = now,
+            raw = packet.raw ?: packet.pack()
+        )
+
+        // Store in announce table for potential path request responses
+        val announceEntry = AnnounceEntry(
+            destinationHash = destinationHash.copyOf(),
+            timestamp = now,
+            retransmits = 0,
+            retransmitTimeout = retransmitTime,
+            raw = queuedAnnounce.raw,
+            hops = packet.hops,
+            receivingInterfaceHash = receivingInterface.hash,
+            localRebroadcasts = 0
+        )
+        announceTable[destKey] = announceEntry
+
+        // Add to retransmit queue
+        queuedAnnounces.add(queuedAnnounce)
+
+        log("Queued announce for ${destinationHash.toHexString()} (retransmit in ${retransmitTime - now}ms)")
+    }
+
     private fun processData(packet: Packet, interfaceRef: InterfaceRef) {
+        // Check if this is a control packet (path request, etc.)
+        if (controlHashes.contains(packet.destinationHash.toKey())) {
+            // Check if this is a path request
+            if (pathRequestDestination != null &&
+                packet.destinationHash.contentEquals(pathRequestDestination!!.hash)) {
+                handlePathRequest(packet.data, packet, interfaceRef)
+                return
+            }
+        }
+
         // Check if this is for a local destination
         val destination = findDestination(packet.destinationHash)
 
@@ -515,7 +798,7 @@ object Transport {
         }
     }
 
-    private fun processProof(packet: Packet, interfaceRef: InterfaceRef) {
+    private fun processProof(packet: Packet, @Suppress("UNUSED_PARAMETER") interfaceRef: InterfaceRef) {
         // Check reverse table for return path
         val reverseEntry = reverseTable[packet.truncatedHash.toKey()]
 
@@ -572,7 +855,7 @@ object Transport {
         pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
     }
 
-    private fun deliverPacket(destination: Destination, packet: Packet) {
+    private fun deliverPacket(destination: Destination, @Suppress("UNUSED_PARAMETER") packet: Packet) {
         // TODO: Decrypt if needed and deliver via callback
         log("Delivering packet to ${destination.hexHash}")
     }
@@ -670,6 +953,9 @@ object Transport {
     private fun runJobs() {
         val now = System.currentTimeMillis()
 
+        // Process queued announces
+        processQueuedAnnounces(now)
+
         // Cull stale table entries
         if (now - tablesLastCulled > TransportConstants.TABLES_CULL_INTERVAL) {
             cullTables()
@@ -683,9 +969,62 @@ object Transport {
         }
     }
 
-    private fun cullTables() {
-        val now = System.currentTimeMillis()
+    /**
+     * Process queued announces that are ready for retransmission.
+     */
+    private fun processQueuedAnnounces(now: Long) {
+        val toRemove = mutableListOf<QueuedAnnounce>()
 
+        for (queued in queuedAnnounces) {
+            if (now >= queued.time) {
+                retransmitAnnounce(queued)
+                toRemove.add(queued)
+            }
+        }
+
+        queuedAnnounces.removeAll(toRemove)
+    }
+
+    /**
+     * Retransmit a queued announce on all interfaces.
+     */
+    private fun retransmitAnnounce(queued: QueuedAnnounce) {
+        val destKey = queued.destinationHash.toKey()
+        val announceEntry = announceTable[destKey] ?: return
+
+        // Check if we've exceeded max local rebroadcasts
+        if (announceEntry.localRebroadcasts >= TransportConstants.LOCAL_REBROADCASTS_MAX) {
+            log("Max rebroadcasts reached for ${queued.destinationHash.toHexString()}")
+            return
+        }
+
+        // Increment hop count in the raw packet
+        val rawCopy = queued.raw.copyOf()
+        rawCopy[1] = ((rawCopy[1].toInt() and 0xFF) + 1).toByte()
+
+        // Transmit on all interfaces except the receiving one
+        var transmitted = false
+        for (iface in interfaces) {
+            if (iface.canSend && iface.online &&
+                !iface.hash.contentEquals(announceEntry.receivingInterfaceHash)) {
+                try {
+                    iface.send(rawCopy)
+                    trafficTxBytes += rawCopy.size
+                    transmitted = true
+                } catch (e: Exception) {
+                    log("Announce retransmit error on ${iface.name}: ${e.message}")
+                }
+            }
+        }
+
+        if (transmitted) {
+            announceEntry.retransmits++
+            announceEntry.localRebroadcasts++
+            log("Retransmitted announce for ${queued.destinationHash.toHexString()} (rebroadcast ${announceEntry.localRebroadcasts})")
+        }
+    }
+
+    private fun cullTables() {
         // Remove expired path entries
         pathTable.entries.removeIf { it.value.isExpired() }
 
