@@ -10,7 +10,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 |-----------|--------|-------|
 | **Core Protocol** | ~90% | Identity, Destination, Packet, Transport, Link, Channel, Resource |
 | **Interfaces** | ~15% | TCP complete; UDP, Serial, RNode, BLE not started |
-| **Utilities/CLI** | 0% | No CLI tools implemented |
+| **Utilities/CLI** | ~15% | rnsd-kt daemon implemented |
 | **Crypto** | 100% | Full BouncyCastle implementation |
 
 ### Core Protocol
@@ -44,18 +44,20 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 
 ### Utilities/CLI
 
-None of the Python CLI tools are implemented yet:
-- `rnid` - Identity management
-- `rnstatus` - Network status
-- `rnpath` - Path discovery
-- `rncp` - File transfer
-- `rnprobe` - Ping/latency
+| Tool | Status | Notes |
+|------|--------|-------|
+| `rnsd-kt` | Complete | Daemon matching Python `rnsd` behavior |
+| `rnid` | Not started | Identity management |
+| `rnstatus` | Not started | Network status |
+| `rnpath` | Not started | Path discovery |
+| `rncp` | Not started | File transfer |
+| `rnprobe` | Not started | Ping/latency |
 
 ---
 
 ## Requirements
 
-- JDK 17+
+- JDK 21+
 - Python 3.8+ with [RNS](https://github.com/markqvist/Reticulum) installed (for interop tests)
 
 ## Project Structure
@@ -63,6 +65,7 @@ None of the Python CLI tools are implemented yet:
 ```
 rns-core/        # Core protocol implementation (Identity, Destination, Link, Channel, etc.)
 rns-interfaces/  # Network interface implementations
+rns-cli/         # CLI utilities (rnsd-kt daemon)
 rns-test/        # Test suite including Python interop tests
 python-bridge/   # Python bridge server for interop testing
 ```
@@ -89,6 +92,32 @@ Run a specific test class:
 ```bash
 ./gradlew test --tests "network.reticulum.interop.identity.IdentityInteropTest"
 ```
+
+## Running rnsd-kt
+
+Build the fat JAR:
+```bash
+./gradlew :rns-cli:shadowJar
+```
+
+Run the daemon:
+```bash
+java -jar rns-cli/build/libs/rnsd-kt.jar
+```
+
+CLI options (matching Python `rnsd`):
+```
+Options:
+  --config PATH     Path to config directory (default: ~/.reticulum)
+  -v, --verbose     Increase verbosity (repeatable)
+  -q, --quiet       Decrease verbosity (repeatable)
+  -s, --service     Run as service (log to file)
+  --exampleconfig   Print example config and exit
+  --version         Show version and exit
+  -h, --help        Show this message and exit
+```
+
+The daemon reads `~/.reticulum/config` (same ConfigObj/INI format as Python RNS) and supports TCPClientInterface and TCPServerInterface.
 
 ## Usage
 
