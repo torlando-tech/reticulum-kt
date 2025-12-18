@@ -310,6 +310,14 @@ object Transport {
     }
 
     /**
+     * Get all registered destinations.
+     * Used by Identity.recall() for fallback lookups.
+     */
+    internal fun getDestinations(): List<Destination> {
+        return destinations.toList()
+    }
+
+    /**
      * Find a registered destination by hash.
      */
     fun findDestination(hash: ByteArray): Destination? {

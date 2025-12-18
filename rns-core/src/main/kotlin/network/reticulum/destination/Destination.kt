@@ -8,8 +8,55 @@ import network.reticulum.common.toHexString
 import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.Token
+import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.identity.Identity
+import org.msgpack.core.MessagePack
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * Request access control policy constants.
+ */
+object RequestPolicy {
+    /** No requests are allowed. */
+    const val ALLOW_NONE = 0x00
+
+    /** All requests are allowed. */
+    const val ALLOW_ALL = 0x01
+
+    /** Only requests from identities in the allowed list are allowed. */
+    const val ALLOW_LIST = 0x02
+}
+
+/**
+ * Request handler configuration.
+ *
+ * @property path The request path (for reference)
+ * @property responseGenerator Function to generate response:
+ *   (path: String, data: ByteArray?, requestId: ByteArray, linkId: ByteArray,
+ *    remoteIdentity: Identity?, requestedAt: Long) -> ByteArray?
+ * @property allow Access control policy (ALLOW_NONE, ALLOW_ALL, ALLOW_LIST)
+ * @property allowedList List of allowed identity hashes (only used if allow == ALLOW_LIST)
+ * @property autoCompress Whether to automatically compress large responses
+ */
+data class RequestHandler(
+    val path: String,
+    val responseGenerator: (
+        path: String,
+        data: ByteArray?,
+        requestId: ByteArray,
+        linkId: ByteArray,
+        remoteIdentity: Identity?,
+        requestedAt: Long
+    ) -> ByteArray?,
+    val allow: Int,
+    val allowedList: List<ByteArray>?,
+    val autoCompress: Boolean
+)
 
 /**
  * A Destination describes an endpoint in a Reticulum Network.
@@ -101,6 +148,54 @@ class Destination private constructor(
      */
     var enforceRatchets: Boolean = false
 
+    // ===== Ratchet State =====
+
+    /**
+     * Whether ratchets are enabled for this destination.
+     */
+    private var ratchetsEnabled: Boolean = false
+
+    /**
+     * Path to the file where ratchets are persisted.
+     */
+    private var ratchetsPath: String? = null
+
+    /**
+     * Lock for file operations on ratchets.
+     */
+    private val ratchetFileLock = ReentrantLock()
+
+    /**
+     * Maximum number of ratchets to retain.
+     */
+    private var retainedRatchets: Int = RATCHET_COUNT
+
+    /**
+     * Minimum interval between ratchet rotations (milliseconds).
+     */
+    private var ratchetInterval: Long = RATCHET_ROTATION_INTERVAL
+
+    /**
+     * Timestamp of the last ratchet rotation (milliseconds).
+     */
+    private var lastRatchetRotation: Long = 0L
+
+    /**
+     * Current ratchet public key (32 bytes).
+     */
+    private var ratchetKey: ByteArray? = null
+
+    /**
+     * Current ratchet ID (first 10 bytes of ratchet hash).
+     */
+    private var ratchetId: ByteArray? = null
+
+    /**
+     * Request handlers registered for this destination.
+     * Maps path hash to RequestHandler.
+     */
+    private val requestHandlers = ConcurrentHashMap<ByteArrayKey, RequestHandler>()
+
     /**
      * Create symmetric keys for a GROUP destination.
      * This generates a random key that can be shared with group members.
@@ -184,7 +279,379 @@ class Destination private constructor(
      */
     fun getRatchet(): ByteArray? = ratchetStorage[hash.toKey()]?.copyOf()
 
+    /**
+     * Enable ratchets on this destination.
+     *
+     * When ratchets are enabled, Reticulum will automatically rotate the keys used
+     * to encrypt packets to this destination, and include the latest ratchet key in
+     * announces.
+     *
+     * Enabling ratchets provides forward secrecy for packets sent to this destination,
+     * even when sent outside a Link. Note that normal Link establishment already
+     * performs ephemeral key exchange, so ratchets are not necessary for Links.
+     *
+     * Enabling ratchets will add 32 bytes to every sent announce.
+     *
+     * @param ratchetsPath The path to a file to store ratchet data in
+     * @return true if the operation succeeded, false otherwise
+     * @throws IllegalStateException if not a SINGLE/IN destination
+     */
+    fun enableRatchets(ratchetsPath: String): Boolean {
+        require(type == DestinationType.SINGLE) { "Only SINGLE destinations support ratchets" }
+        require(direction == DestinationDirection.IN) { "Only IN destinations can enable ratchets" }
+        require(ratchetsPath.isNotEmpty()) { "No ratchet file path specified" }
+
+        this.ratchetsPath = ratchetsPath
+        this.lastRatchetRotation = 0L
+        this.ratchetsEnabled = true  // Enable before calling rotateRatchets
+
+        // Try to reload existing ratchets from disk
+        reloadRatchets()
+
+        // If no ratchets exist, create the first one
+        if (ratchets.isEmpty()) {
+            rotateRatchets()
+        } else {
+            // Update ratchetKey and ratchetId from current ratchet
+            updateRatchetKeyAndId()
+        }
+
+        return true
+    }
+
+    /**
+     * Rotate ratchets by generating a new ratchet key.
+     *
+     * This creates a new X25519 key pair, prepends it to the ratchets list,
+     * trims the list to the maximum size, persists to disk, and updates
+     * the current ratchet key and ID.
+     *
+     * @return true if rotation succeeded, false otherwise
+     * @throws IllegalStateException if ratchets are not enabled
+     */
+    fun rotateRatchets(): Boolean {
+        require(ratchetsEnabled) { "Cannot rotate ratchets on $this, ratchets are not enabled" }
+
+        val now = System.currentTimeMillis()
+
+        // Check if enough time has passed since last rotation (skip check on first rotation)
+        if (lastRatchetRotation > 0 && now <= lastRatchetRotation + ratchetInterval) {
+            return false
+        }
+
+        // Generate new ratchet (X25519 private key)
+        val crypto = defaultCryptoProvider()
+        val newRatchet = crypto.randomBytes(RATCHET_SIZE)
+
+        // Prepend to list
+        ratchets.add(0, newRatchet)
+
+        // Trim if too many
+        cleanRatchets()
+
+        // Update current ratchet key and ID
+        updateRatchetKeyAndId()
+
+        // Persist to disk
+        persistRatchets()
+
+        // Update timestamp
+        lastRatchetRotation = now
+
+        return true
+    }
+
+    /**
+     * Persist ratchets to disk.
+     *
+     * The file format is:
+     * - signature (64 bytes): Ed25519 signature of the packed data
+     * - packed data: MessagePack-encoded list of ratchet private keys
+     *
+     * The signature is computed over: identity_hash + packed_ratchets
+     *
+     * @throws IllegalStateException if ratchets are not enabled or identity lacks private key
+     * @throws java.io.IOException if file write fails
+     */
+    private fun persistRatchets() {
+        val path = ratchetsPath ?: throw IllegalStateException("No ratchets path set")
+        val id = identity ?: throw IllegalStateException("Cannot persist ratchets without identity")
+        require(id.hasPrivateKey) { "Cannot persist ratchets without private key" }
+
+        ratchetFileLock.withLock {
+            try {
+                // Serialize ratchets list using MessagePack
+                val packer = MessagePack.newDefaultBufferPacker()
+                packer.packArrayHeader(ratchets.size)
+                for (ratchet in ratchets) {
+                    packer.packBinaryHeader(ratchet.size)
+                    packer.writePayload(ratchet)
+                }
+                val packedRatchets = packer.toByteArray()
+
+                // Create signed data: identity_hash + packed_ratchets
+                val signedData = hash + packedRatchets
+
+                // Sign with identity private key
+                val signature = id.sign(signedData)
+
+                // Write to temporary file first
+                val file = File(path)
+                val tempFile = File("$path.tmp")
+
+                // Ensure parent directories exist
+                file.parentFile?.mkdirs()
+
+                // Write signature + packed data
+                tempFile.writeBytes(signature + packedRatchets)
+
+                // Atomic rename
+                Files.move(
+                    tempFile.toPath(),
+                    file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE
+                )
+            } catch (e: Exception) {
+                throw java.io.IOException("Could not write ratchet file for $this: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Reload ratchets from disk.
+     *
+     * Reads the ratchet file, verifies the signature, and deserializes the ratchet list.
+     *
+     * @return true if ratchets were successfully loaded, false if file doesn't exist
+     * @throws IllegalStateException if identity is missing
+     * @throws java.io.IOException if file read or verification fails
+     */
+    private fun reloadRatchets(): Boolean {
+        val path = ratchetsPath ?: throw IllegalStateException("No ratchets path set")
+        val id = identity ?: throw IllegalStateException("Cannot reload ratchets without identity")
+
+        val file = File(path)
+        if (!file.exists()) {
+            return false
+        }
+
+        ratchetFileLock.withLock {
+            try {
+                // Read file
+                val fileData = file.readBytes()
+
+                // Extract signature (first 64 bytes) and packed data
+                if (fileData.size < 64) {
+                    throw java.io.IOException("Ratchet file too small")
+                }
+
+                val signature = fileData.copyOfRange(0, 64)
+                val packedRatchets = fileData.copyOfRange(64, fileData.size)
+
+                // Verify signature against identity_hash + packed_ratchets
+                val signedData = hash + packedRatchets
+                if (!id.validate(signature, signedData)) {
+                    throw SecurityException("Invalid ratchet file signature for $this")
+                }
+
+                // Deserialize ratchet list
+                val unpacker = MessagePack.newDefaultUnpacker(packedRatchets)
+                val arraySize = unpacker.unpackArrayHeader()
+                val loadedRatchets = mutableListOf<ByteArray>()
+                for (i in 0 until arraySize) {
+                    val binarySize = unpacker.unpackBinaryHeader()
+                    val ratchet = ByteArray(binarySize)
+                    unpacker.readPayload(ratchet)
+                    loadedRatchets.add(ratchet)
+                }
+
+                // Replace current ratchets
+                ratchets.clear()
+                ratchets.addAll(loadedRatchets)
+
+                return true
+            } catch (e: Exception) {
+                throw java.io.IOException("Could not read ratchet file for $this: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Clean ratchets by trimming to the maximum retained count.
+     */
+    private fun cleanRatchets() {
+        while (ratchets.size > retainedRatchets) {
+            ratchets.removeAt(ratchets.size - 1)
+        }
+    }
+
+    /**
+     * Update ratchetKey and ratchetId from the current (first) ratchet.
+     */
+    private fun updateRatchetKeyAndId() {
+        if (ratchets.isEmpty()) {
+            ratchetKey = null
+            ratchetId = null
+            return
+        }
+
+        // Get the first (most recent) ratchet private key
+        val ratchetPrivate = ratchets[0]
+
+        // Derive public key
+        val crypto = defaultCryptoProvider()
+        val ratchetPublic = crypto.x25519PublicFromPrivate(ratchetPrivate)
+
+        // Set ratchetKey
+        ratchetKey = ratchetPublic
+
+        // Compute ratchetId (first 10 bytes of full hash)
+        ratchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
+    }
+
+    /**
+     * Get the current ratchet ID.
+     *
+     * @return The ratchet ID (10 bytes) or null if ratchets are disabled
+     */
+    fun getRatchetId(): ByteArray? = ratchetId?.copyOf()
+
+    /**
+     * Get the current ratchet public key.
+     *
+     * @return The ratchet public key (32 bytes) or null if ratchets are disabled
+     */
+    fun getRatchetKey(): ByteArray? = ratchetKey?.copyOf()
+
+    /**
+     * Set the number of retained ratchets.
+     *
+     * This determines how many old ratchet keys are kept for decryption.
+     * Defaults to RATCHET_COUNT (512).
+     *
+     * @param count The number of ratchets to retain (must be > 0)
+     * @return true if successful, false otherwise
+     */
+    fun setRetainedRatchets(count: Int): Boolean {
+        if (count <= 0) return false
+        retainedRatchets = count
+        cleanRatchets()
+        return true
+    }
+
+    /**
+     * Set the ratchet rotation interval.
+     *
+     * This is the minimum time between ratchet rotations.
+     * Defaults to RATCHET_ROTATION_INTERVAL (30 days).
+     *
+     * @param interval The interval in milliseconds (must be > 0)
+     * @return true if successful, false otherwise
+     */
+    fun setRatchetInterval(interval: Long): Boolean {
+        if (interval <= 0) return false
+        ratchetInterval = interval
+        return true
+    }
+
+    // ===== Request Handler Methods =====
+
+    /**
+     * Register a request handler for a specific path.
+     *
+     * The response generator function will be called when a request is received
+     * with the matching path hash. The function should return the response data
+     * as ByteArray, or null if no response should be sent.
+     *
+     * @param path The request path (will be hashed)
+     * @param responseGenerator Function to generate response. Receives:
+     *   - path: The original path string
+     *   - data: The request data (may be null)
+     *   - requestId: Unique identifier for this request
+     *   - linkId: The link ID the request came from
+     *   - remoteIdentity: The identity of the requester (may be null)
+     *   - requestedAt: Timestamp when the request was made (milliseconds since epoch)
+     * @param allow Access control policy (RequestPolicy.ALLOW_NONE/ALL/LIST)
+     * @param allowedList List of allowed identity hashes (only used if allow == ALLOW_LIST)
+     * @param autoCompress Whether to automatically compress large responses
+     * @return true if registered successfully
+     * @throws IllegalArgumentException if path is empty or allow policy is invalid
+     */
+    fun registerRequestHandler(
+        path: String,
+        responseGenerator: (
+            path: String,
+            data: ByteArray?,
+            requestId: ByteArray,
+            linkId: ByteArray,
+            remoteIdentity: Identity?,
+            requestedAt: Long
+        ) -> ByteArray?,
+        allow: Int = RequestPolicy.ALLOW_NONE,
+        allowedList: List<ByteArray>? = null,
+        autoCompress: Boolean = true
+    ): Boolean {
+        require(path.isNotEmpty()) { "Invalid path specified" }
+        require(allow in listOf(RequestPolicy.ALLOW_NONE, RequestPolicy.ALLOW_ALL, RequestPolicy.ALLOW_LIST)) {
+            "Invalid request policy"
+        }
+
+        val pathHash = Hashes.truncatedHash(path.toByteArray(Charsets.UTF_8))
+        val handler = RequestHandler(
+            path = path,
+            responseGenerator = responseGenerator,
+            allow = allow,
+            allowedList = allowedList,
+            autoCompress = autoCompress
+        )
+
+        requestHandlers[pathHash.toKey()] = handler
+        return true
+    }
+
+    /**
+     * Deregister a request handler for a specific path.
+     *
+     * @param path The request path to deregister
+     * @return true if a handler was removed, false if no handler was registered
+     */
+    fun deregisterRequestHandler(path: String): Boolean {
+        val pathHash = Hashes.truncatedHash(path.toByteArray(Charsets.UTF_8))
+        return requestHandlers.remove(pathHash.toKey()) != null
+    }
+
+    /**
+     * Get a request handler by path hash.
+     *
+     * @param pathHash The truncated hash of the request path
+     * @return The RequestHandler if found, null otherwise
+     */
+    internal fun getRequestHandler(pathHash: ByteArray): RequestHandler? {
+        return requestHandlers[pathHash.toKey()]
+    }
+
     companion object {
+        /**
+         * Ratchet key size in bytes (32 bytes for X25519).
+         */
+        const val RATCHET_SIZE = 32
+
+        /**
+         * Ratchet ID size in bytes (first 10 bytes of hash).
+         */
+        const val RATCHET_ID_SIZE = 10
+
+        /**
+         * Default ratchet rotation interval (30 days in milliseconds).
+         */
+        const val RATCHET_ROTATION_INTERVAL = 2_592_000_000L  // 30 days
+
+        /**
+         * Default maximum number of ratchets to retain.
+         */
+        const val RATCHET_COUNT = 512
+
         /**
          * Storage for ratchet public keys: destination_hash -> ratchet_public_key
          */
@@ -461,7 +928,10 @@ class Destination private constructor(
         val ratchet: ByteArray
         val hasRatchet: Boolean
 
-        if (ratchets.isNotEmpty()) {
+        if (ratchetsEnabled && ratchets.isNotEmpty()) {
+            // Rotate ratchets if interval has passed
+            rotateRatchets()
+
             // Use the first (most recent) ratchet
             val ratchetPrivate = ratchets[0]
             // Get public key from private key

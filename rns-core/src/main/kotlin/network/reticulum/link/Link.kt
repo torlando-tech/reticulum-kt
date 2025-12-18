@@ -14,6 +14,8 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.transport.Transport
+import org.msgpack.core.MessagePack
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -66,6 +68,11 @@ class Link private constructor(
 ) {
     companion object {
         private val linkCounter = AtomicInteger(0)
+
+        // Resource strategy constants
+        const val ACCEPT_NONE = 0x00
+        const val ACCEPT_ALL = 0x01
+        const val ACCEPT_APP = 0x02
 
         /**
          * Create an outgoing link to a destination.
@@ -301,6 +308,15 @@ class Link private constructor(
     // Resource tracking
     private val outgoingResources = mutableListOf<network.reticulum.resource.Resource>()
     private val incomingResources = mutableListOf<network.reticulum.resource.Resource>()
+    private var resourceStrategy: Int = ACCEPT_NONE
+    private var resourceCallback: ((network.reticulum.resource.ResourceAdvertisement) -> Boolean)? = null
+
+    // Resource performance tracking
+    private var lastResourceWindow: Int? = null
+    private var lastResourceEifr: Float? = null
+
+    // Request/response tracking
+    internal val pendingRequests = mutableListOf<RequestReceipt>()
 
     /**
      * Initialize as link initiator (outgoing link).
@@ -633,6 +649,278 @@ class Link private constructor(
         return Transport.outbound(packet).also { sent ->
             if (sent) hadOutbound(isData = true)
         }
+    }
+
+    /**
+     * Send a request to the remote peer.
+     *
+     * Requests allow querying the remote peer and receiving a response. The request
+     * is sent over the encrypted link, and the response is delivered via callbacks.
+     *
+     * For small requests (<=MDU), the request is sent as a packet. For larger requests,
+     * it's automatically sent as a resource.
+     *
+     * @param path The request path (identifies the handler on the remote side)
+     * @param data The request data (will be serialized with msgpack)
+     * @param responseCallback Optional callback when response is received
+     * @param failedCallback Optional callback when request fails
+     * @param progressCallback Optional callback for response progress
+     * @param timeout Optional timeout in milliseconds (if null, calculated from RTT)
+     * @return RequestReceipt to track the request, or null if link is not active
+     */
+    fun request(
+        path: String,
+        data: Any? = null,
+        responseCallback: ((RequestReceipt) -> Unit)? = null,
+        failedCallback: ((RequestReceipt) -> Unit)? = null,
+        progressCallback: ((RequestReceipt) -> Unit)? = null,
+        timeout: Long? = null
+    ): RequestReceipt? {
+        if (status != LinkConstants.ACTIVE) {
+            log("Cannot send request: link not active")
+            return null
+        }
+
+        // Hash the path
+        val pathHash = Hashes.truncatedHash(path.toByteArray(Charsets.UTF_8))
+
+        // Pack the request: [timestamp, path_hash, data]
+        val timestamp = System.currentTimeMillis()
+        val packedRequest = try {
+            packRequest(timestamp, pathHash, data)
+        } catch (e: Exception) {
+            log("Error packing request: ${e.message}")
+            return null
+        }
+
+        // Calculate timeout if not provided
+        val actualTimeout = timeout ?: calculateRequestTimeout()
+
+        // Generate request ID
+        val requestId = Hashes.truncatedHash(packedRequest)
+
+        // Create the RequestReceipt
+        val receipt = RequestReceipt(
+            link = this,
+            requestId = requestId,
+            requestSize = packedRequest.size,
+            responseCallback = responseCallback,
+            failedCallback = failedCallback,
+            progressCallback = progressCallback,
+            timeout = actualTimeout
+        )
+
+        // Add to pending requests
+        synchronized(pendingRequests) {
+            pendingRequests.add(receipt)
+        }
+
+        // Decide whether to send as packet or resource
+        if (packedRequest.size <= mdu) {
+            // Send as packet
+            val encrypted = encrypt(packedRequest)
+            val packet = Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                context = PacketContext.REQUEST,
+                destinationType = DestinationType.LINK
+            )
+
+            if (!Transport.outbound(packet)) {
+                log("Failed to send request packet")
+                synchronized(pendingRequests) {
+                    pendingRequests.remove(receipt)
+                }
+                return null
+            }
+
+            receipt.startedAt = System.currentTimeMillis()
+            hadOutbound(isData = true)
+
+            // TODO: Set up timeout monitoring thread
+            // For now, the timeout will be handled by the watchdog or caller
+
+        } else {
+            // Send as resource
+            log("Sending request ${requestId.toHexString()} as resource")
+            // TODO: Implement large request sending via Resource
+            // This requires Resource class to support request_id and is_response flags
+            log("Large requests not yet fully implemented")
+            synchronized(pendingRequests) {
+                pendingRequests.remove(receipt)
+            }
+            return null
+        }
+
+        return receipt
+    }
+
+    /**
+     * Identify to the remote peer.
+     *
+     * This method allows the link initiator to reveal their identity to the remote peer
+     * over the encrypted link. This preserves initiator anonymity while allowing authentication.
+     *
+     * Only works if:
+     * - This is the initiator side
+     * - Link is active
+     *
+     * @param identity The identity to identify as
+     * @return true if identification was sent, false otherwise
+     */
+    fun identify(identity: Identity): Boolean {
+        if (!initiator) {
+            log("Cannot identify: only initiator can identify")
+            return false
+        }
+
+        if (status != LinkConstants.ACTIVE) {
+            log("Cannot identify: link not active")
+            return false
+        }
+
+        // Build signed data: link_id + public_key
+        val publicKey = identity.getPublicKey()
+        val signedData = linkId + publicKey
+
+        // Sign the data
+        val signature = identity.sign(signedData)
+            ?: return false.also { log("Failed to sign identity data") }
+
+        // Build proof data: public_key + signature
+        val proofData = publicKey + signature
+
+        // Encrypt and send
+        val encrypted = encrypt(proofData)
+        val packet = Packet.createRaw(
+            destinationHash = linkId,
+            data = encrypted,
+            packetType = PacketType.DATA,
+            context = PacketContext.LINKIDENTIFY,
+            destinationType = DestinationType.LINK
+        )
+
+        return Transport.outbound(packet).also { sent ->
+            if (sent) {
+                hadOutbound(isData = true)
+                log("Sent identity to remote peer")
+            }
+        }
+    }
+
+    /**
+     * Set the resource strategy for this link.
+     *
+     * @param strategy One of ACCEPT_NONE, ACCEPT_ALL, or ACCEPT_APP
+     * @return true if strategy was set successfully, false otherwise
+     */
+    fun setResourceStrategy(strategy: Int): Boolean {
+        return when (strategy) {
+            ACCEPT_NONE, ACCEPT_ALL, ACCEPT_APP -> {
+                resourceStrategy = strategy
+                true
+            }
+            else -> {
+                log("Invalid resource strategy: $strategy")
+                false
+            }
+        }
+    }
+
+    /**
+     * Get the current resource strategy for this link.
+     *
+     * @return The current resource strategy
+     */
+    fun getResourceStrategy(): Int = resourceStrategy
+
+    /**
+     * Set the resource callback for ACCEPT_APP strategy.
+     *
+     * @param callback Function that takes a ResourceAdvertisement and returns true to accept
+     */
+    fun setResourceCallback(callback: ((network.reticulum.resource.ResourceAdvertisement) -> Boolean)?) {
+        resourceCallback = callback
+    }
+
+    /**
+     * Pack a request using msgpack.
+     *
+     * Format: [timestamp, path_hash, data]
+     */
+    private fun packRequest(timestamp: Long, pathHash: ByteArray, data: Any?): ByteArray {
+        val output = ByteArrayOutputStream()
+        val packer = MessagePack.newDefaultPacker(output)
+
+        packer.packArrayHeader(3)
+        packer.packLong(timestamp)
+        packer.packBinaryHeader(pathHash.size)
+        packer.writePayload(pathHash)
+
+        // Pack data (can be null)
+        packValue(packer, data)
+
+        packer.close()
+        return output.toByteArray()
+    }
+
+    /**
+     * Pack a generic value using msgpack.
+     */
+    private fun packValue(packer: org.msgpack.core.MessagePacker, value: Any?) {
+        when (value) {
+            null -> packer.packNil()
+            is ByteArray -> {
+                packer.packBinaryHeader(value.size)
+                packer.writePayload(value)
+            }
+            is String -> packer.packString(value)
+            is Int -> packer.packInt(value)
+            is Long -> packer.packLong(value)
+            is Boolean -> packer.packBoolean(value)
+            is Float -> packer.packFloat(value)
+            is Double -> packer.packDouble(value)
+            is Map<*, *> -> packMap(packer, value)
+            is List<*> -> packList(packer, value)
+            else -> {
+                // For other types, convert to string
+                packer.packString(value.toString())
+            }
+        }
+    }
+
+    /**
+     * Pack a map using msgpack.
+     */
+    private fun packMap(packer: org.msgpack.core.MessagePacker, map: Map<*, *>) {
+        packer.packMapHeader(map.size)
+        for ((key, value) in map) {
+            // Pack key
+            packValue(packer, key)
+            // Pack value recursively
+            packValue(packer, value)
+        }
+    }
+
+    /**
+     * Pack a list using msgpack.
+     */
+    private fun packList(packer: org.msgpack.core.MessagePacker, list: List<*>) {
+        packer.packArrayHeader(list.size)
+        for (item in list) {
+            packValue(packer, item)
+        }
+    }
+
+    /**
+     * Calculate request timeout based on RTT.
+     */
+    private fun calculateRequestTimeout(): Long {
+        val linkRtt = rtt ?: LinkConstants.KEEPALIVE_MAX
+        // Python: timeout = self.rtt * self.traffic_timeout_factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125
+        // For simplicity, use RTT * 6 + 5 seconds
+        return linkRtt * trafficTimeoutFactor + 5000L
     }
 
     /**
@@ -978,24 +1266,75 @@ class Link private constructor(
      * Process request packets.
      */
     private fun processRequest(packet: Packet) {
-        // TODO: Implement request handling
-        // This requires:
-        // - Unpacking msgpack request data
-        // - Looking up request handlers in destination
-        // - Generating and sending responses
-        log("Request handling not yet implemented")
+        try {
+            val requestId = packet.truncatedHash
+            val packedRequest = decrypt(packet.data) ?: return
+
+            // Unpack msgpack request: [timestamp, pathHash, data]
+            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedRequest)
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 3) {
+                log("Invalid request format: expected 3 elements, got $arraySize")
+                return
+            }
+
+            val timestamp = unpacker.unpackLong()
+            val pathHashSize = unpacker.unpackBinaryHeader()
+            val pathHash = ByteArray(pathHashSize)
+            unpacker.readPayload(pathHash)
+
+            val requestData = if (unpacker.tryUnpackNil()) {
+                null
+            } else {
+                val dataSize = unpacker.unpackBinaryHeader()
+                val data = ByteArray(dataSize)
+                unpacker.readPayload(data)
+                data
+            }
+            unpacker.close()
+
+            // Pass to handleRequest
+            val unpackedRequest = listOf(timestamp, pathHash, requestData)
+            handleRequest(requestId, unpackedRequest)
+
+        } catch (e: Exception) {
+            log("Error processing request: ${e.message}")
+        }
     }
 
     /**
      * Process response packets.
      */
     private fun processResponse(packet: Packet) {
-        // TODO: Implement response handling
-        // This requires:
-        // - Unpacking msgpack response data
-        // - Matching with pending requests
-        // - Invoking request callbacks
-        log("Response handling not yet implemented")
+        try {
+            val packedResponse = decrypt(packet.data) ?: return
+
+            // Unpack msgpack response: [requestId, responseData]
+            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedResponse)
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 2) {
+                log("Invalid response format: expected 2 elements, got $arraySize")
+                return
+            }
+
+            val requestIdSize = unpacker.unpackBinaryHeader()
+            val requestId = ByteArray(requestIdSize)
+            unpacker.readPayload(requestId)
+
+            val responseDataSize = unpacker.unpackBinaryHeader()
+            val responseData = ByteArray(responseDataSize)
+            unpacker.readPayload(responseData)
+            unpacker.close()
+
+            // Calculate transfer size (size of msgpack-encoded response data)
+            val transferSize = responseDataSize + 2 // +2 for msgpack overhead
+
+            // Pass to handleResponse
+            handleResponse(requestId, responseData, responseDataSize, transferSize)
+
+        } catch (e: Exception) {
+            log("Error processing response: ${e.message}")
+        }
     }
 
     /**
@@ -1067,50 +1406,290 @@ class Link private constructor(
      * Process resource advertisement packets.
      */
     private fun processResourceAdv(packet: Packet) {
-        // TODO: Implement resource advertisement handling
-        // This requires:
-        // - Decrypting advertisement
-        // - Checking if it's a request response or general advertisement
-        // - Accepting/rejecting based on resource strategy
-        // - Creating Resource instances
-        log("Resource advertisement handling not yet implemented")
+        try {
+            // Decrypt the advertisement data
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Parse the advertisement
+            val advertisement = network.reticulum.resource.ResourceAdvertisement.unpack(plaintext)
+            if (advertisement == null) {
+                log("Failed to unpack resource advertisement")
+                return
+            }
+
+            // Check if this is a request response
+            if (network.reticulum.resource.ResourceAdvertisement.isRequest(plaintext)) {
+                // This is a request being sent as a resource
+                val resource = network.reticulum.resource.Resource.accept(
+                    advertisement = advertisement,
+                    link = this,
+                    callback = { res -> requestResourceConcluded(res) }
+                )
+                if (resource != null) {
+                    registerIncomingResource(resource)
+                }
+                return
+            }
+
+            // Check if this is a response to a pending request
+            if (network.reticulum.resource.ResourceAdvertisement.isResponse(plaintext)) {
+                val requestId = network.reticulum.resource.ResourceAdvertisement.readRequestId(plaintext)
+                if (requestId != null) {
+                    // Find matching pending request
+                    val pendingRequest = synchronized(pendingRequests) {
+                        pendingRequests.find { it.requestId.contentEquals(requestId) }
+                    }
+
+                    if (pendingRequest != null) {
+                        val resource = network.reticulum.resource.Resource.accept(
+                            advertisement = advertisement,
+                            link = this,
+                            callback = { res -> responseResourceConcluded(res) },
+                            progressCallback = { res -> pendingRequest.updateProgress(res.progress) }
+                        )
+                        if (resource != null) {
+                            val responseSize = network.reticulum.resource.ResourceAdvertisement.readSize(plaintext)
+                            val transferSize = network.reticulum.resource.ResourceAdvertisement.readTransferSize(plaintext)
+                            if (responseSize != null) {
+                                pendingRequest.responseSize = responseSize
+                            }
+                            if (transferSize != null) {
+                                if (pendingRequest.responseTransferSize == null) {
+                                    pendingRequest.responseTransferSize = 0
+                                }
+                                pendingRequest.responseTransferSize = (pendingRequest.responseTransferSize ?: 0) + transferSize
+                            }
+                            if (pendingRequest.startedAt == null) {
+                                pendingRequest.startedAt = System.currentTimeMillis()
+                            }
+                            registerIncomingResource(resource)
+                        }
+                    }
+                }
+                return
+            }
+
+            // General resource advertisement - check strategy
+            when (resourceStrategy) {
+                ACCEPT_NONE -> {
+                    log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_NONE)")
+                    network.reticulum.resource.Resource.reject(advertisement, this)
+                }
+                ACCEPT_ALL -> {
+                    log("Accepting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_ALL)")
+                    val resource = network.reticulum.resource.Resource.accept(
+                        advertisement = advertisement,
+                        link = this,
+                        callback = { res -> resourceConcluded(res) }
+                    )
+                    if (resource != null) {
+                        registerIncomingResource(resource)
+                        callbacks.resourceStarted?.let { callback ->
+                            thread(isDaemon = true) {
+                                try {
+                                    callback(resource)
+                                } catch (e: Exception) {
+                                    log("Error in resource started callback: ${e.message}")
+                                }
+                            }
+                        }
+                    }
+                }
+                ACCEPT_APP -> {
+                    val callback = resourceCallback
+                    if (callback != null) {
+                        try {
+                            if (callback(advertisement)) {
+                                log("Accepting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, callback returned true)")
+                                val resource = network.reticulum.resource.Resource.accept(
+                                    advertisement = advertisement,
+                                    link = this,
+                                    callback = { res -> resourceConcluded(res) }
+                                )
+                                if (resource != null) {
+                                    registerIncomingResource(resource)
+                                    callbacks.resourceStarted?.let { startCallback ->
+                                        thread(isDaemon = true) {
+                                            try {
+                                                startCallback(resource)
+                                            } catch (e: Exception) {
+                                                log("Error in resource started callback: ${e.message}")
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, callback returned false)")
+                                network.reticulum.resource.Resource.reject(advertisement, this)
+                            }
+                        } catch (e: Exception) {
+                            log("Error in resource callback: ${e.message}")
+                            network.reticulum.resource.Resource.reject(advertisement, this)
+                        }
+                    } else {
+                        log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, no callback set)")
+                        network.reticulum.resource.Resource.reject(advertisement, this)
+                    }
+                }
+            }
+
+        } catch (e: Exception) {
+            log("Error processing resource advertisement: ${e.message}")
+        }
     }
 
     /**
      * Process resource request packets.
      */
     private fun processResourceReq(packet: Packet) {
-        // TODO: Implement resource request handling
-        // This requires:
-        // - Decrypting request
-        // - Extracting resource hash
-        // - Finding matching outgoing resource
-        // - Processing the request
-        log("Resource request handling not yet implemented")
+        try {
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Extract resource hash from request
+            // Format is either:
+            // - [flags][hash] for normal requests
+            // - [HASHMAP_IS_EXHAUSTED][maphash][hash] for exhausted hashmap requests
+            val resourceHash = if (plaintext.isNotEmpty() &&
+                plaintext[0].toInt() and 0xFF == network.reticulum.resource.ResourceConstants.HASHMAP_IS_EXHAUSTED) {
+                // Exhausted hashmap format: skip first byte + MAPHASH_LEN
+                val offset = 1 + network.reticulum.resource.ResourceConstants.MAPHASH_LEN
+                if (plaintext.size >= offset + RnsConstants.TRUNCATED_HASH_BYTES) {
+                    plaintext.copyOfRange(offset, offset + RnsConstants.TRUNCATED_HASH_BYTES)
+                } else {
+                    log("Invalid exhausted hashmap request size: ${plaintext.size}")
+                    return
+                }
+            } else {
+                // Normal format: skip first byte (flags)
+                if (plaintext.size >= 1 + RnsConstants.TRUNCATED_HASH_BYTES) {
+                    plaintext.copyOfRange(1, 1 + RnsConstants.TRUNCATED_HASH_BYTES)
+                } else {
+                    log("Invalid resource request size: ${plaintext.size}")
+                    return
+                }
+            }
+
+            // Find matching outgoing resource
+            val resource = synchronized(outgoingResources) {
+                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+            }
+
+            if (resource == null) {
+                log("Received request for unknown resource: ${resourceHash.toHexString()}")
+                return
+            }
+
+            // TODO: Process the request when Resource.request() method is available
+            // This would typically:
+            // 1. Check if packet.packetHash is not in resource.reqHashlist (avoid duplicates)
+            // 2. Add packet.packetHash to resource.reqHashlist
+            // 3. Call resource.request(plaintext) to send requested parts
+            log("Processing request for resource ${resourceHash.toHexString()}")
+
+        } catch (e: Exception) {
+            log("Error processing resource request: ${e.message}")
+        }
     }
 
     /**
      * Process resource hashmap update packets.
      */
     private fun processResourceHmu(packet: Packet) {
-        // TODO: Implement resource hashmap update handling
-        log("Resource HMU handling not yet implemented")
+        try {
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Extract resource hash (first 16 bytes)
+            if (plaintext.size < RnsConstants.TRUNCATED_HASH_BYTES) {
+                log("Invalid HMU packet size: ${plaintext.size}")
+                return
+            }
+
+            val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+
+            // Find matching incoming resource
+            val resource = synchronized(incomingResources) {
+                incomingResources.find { it.hash.contentEquals(resourceHash) }
+            }
+
+            if (resource == null) {
+                log("Received HMU for unknown resource: ${resourceHash.toHexString()}")
+                return
+            }
+
+            // TODO: Process hashmap update when Resource.hashmapUpdatePacket() method is available
+            // This would update the resource's received parts bitmap and trigger next part requests
+            log("Processing HMU for resource ${resourceHash.toHexString()}")
+
+        } catch (e: Exception) {
+            log("Error processing resource HMU: ${e.message}")
+        }
     }
 
     /**
      * Process resource initiator cancel packets.
      */
     private fun processResourceIcl(packet: Packet) {
-        // TODO: Implement resource initiator cancel handling
-        log("Resource ICL handling not yet implemented")
+        try {
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Extract resource hash (first 16 bytes)
+            if (plaintext.size < RnsConstants.TRUNCATED_HASH_BYTES) {
+                log("Invalid ICL packet size: ${plaintext.size}")
+                return
+            }
+
+            val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+
+            // Find matching incoming resource (we're receiving, initiator is cancelling)
+            val resource = synchronized(incomingResources) {
+                incomingResources.find { it.hash.contentEquals(resourceHash) }
+            }
+
+            if (resource == null) {
+                log("Received ICL for unknown resource: ${resourceHash.toHexString()}")
+                return
+            }
+
+            log("Initiator cancelled resource ${resourceHash.toHexString()}")
+            resource.cancel()
+
+        } catch (e: Exception) {
+            log("Error processing resource ICL: ${e.message}")
+        }
     }
 
     /**
      * Process resource receiver cancel packets.
      */
     private fun processResourceRcl(packet: Packet) {
-        // TODO: Implement resource receiver cancel handling
-        log("Resource RCL handling not yet implemented")
+        try {
+            val plaintext = decrypt(packet.data) ?: return
+
+            // Extract resource hash (first 16 bytes)
+            if (plaintext.size < RnsConstants.TRUNCATED_HASH_BYTES) {
+                log("Invalid RCL packet size: ${plaintext.size}")
+                return
+            }
+
+            val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+
+            // Find matching outgoing resource (we're sending, receiver is rejecting)
+            val resource = synchronized(outgoingResources) {
+                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+            }
+
+            if (resource == null) {
+                log("Received RCL for unknown resource: ${resourceHash.toHexString()}")
+                return
+            }
+
+            log("Receiver rejected resource ${resourceHash.toHexString()}")
+            // TODO: Call resource.rejected() when method is available
+            resource.cancel()
+
+        } catch (e: Exception) {
+            log("Error processing resource RCL: ${e.message}")
+        }
     }
 
     /**
@@ -1251,17 +1830,381 @@ class Link private constructor(
     }
 
     /**
-     * Remove a resource from tracking when it's complete or cancelled.
+     * Called when a resource transfer concludes (successfully or with failure).
+     * Updates link statistics and removes resource from tracking.
+     *
+     * @param resource The resource that concluded
      */
     fun resourceConcluded(resource: network.reticulum.resource.Resource) {
-        synchronized(outgoingResources) {
-            outgoingResources.remove(resource)
+        val concludedAt = System.currentTimeMillis()
+        val wasIncoming = synchronized(incomingResources) {
+            incomingResources.contains(resource)
         }
-        synchronized(incomingResources) {
-            incomingResources.remove(resource)
+        val wasOutgoing = synchronized(outgoingResources) {
+            outgoingResources.contains(resource)
         }
+
+        // Update statistics based on resource performance
+        if (wasIncoming) {
+            // For incoming resources, track window and EIFR for bandwidth estimation
+            // TODO: Add window and eifr properties to Resource class when implemented
+            // lastResourceWindow = resource.window
+            // lastResourceEifr = resource.eifr
+
+            synchronized(incomingResources) {
+                incomingResources.remove(resource)
+            }
+        }
+
+        if (wasOutgoing) {
+            synchronized(outgoingResources) {
+                outgoingResources.remove(resource)
+            }
+        }
+
+        // Invoke the resource concluded callback if set
+        callbacks.resourceConcluded?.let { callback ->
+            thread(isDaemon = true) {
+                try {
+                    callback(resource)
+                } catch (e: Exception) {
+                    log("Error in resource concluded callback: ${e.message}")
+                }
+            }
+        }
+
         log("Resource ${resource.hash.toHexString()} concluded")
     }
 
+    /**
+     * Handle an incoming request on this link.
+     *
+     * @param requestId The unique request identifier
+     * @param unpackedRequest Array of [timestamp, pathHash, data]
+     */
+    fun handleRequest(requestId: ByteArray, unpackedRequest: List<Any?>) {
+        if (status != LinkConstants.ACTIVE) return
+
+        try {
+            // Extract request components
+            val requestedAt = (unpackedRequest[0] as? Number)?.toLong() ?: System.currentTimeMillis()
+            val pathHash = unpackedRequest[1] as? ByteArray ?: return
+            val requestData = unpackedRequest[2] as? ByteArray
+
+            // Get the destination (owner for incoming links, destination for outgoing)
+            val targetDestination = owner ?: attachedDestination ?: return
+
+            // Look up the request handler
+            val handler = targetDestination.getRequestHandler(pathHash) ?: run {
+                log("No handler found for path hash ${pathHash.toHexString()}")
+                return
+            }
+
+            // Check access control
+            val allowed = when (handler.allow) {
+                network.reticulum.destination.RequestPolicy.ALLOW_NONE -> false
+                network.reticulum.destination.RequestPolicy.ALLOW_ALL -> true
+                network.reticulum.destination.RequestPolicy.ALLOW_LIST -> {
+                    val remoteId = remoteIdentity
+                    remoteId != null && handler.allowedList?.any { it.contentEquals(remoteId.hash) } == true
+                }
+                else -> false
+            }
+
+            if (!allowed) {
+                val identityStr = remoteIdentity?.hexHash ?: "<Unknown>"
+                log("Request ${requestId.toHexString()} from $identityStr not allowed for path: ${handler.path}")
+                return
+            }
+
+            log("Handling request ${requestId.toHexString()} for: ${handler.path}")
+
+            // Generate response
+            val response = try {
+                handler.responseGenerator(
+                    handler.path,
+                    requestData,
+                    requestId,
+                    linkId,
+                    remoteIdentity,
+                    requestedAt
+                )
+            } catch (e: Exception) {
+                log("Error in response generator: ${e.message}")
+                null
+            }
+
+            // Send response if not null
+            if (response != null) {
+                sendResponse(requestId, response, handler.autoCompress)
+            }
+
+        } catch (e: Exception) {
+            log("Error handling request: ${e.message}")
+        }
+    }
+
+    /**
+     * Send a response to a request.
+     *
+     * @param requestId The request ID this is responding to
+     * @param response The response data
+     * @param autoCompress Whether to auto-compress (if large enough)
+     */
+    private fun sendResponse(requestId: ByteArray, response: ByteArray, autoCompress: Boolean) {
+        try {
+            // Pack response as msgpack: [requestId, response]
+            val output = java.io.ByteArrayOutputStream()
+            val packer = org.msgpack.core.MessagePack.newDefaultPacker(output)
+            packer.packArrayHeader(2)
+            packer.packBinaryHeader(requestId.size)
+            packer.writePayload(requestId)
+            packer.packBinaryHeader(response.size)
+            packer.writePayload(response)
+            packer.close()
+
+            val packedResponse = output.toByteArray()
+
+            // Send as packet if small enough, otherwise as resource
+            if (packedResponse.size <= mdu) {
+                val packet = Packet.createRaw(
+                    destinationHash = linkId,
+                    data = encrypt(packedResponse),
+                    packetType = PacketType.DATA,
+                    context = PacketContext.RESPONSE,
+                    destinationType = DestinationType.LINK
+                )
+                Transport.outbound(packet)
+                hadOutbound(isData = true)
+            } else {
+                // TODO: Send as resource
+                // This requires implementing Resource class with is_response flag
+                log("Large response not yet implemented (requires Resource)")
+            }
+        } catch (e: Exception) {
+            log("Error sending response: ${e.message}")
+        }
+    }
+
+    /**
+     * Handle an incoming response to a previous request.
+     *
+     * @param requestId The request ID this is responding to
+     * @param responseData The response data
+     * @param responseSize The total size of the response
+     * @param transferSize The transfer size (may differ due to compression)
+     * @param metadata Optional metadata for file responses
+     */
+    fun handleResponse(
+        requestId: ByteArray,
+        responseData: ByteArray?,
+        responseSize: Int,
+        transferSize: Int,
+        metadata: ByteArray? = null
+    ) {
+        if (status != LinkConstants.ACTIVE) return
+
+        try {
+            // Find matching pending request
+            val receipt = synchronized(pendingRequests) {
+                pendingRequests.find { it.requestId.contentEquals(requestId) }
+            }
+
+            if (receipt == null) {
+                log("Received response for unknown request: ${requestId.toHexString()}")
+                return
+            }
+
+            // Update receipt
+            receipt.responseSize = responseSize
+            if (receipt.responseTransferSize == null) {
+                receipt.responseTransferSize = 0
+            }
+            receipt.responseTransferSize = (receipt.responseTransferSize ?: 0) + transferSize
+
+            // Mark as ready and invoke callback
+            receipt.responseReceived(responseData, metadata)
+
+            // Remove from pending list
+            synchronized(pendingRequests) {
+                pendingRequests.remove(receipt)
+            }
+
+        } catch (e: Exception) {
+            log("Error handling response: ${e.message}")
+        }
+    }
+
+    /**
+     * Called when a request resource transfer completes.
+     *
+     * @param resource The completed resource
+     */
+    fun requestResourceConcluded(resource: network.reticulum.resource.Resource) {
+        // TODO: Implement when Resource class has status property
+        // This should unpack the request data and call handleRequest
+        log("Request resource concluded (not yet fully implemented)")
+    }
+
+    /**
+     * Called when a response resource transfer completes.
+     *
+     * @param resource The completed resource
+     */
+    fun responseResourceConcluded(resource: network.reticulum.resource.Resource) {
+        // TODO: Implement when Resource class is complete
+        // This should:
+        // 1. Check if resource.status == COMPLETE
+        // 2. Unpack the response data
+        // 3. Call handleResponse with the unpacked data
+        log("Response resource concluded (not yet fully implemented)")
+    }
+
     override fun toString(): String = "Link[${linkId.toHexString().take(12)}]"
+}
+
+/**
+ * Receipt for a request sent over a link.
+ * Tracks the status and response of the request.
+ */
+class RequestReceipt(
+    internal val link: Link,
+    internal val requestId: ByteArray,
+    val requestSize: Int,
+    private val responseCallback: ((RequestReceipt) -> Unit)? = null,
+    private val failedCallback: ((RequestReceipt) -> Unit)? = null,
+    private val progressCallback: ((RequestReceipt) -> Unit)? = null,
+    val timeout: Long
+) {
+    companion object {
+        const val FAILED = 0x00
+        const val SENT = 0x01
+        const val DELIVERED = 0x02
+        const val RECEIVING = 0x03
+        const val READY = 0x04
+    }
+
+    var status: Int = SENT
+        private set
+
+    var progress: Float = 0.0f
+        private set
+
+    var response: ByteArray? = null
+        private set
+
+    var metadata: ByteArray? = null
+        private set
+
+    var responseSize: Int? = null
+        internal set
+
+    var responseTransferSize: Int? = null
+        internal set
+
+    private val sentAt = System.currentTimeMillis()
+    private var concludedAt: Long? = null
+    private var responseConcludedAt: Long? = null
+
+    internal var startedAt: Long? = null
+
+    /**
+     * Called when the response is received.
+     */
+    internal fun responseReceived(responseData: ByteArray?, metadata: ByteArray? = null) {
+        if (status == FAILED) return
+
+        this.progress = 1.0f
+        this.response = responseData
+        this.metadata = metadata
+        this.status = READY
+        this.responseConcludedAt = System.currentTimeMillis()
+
+        // Invoke callbacks
+        progressCallback?.let { callback ->
+            kotlin.concurrent.thread(isDaemon = true) {
+                try {
+                    callback(this)
+                } catch (e: Exception) {
+                    println("[RequestReceipt] Error in progress callback: ${e.message}")
+                }
+            }
+        }
+
+        responseCallback?.let { callback ->
+            kotlin.concurrent.thread(isDaemon = true) {
+                try {
+                    callback(this)
+                } catch (e: Exception) {
+                    println("[RequestReceipt] Error in response callback: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Called when the request times out or fails.
+     */
+    internal fun requestFailed() {
+        if (status == READY) return
+
+        this.status = FAILED
+        this.concludedAt = System.currentTimeMillis()
+
+        failedCallback?.let { callback ->
+            kotlin.concurrent.thread(isDaemon = true) {
+                try {
+                    callback(this)
+                } catch (e: Exception) {
+                    println("[RequestReceipt] Error in failed callback: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Update progress for resource transfers.
+     */
+    internal fun updateProgress(newProgress: Float) {
+        if (status == FAILED) return
+
+        this.progress = newProgress
+        if (status != RECEIVING) {
+            status = RECEIVING
+        }
+
+        progressCallback?.let { callback ->
+            kotlin.concurrent.thread(isDaemon = true) {
+                try {
+                    callback(this)
+                } catch (e: Exception) {
+                    println("[RequestReceipt] Error in progress callback: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Get the request ID (copy).
+     */
+    fun getRequestIdCopy(): ByteArray = requestId.copyOf()
+
+    /**
+     * Get the response data if ready (copy).
+     */
+    fun getResponseCopy(): ByteArray? = response?.copyOf()
+
+    /**
+     * Get the response time in milliseconds.
+     */
+    fun getResponseTime(): Long? {
+        val concluded = responseConcludedAt ?: return null
+        val started = startedAt ?: sentAt
+        return concluded - started
+    }
+
+    /**
+     * Check if the request has concluded (success or failure).
+     */
+    fun concluded(): Boolean = status == READY || status == FAILED
 }

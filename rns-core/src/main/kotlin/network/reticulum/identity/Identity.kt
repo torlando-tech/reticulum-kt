@@ -98,6 +98,30 @@ class Identity private constructor(
         private val identityHashIndex = ConcurrentHashMap<ByteArrayKey, ByteArray>()
 
         /**
+         * Storage path for persisting known destinations.
+         * Set by Reticulum during initialization.
+         */
+        @Volatile
+        var storagePath: String = System.getProperty("user.home") + "/.reticulum"
+            private set
+
+        /**
+         * Flag to prevent concurrent saves.
+         */
+        @Volatile
+        private var savingKnownDestinations = false
+
+        /**
+         * Set the storage path for known destinations.
+         * Called by Reticulum during initialization.
+         *
+         * @param path The storage directory path
+         */
+        internal fun setStoragePath(path: String) {
+            storagePath = path
+        }
+
+        /**
          * Create a new identity with randomly generated keys.
          */
         fun create(crypto: CryptoProvider = defaultCryptoProvider()): Identity {
@@ -111,6 +135,49 @@ class Identity private constructor(
                 ed25519KeyPair.privateKey,
                 ed25519KeyPair.publicKey
             )
+        }
+
+        /**
+         * Create an identity from private key bytes.
+         *
+         * The private key format is: X25519 private (32) || Ed25519 private (32) = 64 bytes
+         *
+         * @param prvBytes The private key bytes (64 bytes)
+         * @param crypto The crypto provider to use
+         * @return The loaded identity, or null if the bytes are invalid
+         */
+        fun fromBytes(
+            prvBytes: ByteArray,
+            crypto: CryptoProvider = defaultCryptoProvider()
+        ): Identity? {
+            return try {
+                fromPrivateKey(prvBytes, crypto)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /**
+         * Load an identity from a file.
+         *
+         * @param path The path to the identity file
+         * @param crypto The crypto provider to use
+         * @return The loaded identity, or null if the file doesn't exist or is invalid
+         */
+        fun fromFile(
+            path: String,
+            crypto: CryptoProvider = defaultCryptoProvider()
+        ): Identity? {
+            return try {
+                val file = java.io.File(path)
+                if (!file.exists()) {
+                    return null
+                }
+                val prvBytes = file.readBytes()
+                fromBytes(prvBytes, crypto)
+            } catch (e: Exception) {
+                null
+            }
         }
 
         /**
@@ -168,16 +235,43 @@ class Identity private constructor(
          * Recall a known identity by its destination hash.
          * Returns null if no identity is known for this hash.
          *
+         * This method first checks the known destinations cache, then falls back
+         * to checking registered destinations in Transport.
+         *
          * @param hash The destination hash to look up
          * @return The Identity, or null if not found
          */
         fun recall(hash: ByteArray): Identity? {
-            val data = knownDestinations[hash.toKey()] ?: return null
-            return try {
-                fromPublicKey(data.publicKey)
-            } catch (e: Exception) {
-                null
+            // Check known destinations cache first
+            val data = knownDestinations[hash.toKey()]
+            if (data != null) {
+                return try {
+                    fromPublicKey(data.publicKey)
+                } catch (e: Exception) {
+                    null
+                }
             }
+
+            // Fallback: check Transport registered destinations
+            try {
+                val transport = network.reticulum.transport.Transport
+                for (destination in transport.getDestinations()) {
+                    if (hash.contentEquals(destination.hash)) {
+                        val destIdentity = destination.identity
+                        if (destIdentity != null) {
+                            return try {
+                                fromPublicKey(destIdentity.getPublicKey())
+                            } catch (e: Exception) {
+                                null
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Transport might not be initialized
+            }
+
+            return null
         }
 
         /**
@@ -385,6 +479,223 @@ class Identity private constructor(
                 null
             }
         }
+
+        /**
+         * Save known destinations to disk.
+         * Serializes the known destinations map to msgpack format.
+         * Thread-safe with a lock to prevent concurrent saves.
+         */
+        fun saveKnownDestinations() {
+            try {
+                // Wait for any ongoing save to complete
+                val waitInterval = 200L // milliseconds
+                val waitTimeout = 5000L // 5 seconds
+                val waitStart = System.currentTimeMillis()
+
+                while (savingKnownDestinations) {
+                    Thread.sleep(waitInterval)
+                    if (System.currentTimeMillis() > waitStart + waitTimeout) {
+                        println("Could not save known destinations to storage, waiting for previous save operation timed out.")
+                        return
+                    }
+                }
+
+                savingKnownDestinations = true
+                val saveStart = System.currentTimeMillis()
+
+                // Prepare storage directory
+                val storageDir = java.io.File(storagePath)
+                if (!storageDir.exists()) {
+                    storageDir.mkdirs()
+                }
+
+                val destFile = java.io.File(storagePath, "known_destinations")
+
+                // Load existing data from disk to merge
+                val storageKnownDestinations = mutableMapOf<ByteArray, List<Any?>>()
+                if (destFile.exists()) {
+                    try {
+                        val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(destFile.readBytes())
+                        val mapSize = packer.unpackMapHeader()
+                        repeat(mapSize) {
+                            val keyLen = packer.unpackBinaryHeader()
+                            val key = ByteArray(keyLen)
+                            packer.readPayload(key)
+
+                            packer.unpackArrayHeader() // Skip array size, we know the format
+                            val timestamp = packer.unpackLong()
+
+                            val packetHashLen = packer.unpackBinaryHeader()
+                            val packetHash = ByteArray(packetHashLen)
+                            packer.readPayload(packetHash)
+
+                            val publicKeyLen = packer.unpackBinaryHeader()
+                            val publicKey = ByteArray(publicKeyLen)
+                            packer.readPayload(publicKey)
+
+                            val appData = if (packer.tryUnpackNil()) {
+                                null
+                            } else {
+                                val appDataLen = packer.unpackBinaryHeader()
+                                val data = ByteArray(appDataLen)
+                                packer.readPayload(data)
+                                data
+                            }
+
+                            storageKnownDestinations[key] = listOf(timestamp, packetHash, publicKey, appData)
+                        }
+                        packer.close()
+                    } catch (e: Exception) {
+                        // Ignore errors loading existing data
+                    }
+                }
+
+                // Merge storage data with in-memory data (prefer in-memory)
+                for ((destHash, value) in storageKnownDestinations) {
+                    val key = destHash.toKey()
+                    if (!knownDestinations.containsKey(key)) {
+                        // Convert list format to IdentityData
+                        val timestamp = value[0] as Long
+                        val packetHash = value[1] as ByteArray
+                        val publicKey = value[2] as ByteArray
+                        val appData = value[3] as ByteArray?
+
+                        knownDestinations[key] = IdentityData(timestamp, packetHash, publicKey, appData)
+                    }
+                }
+
+                println("Saving ${knownDestinations.size} known destinations to storage...")
+
+                // Serialize to msgpack
+                val buffer = java.io.ByteArrayOutputStream()
+                val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
+
+                packer.packMapHeader(knownDestinations.size)
+                for ((key, data) in knownDestinations) {
+                    // Pack destination hash (key)
+                    packer.packBinaryHeader(key.bytes.size)
+                    packer.writePayload(key.bytes)
+
+                    // Pack value as array: [timestamp, packet_hash, public_key, app_data]
+                    packer.packArrayHeader(4)
+                    packer.packLong(data.timestamp)
+                    packer.packBinaryHeader(data.packetHash.size)
+                    packer.writePayload(data.packetHash)
+                    packer.packBinaryHeader(data.publicKey.size)
+                    packer.writePayload(data.publicKey)
+
+                    if (data.appData == null) {
+                        packer.packNil()
+                    } else {
+                        packer.packBinaryHeader(data.appData.size)
+                        packer.writePayload(data.appData)
+                    }
+                }
+                packer.close()
+
+                // Write to file atomically
+                val tempFile = java.io.File(storagePath, "known_destinations.tmp")
+                tempFile.writeBytes(buffer.toByteArray())
+                tempFile.renameTo(destFile)
+
+                val saveTime = System.currentTimeMillis() - saveStart
+                val timeStr = if (saveTime < 1000) {
+                    String.format("%.2fms", saveTime.toDouble())
+                } else {
+                    String.format("%.2fs", saveTime / 1000.0)
+                }
+                println("Saved known destinations to storage in $timeStr")
+
+            } catch (e: Exception) {
+                println("Error while saving known destinations to disk: ${e.message}")
+                e.printStackTrace()
+            } finally {
+                savingKnownDestinations = false
+            }
+        }
+
+        /**
+         * Load known destinations from disk.
+         * Deserializes the msgpack file to populate the known destinations map.
+         * Called during Reticulum startup.
+         */
+        fun loadKnownDestinations() {
+            val destFile = java.io.File(storagePath, "known_destinations")
+
+            if (!destFile.exists()) {
+                println("Destinations file does not exist, no known destinations loaded")
+                return
+            }
+
+            try {
+                val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(destFile.readBytes())
+                val mapSize = packer.unpackMapHeader()
+
+                var loadedCount = 0
+                repeat(mapSize) {
+                    try {
+                        val keyLen = packer.unpackBinaryHeader()
+                        val destHash = ByteArray(keyLen)
+                        packer.readPayload(destHash)
+
+                        // Only load if it's the correct hash length (16 bytes)
+                        if (destHash.size != RnsConstants.TRUNCATED_HASH_BYTES) {
+                            // Skip this entry - unpack but don't store
+                            packer.unpackArrayHeader()
+                            packer.unpackLong()
+                            val phLen = packer.unpackBinaryHeader()
+                            packer.readPayload(ByteArray(phLen))
+                            val pkLen = packer.unpackBinaryHeader()
+                            packer.readPayload(ByteArray(pkLen))
+                            if (!packer.tryUnpackNil()) {
+                                val adLen = packer.unpackBinaryHeader()
+                                packer.readPayload(ByteArray(adLen))
+                            }
+                            return@repeat
+                        }
+
+                        packer.unpackArrayHeader() // Skip array size, we know the format
+                        val timestamp = packer.unpackLong()
+
+                        val packetHashLen = packer.unpackBinaryHeader()
+                        val packetHash = ByteArray(packetHashLen)
+                        packer.readPayload(packetHash)
+
+                        val publicKeyLen = packer.unpackBinaryHeader()
+                        val publicKey = ByteArray(publicKeyLen)
+                        packer.readPayload(publicKey)
+
+                        val appData = if (packer.tryUnpackNil()) {
+                            null
+                        } else {
+                            val appDataLen = packer.unpackBinaryHeader()
+                            val data = ByteArray(appDataLen)
+                            packer.readPayload(data)
+                            data
+                        }
+
+                        val data = IdentityData(timestamp, packetHash, publicKey, appData)
+                        knownDestinations[destHash.toKey()] = data
+
+                        // Index by identity hash
+                        val identityHash = Hashes.truncatedHash(publicKey)
+                        identityHashIndex[identityHash.toKey()] = destHash
+
+                        loadedCount++
+                    } catch (e: Exception) {
+                        // Skip corrupted entry
+                        println("Warning: Skipped corrupted entry in known_destinations: ${e.message}")
+                    }
+                }
+                packer.close()
+
+                println("Loaded $loadedCount known destinations from storage")
+
+            } catch (e: Exception) {
+                println("Error loading known destinations from disk, file will be recreated on exit: ${e.message}")
+                e.printStackTrace()
+            }
+        }
     }
 
     /**
@@ -590,6 +901,31 @@ class Identity private constructor(
             null,
             ed25519Public.copyOf()
         )
+    }
+
+    /**
+     * Save the identity's private key to a file.
+     *
+     * WARNING: This writes the private key to disk. Anyone with access to this file
+     * will be able to decrypt all communication for this identity. Use with extreme caution.
+     *
+     * @param path The path where the identity should be saved
+     * @return true if the file was saved successfully, false otherwise
+     */
+    fun toFile(path: String): Boolean {
+        return try {
+            check(hasPrivateKey) { "Cannot save identity without private key" }
+
+            val file = java.io.File(path)
+            // Ensure parent directories exist
+            file.parentFile?.mkdirs()
+
+            // Write the private key bytes
+            file.writeBytes(getPrivateKey())
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     override fun toString(): String = hexHash
