@@ -1033,8 +1033,14 @@ object Transport {
      * @param interfaceRef Interface that received the packet
      */
     fun inbound(raw: ByteArray, interfaceRef: InterfaceRef) {
-        if (!started.get()) return
-        if (raw.size < RnsConstants.HEADER_MIN_SIZE) return
+        if (!started.get()) {
+            log("Transport not started, dropping packet")
+            return
+        }
+        if (raw.size < RnsConstants.HEADER_MIN_SIZE) {
+            log("Packet too small (${raw.size} < ${RnsConstants.HEADER_MIN_SIZE}), dropping")
+            return
+        }
 
         jobsLock.withLock {
             try {
@@ -1047,7 +1053,11 @@ object Transport {
 
     private fun processInbound(raw: ByteArray, interfaceRef: InterfaceRef) {
         // Parse the packet
-        val packet = Packet.unpack(raw) ?: return
+        val packet = Packet.unpack(raw)
+        if (packet == null) {
+            log("Failed to parse packet (${raw.size} bytes)")
+            return
+        }
 
         // Increment hop count
         packet.hops++
@@ -1182,7 +1192,11 @@ object Transport {
 
     private fun processAnnounce(packet: Packet, interfaceRef: InterfaceRef) {
         // Validate and extract announce data
-        val announceData = validateAnnounce(packet) ?: return
+        val announceData = validateAnnounce(packet)
+        if (announceData == null) {
+            log("Announce validation failed for ${packet.destinationHash.toHexString()}")
+            return
+        }
 
         val destHash = packet.destinationHash
         val identity = announceData.identity
@@ -1489,45 +1503,81 @@ object Transport {
 
     private fun validateAnnounce(packet: Packet): AnnounceData? {
         val data = packet.data
-        if (data.size < RnsConstants.ANNOUNCE_MIN_SIZE) return null
+        if (data.size < RnsConstants.ANNOUNCE_MIN_SIZE) {
+            log("Announce too small: ${data.size} < ${RnsConstants.ANNOUNCE_MIN_SIZE}")
+            return null
+        }
 
         // Announce format:
         // [public_key: 64] [name_hash: 10] [random_hash: 10] [signature: 64] [app_data: variable]
-        // Or with ratchet:
+        // Or with ratchet (when context_flag is SET):
         // [public_key: 64] [name_hash: 10] [random_hash: 10] [ratchet: 32] [signature: 64] [app_data: variable]
 
-        val publicKey = data.copyOfRange(0, RnsConstants.IDENTITY_PUBLIC_KEY_SIZE)
-        val nameHash = data.copyOfRange(64, 74)
-        val randomHash = data.copyOfRange(74, 84)
+        val keySize = RnsConstants.IDENTITY_PUBLIC_KEY_SIZE // 64
+        val nameHashLen = 10
+        val randomHashLen = 10
+        val ratchetSize = 32
+        val sigLen = 64
 
-        // Determine if ratchet is present
-        val hasRatchet = data.size >= 84 + 32 + 64
-        val signatureOffset = if (hasRatchet) 84 + 32 else 84
-        val signatureEnd = signatureOffset + 64
+        val publicKey = data.copyOfRange(0, keySize)
+        val nameHash = data.copyOfRange(keySize, keySize + nameHashLen)
+        val randomHash = data.copyOfRange(keySize + nameHashLen, keySize + nameHashLen + randomHashLen)
 
-        if (data.size < signatureEnd) return null
+        // Determine if ratchet is present based on context flag
+        val hasRatchet = packet.contextFlag == ContextFlag.SET
 
-        val signature = data.copyOfRange(signatureOffset, signatureEnd)
-        val appData = if (data.size > signatureEnd) {
-            data.copyOfRange(signatureEnd, data.size)
-        } else null
+        val ratchet: ByteArray
+        val signature: ByteArray
+        val appData: ByteArray?
+
+        if (hasRatchet) {
+            val ratchetStart = keySize + nameHashLen + randomHashLen
+            val ratchetEnd = ratchetStart + ratchetSize
+            val sigEnd = ratchetEnd + sigLen
+
+            if (data.size < sigEnd) {
+                log("Announce data too short for ratchet+signature: ${data.size} < $sigEnd")
+                return null
+            }
+
+            ratchet = data.copyOfRange(ratchetStart, ratchetEnd)
+            signature = data.copyOfRange(ratchetEnd, sigEnd)
+            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else null
+        } else {
+            ratchet = ByteArray(0)
+            val sigStart = keySize + nameHashLen + randomHashLen
+            val sigEnd = sigStart + sigLen
+
+            if (data.size < sigEnd) {
+                log("Announce data too short for signature: ${data.size} < $sigEnd")
+                return null
+            }
+
+            signature = data.copyOfRange(sigStart, sigEnd)
+            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else null
+        }
 
         // Create identity from public key
         val identity = try {
             Identity.fromPublicKey(publicKey)
         } catch (e: Exception) {
+            log("Failed to create identity from public key: ${e.message}")
             return null
         }
 
         // Verify destination hash matches
         val computedDestHash = Destination.computeHash(nameHash, identity.hash)
         if (!computedDestHash.contentEquals(packet.destinationHash)) {
+            log("Destination hash mismatch: computed=${computedDestHash.toHexString()}, packet=${packet.destinationHash.toHexString()}")
             return null
         }
 
-        // Verify signature
-        val signedData = data.copyOfRange(0, signatureOffset)
+        // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+        // IMPORTANT: The destination_hash from packet header is included in signed data!
+        val signedData = packet.destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: ByteArray(0))
+
         if (!identity.validate(signature, signedData)) {
+            log("Signature validation failed")
             return null
         }
 

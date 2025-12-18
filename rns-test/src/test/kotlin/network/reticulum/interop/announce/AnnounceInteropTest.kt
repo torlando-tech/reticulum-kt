@@ -506,4 +506,169 @@ class AnnounceInteropTest : InteropTestBase() {
             signatureValid shouldBe false
         }
     }
+
+    @Nested
+    @DisplayName("Announce Validation (validateAnnounce logic)")
+    inner class AnnounceValidationTests {
+
+        /**
+         * This test verifies the signed_data format used during announce validation.
+         *
+         * Bug fix context: The validateAnnounce function was failing because:
+         * 1. It used packet size to detect ratchet instead of context flag
+         * 2. It did NOT include destination_hash in signed_data during validation
+         *
+         * The correct signed_data format is:
+         *   destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+         */
+        @Test
+        @DisplayName("Announce validation requires destination_hash in signed_data")
+        fun `announce validation requires destination_hash in signed_data`() {
+            val identity = Identity.create()
+            val publicKey = identity.getPublicKey()
+            val privateKey = identity.getPrivateKey()
+
+            // Generate destination components
+            val nameHash = Hashes.nameHash("test.validate")
+            val identityHash = Hashes.truncatedHash(publicKey)
+            val destinationHash = Hashes.truncatedHash(nameHash + identityHash)
+
+            val randomHash = ByteArray(10) { (it + 50).toByte() }
+            val appData = "validation test".toByteArray()
+
+            // Sign announce with Python (correctly includes destination_hash)
+            val signResult = python(
+                "announce_sign",
+                "private_key" to privateKey,
+                "destination_hash" to destinationHash,
+                "public_key" to publicKey,
+                "name_hash" to nameHash,
+                "random_hash" to randomHash,
+                "app_data" to appData
+            )
+
+            val signature = signResult.getBytes("signature")
+
+            // Build announce payload (what would be in packet.data)
+            val announceData = publicKey + nameHash + randomHash + signature + appData
+
+            // Now simulate what validateAnnounce does:
+            // 1. Parse announce data
+            val parsedPublicKey = announceData.copyOfRange(0, 64)
+            val parsedNameHash = announceData.copyOfRange(64, 74)
+            val parsedRandomHash = announceData.copyOfRange(74, 84)
+            val parsedSignature = announceData.copyOfRange(84, 148)
+            val parsedAppData = announceData.copyOfRange(148, announceData.size)
+
+            // 2. Build signed data WITH destination_hash (correct)
+            val correctSignedData = destinationHash + parsedPublicKey + parsedNameHash + parsedRandomHash + parsedAppData
+
+            // 3. Verify signature using Kotlin's Identity.validate (same as validateAnnounce)
+            val validatingIdentity = Identity.fromPublicKey(parsedPublicKey)
+            validatingIdentity.validate(parsedSignature, correctSignedData) shouldBe true
+
+            // 4. Build signed data WITHOUT destination_hash (the bug we fixed)
+            val incorrectSignedData = parsedPublicKey + parsedNameHash + parsedRandomHash + parsedAppData
+
+            // 5. Verify signature should FAIL without destination_hash
+            validatingIdentity.validate(parsedSignature, incorrectSignedData) shouldBe false
+        }
+
+        @Test
+        @DisplayName("Announce validation with ratchet includes destination_hash")
+        fun `announce validation with ratchet includes destination_hash`() {
+            val identity = Identity.create()
+            val publicKey = identity.getPublicKey()
+            val privateKey = identity.getPrivateKey()
+
+            // Generate destination components
+            val nameHash = Hashes.nameHash("test.ratchet")
+            val identityHash = Hashes.truncatedHash(publicKey)
+            val destinationHash = Hashes.truncatedHash(nameHash + identityHash)
+
+            val randomHash = ByteArray(10) { (it + 50).toByte() }
+            val ratchet = ByteArray(32) { (it + 100).toByte() }
+            val appData = "ratchet test".toByteArray()
+
+            // Sign announce with Python (includes ratchet)
+            val signResult = python(
+                "announce_sign",
+                "private_key" to privateKey,
+                "destination_hash" to destinationHash,
+                "public_key" to publicKey,
+                "name_hash" to nameHash,
+                "random_hash" to randomHash,
+                "ratchet" to ratchet,
+                "app_data" to appData
+            )
+
+            val signature = signResult.getBytes("signature")
+
+            // Build announce payload with ratchet
+            val announceData = publicKey + nameHash + randomHash + ratchet + signature + appData
+
+            // Simulate validateAnnounce parsing for ratchet case
+            val parsedPublicKey = announceData.copyOfRange(0, 64)
+            val parsedNameHash = announceData.copyOfRange(64, 74)
+            val parsedRandomHash = announceData.copyOfRange(74, 84)
+            val parsedRatchet = announceData.copyOfRange(84, 116)
+            val parsedSignature = announceData.copyOfRange(116, 180)
+            val parsedAppData = announceData.copyOfRange(180, announceData.size)
+
+            // Correct signed data includes destination_hash and ratchet
+            val correctSignedData = destinationHash + parsedPublicKey + parsedNameHash +
+                parsedRandomHash + parsedRatchet + parsedAppData
+
+            // Verify signature using Kotlin's Identity.validate (same as validateAnnounce)
+            val validatingIdentity = Identity.fromPublicKey(parsedPublicKey)
+            validatingIdentity.validate(parsedSignature, correctSignedData) shouldBe true
+
+            // Also verify that omitting destination_hash fails
+            val incorrectSignedData = parsedPublicKey + parsedNameHash +
+                parsedRandomHash + parsedRatchet + parsedAppData
+            validatingIdentity.validate(parsedSignature, incorrectSignedData) shouldBe false
+        }
+
+        @Test
+        @DisplayName("Kotlin Identity.validate matches Python for announce validation")
+        fun `kotlin identity validate matches python for announce validation`() {
+            val identity = Identity.create()
+            val publicKey = identity.getPublicKey()
+            val privateKey = identity.getPrivateKey()
+
+            // Generate destination components
+            val nameHash = Hashes.nameHash("test.kotlin.validate")
+            val identityHash = Hashes.truncatedHash(publicKey)
+            val destinationHash = Hashes.truncatedHash(nameHash + identityHash)
+
+            val randomHash = ByteArray(10) { (it + 50).toByte() }
+            val appData = "kotlin validate test".toByteArray()
+
+            // Sign with Python
+            val signResult = python(
+                "announce_sign",
+                "private_key" to privateKey,
+                "destination_hash" to destinationHash,
+                "public_key" to publicKey,
+                "name_hash" to nameHash,
+                "random_hash" to randomHash,
+                "app_data" to appData
+            )
+
+            val signature = signResult.getBytes("signature")
+
+            // Build signed data the same way validateAnnounce does
+            val signedData = destinationHash + publicKey + nameHash + randomHash + appData
+
+            // Create identity from public key (as validateAnnounce does)
+            val validatingIdentity = Identity.fromPublicKey(publicKey)
+
+            // Kotlin validation should succeed
+            validatingIdentity.validate(signature, signedData) shouldBe true
+
+            // Validation without destination_hash should fail
+            val wrongSignedData = publicKey + nameHash + randomHash + appData
+            validatingIdentity.validate(signature, wrongSignedData) shouldBe false
+        }
+    }
 }
