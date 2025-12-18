@@ -9,7 +9,8 @@ object RnsConstants {
     const val MTU = 500                              // Maximum Transmission Unit
     const val HEADER_MIN_SIZE = 19                   // 2 + 1 + 16 (flags + hops + dest_hash)
     const val HEADER_MAX_SIZE = 35                   // 2 + 1 + 16 + 16 (with transport_id)
-    const val MDU = MTU - HEADER_MAX_SIZE - 1        // Maximum Data Unit (464)
+    const val IFAC_MIN_SIZE = 1                      // Interface Access Code minimum size
+    const val MDU = MTU - HEADER_MAX_SIZE - IFAC_MIN_SIZE  // Maximum Data Unit
     const val ENCRYPTED_MDU = 383                    // Max encrypted payload
 
     // Hash lengths (in bits)
