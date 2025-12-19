@@ -28,25 +28,35 @@ import java.time.format.DateTimeFormatter
  *   - 'q' + Enter: Quit
  *
  * Usage:
- *   java -jar lxmf-node.jar [displayName]
+ *   java -jar lxmf-node.jar [displayName] [listenPort] [targetPort]
+ *
+ * For testing two nodes on the same machine:
+ *   Terminal 1: java -jar lxmf-node.jar Node1 4242 4243
+ *   Terminal 2: java -jar lxmf-node.jar Node2 4243 4242
  */
 
 private const val ANNOUNCE_INTERVAL_MS = 60_000L
-private const val UDP_PORT = 4242
+private const val DEFAULT_PORT = 4242
 
 fun main(args: Array<String>) {
-    val displayName = args.firstOrNull() ?: "KotlinNode"
+    val displayName = args.getOrNull(0) ?: "KotlinNode"
+    val listenPort = args.getOrNull(1)?.toIntOrNull() ?: DEFAULT_PORT
+    val targetPort = args.getOrNull(2)?.toIntOrNull() ?: listenPort
 
     println("=".repeat(60))
     println("LXMF Node - Kotlin Implementation")
     println("=".repeat(60))
     println()
 
-    val node = LxmfNode(displayName)
+    val node = LxmfNode(displayName, listenPort, targetPort)
     node.run()
 }
 
-class LxmfNode(private val displayName: String) {
+class LxmfNode(
+    private val displayName: String,
+    private val listenPort: Int,
+    private val targetPort: Int
+) {
 
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         .withZone(ZoneId.systemDefault())
@@ -88,16 +98,16 @@ class LxmfNode(private val displayName: String) {
         // Start Reticulum with transport enabled
         Reticulum.start(enableTransport = true)
 
-        log("Creating UDP interface on port $UDP_PORT...")
+        log("Creating UDP interface (listen=$listenPort, target=$targetPort)...")
 
-        // Create UDP broadcast interface for local testing
-        // This allows multiple nodes on the same machine or LAN to discover each other
+        // Create UDP interface for local testing
+        // Use different ports for each node when testing on the same machine
         udpInterface = UDPInterface(
             name = "LXMFNode-UDP",
-            bindPort = UDP_PORT,
-            forwardIp = "255.255.255.255",
-            forwardPort = UDP_PORT,
-            broadcast = true
+            bindPort = listenPort,
+            forwardIp = "127.0.0.1",
+            forwardPort = targetPort,
+            broadcast = false
         )
 
         // Wire up the interface to Transport
@@ -176,13 +186,36 @@ class LxmfNode(private val displayName: String) {
     private fun inputLoop() {
         val reader = System.`in`.bufferedReader()
 
+        // Check if stdin is available (not running in background)
+        val hasStdin = try {
+            System.`in`.available() >= 0
+            true
+        } catch (e: Exception) {
+            false
+        }
+
         while (running) {
+            if (!hasStdin || System.`in`.available() < 0) {
+                // No stdin available (background mode), just sleep
+                Thread.sleep(1000)
+                continue
+            }
+
             print("> ")
             System.out.flush()
 
-            val line = reader.readLine()
+            val line = try {
+                reader.readLine()
+            } catch (e: Exception) {
+                null
+            }
+
             if (line == null) {
-                running = false
+                // EOF on stdin - switch to daemon mode instead of exiting
+                log("No stdin available, running in daemon mode...")
+                while (running) {
+                    Thread.sleep(1000)
+                }
                 break
             }
 
