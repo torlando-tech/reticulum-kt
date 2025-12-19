@@ -25,6 +25,7 @@ object ResourceConstants {
     // Hash and segment constants
     const val MAPHASH_LEN = 4
     const val RANDOM_HASH_SIZE = 4
+    const val RESOURCE_HASH_LEN = 32  // Full hash (256 bits / 8)
 
     // Size limits
     const val MAX_EFFICIENT_SIZE = 1 * 1024 * 1024 - 1  // ~1MB

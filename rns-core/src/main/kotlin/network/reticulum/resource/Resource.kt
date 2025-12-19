@@ -220,6 +220,32 @@ class Resource private constructor(
     private var startedTransferring: Long? = null
     private var retries: Int = 0
 
+    // Request/response timing for RTT calculation
+    private var reqSent: Long = 0
+    private var reqResp: Long? = null
+    private var reqSentBytes: Int = 0
+    private var rttRxdBytes: Long = 0
+    private var rttRxdBytesAtPartReq: Long = 0
+    private var reqRespRttRate: Double = 0.0
+    private var reqDataRttRate: Double = 0.0
+
+    // Rate tracking
+    private var fastRateRounds: Int = 0
+    private var verySlowRateRounds: Int = 0
+    private var windowFlexibility: Int = ResourceConstants.WINDOW_FLEXIBILITY
+    private var eifr: Double = 0.0
+    private var previousEifr: Double? = null
+
+    // Hashmap update tracking
+    private var waitingForHmu: Boolean = false
+    private var receivingPart: Boolean = false
+    private val receiveLock = java.util.concurrent.locks.ReentrantLock()
+    private var assemblyLock: Boolean = false
+
+    // Sender-side tracking
+    private var receiverMinConsecutiveHeight: Int = 0
+    private var advSent: Long = 0
+
     // Watchdog
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
@@ -292,9 +318,9 @@ class Resource private constructor(
         }
         hashmapRaw = hashmapBuilder.toByteArray()
 
-        // Calculate resource hash
-        hash = Hashes.truncatedHash(
-            randomHash + hashmapRaw
+        // Calculate resource hash (full hash to match Python RNS)
+        hash = Hashes.fullHash(
+            transferData + randomHash
         )
         originalHash = hash.copyOf()
 
@@ -370,6 +396,7 @@ class Resource private constructor(
 
         link.send(packet.raw ?: ByteArray(0))
         lastActivity = System.currentTimeMillis()
+        advSent = lastActivity
 
         startWatchdog()
         log("Advertised resource ${hash.toHexString()}")
@@ -415,114 +442,420 @@ class Resource private constructor(
 
     /**
      * Receive a part from the sender.
+     * Parts are identified by their map hash, not by index.
+     * Matches Python RNS receive_part() protocol.
      */
     fun receivePart(data: ByteArray) {
-        if (status != ResourceConstants.TRANSFERRING) return
-        if (data.size < 3) return
+        receiveLock.lock()
+        try {
+            receivingPart = true
+            lastActivity = System.currentTimeMillis()
+            retries = 0
 
-        val index = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
-        val partData = data.copyOfRange(2, data.size)
+            // RTT calculation on first response
+            if (reqResp == null) {
+                reqResp = lastActivity
+                val rttMs = reqResp!! - reqSent
 
-        if (index < 0 || index >= parts.size) {
-            log("Invalid part index: $index")
-            return
-        }
+                if (rtt == null) {
+                    rtt = link.rtt ?: rttMs
+                } else if (rttMs < rtt!!) {
+                    rtt = maxOf(rtt!! - (rtt!! * 0.05).toLong(), rttMs)
+                } else if (rttMs > rtt!!) {
+                    rtt = minOf(rtt!! + (rtt!! * 0.05).toLong(), rttMs)
+                }
 
-        // Verify part hash
-        val expectedHash = hashmap[index]
-        if (expectedHash != null) {
-            val actualHash = getMapHash(partData)
-            if (!expectedHash.contentEquals(actualHash)) {
-                log("Part $index hash mismatch")
+                // Calculate request-response RTT rate
+                if (rttMs > 0) {
+                    val reqRespCost = data.size + reqSentBytes
+                    reqRespRttRate = reqRespCost.toDouble() / (rttMs.toDouble() / 1000.0)
+
+                    if (reqRespRttRate > ResourceConstants.RATE_FAST && fastRateRounds < ResourceConstants.FAST_RATE_THRESHOLD) {
+                        fastRateRounds++
+                        if (fastRateRounds == ResourceConstants.FAST_RATE_THRESHOLD) {
+                            windowMax = ResourceConstants.WINDOW_MAX_FAST
+                        }
+                    }
+                }
+            }
+
+            if (status == ResourceConstants.FAILED) {
+                receivingPart = false
                 return
             }
-        }
 
-        if (parts[index] == null) {
-            parts[index] = partData
-            receivedCount++
-            lastActivity = System.currentTimeMillis()
+            status = ResourceConstants.TRANSFERRING
+            val partData = data
+            val partHash = getMapHash(partData)
 
-            // Update progress
-            callbacks.progress?.invoke(this)
+            // Search for matching hash in current window
+            val searchStart = if (consecutiveCompletedHeight >= 0) consecutiveCompletedHeight else 0
+            for (i in searchStart until minOf(searchStart + window, parts.size)) {
+                val mapHash = hashmap[i]
+                if (mapHash != null && mapHash.contentEquals(partHash)) {
+                    if (parts[i] == null) {
+                        // Insert data into parts list
+                        parts[i] = partData
+                        rttRxdBytes += partData.size
+                        receivedCount++
+                        outstandingParts--
+
+                        // Update consecutive completed pointer
+                        if (i == consecutiveCompletedHeight + 1) {
+                            consecutiveCompletedHeight = i
+                        }
+
+                        // Extend consecutive pointer if possible
+                        var cp = consecutiveCompletedHeight + 1
+                        while (cp < parts.size && parts[cp] != null) {
+                            consecutiveCompletedHeight = cp
+                            cp++
+                        }
+
+                        // Progress callback
+                        try {
+                            callbacks.progress?.invoke(this)
+                        } catch (e: Exception) {
+                            log("Error in progress callback: ${e.message}")
+                        }
+                    }
+                    break
+                }
+            }
+
+            receivingPart = false
 
             // Check if transfer complete
-            if (receivedCount >= parts.size) {
+            if (receivedCount == parts.size && !assemblyLock) {
+                assemblyLock = true
                 assemble()
-            } else {
-                // Request more parts
+            } else if (outstandingParts == 0) {
+                // All outstanding parts received, adjust window and request more
+                if (window < windowMax) {
+                    window++
+                    if ((window - windowMin) > (windowFlexibility - 1)) {
+                        windowMin++
+                    }
+                }
+
+                // Calculate data rate
+                if (reqSent != 0L) {
+                    val rttMs = System.currentTimeMillis() - reqSent
+                    val reqTransferred = rttRxdBytes - rttRxdBytesAtPartReq
+
+                    if (rttMs != 0L) {
+                        reqDataRttRate = reqTransferred.toDouble() / (rttMs.toDouble() / 1000.0)
+                        updateEifr()
+                        rttRxdBytesAtPartReq = rttRxdBytes
+
+                        if (reqDataRttRate > ResourceConstants.RATE_FAST && fastRateRounds < ResourceConstants.FAST_RATE_THRESHOLD) {
+                            fastRateRounds++
+                            if (fastRateRounds == ResourceConstants.FAST_RATE_THRESHOLD) {
+                                windowMax = ResourceConstants.WINDOW_MAX_FAST
+                            }
+                        }
+
+                        if (fastRateRounds == 0 && reqDataRttRate < ResourceConstants.RATE_VERY_SLOW &&
+                            verySlowRateRounds < ResourceConstants.VERY_SLOW_RATE_THRESHOLD) {
+                            verySlowRateRounds++
+                            if (verySlowRateRounds == ResourceConstants.VERY_SLOW_RATE_THRESHOLD) {
+                                windowMax = ResourceConstants.WINDOW_MAX_VERY_SLOW
+                            }
+                        }
+                    }
+                }
+
                 requestNext()
             }
+        } finally {
+            receivingPart = false
+            receiveLock.unlock()
         }
     }
 
     /**
      * Request the next batch of missing parts.
+     * Matches Python RNS request_next() protocol.
      */
     private fun requestNext() {
-        if (status != ResourceConstants.TRANSFERRING) return
+        // Wait for any receiving operation to complete
+        while (receivingPart) {
+            Thread.sleep(1)
+        }
 
-        // Build request for missing parts
-        val missingParts = mutableListOf<Int>()
-        for (i in parts.indices) {
-            if (parts[i] == null && missingParts.size < window) {
-                missingParts.add(i)
+        if (status == ResourceConstants.FAILED) return
+        if (waitingForHmu) return
+
+        outstandingParts = 0
+        var hashmapExhausted = ResourceConstants.HASHMAP_IS_NOT_EXHAUSTED
+        val requestedHashes = ByteArrayOutputStream()
+
+        var i = 0
+        var pn = consecutiveCompletedHeight + 1
+        val searchStart = pn
+
+        for (partIdx in searchStart until minOf(searchStart + window, parts.size)) {
+            if (parts[partIdx] == null) {
+                val partHash = hashmap[partIdx]
+                if (partHash != null) {
+                    requestedHashes.write(partHash)
+                    outstandingParts++
+                    i++
+                } else {
+                    hashmapExhausted = ResourceConstants.HASHMAP_IS_EXHAUSTED
+                }
+            }
+            pn++
+            if (i >= window || hashmapExhausted == ResourceConstants.HASHMAP_IS_EXHAUSTED) {
+                break
             }
         }
 
-        if (missingParts.isEmpty()) return
-
-        // Send request
-        val requestData = ByteArrayOutputStream()
-        for (partIndex in missingParts) {
-            requestData.write((partIndex shr 8) and 0xFF)
-            requestData.write(partIndex and 0xFF)
+        // Build HMU part
+        val hmuPart = ByteArrayOutputStream()
+        hmuPart.write(hashmapExhausted)
+        if (hashmapExhausted == ResourceConstants.HASHMAP_IS_EXHAUSTED) {
+            val lastMapHash = hashmap[hashmapHeight - 1]
+            if (lastMapHash != null) {
+                hmuPart.write(lastMapHash)
+            }
+            waitingForHmu = true
         }
 
-        val packet = Packet.createRaw(
-            destinationHash = link.linkId,
-            data = requestData.toByteArray(),
-            context = PacketContext.RESOURCE_REQ
-        )
+        // Build full request: hmu_part + resource_hash + requested_hashes
+        val requestData = ByteArrayOutputStream()
+        requestData.write(hmuPart.toByteArray())
+        requestData.write(hash)
+        requestData.write(requestedHashes.toByteArray())
 
-        link.send(packet.raw ?: ByteArray(0))
-        lastActivity = System.currentTimeMillis()
-        outstandingParts = missingParts.size
+        try {
+            val packet = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = requestData.toByteArray(),
+                context = PacketContext.RESOURCE_REQ
+            )
+
+            link.send(packet.raw ?: ByteArray(0))
+            lastActivity = System.currentTimeMillis()
+            reqSent = lastActivity
+            reqSentBytes = packet.raw?.size ?: 0
+            reqResp = null
+        } catch (e: Exception) {
+            log("Failed to send resource request: ${e.message}")
+        }
     }
 
     /**
      * Handle a request for parts from the receiver.
+     * Matches Python RNS request() protocol.
      */
     fun handleRequest(data: ByteArray) {
-        if (status != ResourceConstants.ADVERTISED && status != ResourceConstants.TRANSFERRING) return
+        if (status == ResourceConstants.FAILED) return
 
-        if (status == ResourceConstants.ADVERTISED) {
+        // Calculate RTT
+        val rttMs = System.currentTimeMillis() - advSent
+        if (rtt == null) {
+            rtt = rttMs
+        }
+
+        if (status != ResourceConstants.TRANSFERRING) {
             status = ResourceConstants.TRANSFERRING
             startedTransferring = System.currentTimeMillis()
         }
 
-        // Parse requested part indices
-        var sentCount = 0
-        var i = 0
-        while (i + 1 < data.size) {
-            val index = ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            if (index >= 0 && index < parts.size) {
-                val part = parts[index]
-                if (part != null) {
-                    sendPart(index, part)
-                    sentCount++
-                }
-            }
-            i += 2
+        retries = 0
+
+        // Parse request format: [hmu_flag] [last_map_hash?] [resource_hash] [requested_hashes...]
+        val wantsMoreHashmap = data[0].toInt() and 0xFF == ResourceConstants.HASHMAP_IS_EXHAUSTED
+        val pad = if (wantsMoreHashmap) 1 + ResourceConstants.MAPHASH_LEN else 1
+
+        // Extract requested hashes (after pad + resource hash)
+        val hashStart = pad + ResourceConstants.RESOURCE_HASH_LEN
+        if (data.size <= hashStart) return
+
+        val requestedHashesData = data.copyOfRange(hashStart, data.size)
+
+        // Define search scope
+        val searchStart = receiverMinConsecutiveHeight
+        val searchEnd = receiverMinConsecutiveHeight + ResourceAdvertisement.COLLISION_GUARD_SIZE
+
+        // Parse requested map hashes
+        val mapHashes = mutableListOf<ByteArray>()
+        for (i in 0 until requestedHashesData.size / ResourceConstants.MAPHASH_LEN) {
+            val start = i * ResourceConstants.MAPHASH_LEN
+            val end = start + ResourceConstants.MAPHASH_LEN
+            mapHashes.add(requestedHashesData.copyOfRange(start, end))
         }
 
-        lastActivity = System.currentTimeMillis()
+        // Find and send requested parts
+        val searchScope = parts.slice(searchStart until minOf(searchEnd, parts.size))
+        for ((index, part) in searchScope.withIndex()) {
+            if (part != null) {
+                val partMapHash = getMapHash(part)
+                if (mapHashes.any { it.contentEquals(partMapHash) }) {
+                    val actualIndex = searchStart + index
+                    if (!sentPartsSet.contains(actualIndex)) {
+                        sendPart(actualIndex, part)
+                        sentParts++
+                        sentPartsSet.add(actualIndex)
+                    } else {
+                        // Resend
+                        sendPart(actualIndex, part)
+                    }
+                    lastActivity = System.currentTimeMillis()
+                }
+            }
+        }
+
+        // Handle hashmap update request
+        if (wantsMoreHashmap) {
+            val lastMapHash = data.copyOfRange(1, 1 + ResourceConstants.MAPHASH_LEN)
+
+            // Find the part that matches last_map_hash
+            var partIndex = receiverMinConsecutiveHeight
+            for (i in searchStart until minOf(searchEnd, parts.size)) {
+                val part = parts[i]
+                if (part != null) {
+                    val partMapHash = getMapHash(part)
+                    partIndex++
+                    if (partMapHash.contentEquals(lastMapHash)) {
+                        break
+                    }
+                } else {
+                    partIndex++
+                }
+            }
+
+            receiverMinConsecutiveHeight = maxOf(partIndex - 1 - ResourceConstants.WINDOW_MAX, 0)
+
+            if (partIndex % ResourceAdvertisement.HASHMAP_MAX_LEN != 0) {
+                log("Resource sequencing error, cancelling transfer!")
+                cancel()
+                return
+            }
+
+            val segment = partIndex / ResourceAdvertisement.HASHMAP_MAX_LEN
+
+            // Build hashmap update
+            val hashmapStart = segment * ResourceAdvertisement.HASHMAP_MAX_LEN
+            val hashmapEnd = minOf((segment + 1) * ResourceAdvertisement.HASHMAP_MAX_LEN, parts.size)
+
+            val hashmapData = ByteArrayOutputStream()
+            for (i in hashmapStart until hashmapEnd) {
+                val start = i * ResourceConstants.MAPHASH_LEN
+                val end = start + ResourceConstants.MAPHASH_LEN
+                if (end <= hashmapRaw.size) {
+                    hashmapData.write(hashmapRaw.copyOfRange(start, end))
+                }
+            }
+
+            // Send hashmap update: resource_hash + msgpack([segment, hashmap])
+            val hmuData = ByteArrayOutputStream()
+            hmuData.write(hash)
+            // Pack [segment, hashmap] using msgpack
+            val packer = org.msgpack.core.MessagePack.newDefaultPacker(hmuData)
+            packer.packArrayHeader(2)
+            packer.packInt(segment)
+            packer.packBinaryHeader(hashmapData.size())
+            packer.writePayload(hashmapData.toByteArray())
+            packer.close()
+
+            try {
+                val hmuPacket = Packet.createRaw(
+                    destinationHash = link.linkId,
+                    data = hmuData.toByteArray(),
+                    context = PacketContext.RESOURCE_HMU
+                )
+                link.send(hmuPacket.raw ?: ByteArray(0))
+                lastActivity = System.currentTimeMillis()
+            } catch (e: Exception) {
+                log("Failed to send hashmap update: ${e.message}")
+            }
+        }
 
         // Check if all parts have been sent
         if (sentParts >= parts.size) {
             status = ResourceConstants.AWAITING_PROOF
             log("All parts sent, awaiting proof for ${hash.toHexString()}")
         }
+    }
+
+    /**
+     * Handle a hashmap update packet from the sender.
+     * Matches Python RNS hashmap_update_packet().
+     */
+    fun handleHashmapUpdate(plaintext: ByteArray) {
+        if (status == ResourceConstants.FAILED) return
+
+        lastActivity = System.currentTimeMillis()
+        retries = 0
+
+        // Parse: resource_hash (32 bytes) + msgpack([segment, hashmap])
+        if (plaintext.size <= ResourceConstants.RESOURCE_HASH_LEN) return
+
+        val msgpackData = plaintext.copyOfRange(ResourceConstants.RESOURCE_HASH_LEN, plaintext.size)
+
+        try {
+            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(msgpackData)
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 2) return
+
+            val segment = unpacker.unpackInt()
+            val hashmapLen = unpacker.unpackBinaryHeader()
+            val hashmapBytes = unpacker.readPayload(hashmapLen)
+            unpacker.close()
+
+            hashmapUpdate(segment, hashmapBytes)
+        } catch (e: Exception) {
+            log("Failed to parse hashmap update: ${e.message}")
+        }
+    }
+
+    /**
+     * Apply a hashmap update.
+     * Matches Python RNS hashmap_update().
+     */
+    private fun hashmapUpdate(segment: Int, hashmapBytes: ByteArray) {
+        if (status == ResourceConstants.FAILED) return
+
+        status = ResourceConstants.TRANSFERRING
+        val segLen = ResourceAdvertisement.HASHMAP_MAX_LEN
+        val hashes = hashmapBytes.size / ResourceConstants.MAPHASH_LEN
+
+        for (i in 0 until hashes) {
+            val idx = i + segment * segLen
+            if (idx < hashmap.size && hashmap[idx] == null) {
+                hashmapHeight++
+            }
+            if (idx < hashmap.size) {
+                val start = i * ResourceConstants.MAPHASH_LEN
+                val end = start + ResourceConstants.MAPHASH_LEN
+                hashmap[idx] = hashmapBytes.copyOfRange(start, end)
+            }
+        }
+
+        waitingForHmu = false
+        requestNext()
+    }
+
+    /**
+     * Update expected in-flight rate.
+     * Matches Python RNS update_eifr().
+     */
+    private fun updateEifr() {
+        val currentRtt = rtt ?: link.rtt ?: return
+
+        val expectedInflightRate = if (reqDataRttRate != 0.0) {
+            reqDataRttRate * 8
+        } else if (previousEifr != null) {
+            previousEifr!!
+        } else {
+            // Estimate from link establishment cost
+            (link.mdu * 8).toDouble() / (currentRtt.toDouble() / 1000.0)
+        }
+
+        eifr = expectedInflightRate
+        previousEifr = eifr
     }
 
     /**
