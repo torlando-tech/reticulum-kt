@@ -1216,6 +1216,15 @@ class Destination private constructor(
      */
     fun acceptsLinks(): Boolean = acceptLinkRequests
 
+    /**
+     * Invoke the link established callback with the given link.
+     *
+     * @param link The established link
+     */
+    fun invokeLinkEstablished(link: Any) {
+        linkEstablishedCallback?.invoke(link)
+    }
+
     // ===== Ratchet Configuration Setters =====
 
     /**

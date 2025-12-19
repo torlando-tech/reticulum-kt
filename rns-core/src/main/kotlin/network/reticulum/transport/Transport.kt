@@ -2174,14 +2174,14 @@ object Transport {
                         return
                     }
 
-                    // Deliver to link callback if set
-                    val linkCallback = destination.linkRequestCallback
-                    if (linkCallback != null) {
-                        val linkId = packet.truncatedHash
-                        val accepted = linkCallback(linkId)
-                        log("Link request for ${destination.hexHash}: ${if (accepted) "accepted" else "rejected"}")
+                    // Validate and create the incoming link
+                    val link = Link.validateRequest(destination, packet.data, packet)
+                    if (link != null) {
+                        log("Link request for ${destination.hexHash} accepted: ${link.linkId.toHexString()}")
+                        // Invoke the destination's link established callback
+                        destination.invokeLinkEstablished(link)
                     } else {
-                        log("No link callback registered for ${destination.hexHash}")
+                        log("Link request for ${destination.hexHash} rejected (validation failed)")
                     }
                 }
 
