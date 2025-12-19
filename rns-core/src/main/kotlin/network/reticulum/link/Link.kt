@@ -225,7 +225,10 @@ class Link private constructor(
         }
 
         private fun log(message: String) {
-            println("[Link] $message")
+            val timestamp = java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            )
+            println("[$timestamp] [Link] $message")
         }
     }
 

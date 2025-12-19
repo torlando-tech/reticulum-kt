@@ -143,7 +143,10 @@ class Resource private constructor(
         }
 
         private fun log(message: String) {
-            println("[Resource] $message")
+            val timestamp = java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            )
+            println("[$timestamp] [Resource] $message")
         }
     }
 

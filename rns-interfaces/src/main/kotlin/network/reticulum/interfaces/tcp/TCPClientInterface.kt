@@ -262,7 +262,10 @@ class TCPClientInterface(
     }
 
     private fun log(message: String) {
-        println("[$name] $message")
+        val timestamp = java.time.LocalDateTime.now().format(
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        )
+        println("[$timestamp] [$name] $message")
     }
 
     override fun toString(): String = "TCPClientInterface[$name -> $targetHost:$targetPort]"

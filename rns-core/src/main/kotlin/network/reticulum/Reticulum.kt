@@ -139,7 +139,10 @@ class Reticulum private constructor(
         fun linkMtuDiscovery(): Boolean = LINK_MTU_DISCOVERY
 
         private fun log(message: String) {
-            println("[Reticulum] $message")
+            val timestamp = java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            )
+            println("[$timestamp] [Reticulum] $message")
         }
     }
 
