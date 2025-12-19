@@ -275,6 +275,8 @@ class LocalClientInterface : Interface {
     private fun readLoop() {
         val buffer = ByteArray(4096)
 
+        log("Read loop started")
+
         try {
             while (online.get() && !detached.get()) {
                 val sock = socket ?: break
@@ -282,9 +284,11 @@ class LocalClientInterface : Interface {
 
                 if (bytesRead > 0) {
                     val data = buffer.copyOf(bytesRead)
+                    log("Received $bytesRead bytes")
                     hdlcDeframer.process(data)
                 } else if (bytesRead == -1) {
                     // Connection closed
+                    log("Connection closed by remote (read returned -1)")
                     online.set(false)
 
                     if (isSharedInstanceClient.get() && !detached.get()) {
@@ -296,8 +300,10 @@ class LocalClientInterface : Interface {
                     break
                 }
             }
+            log("Read loop exited normally (online=${online.get()}, detached=${detached.get()})")
         } catch (e: IOException) {
             if (!detached.get()) {
+                log("IOException in read loop: ${e.message}")
                 online.set(false)
 
                 if (isSharedInstanceClient.get()) {
@@ -311,6 +317,7 @@ class LocalClientInterface : Interface {
         } catch (e: Exception) {
             if (!detached.get()) {
                 log("Error in read loop: ${e.message}")
+                e.printStackTrace()
                 detach()
             }
         }
@@ -318,6 +325,7 @@ class LocalClientInterface : Interface {
 
     override fun processOutgoing(data: ByteArray) {
         if (!online.get() || detached.get()) {
+            log("processOutgoing called but interface not online (online=${online.get()}, detached=${detached.get()})")
             throw IllegalStateException("Interface is not online")
         }
 
@@ -329,6 +337,7 @@ class LocalClientInterface : Interface {
             writing.set(true)
 
             val framedData = HDLC.frame(data)
+            log("Sending ${framedData.size} bytes (${data.size} unframed)")
 
             socket?.getOutputStream()?.write(framedData)
             socket?.getOutputStream()?.flush()
@@ -385,7 +394,10 @@ class LocalClientInterface : Interface {
     fun isReconnecting(): Boolean = reconnecting.get()
 
     private fun log(message: String) {
-        println("[$name] $message")
+        val timestamp = java.time.LocalDateTime.now().format(
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        )
+        println("[$timestamp] [$name] $message")
     }
 
     override fun toString(): String {

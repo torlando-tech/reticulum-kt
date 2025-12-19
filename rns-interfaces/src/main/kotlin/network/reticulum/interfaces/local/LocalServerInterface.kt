@@ -40,6 +40,9 @@ class LocalServerInterface : Interface {
         /** Default socket path for shared instance. */
         const val DEFAULT_SOCKET_PATH = ".reticulum/rnstransport.socket"
 
+        /** Default instance name for abstract sockets (Python RNS compatible). */
+        const val DEFAULT_INSTANCE_NAME = "default"
+
         /** Default TCP port when Unix sockets unavailable. */
         const val DEFAULT_TCP_PORT = 37428
 
@@ -66,9 +69,20 @@ class LocalServerInterface : Interface {
                 false
             }
         }
+
+        /**
+         * Check if abstract Unix sockets are available (Linux-only).
+         */
+        fun supportsAbstractSockets(): Boolean {
+            if (!supportsUnixSockets()) return false
+            // Abstract sockets are Linux-specific
+            return System.getProperty("os.name").lowercase().contains("linux")
+        }
     }
 
     private val useUnixSocket: Boolean
+    private val useAbstractSocket: Boolean
+    private val abstractSocketName: String?
     private val socketPath: Path?
     private val tcpPort: Int?
 
@@ -82,10 +96,10 @@ class LocalServerInterface : Interface {
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
     override val canReceive: Boolean = true
-    override val canSend: Boolean = false // Server doesn't send directly, clients do
+    override val canSend: Boolean = true // Broadcasts to all connected clients
 
     /**
-     * Create a LocalServerInterface with Unix domain socket.
+     * Create a LocalServerInterface with Unix domain socket (file-based).
      *
      * @param name Interface name
      * @param socketPath Path to Unix socket (expands ~ to user home)
@@ -95,6 +109,8 @@ class LocalServerInterface : Interface {
         socketPath: String = DEFAULT_SOCKET_PATH
     ) : super(name) {
         this.useUnixSocket = supportsUnixSockets()
+        this.useAbstractSocket = false
+        this.abstractSocketName = null
 
         if (this.useUnixSocket) {
             // Expand ~ to user home directory
@@ -125,14 +141,51 @@ class LocalServerInterface : Interface {
         tcpPort: Int
     ) : super(name) {
         this.useUnixSocket = false
+        this.useAbstractSocket = false
+        this.abstractSocketName = null
         this.socketPath = null
         this.tcpPort = tcpPort
         spawnedInterfaces = mutableListOf()
     }
 
+    /**
+     * Create a LocalServerInterface with abstract Unix socket (Python RNS compatible).
+     *
+     * Abstract sockets use the Linux-specific abstract namespace, which doesn't
+     * create a file on the filesystem. Python RNS uses abstract sockets with
+     * the format "\0rns/{instance_name}".
+     *
+     * @param name Interface name
+     * @param instanceName Instance name (used in abstract socket path)
+     * @param useAbstract Must be true to distinguish from file-based constructor
+     */
+    constructor(
+        name: String = "SharedInstance",
+        instanceName: String = DEFAULT_INSTANCE_NAME,
+        useAbstract: Boolean
+    ) : super(name) {
+        if (useAbstract && supportsAbstractSockets()) {
+            this.useUnixSocket = true
+            this.useAbstractSocket = true
+            this.abstractSocketName = "\u0000rns/$instanceName"
+            this.socketPath = null
+            this.tcpPort = null
+        } else {
+            // Fall back to TCP if abstract sockets not supported
+            this.useUnixSocket = false
+            this.useAbstractSocket = false
+            this.abstractSocketName = null
+            this.socketPath = null
+            this.tcpPort = DEFAULT_TCP_PORT
+        }
+        spawnedInterfaces = mutableListOf()
+    }
+
     override fun start() {
         try {
-            if (useUnixSocket && socketPath != null) {
+            if (useAbstractSocket && abstractSocketName != null) {
+                startAbstractSocket()
+            } else if (useUnixSocket && socketPath != null) {
                 startUnixSocket()
             } else if (tcpPort != null) {
                 startTcpSocket()
@@ -149,6 +202,20 @@ class LocalServerInterface : Interface {
             log("Failed to start local server: ${e.message}")
             throw e
         }
+    }
+
+    private fun startAbstractSocket() {
+        val sockName = abstractSocketName ?: throw IllegalStateException("Abstract socket name is null")
+
+        // Create abstract Unix domain socket server
+        // Abstract sockets don't need filesystem cleanup
+        val socketAddress = UnixDomainSocketAddress.of(sockName)
+        serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+        serverChannel?.bind(socketAddress)
+
+        // Display the abstract socket name nicely (replace \0 with @)
+        val displayName = sockName.replace("\u0000", "@")
+        log("Listening on abstract socket: $displayName")
     }
 
     private fun startUnixSocket() {
@@ -186,7 +253,7 @@ class LocalServerInterface : Interface {
     private fun acceptLoop() {
         while (online.get() && !detached.get()) {
             try {
-                val socket = if (useUnixSocket && serverChannel != null) {
+                val socket = if ((useUnixSocket || useAbstractSocket) && serverChannel != null) {
                     acceptUnixSocket()
                 } else if (serverSocket != null) {
                     acceptTcpSocket()
@@ -227,10 +294,10 @@ class LocalServerInterface : Interface {
         }
 
         val clientId = clientCounter.incrementAndGet()
-        val clientName = if (useUnixSocket) {
-            "$clientId@${socketPath?.fileName}"
-        } else {
-            "$clientId@${tcpPort}"
+        val clientName = when {
+            useAbstractSocket -> "$clientId@abstract"
+            useUnixSocket -> "$clientId@${socketPath?.fileName}"
+            else -> "$clientId@${tcpPort}"
         }
 
         val clientInterface = LocalClientInterface(
@@ -309,8 +376,8 @@ class LocalServerInterface : Interface {
         serverChannel = null
         serverSocket = null
 
-        // Clean up Unix socket file
-        if (useUnixSocket && socketPath != null) {
+        // Clean up Unix socket file (not needed for abstract sockets)
+        if (useUnixSocket && !useAbstractSocket && socketPath != null) {
             try {
                 Files.deleteIfExists(socketPath)
             } catch (e: Exception) {
@@ -322,16 +389,27 @@ class LocalServerInterface : Interface {
     }
 
     private fun log(message: String) {
-        println("[$name] $message")
+        val timestamp = java.time.LocalDateTime.now().format(
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        )
+        println("[$timestamp] [$name] $message")
     }
 
     override fun toString(): String {
-        return if (useUnixSocket && socketPath != null) {
-            "LocalServerInterface[$name @ $socketPath]"
-        } else if (tcpPort != null) {
-            "LocalServerInterface[$name @ 127.0.0.1:$tcpPort]"
-        } else {
-            "LocalServerInterface[$name]"
+        return when {
+            useAbstractSocket && abstractSocketName != null -> {
+                val displayName = abstractSocketName.replace("\u0000", "@")
+                "LocalServerInterface[$name @ $displayName]"
+            }
+            useUnixSocket && socketPath != null -> {
+                "LocalServerInterface[$name @ $socketPath]"
+            }
+            tcpPort != null -> {
+                "LocalServerInterface[$name @ 127.0.0.1:$tcpPort]"
+            }
+            else -> {
+                "LocalServerInterface[$name]"
+            }
         }
     }
 }

@@ -1,0 +1,21 @@
+# Reticulum config for Link Test Server
+# This node runs a TCP server that rnsd-kt can connect to
+# Uses non-standard ports to avoid conflicts
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = No
+  shared_instance_port = 47420
+  instance_control_port = 47421
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 7
+
+[interfaces]
+  # TCP Server interface - rnsd-kt will connect to this
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    enabled = yes
+    listen_ip = 127.0.0.1
+    listen_port = 14242

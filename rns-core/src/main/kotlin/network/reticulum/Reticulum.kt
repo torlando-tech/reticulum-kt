@@ -161,10 +161,44 @@ class Reticulum private constructor(
         // Ensure directories exist
         ensureDirectories()
 
-        // Start Transport
-        Transport.start(enableTransport = enableTransport)
+        // Load or create transport identity
+        val transportIdentity = loadOrCreateTransportIdentity()
+
+        // Start Transport with identity
+        Transport.start(transportIdentity = transportIdentity, enableTransport = enableTransport)
 
         log("Reticulum started (transport=${if (enableTransport) "enabled" else "disabled"})")
+    }
+
+    /**
+     * Load transport identity from file or create a new one.
+     * The identity is persisted to ensure consistent RPC keys across restarts.
+     */
+    private fun loadOrCreateTransportIdentity(): Identity {
+        val identityFile = File("$storagePath/transport_identity")
+
+        return if (identityFile.exists()) {
+            val identity = Identity.fromFile(identityFile.absolutePath)
+            if (identity != null) {
+                log("Loaded transport identity")
+                identity
+            } else {
+                log("Failed to load transport identity, creating new")
+                createAndSaveTransportIdentity(identityFile)
+            }
+        } else {
+            log("No transport identity found, creating new")
+            createAndSaveTransportIdentity(identityFile)
+        }
+    }
+
+    /**
+     * Create a new transport identity and save it to file.
+     */
+    private fun createAndSaveTransportIdentity(file: File): Identity {
+        val identity = Identity.create()
+        identity.toFile(file.absolutePath)
+        return identity
     }
 
     /**

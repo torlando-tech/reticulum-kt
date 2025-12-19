@@ -7,6 +7,8 @@ import network.reticulum.cli.config.InterfaceConfigFactory
 import network.reticulum.cli.config.ReticulumConfig
 import network.reticulum.cli.logging.Logger
 import network.reticulum.cli.logging.LogLevel
+import network.reticulum.interfaces.local.LocalServerInterface
+import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -24,6 +26,8 @@ class DaemonRunner(
     private val interactive: Boolean
 ) {
     private val running = AtomicBoolean(true)
+    private var localServerInterface: LocalServerInterface? = null
+    private var rpcServer: RpcServer? = null
 
     /**
      * Run the daemon.
@@ -58,6 +62,12 @@ class DaemonRunner(
 
             // Create and register interfaces from config
             setupInterfaces(config)
+
+            // Set up shared instance if enabled
+            setupSharedInstance(config)
+
+            // Set up RPC server for Python client compatibility
+            setupRpcServer(config)
 
             // Handle interactive mode
             if (interactive) {
@@ -142,6 +152,100 @@ class DaemonRunner(
     }
 
     /**
+     * Set up the shared instance interface if enabled.
+     * This creates a TCP server that Python RNS apps can connect to.
+     *
+     * Note: Python RNS prefers abstract Unix sockets on Linux, but Java's
+     * standard UnixDomainSocketAddress doesn't support abstract sockets.
+     * We use TCP port 37428 which Python RNS supports as fallback.
+     *
+     * To use with Python RNS, set shared_instance_type = tcp in config.
+     */
+    private fun setupSharedInstance(config: ReticulumConfig) {
+        if (!config.reticulum.shareInstance) {
+            Logger.debug("Shared instance disabled")
+            return
+        }
+
+        val port = config.reticulum.sharedInstancePort
+
+        Logger.verbose("Creating shared instance interface on TCP port $port")
+
+        try {
+            // Create the LocalServerInterface with TCP (Python RNS compatible)
+            // Python RNS will connect via TCP if shared_instance_type = tcp
+            localServerInterface = LocalServerInterface(
+                name = "SharedInstance",
+                tcpPort = port
+            )
+
+            // Wire up packet callback to Transport
+            val ifaceRef = localServerInterface!!.toRef()
+            localServerInterface!!.onPacketReceived = { data, _ ->
+                Transport.inbound(data, ifaceRef)
+            }
+
+            // Start the interface
+            localServerInterface!!.start()
+
+            // Register with Transport for outbound packets
+            Transport.registerInterface(ifaceRef)
+
+            Logger.notice("Started shared instance on TCP port $port")
+        } catch (e: Exception) {
+            Logger.error("Failed to start shared instance: ${e.message}")
+            // Don't fail startup - shared instance is optional
+            localServerInterface = null
+        }
+    }
+
+    /**
+     * Set up the RPC server for Python client compatibility.
+     *
+     * Python RNS clients use an RPC interface to query interface statistics
+     * and other daemon information. This server implements that protocol.
+     */
+    private fun setupRpcServer(config: ReticulumConfig) {
+        if (!config.reticulum.shareInstance) {
+            // RPC server only needed when sharing instance
+            return
+        }
+
+        val port = config.reticulum.instanceControlPort
+
+        Logger.verbose("Creating RPC server on TCP port $port")
+
+        try {
+            // Compute RPC auth key from Transport identity
+            // This matches Python: full_hash(Transport.identity.get_private_key())
+            val transportIdentity = Transport.identity
+            if (transportIdentity == null) {
+                Logger.warning("Transport identity not available, RPC server disabled")
+                return
+            }
+
+            val privateKey = transportIdentity.getPrivateKey()
+            if (privateKey == null) {
+                Logger.warning("Transport identity has no private key, RPC server disabled")
+                return
+            }
+
+            // Compute full hash of private key (SHA-256)
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val rpcKey = digest.digest(privateKey)
+
+            rpcServer = RpcServer(port, rpcKey)
+            rpcServer!!.start()
+
+            Logger.notice("Started RPC server on TCP port $port")
+        } catch (e: Exception) {
+            Logger.error("Failed to start RPC server: ${e.message}")
+            // Don't fail startup - RPC is optional
+            rpcServer = null
+        }
+    }
+
+    /**
      * Install JVM shutdown hook for graceful shutdown.
      */
     private fun installShutdownHook() {
@@ -174,6 +278,21 @@ class DaemonRunner(
      */
     private fun shutdown() {
         Logger.notice("Shutting down rnsd-kt...")
+
+        // Stop RPC server
+        rpcServer?.let {
+            Logger.debug("Stopping RPC server...")
+            it.stop()
+            rpcServer = null
+        }
+
+        // Stop shared instance
+        localServerInterface?.let {
+            Logger.debug("Stopping shared instance...")
+            it.detach()
+            localServerInterface = null
+        }
+
         Reticulum.stop()
         Logger.close()
     }

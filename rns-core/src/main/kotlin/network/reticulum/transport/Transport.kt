@@ -15,6 +15,7 @@ import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.link.Link
 import network.reticulum.packet.Packet
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -1892,7 +1893,41 @@ object Transport {
             return
         }
 
-        // Check if we should forward (transport mode)
+        // Check if we have a path to forward this packet
+        val pathEntry = pathTable[packet.destinationHash.toKey()]
+        if (pathEntry != null) {
+            val outboundInterface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
+            if (outboundInterface != null && !outboundInterface.hash.contentEquals(interfaceRef.hash)) {
+                log("Forwarding data packet for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                transmit(outboundInterface, packet.raw ?: packet.pack())
+                return
+            }
+        }
+
+        // Check if this is link data (destination hash is a link_id)
+        val linkEntry = linkTable[packet.destinationHash.toKey()]
+        if (linkEntry != null) {
+            // This is link data - forward to the appropriate interface based on which
+            // interface the packet came from (bidirectional routing)
+            val outboundInterfaceHash = if (interfaceRef.hash.contentEquals(linkEntry.receivingInterfaceHash)) {
+                // Packet came from the link initiator side, forward to the destination side
+                linkEntry.nextHopInterfaceHash
+            } else {
+                // Packet came from the destination side, forward to the initiator side
+                linkEntry.receivingInterfaceHash
+            }
+
+            val outboundInterface = findInterfaceByHash(outboundInterfaceHash)
+            if (outboundInterface != null) {
+                log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                transmit(outboundInterface, packet.raw ?: packet.pack())
+                return
+            } else {
+                log("Link data forward failed: interface ${outboundInterfaceHash.toHexString()} not found")
+            }
+        }
+
+        // Transport-mode forwarding (when we're an intermediate hop)
         if (transportEnabled && packet.transportId != null) {
             val myHash = identity?.hash
             if (myHash != null && packet.transportId.contentEquals(myHash)) {
@@ -1911,13 +1946,46 @@ object Transport {
             return
         }
 
-        // Forward if transport enabled
+        // Check if we have a path to forward this Link request
+        val pathEntry = pathTable[packet.destinationHash.toKey()]
+        if (pathEntry != null) {
+            val outboundInterface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
+            if (outboundInterface != null && !outboundInterface.hash.contentEquals(interfaceRef.hash)) {
+                // Calculate link_id properly using Link.linkIdFromLrPacket
+                // This is the truncated hash of the hashable part, potentially
+                // excluding MTU signalling bytes from the data
+                val linkId = Link.linkIdFromLrPacket(packet)
+
+                // Create link table entry for return routing of proofs (for local client traffic)
+                // The LRPROOF will have this link_id as its destination_hash
+                val linkEntry = LinkEntry(
+                    timestamp = System.currentTimeMillis(),
+                    nextHop = pathEntry.nextHop,
+                    nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
+                    remainingHops = pathEntry.hops,
+                    receivingInterfaceHash = interfaceRef.hash,
+                    takenHops = packet.hops,
+                    destinationHash = packet.destinationHash,
+                    validated = false,
+                    proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
+                )
+                linkTable[linkId.toKey()] = linkEntry
+                log("Forwarding Link request for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (link_id=${linkId.toHexString()})")
+
+                // Forward the packet
+                transmit(outboundInterface, packet.raw ?: packet.pack())
+                return
+            }
+        }
+
+        // Transport-mode forwarding (when we're an intermediate hop)
         if (transportEnabled && packet.transportId != null) {
             val myHash = identity?.hash
             if (myHash != null && packet.transportId.contentEquals(myHash)) {
                 // Record in link table for return path
-                val pathEntry = pathTable[packet.destinationHash.toKey()]
                 if (pathEntry != null) {
+                    // Use proper link_id calculation
+                    val linkId = Link.linkIdFromLrPacket(packet)
                     // Create link table entry for return routing of proofs
                     val linkEntry = LinkEntry(
                         timestamp = System.currentTimeMillis(),
@@ -1930,8 +1998,8 @@ object Transport {
                         validated = false,
                         proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
                     )
-                    linkTable[packet.truncatedHash.toKey()] = linkEntry
-                    log("Created link table entry for ${packet.truncatedHash.toHexString()}")
+                    linkTable[linkId.toKey()] = linkEntry
+                    log("Created link table entry for ${linkId.toHexString()}")
 
                     forwardPacket(packet, interfaceRef)
                 }
@@ -1939,21 +2007,53 @@ object Transport {
         }
     }
 
-    private fun processProof(packet: Packet, @Suppress("UNUSED_PARAMETER") interfaceRef: InterfaceRef) {
-        // Check reverse table for return path
-        val reverseEntry = reverseTable[packet.truncatedHash.toKey()]
+    private fun processProof(packet: Packet, interfaceRef: InterfaceRef) {
+        log("Processing proof: dest=${packet.destinationHash.toHexString()}, context=${packet.context}, from ${interfaceRef.name}")
+
+        // Handle LRPROOF (Link Request Proof) - look up in link table
+        if (packet.context == PacketContext.LRPROOF) {
+            val linkEntry = linkTable[packet.destinationHash.toKey()]
+            if (linkEntry != null) {
+                // Forward proof back to the originating interface
+                val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                if (outboundInterface != null) {
+                    log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                    transmit(outboundInterface, packet.raw ?: packet.pack())
+                }
+                // Mark link as validated (don't remove yet - may be needed for more traffic)
+                // The entry will be cleaned up by timeout
+                return
+            } else {
+                // Debug: show what's in the link table
+                if (linkTable.isNotEmpty()) {
+                    val keys = linkTable.keys.take(3).map { it.toString().take(16) + "..." }
+                    log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table. Keys: $keys")
+                } else {
+                    log("LRPROOF dest=${packet.destinationHash.toHexString()} not found. Link table is empty")
+                }
+            }
+        }
+
+        // For other proof types, try reverse table
+        var reverseEntry = reverseTable[packet.destinationHash.toKey()]
+        if (reverseEntry == null) {
+            reverseEntry = reverseTable[packet.truncatedHash.toKey()]
+        }
 
         if (reverseEntry != null) {
-            // Forward proof back
+            // Forward proof back to the originating interface
             val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
             if (outboundInterface != null) {
+                log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
                 transmit(outboundInterface, packet.raw ?: packet.pack())
             }
+            // Remove the reverse entry after use
+            reverseTable.remove(packet.destinationHash.toKey())
+            reverseTable.remove(packet.truncatedHash.toKey())
             return
         }
 
-        // Check if there's a pending receipt for this proof
-        // The proof's destination hash should match the original packet hash
+        // Check if there's a pending receipt for this proof (local destination)
         val receiptKey = packet.destinationHash.toKey()
         val callback = pendingReceipts.remove(receiptKey)
 
@@ -1962,7 +2062,6 @@ object Transport {
                 val validated = callback.onProofReceived(packet)
                 if (validated) {
                     log("Proof validated for ${packet.destinationHash.toHexString()}")
-                    // Mark path as responsive if we have one
                     markPathResponsive(packet.destinationHash)
                 } else {
                     log("Proof validation failed for ${packet.destinationHash.toHexString()}")
@@ -1971,7 +2070,7 @@ object Transport {
                 log("Proof callback error: ${e.message}")
             }
         } else {
-            log("Received proof with no pending receipt: ${packet.destinationHash.toHexString()}")
+            log("Proof dest=${packet.destinationHash.toHexString()} not found in link_table (${linkTable.size} entries) or reverse_table (${reverseTable.size} entries)")
         }
     }
 
@@ -2454,7 +2553,10 @@ object Transport {
     }
 
     private fun log(message: String) {
-        println("[Transport] $message")
+        val timestamp = java.time.LocalDateTime.now().format(
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        )
+        println("[$timestamp] [Transport] $message")
     }
 }
 
