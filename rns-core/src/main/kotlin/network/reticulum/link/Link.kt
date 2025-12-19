@@ -14,6 +14,8 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.transport.Transport
+import network.reticulum.channel.Channel
+import network.reticulum.channel.ChannelOutlet
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicInteger
@@ -271,6 +273,8 @@ class Link private constructor(
         private set
     var lastData: Long = 0
         private set
+    var lastProof: Long = 0
+        private set
 
     // Traffic counters
     val tx = AtomicLong(0)
@@ -324,6 +328,9 @@ class Link private constructor(
 
     // Request/response tracking
     internal val pendingRequests = mutableListOf<RequestReceipt>()
+
+    // Channel support
+    private var _channel: Channel? = null
 
     /**
      * Initialize as link initiator (outgoing link).
@@ -661,6 +668,80 @@ class Link private constructor(
 
         return Transport.outbound(packet).also { sent ->
             if (sent) hadOutbound(isData = true)
+        }
+    }
+
+    /**
+     * Get the Channel for this link.
+     * Creates the channel lazily on first access.
+     *
+     * @return The Channel for this link
+     */
+    fun getChannel(): Channel {
+        if (_channel == null) {
+            _channel = Channel(LinkChannelOutlet(this))
+        }
+        return _channel!!
+    }
+
+    /**
+     * ChannelOutlet implementation that wraps a Link.
+     * Provides the transport layer for Channel message delivery.
+     */
+    private class LinkChannelOutlet(private val link: Link) : ChannelOutlet {
+        override val mdu: Int
+            get() = link.mdu
+
+        override val rtt: Long?
+            get() = link.rtt
+
+        override val isUsable: Boolean
+            get() = link.status == LinkConstants.ACTIVE
+
+        override val timedOut: Boolean
+            get() = link.status == LinkConstants.CLOSED &&
+                    link.teardownReason == LinkConstants.TEARDOWN_REASON_TIMEOUT
+
+        override fun send(raw: ByteArray): Any? {
+            if (!isUsable) return null
+
+            val encrypted = link.encrypt(raw)
+            val packet = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                context = PacketContext.CHANNEL
+            )
+
+            return if (Transport.outbound(packet)) {
+                link.hadOutbound(isData = true)
+                packet
+            } else {
+                null
+            }
+        }
+
+        override fun resend(packet: Any): Any? {
+            if (packet !is Packet) return null
+            val receipt = packet.resend()
+            return if (receipt != null) packet else null
+        }
+
+        override fun getPacketState(packet: Any): Int {
+            // TODO: Implement proper packet state tracking
+            return 0
+        }
+
+        override fun setPacketTimeoutCallback(packet: Any, callback: ((Any) -> Unit)?, timeout: Long?) {
+            // TODO: Implement packet timeout callback
+        }
+
+        override fun setPacketDeliveredCallback(packet: Any, callback: ((Any) -> Unit)?) {
+            // TODO: Implement packet delivered callback
+        }
+
+        override fun getPacketId(packet: Any): Any {
+            return if (packet is Packet) packet.packetHash else packet
         }
     }
 
@@ -1086,32 +1167,45 @@ class Link private constructor(
 
     /**
      * Check for link timeout.
+     * Matches Python RNS watchdog state machine.
      */
     private fun checkTimeout() {
         val now = System.currentTimeMillis()
 
         when (status) {
-            LinkConstants.PENDING, LinkConstants.HANDSHAKE -> {
-                if (now - requestTime > establishmentTimeout) {
-                    log("Link establishment timeout")
+            LinkConstants.PENDING -> {
+                // Link was initiated, but no response from destination yet
+                if (now >= requestTime + establishmentTimeout) {
+                    log("Link establishment timed out")
+                    teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
+                }
+            }
+
+            LinkConstants.HANDSHAKE -> {
+                // Waiting for link proof or RTT packet
+                if (now >= requestTime + establishmentTimeout) {
+                    if (initiator) {
+                        log("Timeout waiting for link request proof")
+                    } else {
+                        log("Timeout waiting for RTT packet from link initiator")
+                    }
                     teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
                 }
             }
 
             LinkConstants.ACTIVE -> {
-                val inactivity = noInboundFor()
+                val activatedTime = activatedAt ?: 0L
+                val lastInbound = maxOf(maxOf(this.lastInbound, lastProof), activatedTime)
+                val inactivity = now - lastInbound
 
-                if (inactivity > staleTime) {
-                    // Send keepalive if we haven't recently
-                    if (noOutboundFor() > keepalive / 2) {
+                if (inactivity >= keepalive) {
+                    // Send keepalive if we're the initiator and haven't sent one recently
+                    if (initiator && (now - lastKeepalive) >= keepalive) {
                         sendKeepalive()
                     }
 
-                    // Check for stale
-                    if (inactivity > staleTime + (rtt ?: 0) * keepaliveTimeoutFactor + LinkConstants.STALE_GRACE) {
-                        log("Link timeout (no response)")
-                        teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
-                    } else if (status != LinkConstants.STALE) {
+                    // Transition to stale if no inbound for stale_time
+                    if (inactivity >= staleTime) {
                         status = LinkConstants.STALE
                         log("Link marked stale")
                     }
@@ -1119,12 +1213,29 @@ class Link private constructor(
             }
 
             LinkConstants.STALE -> {
-                val inactivity = noInboundFor()
-                if (inactivity > staleTime + (rtt ?: 0) * keepaliveTimeoutFactor + LinkConstants.STALE_GRACE) {
-                    log("Stale link timeout")
-                    teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
-                }
+                // In Python, STALE immediately sends teardown and closes
+                sendTeardownPacket()
+                teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
             }
+        }
+    }
+
+    /**
+     * Send a teardown packet to the remote end.
+     */
+    private fun sendTeardownPacket() {
+        try {
+            val teardownData = linkId  // Send link ID as teardown data
+            val packet = Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypt(teardownData),
+                packetType = PacketType.DATA,
+                context = PacketContext.LINKCLOSE,
+                destinationType = DestinationType.LINK
+            )
+            Transport.outbound(packet)
+        } catch (e: Exception) {
+            log("Error sending teardown packet: ${e.message}")
         }
     }
 
@@ -1378,9 +1489,27 @@ class Link private constructor(
             val measuredRtt = System.currentTimeMillis() - requestTime
             val plaintext = decrypt(packet.data) ?: return
 
-            // TODO: Unpack msgpack RTT value from plaintext
-            // For now, use measured RTT
-            rtt = measuredRtt
+            // Unpack msgpack RTT value from plaintext
+            // Python sends RTT as a float in seconds
+            val remoteRtt = try {
+                val unpacker = MessagePack.newDefaultUnpacker(plaintext)
+                val rttSeconds = unpacker.unpackDouble()
+                unpacker.close()
+                (rttSeconds * 1000).toLong()  // Convert seconds to ms
+            } catch (e: Exception) {
+                // Fallback: try as float
+                try {
+                    val unpacker = MessagePack.newDefaultUnpacker(plaintext)
+                    val rttSeconds = unpacker.unpackFloat()
+                    unpacker.close()
+                    (rttSeconds * 1000).toLong()
+                } catch (e2: Exception) {
+                    measuredRtt  // Use measured if unpacking fails
+                }
+            }
+
+            // Use max of measured and remote RTT
+            rtt = maxOf(measuredRtt, remoteRtt)
             status = LinkConstants.ACTIVE
             activatedAt = System.currentTimeMillis()
 
@@ -1824,6 +1953,7 @@ class Link private constructor(
             // Validate the proof
             if (resource.validateProof(data)) {
                 log("Proof validated for resource ${resourceHash.toHexString()}")
+                lastProof = System.currentTimeMillis()
                 // Resource validation handles completion logic
             } else {
                 log("Proof validation failed for resource ${resourceHash.toHexString()}")
