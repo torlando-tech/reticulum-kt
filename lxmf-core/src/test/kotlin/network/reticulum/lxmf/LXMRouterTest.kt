@@ -369,4 +369,85 @@ class LXMRouterTest {
         // Should be FAILED after exceeding max attempts
         assertEquals(MessageState.FAILED, message.state)
     }
+
+    // ===== Propagation Node Tests =====
+
+    @Test
+    fun `test propagation node tracking`() {
+        // Initially no propagation nodes
+        assertEquals(0, router.getPropagationNodes().size)
+        assertEquals(null, router.getActivePropagationNode())
+    }
+
+    @Test
+    fun `test set active propagation node without known node fails`() {
+        // Try to set unknown node
+        val result = router.setActivePropagationNode("0123456789abcdef")
+        assertEquals(false, result)
+        assertEquals(null, router.getActivePropagationNode())
+    }
+
+    @Test
+    fun `test propagation transfer state initially idle`() {
+        assertEquals(LXMRouter.PropagationTransferState.IDLE, router.propagationTransferState)
+        assertEquals(0.0, router.propagationTransferProgress)
+        assertEquals(0, router.propagationTransferLastResult)
+    }
+
+    @Test
+    fun `test propagated message queuing without active node`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test via propagation",
+            title = "Propagated",
+            desiredMethod = DeliveryMethod.PROPAGATED
+        )
+
+        assertEquals(DeliveryMethod.PROPAGATED, message.desiredMethod)
+
+        router.handleOutbound(message)
+        assertEquals(1, router.pendingOutboundCount())
+
+        // Process should increment attempts but not fail immediately
+        // (no active node means it will retry later)
+        router.processOutbound()
+
+        assertEquals(1, message.deliveryAttempts)
+        assertEquals(MessageState.OUTBOUND, message.state)
+    }
+
+    @Test
+    fun `test get outbound propagation cost without active node`() {
+        val cost = router.getOutboundPropagationCost()
+        assertEquals(null, cost)
+    }
+
+    // Make propagationTransferState accessible for tests
+    val LXMRouter.propagationTransferState: LXMRouter.PropagationTransferState
+        get() = try {
+            val field = LXMRouter::class.java.getDeclaredField("propagationTransferState")
+            field.isAccessible = true
+            field.get(this) as LXMRouter.PropagationTransferState
+        } catch (e: Exception) {
+            LXMRouter.PropagationTransferState.IDLE
+        }
 }

@@ -258,6 +258,51 @@ object LXMFConstants {
     const val ENCRYPTION_DESCRIPTION_AES = "AES-128"
     const val ENCRYPTION_DESCRIPTION_EC = "Curve25519"
     const val ENCRYPTION_DESCRIPTION_UNENCRYPTED = "Unencrypted"
+
+    // ===== Propagation Constants =====
+
+    /** Minimum allowed propagation stamp cost */
+    const val PROPAGATION_COST_MIN = 13
+
+    /** Default propagation stamp cost flexibility */
+    const val PROPAGATION_COST_FLEX = 3
+
+    /** Default propagation stamp cost target */
+    const val PROPAGATION_COST = 16
+
+    /** Default peering stamp cost */
+    const val PEERING_COST = 18
+
+    /** Maximum acceptable peering cost */
+    const val MAX_PEERING_COST = 26
+
+    /** Maximum KB per propagation transfer */
+    const val PROPAGATION_LIMIT_KB = 256
+
+    /** Maximum KB per sync transfer */
+    const val SYNC_LIMIT_KB = PROPAGATION_LIMIT_KB * 40
+
+    /** Maximum KB per delivery transfer */
+    const val DELIVERY_LIMIT_KB = 1000
+
+    // ===== Propagation Peer Error Codes =====
+
+    /** Error: client not identified */
+    const val ERROR_NO_IDENTITY = 0xf0
+
+    /** Error: access denied */
+    const val ERROR_NO_ACCESS = 0xf1
+
+    /** Error: invalid propagation stamp */
+    const val ERROR_INVALID_STAMP = 0xf5
+
+    // ===== Propagation Request Paths =====
+
+    /** Request path for getting messages from propagation node */
+    const val MESSAGE_GET_PATH = "/get"
+
+    /** Request path for offering messages to peers */
+    const val OFFER_REQUEST_PATH = "/offer"
 }
 
 /**
