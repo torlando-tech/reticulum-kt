@@ -675,9 +675,9 @@ class Destination private constructor(
         const val RATCHET_ID_SIZE = 10
 
         /**
-         * Default ratchet rotation interval (30 days in milliseconds).
+         * Default ratchet rotation interval (30 minutes in milliseconds).
          */
-        const val RATCHET_ROTATION_INTERVAL = 2_592_000_000L  // 30 days
+        const val RATCHET_ROTATION_INTERVAL = 1_800_000L  // 30 minutes (matches Python RNS)
 
         /**
          * Default maximum number of ratchets to retain.
@@ -693,17 +693,17 @@ class Destination private constructor(
         /**
          * Proof strategy: Never send proofs.
          */
-        const val PROVE_NONE = 0x00
+        const val PROVE_NONE = 0x21
 
         /**
          * Proof strategy: Let the application decide via callback.
          */
-        const val PROVE_APP = 0x01
+        const val PROVE_APP = 0x22
 
         /**
          * Proof strategy: Always send proofs when requested.
          */
-        const val PROVE_ALL = 0x02
+        const val PROVE_ALL = 0x23
 
         /**
          * Storage for ratchet public keys: destination_hash -> ratchet_public_key

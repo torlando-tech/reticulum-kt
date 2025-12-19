@@ -6,13 +6,14 @@ import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
 import network.reticulum.link.Link
 import network.reticulum.packet.Packet
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.util.zip.Deflater
-import java.util.zip.Inflater
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream
 import kotlin.concurrent.thread
 import kotlin.math.ceil
 import kotlin.math.max
@@ -803,39 +804,29 @@ class Resource private constructor(
     }
 
     /**
-     * Compress data using DEFLATE.
+     * Compress data using BZ2 (matches Python RNS).
      */
     private fun compress(data: ByteArray): ByteArray {
-        val deflater = Deflater(Deflater.BEST_COMPRESSION)
-        deflater.setInput(data)
-        deflater.finish()
-
         val output = ByteArrayOutputStream()
-        val buffer = ByteArray(1024)
-        while (!deflater.finished()) {
-            val count = deflater.deflate(buffer)
-            output.write(buffer, 0, count)
+        BZip2CompressorOutputStream(output).use { bz2 ->
+            bz2.write(data)
         }
-        deflater.end()
-
         return output.toByteArray()
     }
 
     /**
-     * Decompress DEFLATE data.
+     * Decompress BZ2 data (matches Python RNS).
      */
     private fun decompress(data: ByteArray): ByteArray {
-        val inflater = Inflater()
-        inflater.setInput(data)
-
+        val input = ByteArrayInputStream(data)
         val output = ByteArrayOutputStream()
-        val buffer = ByteArray(1024)
-        while (!inflater.finished()) {
-            val count = inflater.inflate(buffer)
-            output.write(buffer, 0, count)
+        BZip2CompressorInputStream(input).use { bz2 ->
+            val buffer = ByteArray(1024)
+            var len: Int
+            while (bz2.read(buffer).also { len = it } != -1) {
+                output.write(buffer, 0, len)
+            }
         }
-        inflater.end()
-
         return output.toByteArray()
     }
 
