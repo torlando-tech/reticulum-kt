@@ -8,7 +8,11 @@ import network.reticulum.crypto.CryptoProvider
 import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.Token
 import network.reticulum.crypto.defaultCryptoProvider
+import org.msgpack.core.MessagePack
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Identity is the core authentication primitive in Reticulum.
@@ -125,12 +129,23 @@ class Identity private constructor(
         const val RATCHET_EXPIRY = 2_592_000_000L  // 30 days in ms
 
         /**
+         * Lock for ratchet disk persistence.
+         */
+        private val ratchetPersistLock = ReentrantLock()
+
+        /**
          * Storage path for persisting known destinations.
          * Set by Reticulum during initialization.
          */
         @Volatile
         var storagePath: String = System.getProperty("user.home") + "/.reticulum"
             private set
+
+        /**
+         * Get the ratchet storage directory path.
+         */
+        private val ratchetPath: String
+            get() = "$storagePath/ratchets"
 
         /**
          * Flag to prevent concurrent saves.
@@ -740,6 +755,7 @@ class Identity private constructor(
             val key = destHash.toKey()
             val now = System.currentTimeMillis()
             val entry = RatchetEntry(ratchet.copyOf(), now)
+            var shouldPersist = false
 
             synchronized(destinationRatchets) {
                 val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
@@ -751,14 +767,61 @@ class Identity private constructor(
 
                 // Prepend (newest first)
                 entries.add(0, entry)
+                shouldPersist = true
 
                 // Clean expired entries for this destination
                 entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+            }
+
+            // Persist to disk
+            if (shouldPersist) {
+                persistRatchet(destHash, ratchet, now)
+            }
+        }
+
+        /**
+         * Persist a ratchet to disk.
+         * Uses atomic write (write to temp file, then rename) for safety.
+         */
+        private fun persistRatchet(destHash: ByteArray, ratchet: ByteArray, timestamp: Long) {
+            try {
+                ratchetPersistLock.lock()
+                try {
+                    // Create ratchet directory if needed
+                    val ratchetDir = File(ratchetPath)
+                    if (!ratchetDir.exists()) {
+                        ratchetDir.mkdirs()
+                    }
+
+                    // Serialize ratchet data with msgpack: {"ratchet": bytes, "received": timestamp}
+                    val buffer = ByteArrayOutputStream()
+                    val packer = MessagePack.newDefaultPacker(buffer)
+                    packer.packMapHeader(2)
+                    packer.packString("ratchet")
+                    packer.packBinaryHeader(ratchet.size)
+                    packer.writePayload(ratchet)
+                    packer.packString("received")
+                    // Store as seconds (like Python) for compatibility
+                    packer.packDouble(timestamp / 1000.0)
+                    packer.close()
+
+                    // Write atomically
+                    val hexHash = destHash.toHexString()
+                    val outFile = File(ratchetDir, "$hexHash.out")
+                    val finalFile = File(ratchetDir, hexHash)
+                    outFile.writeBytes(buffer.toByteArray())
+                    outFile.renameTo(finalFile)
+                } finally {
+                    ratchetPersistLock.unlock()
+                }
+            } catch (e: Exception) {
+                println("Could not persist ratchet for ${destHash.toHexString()}: ${e.message}")
             }
         }
 
         /**
          * Get the most recent ratchet for a destination.
+         * Checks in-memory cache first, then tries to load from disk.
          *
          * @param destHash The destination hash
          * @return The most recent ratchet, or null if none stored
@@ -767,14 +830,88 @@ class Identity private constructor(
             val key = destHash.toKey()
             val now = System.currentTimeMillis()
 
+            // Check in-memory cache first
             synchronized(destinationRatchets) {
-                val entries = destinationRatchets[key] ?: return null
+                val entries = destinationRatchets[key]
+                if (entries != null) {
+                    // Clean expired entries
+                    entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+                    val ratchet = entries.firstOrNull()?.ratchet?.copyOf()
+                    if (ratchet != null) {
+                        return ratchet
+                    }
+                }
+            }
 
-                // Clean expired entries
-                entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
+            // Try to load from disk
+            return loadRatchetFromDisk(destHash)
+        }
 
-                // Return most recent (first in list)
-                return entries.firstOrNull()?.ratchet?.copyOf()
+        /**
+         * Load a ratchet from disk if it exists and is not expired.
+         */
+        private fun loadRatchetFromDisk(destHash: ByteArray): ByteArray? {
+            try {
+                val hexHash = destHash.toHexString()
+                val ratchetFile = File(ratchetPath, hexHash)
+
+                if (!ratchetFile.exists()) {
+                    return null
+                }
+
+                val unpacker = MessagePack.newDefaultUnpacker(ratchetFile.readBytes())
+                val mapSize = unpacker.unpackMapHeader()
+
+                var ratchet: ByteArray? = null
+                var received: Double? = null
+
+                repeat(mapSize) {
+                    val keyName = unpacker.unpackString()
+                    when (keyName) {
+                        "ratchet" -> {
+                            val len = unpacker.unpackBinaryHeader()
+                            ratchet = ByteArray(len)
+                            unpacker.readPayload(ratchet!!)
+                        }
+                        "received" -> {
+                            received = unpacker.unpackDouble()
+                        }
+                        else -> {
+                            // Skip unknown key
+                            unpacker.skipValue()
+                        }
+                    }
+                }
+                unpacker.close()
+
+                // Validate ratchet
+                if (ratchet == null || ratchet!!.size != RnsConstants.KEY_SIZE) {
+                    println("Invalid ratchet data for ${destHash.toHexString()}")
+                    return null
+                }
+
+                // Check if expired
+                val now = System.currentTimeMillis()
+                val receivedMs = ((received ?: 0.0) * 1000).toLong()
+                if (now - receivedMs > RATCHET_EXPIRY) {
+                    // Expired, delete file
+                    ratchetFile.delete()
+                    return null
+                }
+
+                // Add to in-memory cache
+                val key = destHash.toKey()
+                synchronized(destinationRatchets) {
+                    val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
+                    if (!entries.any { it.ratchet.contentEquals(ratchet!!) }) {
+                        entries.add(0, RatchetEntry(ratchet!!.copyOf(), receivedMs))
+                    }
+                }
+
+                return ratchet!!.copyOf()
+            } catch (e: Exception) {
+                println("Error loading ratchet for ${destHash.toHexString()}: ${e.message}")
+                return null
             }
         }
 
@@ -813,11 +950,14 @@ class Identity private constructor(
         }
 
         /**
-         * Clean all expired ratchets from storage.
-         * Should be called periodically to free memory.
+         * Clean all expired ratchets from memory and disk.
+         * Should be called periodically to free memory and disk space.
          */
         fun cleanRatchets() {
+            println("Cleaning ratchets...")
             val now = System.currentTimeMillis()
+
+            // Clean in-memory cache
             synchronized(destinationRatchets) {
                 val iterator = destinationRatchets.entries.iterator()
                 while (iterator.hasNext()) {
@@ -832,6 +972,74 @@ class Identity private constructor(
                         iterator.remove()
                     }
                 }
+            }
+
+            // Clean disk
+            cleanRatchetsFromDisk()
+        }
+
+        /**
+         * Clean expired ratchet files from disk.
+         */
+        private fun cleanRatchetsFromDisk() {
+            try {
+                val ratchetDir = File(ratchetPath)
+                if (!ratchetDir.isDirectory) {
+                    return
+                }
+
+                val now = System.currentTimeMillis()
+                val files = ratchetDir.listFiles() ?: return
+
+                for (file in files) {
+                    // Skip temp files (will be cleaned up or completed)
+                    if (file.name.endsWith(".out")) {
+                        continue
+                    }
+
+                    try {
+                        val unpacker = MessagePack.newDefaultUnpacker(file.readBytes())
+                        val mapSize = unpacker.unpackMapHeader()
+
+                        var received: Double? = null
+                        var ratchetSize = 0
+
+                        repeat(mapSize) {
+                            val keyName = unpacker.unpackString()
+                            when (keyName) {
+                                "ratchet" -> {
+                                    ratchetSize = unpacker.unpackBinaryHeader()
+                                    // Skip the binary content
+                                    unpacker.readPayload(ByteArray(ratchetSize))
+                                }
+                                "received" -> {
+                                    received = unpacker.unpackDouble()
+                                }
+                                else -> {
+                                    unpacker.skipValue()
+                                }
+                            }
+                        }
+                        unpacker.close()
+
+                        // Check if expired or corrupted
+                        val receivedMs = ((received ?: 0.0) * 1000).toLong()
+                        val isExpired = now - receivedMs > RATCHET_EXPIRY
+                        val isCorrupted = ratchetSize != RnsConstants.KEY_SIZE
+
+                        if (isExpired || isCorrupted) {
+                            if (isCorrupted) {
+                                println("Removing corrupted ratchet file: ${file.name}")
+                            }
+                            file.delete()
+                        }
+                    } catch (e: Exception) {
+                        println("Error reading ratchet file ${file.name}, removing: ${e.message}")
+                        file.delete()
+                    }
+                }
+            } catch (e: Exception) {
+                println("Error cleaning ratchets from disk: ${e.message}")
             }
         }
     }

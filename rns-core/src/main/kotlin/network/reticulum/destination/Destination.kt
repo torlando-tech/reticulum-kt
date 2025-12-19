@@ -1232,63 +1232,74 @@ class Destination private constructor(
 
     /**
      * Check if a path response with this tag was recently processed.
-     * Returns true if duplicate, false if new (and stores it).
+     * Returns true if duplicate with cached data, false if new.
      *
      * @param tag The path response tag to check
      * @return true if duplicate, false if new
      */
     fun isDuplicatePathResponse(tag: ByteArray): Boolean {
         pathResponseLock.withLock {
-            val now = System.currentTimeMillis()
+            cleanStalePathResponses()
 
-            // Clean expired tags
-            val staleKeys = pathResponses.entries
-                .filter { now - it.value.first > PR_TAG_WINDOW }
-                .map { it.key }
-                .toList()
-
-            staleKeys.forEach { pathResponses.remove(it) }
-
-            // Check if tag exists
+            // Check if tag exists with non-empty cached data
             val key = tag.toKey()
-            if (pathResponses.containsKey(key)) {
-                return true  // Duplicate
-            }
-
-            // Store new tag with current timestamp (announce_data will be filled later if needed)
-            pathResponses[key] = Pair(now, ByteArray(0))
-            return false
+            val cached = pathResponses[key]
+            return cached != null && cached.second.isNotEmpty()
         }
     }
 
     /**
-     * Create and send an announce packet for this destination.
+     * Get cached announce data for a path response tag if available.
      *
-     * Announces broadcast the destination's public keys and optional application data
-     * to the network. Only SINGLE/IN destinations can announce.
-     *
-     * @param appData Optional application-specific data to include in the announce
-     * @param pathResponse Whether this is a path response (used internally by Transport)
-     * @param tag Optional tag for path response deduplication
-     * @param send If true, send the packet immediately; if false, return the packet
-     * @return The announce Packet if send=false, null otherwise
-     * @throws IllegalStateException if destination cannot announce
+     * @param tag The path response tag
+     * @return Cached announce data, or null if not available
      */
-    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, tag: ByteArray? = null, send: Boolean = true): network.reticulum.packet.Packet? {
-        require(type == DestinationType.SINGLE) { "Only SINGLE destination types can be announced" }
-        require(direction == DestinationDirection.IN) { "Only IN destination types can be announced" }
-
-        val id = identity ?: throw IllegalStateException("Cannot announce destination without identity")
-        require(id.hasPrivateKey) { "Cannot announce destination without private key" }
-
-        // Check for duplicate path response
-        if (pathResponse && tag != null) {
-            if (isDuplicatePathResponse(tag)) {
-                // Skip duplicate path response
-                return null
+    fun getCachedPathResponse(tag: ByteArray): ByteArray? {
+        pathResponseLock.withLock {
+            cleanStalePathResponses()
+            val key = tag.toKey()
+            val cached = pathResponses[key]
+            return if (cached != null && cached.second.isNotEmpty()) {
+                cached.second.copyOf()
+            } else {
+                null
             }
         }
+    }
 
+    /**
+     * Store announce data for a path response tag.
+     *
+     * @param tag The path response tag
+     * @param announceData The announce data to cache
+     */
+    fun cachePathResponse(tag: ByteArray, announceData: ByteArray) {
+        pathResponseLock.withLock {
+            val key = tag.toKey()
+            pathResponses[key] = Pair(System.currentTimeMillis(), announceData.copyOf())
+        }
+    }
+
+    /**
+     * Clean expired path response entries.
+     */
+    private fun cleanStalePathResponses() {
+        val now = System.currentTimeMillis()
+        val staleKeys = pathResponses.entries
+            .filter { now - it.value.first > PR_TAG_WINDOW }
+            .map { it.key }
+            .toList()
+        staleKeys.forEach { pathResponses.remove(it) }
+    }
+
+    /**
+     * Generate announce data for this destination.
+     *
+     * @param id The identity to use for signing
+     * @param appData Optional application data to include
+     * @return Pair of (announceData, hasRatchet)
+     */
+    private fun generateAnnounceData(id: Identity, appData: ByteArray?): Pair<ByteArray, Boolean> {
         // Generate random hash component (5 random bytes + 5 timestamp bytes)
         val randomPart = Hashes.getRandomHash().copyOf(5)
         val timestamp = System.currentTimeMillis() / 1000 // Convert to seconds
@@ -1334,6 +1345,62 @@ class Destination private constructor(
             publicKey + nameHash + randomHash + ratchet + signature + (actualAppData ?: byteArrayOf())
         } else {
             publicKey + nameHash + randomHash + signature + (actualAppData ?: byteArrayOf())
+        }
+
+        return Pair(announceData, hasRatchet)
+    }
+
+    /**
+     * Create and send an announce packet for this destination.
+     *
+     * Announces broadcast the destination's public keys and optional application data
+     * to the network. Only SINGLE/IN destinations can announce.
+     *
+     * @param appData Optional application-specific data to include in the announce
+     * @param pathResponse Whether this is a path response (used internally by Transport)
+     * @param tag Optional tag for path response deduplication
+     * @param send If true, send the packet immediately; if false, return the packet
+     * @return The announce Packet if send=false, null otherwise
+     * @throws IllegalStateException if destination cannot announce
+     */
+    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, tag: ByteArray? = null, send: Boolean = true): network.reticulum.packet.Packet? {
+        require(type == DestinationType.SINGLE) { "Only SINGLE destination types can be announced" }
+        require(direction == DestinationDirection.IN) { "Only IN destination types can be announced" }
+
+        val id = identity ?: throw IllegalStateException("Cannot announce destination without identity")
+        require(id.hasPrivateKey) { "Cannot announce destination without private key" }
+
+        // For path responses with a tag, check for cached announce data
+        val announceData: ByteArray
+        val hasRatchet: Boolean
+
+        if (pathResponse && tag != null) {
+            val cachedData = getCachedPathResponse(tag)
+            if (cachedData != null) {
+                // Use cached announce data for multi-path support
+                println("Using cached announce data for path response with tag ${tag.toHexString()}")
+                announceData = cachedData
+                // Determine hasRatchet from cached data - if ratchets are enabled, assume it has one
+                hasRatchet = ratchetsEnabled && ratchets.isNotEmpty()
+            } else {
+                // Generate new announce data
+                val result = generateAnnounceData(id, appData)
+                announceData = result.first
+                hasRatchet = result.second
+
+                // Cache the announce data for this tag
+                cachePathResponse(tag, announceData)
+            }
+        } else {
+            // Generate new announce data
+            val result = generateAnnounceData(id, appData)
+            announceData = result.first
+            hasRatchet = result.second
+
+            // Cache for path responses with a tag
+            if (tag != null) {
+                cachePathResponse(tag, announceData)
+            }
         }
 
         // Determine context and context flag
