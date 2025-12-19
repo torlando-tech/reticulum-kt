@@ -17,6 +17,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
 import network.reticulum.packet.Packet
+import network.reticulum.packet.PacketReceipt
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -167,6 +168,10 @@ object Transport {
 
     /** Pending receipts: packet_hash -> ProofCallback. */
     private val pendingReceipts = ConcurrentHashMap<ByteArrayKey, ProofCallback>()
+
+    /** All outgoing packet receipts for timeout tracking. */
+    private val receipts = CopyOnWriteArrayList<PacketReceipt>()
+    private var receiptsLastChecked: Long = 0
 
     /** Announce timing per destination: dest_hash -> allowed_at timestamp. */
     private val announceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
@@ -353,6 +358,24 @@ object Transport {
     fun findDestination(hash: ByteArray): Destination? {
         val key = hash.toKey()
         return destinations.find { it.hash.toKey() == key }
+    }
+
+    // ===== Receipt Tracking =====
+
+    /**
+     * Register a packet receipt for timeout tracking.
+     * Called automatically when packets are sent with createReceipt=true.
+     */
+    fun registerReceipt(receipt: PacketReceipt) {
+        receipts.add(receipt)
+    }
+
+    /**
+     * Find a receipt by packet hash.
+     */
+    fun findReceipt(packetHash: ByteArray): PacketReceipt? {
+        val key = packetHash.toKey()
+        return receipts.find { it.hash.toKey() == key }
     }
 
     // ===== Announce Handlers =====
@@ -2020,8 +2043,8 @@ object Transport {
                     log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
                     transmit(outboundInterface, packet.raw ?: packet.pack())
                 }
-                // Mark link as validated (don't remove yet - may be needed for more traffic)
-                // The entry will be cleaned up by timeout
+                // Mark link as validated
+                linkEntry.validated = true
                 return
             } else {
                 // Debug: show what's in the link table
@@ -2309,6 +2332,12 @@ object Transport {
         // Update traffic speed
         updateTrafficSpeed(now)
 
+        // Check receipt timeouts
+        if (now - receiptsLastChecked > TransportConstants.RECEIPTS_CHECK_INTERVAL) {
+            checkReceiptTimeouts()
+            receiptsLastChecked = now
+        }
+
         // Cull stale table entries
         if (now - tablesLastCulled > TransportConstants.TABLES_CULL_INTERVAL) {
             cullTables()
@@ -2320,6 +2349,29 @@ object Transport {
             packetHashlistPrev.clear()
             hashlistLastCleaned = now
         }
+    }
+
+    /**
+     * Check receipt timeouts and cull old receipts.
+     * Matches Python RNS behavior.
+     */
+    private fun checkReceiptTimeouts() {
+        // Cull excess receipts (oldest first)
+        while (receipts.size > TransportConstants.MAX_RECEIPTS) {
+            val culled = receipts.removeAt(0)
+            // Force timeout with CULLED status
+            culled.checkTimeout()
+        }
+
+        // Check all receipts for timeout
+        val toRemove = mutableListOf<PacketReceipt>()
+        for (receipt in receipts) {
+            receipt.checkTimeout()
+            if (receipt.status != PacketReceipt.SENT) {
+                toRemove.add(receipt)
+            }
+        }
+        receipts.removeAll(toRemove)
     }
 
     /**
@@ -2361,11 +2413,29 @@ object Transport {
     }
 
     private fun cullTables() {
+        val now = System.currentTimeMillis()
+
         // Remove expired path entries
         pathTable.entries.removeIf { it.value.isExpired() }
 
         // Remove expired reverse entries
         reverseTable.entries.removeIf { it.value.isExpired() }
+
+        // Remove unvalidated link entries that have timed out
+        // Validated entries are kept longer (until general expiry)
+        linkTable.entries.removeIf { entry ->
+            val linkEntry = entry.value
+            if (!linkEntry.validated && now > linkEntry.proofTimeout) {
+                log("Removing unvalidated link entry: ${entry.key}")
+                true
+            } else if (linkEntry.validated &&
+                       now - linkEntry.timestamp > TransportConstants.LINK_TIMEOUT) {
+                // Also clean up old validated entries
+                true
+            } else {
+                false
+            }
+        }
 
         // Remove expired tunnels
         cleanExpiredTunnels()

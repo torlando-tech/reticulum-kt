@@ -62,6 +62,9 @@ object TransportConstants {
     /** Link proof timeout in milliseconds (10 minutes). */
     const val LINK_PROOF_TIMEOUT = 10L * 60 * 1000
 
+    /** Link table entry timeout for validated links (1 hour). */
+    const val LINK_TIMEOUT = 60L * 60 * 1000
+
     /** Destination table entry timeout (1 week in milliseconds). */
     const val DESTINATION_TIMEOUT = 7L * 24 * 60 * 60 * 1000
 
