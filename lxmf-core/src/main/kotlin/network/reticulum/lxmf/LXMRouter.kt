@@ -12,6 +12,7 @@ import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.transport.Transport
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -292,6 +293,9 @@ class LXMRouter(
             val appData = packAnnounceAppData(displayName, stampCost)
             destination.setDefaultAppData(appData)
         }
+
+        // Register with Transport so it can receive packets
+        Transport.registerDestination(destination)
 
         // Store the delivery destination
         val deliveryDest = DeliveryDestination(
