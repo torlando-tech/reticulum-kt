@@ -130,6 +130,14 @@ class LXMessage private constructor(
     /** Callback when message delivery fails */
     var failedCallback: ((LXMessage) -> Unit)? = null
 
+    // ===== Delivery Tracking =====
+
+    /** Number of delivery attempts made */
+    var deliveryAttempts: Int = 0
+
+    /** Next delivery attempt timestamp (milliseconds) */
+    var nextDeliveryAttempt: Long? = null
+
     /**
      * Pack the message into wire format.
      *
