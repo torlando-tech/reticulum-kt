@@ -181,4 +181,192 @@ class LXMRouterTest {
 
         assertTrue(message.deliveryAttempts > 0)
     }
+
+    @Test
+    fun `test message representation is PACKET for small messages`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        // Small message - should be PACKET representation
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Short message",
+            title = "Test"
+        )
+
+        router.handleOutbound(message)
+
+        assertEquals(MessageRepresentation.PACKET, message.representation)
+    }
+
+    @Test
+    fun `test message representation is RESOURCE for large messages`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        // Large message - should be RESOURCE representation
+        val largeContent = "X".repeat(500)  // Well over link packet limit
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = largeContent,
+            title = "Large"
+        )
+
+        router.handleOutbound(message)
+
+        assertEquals(MessageRepresentation.RESOURCE, message.representation)
+    }
+
+    @Test
+    fun `test direct delivery method increments attempts`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test",
+            desiredMethod = DeliveryMethod.DIRECT
+        )
+
+        assertEquals(DeliveryMethod.DIRECT, message.desiredMethod)
+        assertEquals(0, message.deliveryAttempts)
+
+        router.handleOutbound(message)
+        router.processOutbound()
+
+        // Direct delivery without path/link should increment attempts
+        assertEquals(1, message.deliveryAttempts)
+
+        // Process again
+        router.processOutbound()
+
+        // May retry depending on timing
+        assertTrue(message.deliveryAttempts >= 1)
+    }
+
+    @Test
+    fun `test message state transitions`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test"
+        )
+
+        // Initially GENERATING
+        assertEquals(MessageState.GENERATING, message.state)
+
+        // After handleOutbound - should be OUTBOUND
+        router.handleOutbound(message)
+        assertEquals(MessageState.OUTBOUND, message.state)
+    }
+
+    @Test
+    fun `test max delivery attempts results in failure`() = runBlocking {
+        val destIdentity = Identity.create()
+
+        val sourceDestination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val destDestination = Destination.create(
+            identity = destIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val message = LXMessage.create(
+            destination = destDestination,
+            source = sourceDestination,
+            content = "Test",
+            title = "Test",
+            desiredMethod = DeliveryMethod.DIRECT
+        )
+
+        // Set delivery attempts to max
+        message.deliveryAttempts = LXMRouter.MAX_DELIVERY_ATTEMPTS
+
+        router.handleOutbound(message)
+
+        // Force immediate retry by clearing next attempt time
+        message.nextDeliveryAttempt = null
+
+        router.processOutbound()
+
+        // Should be FAILED after exceeding max attempts
+        assertEquals(MessageState.FAILED, message.state)
+    }
 }

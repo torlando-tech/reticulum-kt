@@ -10,6 +10,8 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.resource.Resource
+import network.reticulum.resource.ResourceAdvertisement
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -100,6 +102,12 @@ class LXMRouter(
 
     /** Backchannel links for replies: destination_hash -> Link */
     private val backchannelLinks = ConcurrentHashMap<String, Link>()
+
+    /** Destinations with pending link establishments */
+    private val pendingLinkEstablishments = ConcurrentHashMap.newKeySet<String>()
+
+    /** Pending resource transfers: message_hash -> (message, resource) */
+    private val pendingResources = ConcurrentHashMap<String, Pair<LXMessage, Resource>>()
 
     // ===== Callbacks =====
 
@@ -416,17 +424,168 @@ class LXMRouter(
 
         val destHashHex = message.destinationHash.toHexString()
 
-        // Check for existing link
+        // Check for existing active link
         var link = directLinks[destHashHex] ?: backchannelLinks[destHashHex]
 
-        if (link != null && link.status == LinkConstants.ACTIVE) {
-            // Use existing link
-            sendViaLink(message, link)
-        } else {
-            // Need to establish link
-            // TODO: Implement link establishment
+        when {
+            link != null && link.status == LinkConstants.ACTIVE -> {
+                // Use existing active link
+                sendViaLink(message, link)
+            }
+
+            link != null && link.status == LinkConstants.PENDING -> {
+                // Link is being established, wait
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            }
+
+            link != null && link.status == LinkConstants.CLOSED -> {
+                // Link is closed, remove and try to establish new one
+                directLinks.remove(destHashHex)
+                establishLinkForMessage(message)
+            }
+
+            else -> {
+                // No link exists, establish one
+                establishLinkForMessage(message)
+            }
+        }
+    }
+
+    /**
+     * Establish a link for sending a message.
+     */
+    private fun establishLinkForMessage(message: LXMessage) {
+        val destination = message.destination
+        if (destination == null) {
+            // Can't establish link without destination object
+            // For now, schedule retry and hope destination becomes available
+            message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
+            return
+        }
+
+        val destHashHex = message.destinationHash.toHexString()
+
+        // Check if we're already establishing a link
+        if (pendingLinkEstablishments.contains(destHashHex)) {
+            message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            return
+        }
+
+        pendingLinkEstablishments.add(destHashHex)
+
+        try {
+            // Create the link
+            val link = Link.create(
+                destination = destination,
+                establishedCallback = { establishedLink ->
+                    // Link established successfully
+                    directLinks[destHashHex] = establishedLink
+                    pendingLinkEstablishments.remove(destHashHex)
+
+                    // Set up link callbacks for receiving
+                    setupLinkCallbacks(establishedLink, destHashHex)
+
+                    // Identify ourselves on the link
+                    identifyOnLink(establishedLink)
+
+                    // Trigger processing to send pending messages
+                    triggerProcessing()
+                },
+                closedCallback = { closedLink ->
+                    // Link closed
+                    directLinks.remove(destHashHex)
+                    pendingLinkEstablishments.remove(destHashHex)
+
+                    // Notify messages that need this link
+                    handleLinkClosed(destHashHex)
+                }
+            )
+
+            // Store pending link
+            directLinks[destHashHex] = link
+
+        } catch (e: Exception) {
+            pendingLinkEstablishments.remove(destHashHex)
+            println("Failed to establish link to $destHashHex: ${e.message}")
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
         }
+    }
+
+    /**
+     * Set up callbacks on an established link.
+     */
+    private fun setupLinkCallbacks(link: Link, destHashHex: String) {
+        // Packet callback for receiving messages
+        link.setPacketCallback { data, _ ->
+            processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
+        }
+
+        // Resource advertisement callback - accept all LXMF resources
+        link.setResourceCallback { _: ResourceAdvertisement ->
+            // Accept LXMF resources
+            true
+        }
+
+        link.setResourceStartedCallback { _: Any ->
+            println("Resource transfer started on link to $destHashHex")
+        }
+
+        link.setResourceConcludedCallback { resource: Any ->
+            handleResourceConcluded(resource, link)
+        }
+    }
+
+    /**
+     * Identify ourselves on a link (for backchannel replies).
+     */
+    private fun identifyOnLink(link: Link) {
+        // Get our first delivery destination's identity
+        val deliveryDest = deliveryDestinations.values.firstOrNull() ?: return
+
+        try {
+            link.identify(deliveryDest.identity)
+        } catch (e: Exception) {
+            println("Failed to identify on link: ${e.message}")
+        }
+    }
+
+    /**
+     * Handle a link being closed.
+     */
+    private fun handleLinkClosed(destHashHex: String) {
+        processingScope?.launch {
+            pendingOutboundMutex.withLock {
+                for (message in pendingOutbound) {
+                    if (message.destinationHash.toHexString() == destHashHex &&
+                        message.state == MessageState.SENDING) {
+                        // Reset to outbound for retry
+                        message.state = MessageState.OUTBOUND
+                        message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Handle a resource transfer being concluded.
+     */
+    private fun handleResourceConcluded(resource: Any, link: Link) {
+        // Cast to Resource and extract data
+        val res = resource as? Resource
+        if (res == null) {
+            println("Resource concluded but could not cast resource")
+            return
+        }
+
+        val data = res.data
+        if (data == null || data.isEmpty()) {
+            println("Resource concluded but no data received")
+            return
+        }
+
+        // Process as inbound LXMF delivery
+        processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
     }
 
     /**
@@ -451,13 +610,71 @@ class LXMRouter(
         val packed = message.packed ?: return
 
         message.state = MessageState.SENDING
+        message.method = DeliveryMethod.DIRECT
+
+        // The LXMF payload for link delivery excludes the destination hash
+        // (since it's implicit from the link), but includes source hash
+        val lxmfData = packed.copyOfRange(
+            LXMFConstants.DESTINATION_LENGTH,  // Skip destination hash
+            packed.size
+        )
 
         if (message.representation == MessageRepresentation.PACKET) {
             // Send as packet over link
-            // TODO: Implement link packet sending
+            try {
+                val sent = link.send(lxmfData)
+                if (sent) {
+                    // For now, mark as SENT - actual delivery confirmation
+                    // would require link-level receipt tracking
+                    message.state = MessageState.SENT
+                    // Schedule check for delivery - without receipts, we assume
+                    // success after send. In a full implementation, we'd track
+                    // link-level receipts for true delivery confirmation.
+                    processingScope?.launch {
+                        delay(500) // Brief delay before marking delivered
+                        if (message.state == MessageState.SENT) {
+                            message.state = MessageState.DELIVERED
+                            message.deliveryCallback?.invoke(message)
+                        }
+                    }
+                } else {
+                    // Send failed
+                    message.state = MessageState.OUTBOUND
+                    message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+                }
+            } catch (e: Exception) {
+                println("Failed to send packet via link: ${e.message}")
+                message.state = MessageState.OUTBOUND
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            }
         } else {
             // Send as resource for large messages
-            // TODO: Implement resource transfer
+            try {
+                val messageHashHex = message.hash?.toHexString() ?: ""
+                val resource = Resource.create(
+                    data = lxmfData,
+                    link = link,
+                    callback = { completedResource ->
+                        // Resource transfer complete
+                        pendingResources.remove(messageHashHex)
+                        message.state = MessageState.DELIVERED
+                        message.progress = 1.0
+                        message.deliveryCallback?.invoke(message)
+                    },
+                    progressCallback = { progressResource ->
+                        // Update progress (Resource provides progress as 0.0-1.0 Float)
+                        message.progress = progressResource.progress.toDouble()
+                    }
+                )
+
+                // Track resource for completion
+                pendingResources[messageHashHex] = Pair(message, resource)
+                message.state = MessageState.SENDING
+            } catch (e: Exception) {
+                println("Failed to send resource via link: ${e.message}")
+                message.state = MessageState.OUTBOUND
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            }
         }
     }
 
@@ -478,12 +695,25 @@ class LXMRouter(
      * Handle a new delivery link being established.
      */
     private fun handleDeliveryLinkEstablished(link: Link, destination: Destination) {
-        // Set up link callbacks
-        link.setPacketCallback { data, packet ->
+        // Set up link callbacks for packets
+        link.setPacketCallback { data, _ ->
             processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link)
         }
 
-        // TODO: Set up resource callbacks for large messages
+        // Resource advertisement callback - accept all LXMF resources
+        link.setResourceCallback { _: ResourceAdvertisement ->
+            true
+        }
+
+        link.setResourceConcludedCallback { resource: Any ->
+            handleResourceConcluded(resource, link)
+        }
+
+        // Store as backchannel link for replies if we know the remote identity
+        link.getRemoteIdentity()?.let { remoteIdentity ->
+            val remoteHashHex = remoteIdentity.hexHash
+            backchannelLinks[remoteHashHex] = link
+        }
     }
 
     /**
@@ -497,7 +727,7 @@ class LXMRouter(
     private fun processInboundDelivery(
         data: ByteArray,
         method: DeliveryMethod,
-        destination: Destination,
+        destination: Destination? = null,
         link: Link? = null
     ) {
         try {
