@@ -7,7 +7,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
-import network.reticulum.interfaces.tcp.TCPClientInterface
+import network.reticulum.interfaces.auto.AutoInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMessage
@@ -21,47 +21,36 @@ import java.time.format.DateTimeFormatter
  * LXMF Echo Bot - A simple bot that echoes back any message it receives.
  *
  * Features:
- * - Connects to the Reticulum testnet via TCP
+ * - Uses AutoInterface for automatic peer discovery on local network
  * - Advertises itself as "Kotlin Echo Bot"
  * - Announces every 60 seconds
  * - Replies to every incoming message with the exact same content
  *
  * Usage:
- *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfEchoBotKt [host] [port]
- *
- * Defaults:
- *   host: amsterdam.connect.reticulum.network
- *   port: 4965
+ *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfEchoBotKt
  */
 
 private const val ANNOUNCE_INTERVAL_MS = 60_000L
-private const val DEFAULT_HOST = "amsterdam.connect.reticulum.network"
-private const val DEFAULT_PORT = 4965
 private const val DISPLAY_NAME = "Kotlin Echo Bot"
+private const val IDENTITY_FILE = "echobot_identity"
 
 fun main(args: Array<String>) {
-    val host = args.getOrNull(0) ?: DEFAULT_HOST
-    val port = args.getOrNull(1)?.toIntOrNull() ?: DEFAULT_PORT
-
     println("=".repeat(60))
-    println("LXMF Echo Bot - Kotlin Implementation")
+    println("LXMF Echo Bot - Kotlin Implementation (AutoInterface)")
     println("=".repeat(60))
     println()
 
-    val bot = LxmfEchoBot(host, port)
+    val bot = LxmfEchoBot()
     bot.run()
 }
 
-class LxmfEchoBot(
-    private val targetHost: String,
-    private val targetPort: Int
-) {
+class LxmfEchoBot {
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         .withZone(ZoneId.systemDefault())
 
     private lateinit var identity: Identity
     private lateinit var router: LXMRouter
-    private lateinit var tcpInterface: TCPClientInterface
+    private lateinit var autoInterface: AutoInterface
     private lateinit var myDestination: Destination
 
     @Volatile
@@ -97,29 +86,22 @@ class LxmfEchoBot(
         // Start Reticulum with transport enabled
         Reticulum.start(enableTransport = true)
 
-        log("Connecting to $targetHost:$targetPort...")
+        log("Starting AutoInterface for peer discovery...")
 
-        // Create TCP interface to testnet
-        tcpInterface = TCPClientInterface(
-            name = "Testnet-TCP",
-            targetHost = targetHost,
-            targetPort = targetPort
-        )
+        // Create AutoInterface for automatic peer discovery
+        autoInterface = AutoInterface(name = "EchoBot AutoInterface")
+        autoInterface.start()
+        Transport.registerInterface(autoInterface.toRef())
 
-        // Wire up the interface to Transport
-        val ifaceRef = tcpInterface.toRef()
-        tcpInterface.onPacketReceived = { data, _ ->
-            Transport.inbound(data, ifaceRef)
+        log("Loading or creating identity...")
+
+        // Try to load existing identity, or create a new one
+        identity = Identity.fromFile(IDENTITY_FILE) ?: run {
+            log("No existing identity found, creating new one...")
+            val newIdentity = Identity.create()
+            newIdentity.toFile(IDENTITY_FILE)
+            newIdentity
         }
-
-        // Start interface and register with Transport
-        tcpInterface.start()
-        Transport.registerInterface(ifaceRef)
-
-        log("Creating identity...")
-
-        // Create a new identity for this bot
-        identity = Identity.create()
 
         log("Creating LXMF router...")
 
@@ -140,7 +122,10 @@ class LxmfEchoBot(
         log("Echo Bot initialized!")
         log("  Address: <${myDestination.hexHash}>")
         log("  Display name: $DISPLAY_NAME")
-        log("  Connected to: $targetHost:$targetPort")
+
+        // Wait briefly for AutoInterface to discover peers
+        log("Waiting for peer discovery...")
+        Thread.sleep(3000)
 
         // Send initial announce
         log("Sending initial announce...")
@@ -154,10 +139,29 @@ class LxmfEchoBot(
         log("  Content: ${message.content.ifEmpty { "(empty)" }}")
 
         // Try to recall sender's identity
-        val senderIdentity = Identity.recall(message.sourceHash)
+        var senderIdentity = Identity.recall(message.sourceHash)
         if (senderIdentity == null) {
-            log("  Cannot echo: sender identity not known")
-            return
+            log("  Sender identity not known, requesting path...")
+
+            // Request a path to the sender - this should trigger network to send their announce
+            Transport.requestPath(message.sourceHash) { found ->
+                if (found) {
+                    log("  Path request succeeded for <$senderHash>")
+                } else {
+                    log("  Path request timed out for <$senderHash>")
+                }
+            }
+
+            // Wait briefly for the announce to arrive (path requests can take a few seconds)
+            Thread.sleep(3000)
+
+            // Try again after path request
+            senderIdentity = Identity.recall(message.sourceHash)
+            if (senderIdentity == null) {
+                log("  Cannot echo: sender identity still not known after path request")
+                log("  (Note: If you're on the same hub, announces may not be forwarded between direct clients)")
+                return
+            }
         }
 
         // Create outbound destination to sender
@@ -170,12 +174,13 @@ class LxmfEchoBot(
         )
 
         // Create reply with exact same content
+        // Use OPPORTUNISTIC delivery - single encrypted packet, no link required
         val reply = LXMessage.create(
             destination = replyDestination,
             source = myDestination,
             content = message.content,
             title = message.title,
-            desiredMethod = DeliveryMethod.DIRECT
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC
         )
 
         // Send via coroutine
@@ -228,7 +233,7 @@ class LxmfEchoBot(
         println("Echo Bot Status:")
         println("  Address: <${myDestination.hexHash}>")
         println("  Display name: $DISPLAY_NAME")
-        println("  Interface: ${if (tcpInterface.online.get()) "connected" else "connecting..."}")
+        println("  Interface: AutoInterface (peer discovery enabled)")
         println("-".repeat(40))
         println()
     }
@@ -244,8 +249,8 @@ class LxmfEchoBot(
             router.stop()
         }
 
-        if (::tcpInterface.isInitialized) {
-            tcpInterface.detach()
+        if (::autoInterface.isInitialized) {
+            autoInterface.detach()
         }
 
         Reticulum.stop()

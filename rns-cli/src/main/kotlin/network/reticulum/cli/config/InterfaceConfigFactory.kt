@@ -2,6 +2,7 @@ package network.reticulum.cli.config
 
 import network.reticulum.cli.logging.Logger
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.auto.AutoInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
@@ -34,10 +35,7 @@ object InterfaceConfigFactory {
                 Logger.warning("UDPInterface is not yet implemented")
                 null
             }
-            InterfaceType.AUTO -> {
-                Logger.warning("AutoInterface is not yet implemented")
-                null
-            }
+            InterfaceType.AUTO -> createAutoInterface(config)
             InterfaceType.RNODE -> {
                 Logger.warning("RNodeInterface is not yet implemented")
                 null
@@ -124,6 +122,25 @@ object InterfaceConfigFactory {
             name = config.name,
             bindAddress = listenIp,
             bindPort = listenPort
+        )
+    }
+
+    /**
+     * Create an AutoInterface for local peer discovery.
+     */
+    private fun createAutoInterface(config: InterfaceConfig): Interface? {
+        Logger.debug("Creating AutoInterface ${config.name}")
+
+        return AutoInterface(
+            name = config.name,
+            groupId = config.groupId?.toByteArray(Charsets.UTF_8)
+                ?: network.reticulum.interfaces.auto.AutoInterfaceConstants.DEFAULT_GROUP_ID,
+            discoveryPort = config.discoveryPort
+                ?: network.reticulum.interfaces.auto.AutoInterfaceConstants.DEFAULT_DISCOVERY_PORT,
+            dataPort = config.dataPort
+                ?: network.reticulum.interfaces.auto.AutoInterfaceConstants.DEFAULT_DATA_PORT,
+            allowedDevices = config.devices,
+            ignoredDevices = config.ignoredDevices ?: emptyList()
         )
     }
 }

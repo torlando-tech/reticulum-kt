@@ -53,9 +53,28 @@ data class InterfaceConfig(
     val targetPort: Int? get() = (options["target_port"] as? Number)?.toInt()
     val listenIp: String? get() = options["listen_ip"] as? String
     val listenPort: Int? get() = (options["listen_port"] as? Number)?.toInt()
-    val devices: String? get() = options["devices"] as? String
     val mode: Int? get() = (options["selected_interface_mode"] as? Number)?.toInt()
     val bitrate: Int? get() = (options["configured_bitrate"] as? Number)?.toInt()
+
+    // AutoInterface options
+    val groupId: String? get() = options["group_id"] as? String
+    val discoveryPort: Int? get() = (options["discovery_port"] as? Number)?.toInt()
+    val dataPort: Int? get() = (options["data_port"] as? Number)?.toInt()
+    val discoveryScope: String? get() = options["discovery_scope"] as? String
+
+    @Suppress("UNCHECKED_CAST")
+    val devices: List<String>? get() = when (val d = options["devices"]) {
+        is List<*> -> d as? List<String>
+        is String -> d.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        else -> null
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val ignoredDevices: List<String>? get() = when (val d = options["ignored_devices"]) {
+        is List<*> -> d as? List<String>
+        is String -> d.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        else -> null
+    }
 }
 
 /**
