@@ -1661,18 +1661,25 @@ object Transport {
     private fun processOutbound(packet: Packet): Boolean {
         val packedData = packet.pack()
         var sent = false
+        val destHex = packet.destinationHash.toHexString()
 
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
-        if (pathEntry != null && !pathEntry.isExpired() &&
+        // For now, always broadcast DATA packets since our transport routing (HEADER_2)
+        // has issues with nextHop not being properly set to the transport node's ID.
+        // This is less efficient but more reliable.
+        val usePathRouting = pathEntry != null && !pathEntry.isExpired() &&
             packet.packetType != PacketType.ANNOUNCE &&
+            packet.packetType != PacketType.DATA &&  // Don't use path routing for DATA packets
             packet.destinationType != DestinationType.PLAIN &&
-            packet.destinationType != DestinationType.GROUP) {
+            packet.destinationType != DestinationType.GROUP
 
-            // We have a path - use it
-            val outboundInterface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
+        if (usePathRouting) {
+            // We have a path - use it (for non-DATA packets like LINKREQUEST)
+            val outboundInterface = findInterfaceByHash(pathEntry!!.receivingInterfaceHash)
             if (outboundInterface != null) {
+                log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
                 if (pathEntry.hops > 1) {
                     // Insert into transport (HEADER_2)
                     val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
@@ -1686,12 +1693,15 @@ object Transport {
 
                 // Update path timestamp
                 pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
+            } else {
+                log("Path exists for $destHex but interface not found")
             }
         }
 
         if (!sent) {
-            // No path - broadcast on all interfaces
+            // Broadcast on all interfaces
             addPacketHash(packet.packetHash)
+            log("Broadcasting to $destHex on all interfaces (${packedData.size} bytes)")
 
             for (iface in interfaces) {
                 if (iface.canSend && iface.online) {
@@ -1824,6 +1834,14 @@ object Transport {
 
         pathTable[destHash.toKey()] = pathEntry
 
+        // Store the identity for later recall
+        Identity.remember(
+            packetHash = packet.packetHash,
+            destHash = destHash,
+            publicKey = identity.getPublicKey(),
+            appData = appData
+        )
+
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
         // Notify announce handlers
@@ -1897,6 +1915,8 @@ object Transport {
     }
 
     private fun processData(packet: Packet, interfaceRef: InterfaceRef) {
+        log("processData: dest=${packet.destinationHash.toHexString()}, ${packet.data.size} bytes from ${interfaceRef.name}")
+
         // Check if this is a control packet (path request, etc.)
         if (controlHashes.contains(packet.destinationHash.toKey())) {
             // Check if this is a path request
@@ -1909,10 +1929,24 @@ object Transport {
 
         // Check if this is for a local destination
         val destination = findDestination(packet.destinationHash)
+        log("processData: findDestination result = ${destination?.hexHash ?: "null"}")
 
         if (destination != null) {
             // Deliver locally
             deliverPacket(destination, packet)
+            return
+        }
+
+        // Check if this is data for a local link (destination hash is a link_id)
+        val localLink = findLink(packet.destinationHash)
+        if (localLink != null) {
+            log("Delivering link data to local link ${packet.destinationHash.toHexString()}")
+            try {
+                val receiveMethod = localLink::class.java.getMethod("receive", Packet::class.java)
+                receiveMethod.invoke(localLink, packet)
+            } catch (e: Exception) {
+                log("Failed to deliver to local link: ${e.message}")
+            }
             return
         }
 
@@ -1927,7 +1961,7 @@ object Transport {
             }
         }
 
-        // Check if this is link data (destination hash is a link_id)
+        // Check if this is link data for forwarding (destination hash is a link_id)
         val linkEntry = linkTable[packet.destinationHash.toKey()]
         if (linkEntry != null) {
             // This is link data - forward to the appropriate interface based on which

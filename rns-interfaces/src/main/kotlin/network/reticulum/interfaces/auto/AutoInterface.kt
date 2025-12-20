@@ -586,17 +586,17 @@ class AutoInterface(
     private fun addPeer(address: String, interfaceName: String) {
         val cleanAddr = address.substringBefore('%')
 
-        // Check if already known
-        if (peers.containsKey(cleanAddr)) {
-            // Just refresh
+        // Atomic check-and-insert to prevent race condition when peer is
+        // discovered simultaneously on multiple network interfaces
+        val newPeerInfo = PeerInfo(interfaceName)
+        val existing = peers.putIfAbsent(cleanAddr, newPeerInfo)
+        if (existing != null) {
+            // Already known - just refresh
             refreshPeer(cleanAddr)
             return
         }
 
         log("Discovered peer: $cleanAddr on $interfaceName")
-
-        // Create peer info
-        peers[cleanAddr] = PeerInfo(interfaceName)
 
         // Create AutoInterfacePeer interface
         // For IPv6 link-local addresses, we need to include the scope ID (interface)
@@ -617,7 +617,13 @@ class AutoInterface(
         )
 
         peer.start()
-        spawnedPeers[cleanAddr] = peer
+
+        // Clean up any existing peer before registering new one (defensive cleanup)
+        val oldPeer = spawnedPeers.put(cleanAddr, peer)
+        oldPeer?.let {
+            log("Cleaning up stale peer interface for $cleanAddr")
+            it.detach()
+        }
 
         // Wire up to Transport
         val peerRef = peer.toRef()

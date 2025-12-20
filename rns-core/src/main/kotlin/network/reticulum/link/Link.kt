@@ -13,6 +13,7 @@ import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
+import network.reticulum.packet.PacketReceipt
 import network.reticulum.transport.Transport
 import network.reticulum.channel.Channel
 import network.reticulum.channel.ChannelOutlet
@@ -261,6 +262,17 @@ class Link private constructor(
 
     // Callbacks
     val callbacks = LinkCallbacks()
+
+    /**
+     * Get the peer's combined public key (X25519 + Ed25519).
+     * This can be used to create an Identity from the link peer.
+     * Returns null if peer keys are not yet loaded.
+     */
+    fun getPeerPublicKey(): ByteArray? {
+        val x25519Key = peerPub ?: return null
+        val ed25519Key = peerSigPub ?: return null
+        return x25519Key + ed25519Key
+    }
 
     // Timestamps
     private var requestTime: Long = 0
@@ -654,8 +666,18 @@ class Link private constructor(
      * Send data over the link.
      */
     fun send(data: ByteArray): Boolean {
+        return sendWithReceipt(data) != null
+    }
+
+    /**
+     * Send data over the link and return a receipt for delivery tracking.
+     *
+     * @param data The data to send
+     * @return PacketReceipt if sent successfully, null otherwise
+     */
+    fun sendWithReceipt(data: ByteArray): PacketReceipt? {
         if (status != LinkConstants.ACTIVE) {
-            return false
+            return null
         }
 
         val encrypted = encrypt(data)
@@ -663,12 +685,16 @@ class Link private constructor(
             destinationHash = linkId,
             data = encrypted,
             packetType = PacketType.DATA,
-            destinationType = DestinationType.LINK
+            destinationType = DestinationType.LINK,
+            createReceipt = true
         )
 
-        return Transport.outbound(packet).also { sent ->
-            if (sent) hadOutbound(isData = true)
+        val receipt = packet.send()
+        if (receipt != null) {
+            receipt.setLink(this)
+            hadOutbound(isData = true)
         }
+        return receipt
     }
 
     /**
@@ -1310,6 +1336,7 @@ class Link private constructor(
      * Process DATA type packets with various contexts.
      */
     private fun processDataPacket(packet: Packet) {
+        log("Processing link DATA packet: context=${packet.context}, size=${packet.data.size}")
         when (packet.context) {
             PacketContext.NONE -> processRegularData(packet)
             PacketContext.LINKIDENTIFY -> processLinkIdentify(packet)
@@ -1360,15 +1387,17 @@ class Link private constructor(
     private fun processLinkIdentify(packet: Packet) {
         val plaintext = decrypt(packet.data) ?: return
 
+        log("Processing LINKIDENTIFY packet: ${plaintext.size} bytes (expected ${RnsConstants.IDENTITY_PUBLIC_KEY_SIZE + RnsConstants.SIGNATURE_SIZE})")
+
         // Only receivers process identity packets, and format is:
-        // public_key (32 bytes) + signature (64 bytes)
-        if (!initiator && plaintext.size == RnsConstants.KEY_SIZE + RnsConstants.SIGNATURE_SIZE) {
+        // public_key (64 bytes: X25519 + Ed25519) + signature (64 bytes)
+        if (!initiator && plaintext.size == RnsConstants.IDENTITY_PUBLIC_KEY_SIZE + RnsConstants.SIGNATURE_SIZE) {
             try {
-                val publicKey = plaintext.copyOfRange(0, RnsConstants.KEY_SIZE)
+                val publicKey = plaintext.copyOfRange(0, RnsConstants.IDENTITY_PUBLIC_KEY_SIZE)
                 val signedData = linkId + publicKey
                 val signature = plaintext.copyOfRange(
-                    RnsConstants.KEY_SIZE,
-                    RnsConstants.KEY_SIZE + RnsConstants.SIGNATURE_SIZE
+                    RnsConstants.IDENTITY_PUBLIC_KEY_SIZE,
+                    RnsConstants.IDENTITY_PUBLIC_KEY_SIZE + RnsConstants.SIGNATURE_SIZE
                 )
 
                 // Load and validate the identity
@@ -1393,6 +1422,8 @@ class Link private constructor(
             } catch (e: Exception) {
                 log("Error processing link identify: ${e.message}")
             }
+        } else {
+            log("Ignoring LINKIDENTIFY: initiator=$initiator, size=${plaintext.size}")
         }
     }
 

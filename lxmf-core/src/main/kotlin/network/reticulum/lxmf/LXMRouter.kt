@@ -5,11 +5,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
+import network.reticulum.common.PacketContext
+import network.reticulum.common.PacketType
+import network.reticulum.common.TransportType
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
 import network.reticulum.transport.Transport
@@ -481,20 +485,70 @@ class LXMRouter(
 
     /**
      * Send a message opportunistically (single encrypted packet).
+     *
+     * This uses Packet.create() with the destination object, which matches
+     * how Python RNS creates packets. The Packet class handles encryption
+     * automatically based on destination type.
      */
     private fun sendOpportunisticMessage(message: LXMessage): Boolean {
         // Get the packed message data
         val packed = message.packed ?: return false
 
-        // For opportunistic delivery, we prepend the source hash
-        val data = message.sourceHash + packed.copyOfRange(
-            LXMFConstants.DESTINATION_LENGTH,
-            packed.size
+        // Get the destination - required for encryption
+        val dest = message.destination
+        if (dest == null) {
+            println("[LXMRouter] Cannot send opportunistic: no destination")
+            return false
+        }
+
+        // For opportunistic delivery, we send:
+        // - Destination hash is in the packet header
+        // - Data is: source_hash + signature + payload (everything after dest hash)
+        // - This data is encrypted by Packet.create() for the destination
+        val plainData = packed.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packed.size)
+
+        // Debug logging
+        val destPubKey = dest.identity?.getPublicKey()
+        println("[LXMRouter] sendOpportunisticMessage:")
+        println("[LXMRouter]   Destination hash: ${message.destinationHash.toHexString()}")
+        println("[LXMRouter]   Dest identity hash: ${dest.identity?.hash?.toHexString() ?: "null"}")
+        println("[LXMRouter]   Dest public key (first 8 bytes): ${destPubKey?.take(8)?.toByteArray()?.toHexString() ?: "null"}")
+        println("[LXMRouter]   Plain data size: ${plainData.size} bytes")
+        println("[LXMRouter]   Plain data (first 32 bytes): ${plainData.take(32).toByteArray().toHexString()}")
+
+        // Create the packet - Packet.create() will encrypt the data for us
+        val packet = Packet.create(
+            destination = dest,
+            data = plainData,
+            packetType = PacketType.DATA,
+            context = PacketContext.NONE,
+            transportType = TransportType.BROADCAST
         )
 
-        // TODO: Create and send packet via Transport
-        // For now, return false as Transport integration is not complete
-        return false
+        println("[LXMRouter]   Packed packet size: ${packet.raw?.size ?: packet.pack().size} bytes")
+
+        // Send via packet.send() to get receipt for delivery confirmation
+        val receipt = packet.send()
+        if (receipt != null) {
+            println("[LXMRouter] Sent opportunistic message to ${message.destinationHash.toHexString()}")
+
+            // Set up delivery confirmation callback
+            receipt.setDeliveryCallback { _ ->
+                message.state = MessageState.DELIVERED
+                message.deliveryCallback?.invoke(message)
+            }
+
+            // Set up timeout callback
+            receipt.setTimeoutCallback { _ ->
+                message.state = MessageState.FAILED
+                message.failedCallback?.invoke(message)
+            }
+
+            return true
+        } else {
+            println("[LXMRouter] Failed to send opportunistic message")
+            return false
+        }
     }
 
     /**
@@ -776,22 +830,22 @@ class LXMRouter(
         )
 
         if (message.representation == MessageRepresentation.PACKET) {
-            // Send as packet over link
+            // Send as packet over link with receipt tracking
             try {
-                val sent = link.send(lxmfData)
-                if (sent) {
-                    // For now, mark as SENT - actual delivery confirmation
-                    // would require link-level receipt tracking
+                val receipt = link.sendWithReceipt(lxmfData)
+                if (receipt != null) {
                     message.state = MessageState.SENT
-                    // Schedule check for delivery - without receipts, we assume
-                    // success after send. In a full implementation, we'd track
-                    // link-level receipts for true delivery confirmation.
-                    processingScope?.launch {
-                        delay(500) // Brief delay before marking delivered
-                        if (message.state == MessageState.SENT) {
-                            message.state = MessageState.DELIVERED
-                            message.deliveryCallback?.invoke(message)
-                        }
+
+                    // Set up delivery confirmation callback
+                    receipt.setDeliveryCallback { _ ->
+                        message.state = MessageState.DELIVERED
+                        message.deliveryCallback?.invoke(message)
+                    }
+
+                    // Set up timeout callback
+                    receipt.setTimeoutCallback { _ ->
+                        message.state = MessageState.FAILED
+                        message.failedCallback?.invoke(message)
                     }
                 } else {
                     // Send failed
@@ -840,11 +894,16 @@ class LXMRouter(
      * Handle an incoming delivery packet.
      */
     private fun handleDeliveryPacket(data: ByteArray, destination: Destination) {
-        // Determine delivery method based on context
+        println("[LXMRouter] handleDeliveryPacket called with ${data.size} bytes for ${destination.hexHash}")
+        // For OPPORTUNISTIC delivery (single packet), the data doesn't include the
+        // destination hash - we need to prepend it to match the LXMF message format.
+        // Format: [destination_hash (16)] + [source_hash (16)] + [signature (64)] + [payload]
         val method = DeliveryMethod.OPPORTUNISTIC
+        val lxmfData = destination.hash + data
+        println("[LXMRouter] Prepended dest hash, lxmfData size: ${lxmfData.size} bytes (was ${data.size})")
 
         // Process the delivery
-        processInboundDelivery(data, method, destination)
+        processInboundDelivery(lxmfData, method, destination)
     }
 
     /**
@@ -865,7 +924,34 @@ class LXMRouter(
             handleResourceConcluded(resource, link)
         }
 
-        // Store as backchannel link for replies if we know the remote identity
+        // Set up callback for when the remote peer identifies themselves
+        // This is critical for backchannel replies - the sender calls link.identify()
+        // to reveal their identity so we can reply to them
+        link.setRemoteIdentifiedCallback { _, remoteIdentity ->
+            val remoteHashHex = remoteIdentity.hexHash
+            println("[LXMRouter] Remote peer identified on link: $remoteHashHex")
+
+            // Calculate the LXMF delivery destination hash from the identity
+            // This is the hash that will appear as sourceHash in LXMF messages
+            val lxmfDestHash = Destination.hashFromNameAndIdentity("lxmf.delivery", remoteIdentity)
+            val lxmfDestHashHex = lxmfDestHash.toHexString()
+
+            // Store the backchannel link for replies (use LXMF dest hash, not identity hash)
+            backchannelLinks[lxmfDestHashHex] = link
+
+            // Store the identity so Identity.recall(sourceHash) works
+            // This is needed because receivers use Identity.recall(message.sourceHash)
+            // to get the sender's identity for replies
+            Identity.remember(
+                packetHash = link.hash,  // Use link hash as packet hash
+                destHash = lxmfDestHash,  // Use LXMF destination hash as lookup key
+                publicKey = remoteIdentity.getPublicKey(),
+                appData = null
+            )
+            println("[LXMRouter] Stored identity for LXMF dest: $lxmfDestHashHex")
+        }
+
+        // Also check if identity is already known (for immediate identification)
         link.getRemoteIdentity()?.let { remoteIdentity ->
             val remoteHashHex = remoteIdentity.hexHash
             backchannelLinks[remoteHashHex] = link
@@ -886,13 +972,15 @@ class LXMRouter(
         destination: Destination? = null,
         link: Link? = null
     ) {
+        println("[LXMRouter] processInboundDelivery called with ${data.size} bytes, method=$method")
         try {
             // Unpack the message
             val message = LXMessage.unpackFromBytes(data, method)
             if (message == null) {
-                println("Failed to unpack LXMF message")
+                println("[LXMRouter] Failed to unpack LXMF message")
                 return
             }
+            println("[LXMRouter] Unpacked message from ${message.sourceHash.toHexString()}")
 
             message.incoming = true
             message.method = method
@@ -923,10 +1011,28 @@ class LXMRouter(
 
             // TODO: Validate stamp if required
 
-            // Store backchannel link for replies
+            // Store backchannel link and identity for replies
             if (link != null) {
                 val sourceHashHex = message.sourceHash.toHexString()
                 backchannelLinks[sourceHashHex] = link
+
+                // If the link has a remote identity, store it so Identity.recall() works
+                // This is needed for echo/reply functionality
+                link.getRemoteIdentity()?.let { remoteIdentity ->
+                    // Calculate the LXMF delivery destination hash from the identity
+                    val lxmfDestHash = Destination.hashFromNameAndIdentity("lxmf.delivery", remoteIdentity)
+
+                    // Only store if the identity's LXMF dest hash matches the source hash
+                    if (lxmfDestHash.contentEquals(message.sourceHash)) {
+                        Identity.remember(
+                            packetHash = link.hash,
+                            destHash = lxmfDestHash,
+                            publicKey = remoteIdentity.getPublicKey(),
+                            appData = null
+                        )
+                        println("[LXMRouter] Stored identity from link for LXMF dest: $sourceHashHex")
+                    }
+                }
             }
 
             // Mark as delivered

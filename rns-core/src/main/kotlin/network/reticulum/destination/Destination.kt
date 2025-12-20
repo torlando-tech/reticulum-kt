@@ -980,6 +980,9 @@ class Destination private constructor(
                 // Check for stored ratchet public key for this destination
                 val ratchet = getRatchetForDestination(hash)
 
+                // Debug logging
+                println("[Destination] encrypt() for ${hash.toHexString()}: ratchet=${if (ratchet != null) "present (${ratchet.size} bytes)" else "null"}")
+
                 // If a ratchet is available, store its ID for tracking
                 if (ratchet != null) {
                     latestRatchetId = getRatchetId(ratchet)
