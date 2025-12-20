@@ -79,6 +79,10 @@ class AutoInterface(
 
     override val hwMtu: Int = AutoInterfaceConstants.HW_MTU
 
+    // Main AutoInterface doesn't send directly - spawned peers handle sending.
+    // This prevents duplicate packets when Transport broadcasts to all interfaces.
+    override val canSend: Boolean = false
+
     override fun start() {
         if (running.getAndSet(true)) return
 
@@ -138,14 +142,9 @@ class AutoInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        // AutoInterface doesn't send directly - data goes through spawned peers
-        // This is called when Transport wants to broadcast on all interfaces
-        // We forward to all spawned peer interfaces
-        spawnedPeers.values.forEach { peer ->
-            if (peer.online.get()) {
-                peer.processOutgoing(data)
-            }
-        }
+        // AutoInterface doesn't send directly - spawned peers handle sending.
+        // This method is a no-op since canSend=false prevents Transport from calling it.
+        // The spawned AutoInterfacePeer instances are registered directly with Transport.
     }
 
     /**

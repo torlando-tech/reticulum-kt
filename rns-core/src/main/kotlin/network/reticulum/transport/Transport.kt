@@ -1666,17 +1666,25 @@ object Transport {
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
-        // For now, always broadcast DATA packets since our transport routing (HEADER_2)
-        // has issues with nextHop not being properly set to the transport node's ID.
-        // This is less efficient but more reliable.
+        // Use path routing when we have a valid, unexpired path.
+        // For DATA packets with multi-hop paths, we still broadcast since HEADER_2 transport
+        // routing has issues with nextHop. But for 1-hop (direct) paths, we use path routing
+        // to avoid duplicate sends across multiple interfaces.
         val usePathRouting = pathEntry != null && !pathEntry.isExpired() &&
             packet.packetType != PacketType.ANNOUNCE &&
-            packet.packetType != PacketType.DATA &&  // Don't use path routing for DATA packets
             packet.destinationType != DestinationType.PLAIN &&
             packet.destinationType != DestinationType.GROUP
 
-        if (usePathRouting) {
-            // We have a path - use it (for non-DATA packets like LINKREQUEST)
+        // For DATA packets, only use path routing for direct (1-hop) connections
+        // Multi-hop DATA packets still need broadcasting until transport routing is fixed
+        val effectiveUsePathRouting = if (packet.packetType == PacketType.DATA && pathEntry != null) {
+            usePathRouting && pathEntry.hops == 1
+        } else {
+            usePathRouting
+        }
+
+        if (effectiveUsePathRouting) {
+            // We have a path - use it
             val outboundInterface = findInterfaceByHash(pathEntry!!.receivingInterfaceHash)
             if (outboundInterface != null) {
                 log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
