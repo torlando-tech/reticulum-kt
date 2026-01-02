@@ -284,7 +284,7 @@ class LXMRouter(
 
         // Set up packet callback for incoming messages
         destination.packetCallback = { data, packet ->
-            handleDeliveryPacket(data, destination)
+            handleDeliveryPacket(data, destination, packet as? Packet)
         }
 
         // Set up link established callback
@@ -656,7 +656,9 @@ class LXMRouter(
      */
     private fun setupLinkCallbacks(link: Link, destHashHex: String) {
         // Packet callback for receiving messages
-        link.setPacketCallback { data, _ ->
+        link.setPacketCallback { data, packet ->
+            // Send proof back to sender for delivery confirmation
+            packet?.prove()
             processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
         }
 
@@ -893,7 +895,11 @@ class LXMRouter(
     /**
      * Handle an incoming delivery packet.
      */
-    private fun handleDeliveryPacket(data: ByteArray, destination: Destination) {
+    private fun handleDeliveryPacket(data: ByteArray, destination: Destination, packet: Packet?) {
+        // CRITICAL: Send proof back to sender FIRST, before processing
+        // This is what triggers delivery confirmation on the sender side
+        packet?.prove()
+
         println("[LXMRouter] handleDeliveryPacket called with ${data.size} bytes for ${destination.hexHash}")
         // For OPPORTUNISTIC delivery (single packet), the data doesn't include the
         // destination hash - we need to prepend it to match the LXMF message format.
@@ -911,7 +917,9 @@ class LXMRouter(
      */
     private fun handleDeliveryLinkEstablished(link: Link, destination: Destination) {
         // Set up link callbacks for packets
-        link.setPacketCallback { data, _ ->
+        link.setPacketCallback { data, packet ->
+            // Send proof back to sender for delivery confirmation
+            packet?.prove()
             processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link)
         }
 
