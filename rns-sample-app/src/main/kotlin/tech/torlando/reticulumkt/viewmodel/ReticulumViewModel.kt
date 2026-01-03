@@ -362,11 +362,19 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Memory management
     fun trimMemory() {
+        // Trim Reticulum's internal caches (path table, announce queues, etc.)
+        if (Reticulum.isStarted()) {
+            network.reticulum.transport.Transport.trimMemory()
+        }
         System.gc()
         updateMonitorState()
     }
 
     fun forceGc() {
+        // Aggressive cleanup of Reticulum's internal state
+        if (Reticulum.isStarted()) {
+            network.reticulum.transport.Transport.aggressiveTrimMemory()
+        }
         System.gc()
         System.runFinalization()
         System.gc()
