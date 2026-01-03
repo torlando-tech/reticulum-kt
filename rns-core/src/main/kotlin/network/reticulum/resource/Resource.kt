@@ -1,6 +1,8 @@
 package network.reticulum.resource
 
+import network.reticulum.common.DestinationType
 import network.reticulum.common.PacketContext
+import network.reticulum.common.PacketType
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
@@ -217,6 +219,7 @@ class Resource private constructor(
     // Timing
     private var rtt: Long? = null
     private var lastActivity: Long = System.currentTimeMillis()
+    private var lastPartSent: Long = 0
     private var startedTransferring: Long? = null
     private var retries: Int = 0
 
@@ -269,63 +272,86 @@ class Resource private constructor(
 
     /**
      * Initialize resource for sending.
+     * Matches Python RNS Resource.__init__() protocol.
      */
     private fun initializeForSending(data: ByteArray, metadata: ByteArray?, autoCompress: Boolean) {
         uncompressedData = data
         totalSize = data.size
         uncompressedSize = data.size
 
-        // Handle metadata
+        // Handle metadata - prepend with 3-byte size prefix like Python
+        var dataWithMetadata = data
         if (metadata != null && metadata.size <= ResourceConstants.METADATA_MAX_SIZE) {
             this.metadata = metadata
             this.hasMetadata = true
-            totalSize += metadata.size
+            // Pack metadata with 3-byte size prefix (big-endian)
+            val metaSize = metadata.size
+            val metaPrefix = byteArrayOf(
+                ((metaSize shr 16) and 0xFF).toByte(),
+                ((metaSize shr 8) and 0xFF).toByte(),
+                (metaSize and 0xFF).toByte()
+            )
+            dataWithMetadata = metaPrefix + metadata + data
+            totalSize = dataWithMetadata.size
         }
 
         // Compress if requested and within limits
-        compressedData = if (autoCompress && data.size <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
-            compress(data)
+        val compressedResult = if (autoCompress && dataWithMetadata.size <= ResourceConstants.AUTO_COMPRESS_MAX_SIZE) {
+            compress(dataWithMetadata)
         } else {
-            data
+            dataWithMetadata
         }
 
-        compressed = compressedData!!.size < data.size
+        compressed = compressedResult.size < dataWithMetadata.size
+        compressedData = if (compressed) compressedResult else null
 
-        // Use compressed data if it's smaller
-        val transferData = if (compressed) compressedData!! else data
-        size = transferData.size
+        // Use compressed data if it's smaller, otherwise uncompressed
+        val contentData = if (compressed) compressedResult else dataWithMetadata
 
-        // Split into parts
+        // Generate random hash for hash calculations (this is sent in advertisement)
+        randomHash = ByteArray(ResourceConstants.RANDOM_HASH_SIZE).also { random.nextBytes(it) }
+
+        // Generate random prefix for the data stream (different from randomHash!)
+        // This provides uniqueness for the encrypted stream
+        val dataRandomPrefix = ByteArray(ResourceConstants.RANDOM_HASH_SIZE).also { random.nextBytes(it) }
+
+        // Build the transfer data: random_prefix + content
+        val prefixedData = dataRandomPrefix + contentData
+
+        // Encrypt the entire data stream using the link's encryption
+        val encryptedData = link.encrypt(prefixedData)
+        encrypted = true
+
+        size = encryptedData.size
+        log("initializeForSending: prefixedData=${prefixedData.size} bytes, encryptedData=${encryptedData.size} bytes")
+
+        // Split encrypted data into parts
         val totalParts = ceil(size.toDouble() / sdu).toInt()
         parts = arrayOfNulls(totalParts)
         hashmap = arrayOfNulls(totalParts)
 
-        // Generate random hash for uniqueness
-        randomHash = ByteArray(ResourceConstants.RANDOM_HASH_SIZE).also { random.nextBytes(it) }
-
-        // Create hashmap and parts
+        // Create hashmap and parts from encrypted data
         val hashmapBuilder = ByteArrayOutputStream()
         for (i in 0 until totalParts) {
             val start = i * sdu
             val end = min(start + sdu, size)
-            val part = transferData.copyOfRange(start, end)
+            val part = encryptedData.copyOfRange(start, end)
             parts[i] = part
 
-            // Calculate part hash
+            // Calculate part hash: full_hash(part + randomHash)[:MAPHASH_LEN]
             val partHash = getMapHash(part)
             hashmap[i] = partHash
             hashmapBuilder.write(partHash)
         }
         hashmapRaw = hashmapBuilder.toByteArray()
 
-        // Calculate resource hash (full hash to match Python RNS)
-        hash = Hashes.fullHash(
-            transferData + randomHash
-        )
+        // Calculate resource hash from UNCOMPRESSED data (with metadata) + randomHash
+        // This matches Python: self.hash = RNS.Identity.full_hash(data+self.random_hash)
+        hash = Hashes.fullHash(dataWithMetadata + randomHash)
         originalHash = hash.copyOf()
 
-        // Calculate expected proof (full hash of data + hash)
-        expectedProof = Hashes.fullHash(transferData + hash)
+        // Calculate expected proof: full_hash(uncompressed_data + hash)
+        expectedProof = Hashes.fullHash(dataWithMetadata + hash)
 
         // Check for segmentation
         if (totalSize > ResourceConstants.MAX_EFFICIENT_SIZE) {
@@ -334,7 +360,7 @@ class Resource private constructor(
         }
 
         status = ResourceConstants.QUEUED
-        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts")
+        log("Resource ${hash.toHexString()} created: $size bytes in ${parts.size} parts (compressed=$compressed, encrypted=$encrypted)")
     }
 
     /**
@@ -388,13 +414,30 @@ class Resource private constructor(
         val adv = ResourceAdvertisement.fromResource(this)
         val advData = adv.pack()
 
+        // Debug: log the advertisement content
+        log("Advertisement content:")
+        log("  transferSize=${adv.transferSize}, dataSize=${adv.dataSize}, numParts=${adv.numParts}")
+        log("  hash=${adv.hash.toHexString()} (${adv.hash.size} bytes)")
+        log("  randomHash=${adv.randomHash.toHexString()} (${adv.randomHash.size} bytes)")
+        log("  flags=${adv.flags}, segmentIndex=${adv.segmentIndex}, totalSegments=${adv.totalSegments}")
+        log("  advData size=${advData.size} bytes")
+
+        // Send encrypted via link
+        val encrypted = link.encrypt(advData)
+        log("  encrypted size=${encrypted.size} bytes")
+
         val packet = Packet.createRaw(
             destinationHash = link.linkId,
-            data = advData,
+            data = encrypted,
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.LINK,
             context = PacketContext.RESOURCE_ADV
         )
 
-        link.send(packet.raw ?: ByteArray(0))
+        log("  packet linkId=${link.linkId.toHexString()}, raw size=${packet.raw?.size ?: "null"}")
+        log("  link status=${link.status}")
+        val receipt = packet.send()
+        log("  send result: receipt=${receipt != null}, packet.sent=${packet.sent}")
         lastActivity = System.currentTimeMillis()
         advSent = lastActivity
 
@@ -422,17 +465,15 @@ class Resource private constructor(
 
     /**
      * Send a single part.
+     * Matches Python: part is just the encrypted data chunk, no index prefix.
+     * The receiver identifies parts by their map hash, not by index.
      */
     private fun sendPart(index: Int, data: ByteArray) {
-        val partData = byteArrayOf((index shr 8).toByte(), (index and 0xFF).toByte()) + data
-        val packet = Packet.createRaw(
-            destinationHash = link.linkId,
-            data = partData,
-            context = PacketContext.RESOURCE
-        )
-
-        link.send(packet.raw ?: ByteArray(0))
+        // Send just the data - no index prefix!
+        // Python identifies parts by computing the map hash of the received data
+        link.sendResourceData(data)
         lastActivity = System.currentTimeMillis()
+        lastPartSent = lastActivity
 
         // Track sent parts
         if (sentPartsSet.add(index)) {
@@ -488,8 +529,15 @@ class Resource private constructor(
             val partData = data
             val partHash = getMapHash(partData)
 
+            log("receivePart: received ${partData.size} bytes, partHash=${partHash.toHexString()}")
+            log("receivePart: randomHash=${randomHash.toHexString()}, hashmap size=${hashmap.size}")
+            if (hashmap.isNotEmpty() && hashmap[0] != null) {
+                log("receivePart: expected hashmap[0]=${hashmap[0]!!.toHexString()}")
+            }
+
             // Search for matching hash in current window
             val searchStart = if (consecutiveCompletedHeight >= 0) consecutiveCompletedHeight else 0
+            log("receivePart: searchStart=$searchStart, window=$window, parts.size=${parts.size}")
             for (i in searchStart until minOf(searchStart + window, parts.size)) {
                 val mapHash = hashmap[i]
                 if (mapHash != null && mapHash.contentEquals(partHash)) {
@@ -629,16 +677,21 @@ class Resource private constructor(
         requestData.write(requestedHashes.toByteArray())
 
         try {
+            // Send encrypted via link
+            val reqDataBytes = requestData.toByteArray()
+            val encrypted = link.encrypt(reqDataBytes)
             val packet = Packet.createRaw(
                 destinationHash = link.linkId,
-                data = requestData.toByteArray(),
+                data = encrypted,
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
                 context = PacketContext.RESOURCE_REQ
             )
 
-            link.send(packet.raw ?: ByteArray(0))
+            packet.send()
             lastActivity = System.currentTimeMillis()
             reqSent = lastActivity
-            reqSentBytes = packet.raw?.size ?: 0
+            reqSentBytes = encrypted.size
             reqResp = null
         } catch (e: Exception) {
             log("Failed to send resource request: ${e.message}")
@@ -761,12 +814,17 @@ class Resource private constructor(
             packer.close()
 
             try {
+                // Send encrypted via link
+                val hmuBytes = hmuData.toByteArray()
+                val encrypted = link.encrypt(hmuBytes)
                 val hmuPacket = Packet.createRaw(
                     destinationHash = link.linkId,
-                    data = hmuData.toByteArray(),
+                    data = encrypted,
+                    packetType = PacketType.DATA,
+                    destinationType = DestinationType.LINK,
                     context = PacketContext.RESOURCE_HMU
                 )
-                link.send(hmuPacket.raw ?: ByteArray(0))
+                hmuPacket.send()
                 lastActivity = System.currentTimeMillis()
             } catch (e: Exception) {
                 log("Failed to send hashmap update: ${e.message}")
@@ -861,13 +919,16 @@ class Resource private constructor(
     /**
      * Send proof of complete receipt to sender.
      * Called by receiver after successfully assembling all parts.
+     * Matches Python: proof = full_hash(self.data + self.hash)
+     * where self.data includes metadata (before stripping).
      */
     private fun prove() {
         if (status == ResourceConstants.FAILED) return
 
         try {
-            // Calculate proof: hash of (assembled data + resource hash)
-            val proofData = assembledData ?: uncompressedData
+            // Use uncompressedData which contains data WITH metadata
+            // This matches Python's prove() which uses self.data before metadata is stripped
+            val proofData = uncompressedData
             if (proofData == null) {
                 log("Cannot prove resource: no assembled data")
                 return
@@ -876,14 +937,16 @@ class Resource private constructor(
             val proof = Hashes.fullHash(proofData + hash)
             val proofPayload = hash + proof
 
-            // Create proof packet
+            // Create proof packet - NOT encrypted (matches Python: resource proofs are not encrypted)
             val packet = Packet.createRaw(
                 destinationHash = link.linkId,
                 data = proofPayload,
+                packetType = PacketType.PROOF,
+                destinationType = DestinationType.LINK,
                 context = PacketContext.RESOURCE_PRF
             )
 
-            link.send(packet.raw ?: ByteArray(0))
+            packet.send()
             log("Sent proof for resource ${hash.toHexString()}")
 
         } catch (e: Exception) {
@@ -1032,6 +1095,7 @@ class Resource private constructor(
 
     /**
      * Assemble received parts into final data.
+     * Matches Python RNS Resource.assemble() protocol.
      */
     private fun assemble() {
         if (status != ResourceConstants.TRANSFERRING) return
@@ -1040,7 +1104,7 @@ class Resource private constructor(
         log("Assembling resource ${hash.toHexString()}")
 
         try {
-            // Combine all parts
+            // Combine all parts (encrypted stream)
             val output = ByteArrayOutputStream()
             for (part in parts) {
                 if (part == null) {
@@ -1052,12 +1116,48 @@ class Resource private constructor(
                 output.write(part)
             }
 
-            var assembled = output.toByteArray()
+            val encryptedStream = output.toByteArray()
+
+            // Decrypt the stream if encrypted
+            var decryptedData = if (encrypted) {
+                link.decrypt(encryptedStream) ?: run {
+                    status = ResourceConstants.FAILED
+                    log("Assembly failed: decryption error")
+                    callbacks.failed?.invoke(this)
+                    return
+                }
+            } else {
+                encryptedStream
+            }
+
+            // Strip off the random prefix (first RANDOM_HASH_SIZE bytes)
+            if (decryptedData.size < ResourceConstants.RANDOM_HASH_SIZE) {
+                status = ResourceConstants.FAILED
+                log("Assembly failed: data too short after decryption")
+                callbacks.failed?.invoke(this)
+                return
+            }
+            decryptedData = decryptedData.copyOfRange(ResourceConstants.RANDOM_HASH_SIZE, decryptedData.size)
 
             // Decompress if needed
-            if (compressed) {
-                assembled = decompress(assembled)
+            var assembled = if (compressed) {
+                decompress(decryptedData)
+            } else {
+                decryptedData
             }
+
+            // Verify hash matches
+            val calculatedHash = Hashes.fullHash(assembled + randomHash)
+            if (!calculatedHash.contentEquals(hash)) {
+                status = ResourceConstants.CORRUPT
+                log("Assembly failed: hash mismatch")
+                callbacks.failed?.invoke(this)
+                return
+            }
+
+            // Store the full assembled data (with metadata) for proof calculation
+            // This matches Python where self.data in prove() includes metadata
+            val dataForProof = assembled
 
             // Strip metadata if present
             if (hasMetadata && assembled.size > 3) {
@@ -1070,8 +1170,10 @@ class Resource private constructor(
                 }
             }
 
+            // assembledData = data after metadata stripped (what caller receives)
+            // uncompressedData = data with metadata (for proof calculation)
             assembledData = assembled
-            uncompressedData = assembled
+            uncompressedData = dataForProof
 
             status = ResourceConstants.COMPLETE
             stopWatchdog()
@@ -1086,6 +1188,7 @@ class Resource private constructor(
         } catch (e: Exception) {
             status = ResourceConstants.FAILED
             log("Assembly error: ${e.message}")
+            e.printStackTrace()
             callbacks.failed?.invoke(this)
         }
     }
@@ -1101,10 +1204,10 @@ class Resource private constructor(
     }
 
     /**
-     * Get the received/assembled data.
+     * Get the received/assembled data (without metadata).
      */
     val data: ByteArray?
-        get() = assembledData ?: uncompressedData
+        get() = assembledData
 
     /**
      * Get transfer progress (0.0 to 1.0).
@@ -1131,9 +1234,10 @@ class Resource private constructor(
 
     /**
      * Calculate a short hash for a part.
+     * Matches Python: RNS.Identity.full_hash(data+self.random_hash)[:MAPHASH_LEN]
      */
     private fun getMapHash(data: ByteArray): ByteArray {
-        return Hashes.fullHash(data).copyOf(ResourceConstants.MAPHASH_LEN)
+        return Hashes.fullHash(data + randomHash).copyOf(ResourceConstants.MAPHASH_LEN)
     }
 
     /**

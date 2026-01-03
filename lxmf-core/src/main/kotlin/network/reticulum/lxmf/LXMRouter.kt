@@ -564,8 +564,14 @@ class LXMRouter(
 
         val destHashHex = message.destinationHash.toHexString()
 
+        // Debug logging
+        println("[LXMRouter] processDirectDelivery: destHashHex=$destHashHex")
+        println("[LXMRouter] processDirectDelivery: directLinks keys=${directLinks.keys}")
+        println("[LXMRouter] processDirectDelivery: backchannelLinks keys=${backchannelLinks.keys}")
+
         // Check for existing active link
         var link = directLinks[destHashHex] ?: backchannelLinks[destHashHex]
+        println("[LXMRouter] processDirectDelivery: found link=${link != null}, status=${link?.status}")
 
         when {
             link != null && link.status == LinkConstants.ACTIVE -> {
@@ -827,14 +833,15 @@ class LXMRouter(
         message.state = MessageState.SENDING
         message.method = DeliveryMethod.DIRECT
 
-        // The LXMF payload for link delivery excludes the destination hash
-        // (since it's implicit from the link), but includes source hash
-        val lxmfData = packed.copyOfRange(
-            LXMFConstants.DESTINATION_LENGTH,  // Skip destination hash
-            packed.size
-        )
-
         if (message.representation == MessageRepresentation.PACKET) {
+            // For packet delivery over link, Python strips destination hash (see __as_packet for DIRECT)
+            // Actually, Python sends full packed for DIRECT: return RNS.Packet(self.__delivery_destination, self.packed)
+            // But the receiver uses Link.callbacks.packet which receives decrypted data
+            // The destination hash is implicit from the link, so we strip it
+            val lxmfData = packed.copyOfRange(
+                LXMFConstants.DESTINATION_LENGTH,  // Skip destination hash
+                packed.size
+            )
             // Send as packet over link with receipt tracking
             try {
                 val receipt = link.sendWithReceipt(lxmfData)
@@ -864,10 +871,11 @@ class LXMRouter(
             }
         } else {
             // Send as resource for large messages
+            // Python's __as_resource() sends self.packed (full message including dest hash)
             try {
                 val messageHashHex = message.hash?.toHexString() ?: ""
                 val resource = Resource.create(
-                    data = lxmfData,
+                    data = packed,  // Full packed message, matches Python's __as_resource()
                     link = link,
                     callback = { completedResource ->
                         // Resource transfer complete

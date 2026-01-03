@@ -426,6 +426,25 @@ object Transport {
     }
 
     /**
+     * Register a path entry for a link so that outbound packets use the correct interface.
+     * This should be called when a link is established with the receiving interface hash.
+     */
+    fun registerLinkPath(linkId: ByteArray, receivingInterfaceHash: ByteArray, hops: Int = 1) {
+        val now = System.currentTimeMillis()
+        val entry = PathEntry(
+            timestamp = now,
+            nextHop = linkId,  // Use linkId as nextHop (will route to link)
+            hops = hops,
+            expires = now + TransportConstants.PATHFINDER_E,
+            randomBlobs = mutableListOf(),
+            receivingInterfaceHash = receivingInterfaceHash,
+            announcePacketHash = linkId  // Use linkId as placeholder
+        )
+        pathTable[linkId.toKey()] = entry
+        log("Registered link path for ${linkId.toHexString()} via interface ${receivingInterfaceHash.toHexString()}")
+    }
+
+    /**
      * Deregister a link.
      */
     fun deregisterLink(link: Any) {
@@ -1614,6 +1633,9 @@ object Transport {
             return
         }
 
+        // Track which interface this packet was received on
+        packet.receivingInterfaceHash = interfaceRef.hash
+
         // Increment hop count
         packet.hops++
 
@@ -1670,6 +1692,11 @@ object Transport {
         var sent = false
         val destHex = packet.destinationHash.toHexString()
 
+        // Debug for LINK packets
+        if (packet.destinationType == DestinationType.LINK) {
+            log("Outbound LINK packet: dest=$destHex, context=${packet.context}, size=${packedData.size}")
+        }
+
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
@@ -1716,7 +1743,8 @@ object Transport {
         if (!sent) {
             // Broadcast on all interfaces
             addPacketHash(packet.packetHash)
-            log("Broadcasting to $destHex on all interfaces (${packedData.size} bytes)")
+            val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
+            log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
             for (iface in interfaces) {
                 if (iface.canSend && iface.online) {

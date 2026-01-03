@@ -65,6 +65,10 @@ class Packet private constructor(
     /** The link this packet is associated with (null if not a link packet). */
     internal var link: Link? = null
 
+    /** Hash of the interface this packet was received on (set during inbound processing). */
+    var receivingInterfaceHash: ByteArray? = null
+        internal set
+
     /** Whether this packet has been sent. */
     var sent: Boolean = false
         private set
@@ -300,7 +304,8 @@ class Packet private constructor(
                     HeaderType.HEADER_1 -> {
                         transportId = null
                         destinationHash = raw.copyOfRange(2, 2 + dstLen)
-                        context = PacketContext.fromValue(raw[2 + dstLen].toInt() and 0xFF)
+                        val contextByte = raw[2 + dstLen].toInt() and 0xFF
+                        context = PacketContext.fromValue(contextByte)
                         data = raw.copyOfRange(3 + dstLen, raw.size)
                     }
                     HeaderType.HEADER_2 -> {
@@ -461,8 +466,7 @@ class Packet private constructor(
             }
             // Proof for link
             link != null -> {
-                // TODO: Implement link.provePacket(this)
-                throw IllegalStateException("Link proofs not yet implemented")
+                link.provePacket(this)
             }
             else -> {
                 // Cannot prove packet

@@ -157,6 +157,12 @@ class Link private constructor(
 
                 log("Validating link request ${link.linkId.toHexString()}")
 
+                // Register path for this link BEFORE sending proof so proof goes via correct interface
+                // This ensures Python's attached_interface matches the interface we'll use later
+                packet.receivingInterfaceHash?.let { interfaceHash ->
+                    Transport.registerLinkPath(link.linkId, interfaceHash, packet.hops)
+                }
+
                 // Perform handshake and send proof
                 link.handshake()
                 link.prove()
@@ -548,6 +554,11 @@ class Link private constructor(
 
             Transport.activateLink(this)
 
+            // Register path for this link so outbound packets use correct interface
+            packet.receivingInterfaceHash?.let { interfaceHash ->
+                Transport.registerLinkPath(linkId, interfaceHash, packet.hops)
+            }
+
             log("Link ${linkId.toHexString()} established, RTT: ${rtt}ms")
 
             updateKeepalive()
@@ -695,6 +706,29 @@ class Link private constructor(
             hadOutbound(isData = true)
         }
         return receipt
+    }
+
+    /**
+     * Send resource data over this link.
+     * NOTE: Resource data is NOT link-encrypted! It's already encrypted at the
+     * resource level. This matches Python RNS behavior.
+     */
+    fun sendResourceData(data: ByteArray) {
+        if (status != LinkConstants.ACTIVE) {
+            throw IllegalStateException("Link is not active")
+        }
+
+        log("sendResourceData: sending ${data.size} bytes (already resource-encrypted, no link encryption)")
+        val packet = Packet.createRaw(
+            destinationHash = linkId,
+            data = data,  // Send directly - already resource-level encrypted
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.LINK,
+            context = PacketContext.RESOURCE
+        )
+
+        packet.send()
+        hadOutbound(isData = true)
     }
 
     /**
@@ -1366,6 +1400,9 @@ class Link private constructor(
     private fun processRegularData(packet: Packet) {
         val plaintext = decrypt(packet.data) ?: return
 
+        // Associate the packet with this link so prove() can work
+        packet.link = this
+
         // Invoke packet callback
         callbacks.packet?.let { callback ->
             thread(isDaemon = true) {
@@ -1758,9 +1795,11 @@ class Link private constructor(
                 }
             }
 
-            // Find matching outgoing resource
+            // Find matching outgoing resource - compare truncated hash (first 16 bytes)
             val resource = synchronized(outgoingResources) {
-                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+                outgoingResources.find {
+                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                }
             }
 
             if (resource == null) {
@@ -1768,12 +1807,9 @@ class Link private constructor(
                 return
             }
 
-            // TODO: Process the request when Resource.request() method is available
-            // This would typically:
-            // 1. Check if packet.packetHash is not in resource.reqHashlist (avoid duplicates)
-            // 2. Add packet.packetHash to resource.reqHashlist
-            // 3. Call resource.request(plaintext) to send requested parts
+            // Process the request - send requested parts
             log("Processing request for resource ${resourceHash.toHexString()}")
+            resource.handleRequest(plaintext)
 
         } catch (e: Exception) {
             log("Error processing resource request: ${e.message}")
@@ -1795,9 +1831,11 @@ class Link private constructor(
 
             val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
-            // Find matching incoming resource
+            // Find matching incoming resource - compare truncated hash (first 16 bytes)
             val resource = synchronized(incomingResources) {
-                incomingResources.find { it.hash.contentEquals(resourceHash) }
+                incomingResources.find {
+                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                }
             }
 
             if (resource == null) {
@@ -1805,9 +1843,9 @@ class Link private constructor(
                 return
             }
 
-            // TODO: Process hashmap update when Resource.hashmapUpdatePacket() method is available
-            // This would update the resource's received parts bitmap and trigger next part requests
+            // Process hashmap update - update received parts and request next
             log("Processing HMU for resource ${resourceHash.toHexString()}")
+            resource.handleHashmapUpdate(plaintext)
 
         } catch (e: Exception) {
             log("Error processing resource HMU: ${e.message}")
@@ -1830,8 +1868,11 @@ class Link private constructor(
             val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
             // Find matching incoming resource (we're receiving, initiator is cancelling)
+            // Compare truncated hash (first 16 bytes)
             val resource = synchronized(incomingResources) {
-                incomingResources.find { it.hash.contentEquals(resourceHash) }
+                incomingResources.find {
+                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                }
             }
 
             if (resource == null) {
@@ -1863,8 +1904,11 @@ class Link private constructor(
             val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
             // Find matching outgoing resource (we're sending, receiver is rejecting)
+            // Compare truncated hash (first 16 bytes)
             val resource = synchronized(outgoingResources) {
-                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+                outgoingResources.find {
+                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                }
             }
 
             if (resource == null) {
@@ -1883,13 +1927,33 @@ class Link private constructor(
 
     /**
      * Process resource data packets.
+     * NOTE: Resource data is NOT link-encrypted! It's already encrypted at the
+     * resource level. We pass it directly to the Resource without decrypting.
+     * This matches Python RNS behavior.
      */
     private fun processResource(packet: Packet) {
-        // TODO: Implement resource data handling
-        // This requires:
-        // - Finding matching incoming resource
-        // - Passing packet to resource for processing
-        log("Resource data handling not yet implemented")
+        try {
+            log("processResource: packet.data.size=${packet.data.size} bytes (not decrypting - resource-level encrypted)")
+
+            // Find matching incoming resource by trying each one
+            // Resource parts are identified by their map hash, not by an explicit resource hash in the packet
+            val resource = synchronized(incomingResources) {
+                incomingResources.toList()
+            }.firstOrNull { res ->
+                res.status == network.reticulum.resource.ResourceConstants.TRANSFERRING
+            }
+
+            if (resource == null) {
+                log("Received resource data but no active incoming resource")
+                return
+            }
+
+            // Pass the data directly - it's already resource-level encrypted, NOT link-encrypted
+            resource.receivePart(packet.data)
+
+        } catch (e: Exception) {
+            log("Error processing resource data: ${e.message}")
+        }
     }
 
     /**
@@ -1971,9 +2035,11 @@ class Link private constructor(
             // Extract resource hash
             val resourceHash = data.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
-            // Find matching outgoing resource
+            // Find matching outgoing resource - compare truncated hash (first 16 bytes)
             val resource = synchronized(outgoingResources) {
-                outgoingResources.find { it.hash.contentEquals(resourceHash) }
+                outgoingResources.find {
+                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                }
             }
 
             if (resource == null) {

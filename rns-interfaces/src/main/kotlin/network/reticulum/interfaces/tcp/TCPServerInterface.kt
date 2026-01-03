@@ -273,6 +273,7 @@ class TCPServerClientInterface internal constructor(
             socket.getOutputStream().write(framedData)
             socket.getOutputStream().flush()
 
+            log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
             txBytes.addAndGet(framedData.size.toLong())
             parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
 
