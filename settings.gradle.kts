@@ -25,3 +25,6 @@ include(":lxmf-examples")
 
 // Android module for battery-optimized mobile deployment
 include(":rns-android")
+
+// Sample app for device testing
+include(":rns-sample-app")
