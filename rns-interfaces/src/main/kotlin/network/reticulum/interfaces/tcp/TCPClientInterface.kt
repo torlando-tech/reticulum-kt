@@ -33,7 +33,9 @@ class TCPClientInterface(
     private val targetPort: Int,
     private val useKissFraming: Boolean = false,
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
-    private val maxReconnectAttempts: Int? = null
+    private val maxReconnectAttempts: Int? = null,
+    /** Enable TCP keep-alive. Disabled by default for battery efficiency on mobile. */
+    private val keepAlive: Boolean = false
 ) : Interface(name) {
 
     companion object {
@@ -81,7 +83,7 @@ class TCPClientInterface(
             val sock = Socket()
             sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
             sock.tcpNoDelay = true
-            sock.keepAlive = true
+            sock.keepAlive = keepAlive
             sock.soTimeout = 0 // Block on read
 
             // Get input stream immediately while we have the socket reference

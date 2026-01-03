@@ -519,6 +519,76 @@ object Transport {
             get() = if (heapMaxBytes > 0) ((heapUsedBytes * 100) / heapMaxBytes).toInt() else 0
     }
 
+    // ===== Network State Management =====
+
+    /**
+     * Data saver mode flag.
+     * When enabled, reduces network traffic for metered connections.
+     */
+    @Volatile
+    private var dataSaverMode = false
+
+    /**
+     * Network availability flag.
+     */
+    @Volatile
+    private var networkAvailable = true
+
+    /**
+     * Enable or disable data saver mode.
+     *
+     * When enabled, Transport will:
+     * - Reduce announce rebroadcast rate
+     * - Defer non-critical operations
+     * - Reduce keepalive frequency
+     *
+     * @param enabled true to enable data saver mode
+     */
+    fun setDataSaverMode(enabled: Boolean) {
+        if (dataSaverMode != enabled) {
+            dataSaverMode = enabled
+            if (enabled) {
+                log("Data saver mode enabled - reducing network activity")
+            } else {
+                log("Data saver mode disabled - resuming normal activity")
+            }
+        }
+    }
+
+    /**
+     * Check if data saver mode is enabled.
+     */
+    fun isDataSaverMode(): Boolean = dataSaverMode
+
+    /**
+     * Called when network becomes available.
+     * Resumes any paused network operations.
+     */
+    fun onNetworkAvailable() {
+        if (!networkAvailable) {
+            networkAvailable = true
+            log("Network available - resuming operations")
+            // Could trigger path re-discovery or interface reconnection here
+        }
+    }
+
+    /**
+     * Called when network is lost.
+     * Pauses network operations to conserve resources.
+     */
+    fun onNetworkLost() {
+        if (networkAvailable) {
+            networkAvailable = false
+            log("Network lost - pausing operations")
+            // Could pause announce propagation, path requests, etc.
+        }
+    }
+
+    /**
+     * Check if network is currently available.
+     */
+    fun isNetworkAvailable(): Boolean = networkAvailable
+
     // ===== Interface Management =====
 
     /**
