@@ -160,11 +160,17 @@ class LxmfEchoBot {
                 }
             }
 
-            // Wait briefly for the announce to arrive (path requests can take a few seconds)
-            Thread.sleep(3000)
+            // Wait for the announce to arrive (path requests can take several seconds)
+            // Try multiple times with short waits
+            for (attempt in 1..15) {
+                Thread.sleep(1000)
+                senderIdentity = Identity.recall(message.sourceHash)
+                if (senderIdentity != null) {
+                    log("  Sender identity found after ${attempt}s")
+                    break
+                }
+            }
 
-            // Try again after path request
-            senderIdentity = Identity.recall(message.sourceHash)
             if (senderIdentity == null) {
                 log("  Cannot echo: sender identity still not known after path request")
                 log("  (Note: If you're on the same hub, announces may not be forwarded between direct clients)")

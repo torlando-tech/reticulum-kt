@@ -662,6 +662,9 @@ class LXMRouter(
             processInboundDelivery(data, DeliveryMethod.DIRECT, null, link)
         }
 
+        // Enable app-controlled resource acceptance for LXMF messages
+        link.setResourceStrategy(Link.ACCEPT_APP)
+
         // Resource advertisement callback - accept all LXMF resources
         link.setResourceCallback { _: ResourceAdvertisement ->
             // Accept LXMF resources
@@ -922,6 +925,9 @@ class LXMRouter(
             packet?.prove()
             processInboundDelivery(data, DeliveryMethod.DIRECT, destination, link)
         }
+
+        // Enable app-controlled resource acceptance for LXMF messages
+        link.setResourceStrategy(Link.ACCEPT_APP)
 
         // Resource advertisement callback - accept all LXMF resources
         link.setResourceCallback { _: ResourceAdvertisement ->
