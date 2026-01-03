@@ -388,6 +388,137 @@ object Transport {
         storagePath = path
     }
 
+    // ===== Memory Management =====
+
+    /**
+     * Trim memory usage for low-memory situations.
+     *
+     * This method reduces memory consumption by:
+     * - Clearing the byte array pool
+     * - Trimming hashlists to minimum required
+     * - Clearing stale entries from tables
+     *
+     * Call this when Android reports onTrimMemory() or similar.
+     */
+    fun trimMemory() {
+        log("Trimming memory...")
+
+        // Clear byte array pool
+        network.reticulum.common.ByteArrayPool.clear()
+
+        // Trim packet hashlists (keep recent, drop old)
+        val now = System.currentTimeMillis()
+        val maxHashlistSize = network.reticulum.common.Platform.recommendedHashlistSize / 2
+
+        if (packetHashlist.size > maxHashlistSize) {
+            val toRemove = packetHashlist.size - maxHashlistSize
+            val iterator = packetHashlist.iterator()
+            repeat(toRemove) {
+                if (iterator.hasNext()) {
+                    iterator.next()
+                    iterator.remove()
+                }
+            }
+        }
+
+        // Clear previous hashlist entirely during memory pressure
+        packetHashlistPrev.clear()
+
+        // Trim announce table to reduce memory
+        if (announceTable.size > 1000) {
+            val expireThreshold = now - TransportConstants.DESTINATION_TIMEOUT
+            announceTable.entries.removeIf { (_, entry) ->
+                (entry as? AnnounceEntry)?.timestamp ?: 0L < expireThreshold
+            }
+        }
+
+        // Trim queued announces
+        val maxQueued = network.reticulum.common.Platform.recommendedMaxQueuedAnnounces / 2
+        if (queuedAnnounces.size > maxQueued) {
+            val toRemove = queuedAnnounces.size - maxQueued
+            repeat(toRemove) {
+                if (queuedAnnounces.isNotEmpty()) {
+                    queuedAnnounces.removeAt(0)
+                }
+            }
+        }
+
+        // Force garbage collection hint
+        System.gc()
+
+        log("Memory trimmed: hashlist=${packetHashlist.size}, announces=${announceTable.size}")
+    }
+
+    /**
+     * Aggressive memory trimming for critical low-memory situations.
+     *
+     * This clears more aggressively than trimMemory(), potentially
+     * affecting network performance temporarily.
+     */
+    fun aggressiveTrimMemory() {
+        log("Aggressive memory trim...")
+
+        // Clear byte array pool
+        network.reticulum.common.ByteArrayPool.clear()
+
+        // Clear all hashlists (will cause some duplicate packet processing)
+        packetHashlist.clear()
+        packetHashlistPrev.clear()
+
+        // Clear path requests (will be re-requested as needed)
+        pathRequests.clear()
+        discoveryPrTags.clear()
+
+        // Clear held announces (will be re-announced)
+        heldAnnounces.clear()
+
+        // Clear announce rate table
+        announceRateTable.clear()
+
+        // Clear interface announce queues
+        interfaceAnnounceQueues.clear()
+
+        // Force GC
+        System.gc()
+
+        log("Aggressive memory trim complete")
+    }
+
+    /**
+     * Get current memory statistics.
+     */
+    fun getMemoryStats(): MemoryStats {
+        return MemoryStats(
+            pathTableSize = pathTable.size,
+            linkTableSize = linkTable.size,
+            announceTableSize = announceTable.size,
+            packetHashlistSize = packetHashlist.size,
+            queuedAnnouncesSize = queuedAnnounces.size,
+            tunnelsSize = tunnels.size,
+            byteArrayPoolBytes = network.reticulum.common.ByteArrayPool.pooledBytes(),
+            heapUsedBytes = network.reticulum.common.Platform.usedHeapMemory,
+            heapMaxBytes = network.reticulum.common.Platform.maxHeapMemory
+        )
+    }
+
+    /**
+     * Memory statistics for monitoring.
+     */
+    data class MemoryStats(
+        val pathTableSize: Int,
+        val linkTableSize: Int,
+        val announceTableSize: Int,
+        val packetHashlistSize: Int,
+        val queuedAnnouncesSize: Int,
+        val tunnelsSize: Int,
+        val byteArrayPoolBytes: Long,
+        val heapUsedBytes: Long,
+        val heapMaxBytes: Long
+    ) {
+        val heapUsedPercent: Int
+            get() = if (heapMaxBytes > 0) ((heapUsedBytes * 100) / heapMaxBytes).toInt() else 0
+    }
+
     // ===== Interface Management =====
 
     /**

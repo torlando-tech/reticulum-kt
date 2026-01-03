@@ -101,7 +101,7 @@ class ReticulumService : LifecycleService() {
             TRIM_MEMORY_RUNNING_CRITICAL,
             TRIM_MEMORY_COMPLETE -> {
                 // Aggressive memory cleanup
-                trimMemory()
+                trimMemory(aggressive = true)
             }
             TRIM_MEMORY_RUNNING_LOW,
             TRIM_MEMORY_MODERATE -> {
@@ -109,6 +109,12 @@ class ReticulumService : LifecycleService() {
                 trimMemory(aggressive = false)
             }
         }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        // System is critically low on memory - aggressive cleanup
+        trimMemory(aggressive = true)
     }
 
     private suspend fun initializeReticulum() {
@@ -154,10 +160,29 @@ class ReticulumService : LifecycleService() {
     }
 
     private fun trimMemory(aggressive: Boolean = true) {
-        // TODO: Implement memory trimming
-        // - Clear byte array pools
-        // - Trim hashlists
-        // - Clear caches
+        try {
+            if (aggressive) {
+                // Critical memory situation - aggressive cleanup
+                network.reticulum.transport.Transport.aggressiveTrimMemory()
+            } else {
+                // Moderate memory pressure - normal trim
+                network.reticulum.transport.Transport.trimMemory()
+            }
+        } catch (e: Exception) {
+            // Don't crash on memory trim errors
+        }
+    }
+
+    /**
+     * Get current memory statistics.
+     * Useful for monitoring and debugging memory usage.
+     */
+    fun getMemoryStats(): network.reticulum.transport.Transport.MemoryStats? {
+        return try {
+            network.reticulum.transport.Transport.getMemoryStats()
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun createNotificationChannel() {

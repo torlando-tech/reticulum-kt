@@ -51,4 +51,53 @@ object Platform {
      */
     val recommendedJobIntervalMs: Long
         get() = if (isAndroid) 60_000L else 250L
+
+    /**
+     * Get the recommended max tunnels for this platform.
+     */
+    val recommendedMaxTunnels: Int
+        get() = if (isAndroid) 1_000 else 10_000
+
+    /**
+     * Get the recommended max receipts for this platform.
+     */
+    val recommendedMaxReceipts: Int
+        get() = if (isAndroid) 256 else 1_024
+
+    /**
+     * Get the recommended max random blobs per destination.
+     */
+    val recommendedMaxRandomBlobs: Int
+        get() = if (isAndroid) 16 else 64
+
+    /**
+     * Get the available heap memory in bytes.
+     * Useful for adaptive memory management.
+     */
+    val availableHeapMemory: Long
+        get() {
+            val runtime = Runtime.getRuntime()
+            return runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
+        }
+
+    /**
+     * Get the used heap memory in bytes.
+     */
+    val usedHeapMemory: Long
+        get() {
+            val runtime = Runtime.getRuntime()
+            return runtime.totalMemory() - runtime.freeMemory()
+        }
+
+    /**
+     * Get the max heap memory in bytes.
+     */
+    val maxHeapMemory: Long
+        get() = Runtime.getRuntime().maxMemory()
+
+    /**
+     * Check if memory is running low (> 80% used).
+     */
+    val isLowMemory: Boolean
+        get() = usedHeapMemory > (maxHeapMemory * 0.8)
 }
