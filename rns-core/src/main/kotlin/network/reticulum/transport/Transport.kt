@@ -18,6 +18,9 @@ import network.reticulum.identity.Identity
 import network.reticulum.link.Link
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
+import org.msgpack.core.MessagePack
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -142,6 +145,14 @@ object Transport {
     /** Last time cache was cleaned. */
     private var cacheLastCleaned: Long = 0
 
+    /** Cache path for persistent announce storage. Set by Reticulum during init. */
+    @Volatile
+    private var cachePath: String = System.getProperty("user.home") + "/.reticulum/cache"
+
+    /** Storage path for persistent data. Set by Reticulum during init. */
+    @Volatile
+    private var storagePath: String = System.getProperty("user.home") + "/.reticulum/storage"
+
     // ===== Registered Objects =====
 
     /** Registered interfaces. */
@@ -244,6 +255,11 @@ object Transport {
         // Initialize path request destination
         initializeControlDestinations()
 
+        // Load persisted tunnel table
+        if (enableTransport) {
+            loadTunnelTable()
+        }
+
         // Start background job thread
         thread(name = "Transport-jobs", isDaemon = true) {
             jobLoop()
@@ -253,7 +269,7 @@ object Transport {
     }
 
     /**
-     * Initialize control destinations (path request, etc.).
+     * Initialize control destinations (path request, tunnel synthesize, etc.).
      */
     private fun initializeControlDestinations() {
         // Create path request destination
@@ -266,6 +282,17 @@ object Transport {
         )
         controlHashes.add(pathRequestDestination!!.hash.toKey())
         log("Path request destination: ${pathRequestDestination!!.hexHash}")
+
+        // Create tunnel synthesize destination
+        tunnelSynthesizeDestination = Destination.create(
+            identity = null,
+            direction = DestinationDirection.IN,
+            type = DestinationType.PLAIN,
+            appName = TransportConstants.APP_NAME,
+            aspects = arrayOf("tunnel", "synthesize")
+        )
+        controlHashes.add(tunnelSynthesizeDestination!!.hash.toKey())
+        log("Tunnel synthesize destination: ${tunnelSynthesizeDestination!!.hexHash}")
     }
 
     /**
@@ -291,6 +318,12 @@ object Transport {
         pathRequests.clear()
         discoveryPrTags.clear()
         pendingReceipts.clear()
+
+        // Persist data before clearing
+        if (transportEnabled) {
+            persistData()
+        }
+
         tunnels.clear()
         tunnelInterfaces.clear()
 
@@ -301,6 +334,22 @@ object Transport {
         lastTrafficTime = 0L
 
         log("Transport stopped")
+    }
+
+    /**
+     * Set the cache path for persistent announce storage.
+     * Called by Reticulum during initialization.
+     */
+    internal fun setCachePath(path: String) {
+        cachePath = path
+    }
+
+    /**
+     * Set the storage path for persistent data.
+     * Called by Reticulum during initialization.
+     */
+    internal fun setStoragePath(path: String) {
+        storagePath = path
     }
 
     // ===== Interface Management =====
@@ -1339,6 +1388,9 @@ object Transport {
     /** Path request destination for sending requests. */
     private var pathRequestDestination: Destination? = null
 
+    /** Tunnel synthesis destination for receiving tunnel requests. */
+    private var tunnelSynthesizeDestination: Destination? = null
+
     /**
      * Request a path to a destination from the network.
      *
@@ -1885,6 +1937,14 @@ object Transport {
 
         pathTable[destHash.toKey()] = pathEntry
 
+        // If receiving interface has a tunnel, also store path in tunnel for persistence
+        addPathToTunnel(
+            destHash = destHash,
+            pathEntry = pathEntry,
+            packet = packet,
+            interface_ = interfaceRef
+        )
+
         // Store the identity for later recall
         Identity.remember(
             packetHash = packet.packetHash,
@@ -1968,12 +2028,20 @@ object Transport {
     private fun processData(packet: Packet, interfaceRef: InterfaceRef) {
         log("processData: dest=${packet.destinationHash.toHexString()}, ${packet.data.size} bytes from ${interfaceRef.name}")
 
-        // Check if this is a control packet (path request, etc.)
+        // Check if this is a control packet (path request, tunnel synthesis, etc.)
         if (controlHashes.contains(packet.destinationHash.toKey())) {
             // Check if this is a path request
             if (pathRequestDestination != null &&
                 packet.destinationHash.contentEquals(pathRequestDestination!!.hash)) {
                 handlePathRequest(packet.data, packet, interfaceRef)
+                return
+            }
+
+            // Check if this is a tunnel synthesis request
+            if (tunnelSynthesizeDestination != null &&
+                packet.destinationHash.contentEquals(tunnelSynthesizeDestination!!.hash)) {
+                log("Received tunnel synthesis request on ${interfaceRef.name}")
+                tunnelSynthesizeHandler(packet.data, packet, interfaceRef)
                 return
             }
         }
@@ -2436,6 +2504,9 @@ object Transport {
     private fun runJobs() {
         val now = System.currentTimeMillis()
 
+        // Synthesize tunnels for interfaces that want them
+        synthesizeTunnelsForWaitingInterfaces()
+
         // Process queued announces
         processQueuedAnnounces(now)
 
@@ -2461,6 +2532,12 @@ object Transport {
         if (now - hashlistLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             packetHashlistPrev.clear()
             hashlistLastCleaned = now
+        }
+
+        // Clean announce cache periodically
+        if (now - cacheLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
+            cleanAnnounceCache()
+            cacheLastCleaned = now
         }
     }
 
@@ -2557,33 +2634,87 @@ object Transport {
     // ===== Tunnel Management =====
 
     /**
-     * Synthesize a virtual tunnel through an interface.
-     * Used for creating persistent paths through the network.
-     *
-     * @param interface_ The interface to create the tunnel on
-     * @return Tunnel ID, or null if maximum tunnels reached
+     * Check all interfaces for those wanting tunnel synthesis and synthesize them.
+     * Called periodically from the job loop.
      */
-    fun synthesizeTunnel(interface_: InterfaceRef): ByteArray? {
-        if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
-            cleanExpiredTunnels()
-            if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
-                log("Maximum tunnels reached, cannot create new tunnel")
-                return null
+    private fun synthesizeTunnelsForWaitingInterfaces() {
+        for (interface_ in interfaces) {
+            if (interface_.wantsTunnel && interface_.online) {
+                log("Interface ${interface_.name} wants tunnel, synthesizing...")
+                val tunnelId = synthesizeTunnel(interface_)
+                if (tunnelId != null) {
+                    log("Tunnel synthesized: ${tunnelId.toHexString().take(16)}")
+                }
+                // wantsTunnel is cleared by synthesizeTunnel on success
             }
         }
+    }
 
-        // Generate unique tunnel ID
-        val tunnelId = Hashes.getRandomHash()
-        val key = ByteArrayKey(tunnelId)
+    /**
+     * Synthesize a virtual tunnel through an interface.
+     *
+     * Creates a tunnel by:
+     * 1. Calculating tunnel ID: SHA256(public_key + interface_hash)
+     * 2. Creating signed data: (public_key + interface_hash + random_hash)
+     * 3. Sending broadcast packet to "rnstransport.tunnel.synthesize"
+     *
+     * The receiver validates the signature and establishes the tunnel.
+     *
+     * @param interface_ The interface to create the tunnel on
+     * @return Tunnel ID, or null if synthesis failed
+     */
+    fun synthesizeTunnel(interface_: InterfaceRef): ByteArray? {
+        val transportIdentity = identity ?: run {
+            log("Cannot synthesize tunnel: no transport identity")
+            return null
+        }
 
-        // Create tunnel info
-        val tunnel = TunnelInfo(
-            tunnelId = tunnelId,
-            interface_ = interface_
+        // Get interface hash (32 bytes)
+        val interfaceHash = interface_.getInterfaceHash()
+
+        // Get public key (64 bytes: 32 X25519 + 32 Ed25519)
+        val publicKey = transportIdentity.getPublicKey()
+
+        // Calculate tunnel ID: SHA256(public_key + interface_hash)
+        val tunnelIdData = publicKey + interfaceHash
+        val tunnelId = Hashes.fullHash(tunnelIdData)
+
+        // Create random hash for replay protection (16 bytes, truncated)
+        val randomHash = Hashes.getRandomHash()
+
+        // Create signed data: tunnel_id_data + random_hash
+        val signedData = tunnelIdData + randomHash
+
+        // Sign the data
+        val signature = transportIdentity.sign(signedData)
+
+        // Packet data: public_key(64) + interface_hash(32) + random_hash(16) + signature(64) = 176 bytes
+        val packetData = publicKey + interfaceHash + randomHash + signature
+
+        // Create destination hash for "rnstransport.tunnel.synthesize" (PLAIN destination)
+        val destHash = Destination.computeHash("rnstransport", listOf("tunnel", "synthesize"), null)
+
+        // Send as broadcast packet directly on the interface
+        val packet = Packet.createRaw(
+            destinationHash = destHash,
+            data = packetData,
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.PLAIN,
+            transportType = TransportType.BROADCAST,
+            headerType = HeaderType.HEADER_1
         )
 
-        tunnels[key] = tunnel
-        tunnelInterfaces[key] = interface_
+        // Send directly on this interface (not through outbound routing)
+        try {
+            interface_.send(packet.pack())
+            recordTxBytes(interface_, packet.pack().size)
+        } catch (e: Exception) {
+            log("Failed to send tunnel synthesis packet: ${e.message}")
+            return null
+        }
+
+        // Mark interface as no longer wanting a tunnel
+        interface_.wantsTunnel = false
 
         log("Synthesized tunnel ${tunnelId.toHexString()} on ${interface_.name}")
 
@@ -2593,48 +2724,554 @@ object Transport {
     /**
      * Handle incoming tunnel synthesis requests.
      *
-     * @param data Packet data containing tunnel synthesis information
+     * Validates the tunnel synthesis packet:
+     * 1. Extracts public_key, interface_hash, random_hash, signature (176 bytes total)
+     * 2. Reconstructs tunnel ID: SHA256(public_key + interface_hash)
+     * 3. Validates Ed25519 signature over (public_key + interface_hash + random_hash)
+     * 4. Creates tunnel entry on successful validation
+     *
+     * @param data Packet data: public_key(64) + interface_hash(32) + random_hash(16) + signature(64)
      * @param packet The packet containing the request
      * @param receivingInterface The interface that received the packet
      * @return true if tunnel was created successfully
      */
     fun tunnelSynthesizeHandler(data: ByteArray, @Suppress("UNUSED_PARAMETER") packet: Packet, receivingInterface: InterfaceRef): Boolean {
-        if (data.size < RnsConstants.TRUNCATED_HASH_BYTES) {
-            log("Invalid tunnel synthesis request: data too short")
+        // Expected: public_key(64) + interface_hash(32) + random_hash(16) + signature(64) = 176 bytes
+        val expectedLength = 64 + 32 + 16 + 64
+        if (data.size != expectedLength) {
+            log("Invalid tunnel synthesis: expected $expectedLength bytes, got ${data.size}")
             return false
         }
 
-        val tunnelId = data.copyOf(RnsConstants.TRUNCATED_HASH_BYTES)
-        val interface_ = receivingInterface
+        try {
+            // Parse packet components
+            val publicKey = data.copyOfRange(0, 64)
+            val interfaceHash = data.copyOfRange(64, 96)
+            val randomHash = data.copyOfRange(96, 112)
+            val signature = data.copyOfRange(112, 176)
 
-        // Create tunnel for this request
-        val key = ByteArrayKey(tunnelId)
+            // Calculate tunnel ID: SHA256(public_key + interface_hash)
+            val tunnelIdData = publicKey + interfaceHash
+            val tunnelId = Hashes.fullHash(tunnelIdData)
 
-        if (tunnels.containsKey(key)) {
-            // Tunnel already exists, update activity
-            tunnels[key]?.lastActivity = System.currentTimeMillis()
-            return true
-        }
+            // Reconstruct signed data
+            val signedData = tunnelIdData + randomHash
 
-        if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
-            cleanExpiredTunnels()
-            if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
-                log("Cannot create tunnel, max tunnels reached")
+            // Create identity from public key and validate signature
+            val remoteIdentity = Identity.fromPublicKey(publicKey)
+            if (!remoteIdentity.validate(signature, signedData)) {
+                log("Invalid tunnel synthesis signature from ${remoteIdentity.hash.toHexString()}")
                 return false
             }
+
+            // Valid signature - handle the tunnel
+            handleTunnelEstablishment(tunnelId, receivingInterface)
+            return true
+
+        } catch (e: Exception) {
+            log("Error validating tunnel synthesis: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Handle tunnel establishment after signature validation.
+     *
+     * If the tunnel already exists (reconnection), restores paths.
+     * If new, creates an empty tunnel entry.
+     */
+    private fun handleTunnelEstablishment(tunnelId: ByteArray, interface_: InterfaceRef) {
+        val key = ByteArrayKey(tunnelId)
+        val now = System.currentTimeMillis()
+        val expires = now + TransportConstants.DESTINATION_TIMEOUT
+
+        val existingTunnel = tunnels[key]
+        if (existingTunnel == null) {
+            // New tunnel - create with empty paths
+            if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+                cleanExpiredTunnels()
+                if (tunnels.size >= TransportConstants.MAX_TUNNELS) {
+                    log("Cannot create tunnel, max tunnels reached")
+                    return
+                }
+            }
+
+            log("Tunnel endpoint ${tunnelId.toHexString()} established")
+            val tunnel = TunnelInfo(
+                tunnelId = tunnelId,
+                interface_ = interface_,
+                expires = expires
+            )
+            interface_.tunnelId = tunnelId
+            tunnels[key] = tunnel
+            tunnelInterfaces[key] = interface_
+        } else {
+            // Existing tunnel reappeared - restore paths
+            log("Tunnel endpoint ${tunnelId.toHexString()} reappeared. Restoring paths...")
+            existingTunnel.interface_ = interface_
+            existingTunnel.expires = expires
+            existingTunnel.lastActivity = now
+            interface_.tunnelId = tunnelId
+            tunnelInterfaces[key] = interface_
+
+            // Restore valid paths to main path table
+            restoreTunnelPaths(existingTunnel, interface_)
+        }
+    }
+
+    /**
+     * Restore paths from a tunnel to the main path table.
+     * Only restores paths that are still valid and better than existing paths.
+     */
+    private fun restoreTunnelPaths(tunnel: TunnelInfo, interface_: InterfaceRef) {
+        val now = System.currentTimeMillis()
+        val deprecatedPaths = mutableListOf<ByteArrayKey>()
+
+        for ((destKey, pathEntry) in tunnel.paths) {
+            // Check if path has expired
+            if (now > pathEntry.expires) {
+                log("Not restoring expired path to ${destKey}")
+                deprecatedPaths.add(destKey)
+                continue
+            }
+
+            // Check if we have a better existing path
+            val existingPath = pathTable[destKey]
+            if (existingPath != null) {
+                if (pathEntry.hops > existingPath.hops && now < existingPath.expires) {
+                    log("Not restoring path to ${destKey}: better path exists")
+                    continue
+                }
+            }
+
+            // Restore path to path table
+            val restoredPath = PathEntry(
+                timestamp = now,
+                nextHop = pathEntry.receivedFrom,
+                hops = pathEntry.hops,
+                expires = pathEntry.expires,
+                randomBlobs = pathEntry.randomBlobs.toMutableList(),
+                receivingInterfaceHash = interface_.hash,
+                announcePacketHash = pathEntry.packetHash
+            )
+            pathTable[destKey] = restoredPath
+            log("Restored path to ${destKey} (${pathEntry.hops} hops) via tunnel ${tunnel.tunnelId.toHexString()}")
         }
 
-        val tunnel = TunnelInfo(
-            tunnelId = tunnelId,
-            interface_ = interface_
+        // Remove expired paths from tunnel
+        deprecatedPaths.forEach { tunnel.paths.remove(it) }
+    }
+
+    /**
+     * Add an announce path to a tunnel for persistence.
+     *
+     * If the receiving interface has an associated tunnel, the path is stored
+     * in the tunnel so it can be restored if the tunnel reconnects.
+     *
+     * @param destHash Destination hash for the path
+     * @param pathEntry The path entry from the path table
+     * @param packet The announce packet
+     * @param interface_ The receiving interface
+     */
+    private fun addPathToTunnel(
+        destHash: ByteArray,
+        pathEntry: PathEntry,
+        packet: Packet,
+        interface_: InterfaceRef
+    ) {
+        val tunnelId = interface_.tunnelId ?: return
+        val tunnel = tunnels[ByteArrayKey(tunnelId)] ?: return
+
+        // Create tunnel path entry
+        val tunnelPath = TunnelPathEntry(
+            timestamp = pathEntry.timestamp,
+            receivedFrom = pathEntry.nextHop.copyOf(),
+            hops = pathEntry.hops,
+            expires = pathEntry.expires,
+            randomBlobs = pathEntry.randomBlobs.toMutableList(),
+            packetHash = packet.packetHash.copyOf()
         )
 
-        tunnels[key] = tunnel
-        tunnelInterfaces[key] = interface_
+        tunnel.paths[destHash.toKey()] = tunnelPath
+        tunnel.expires = System.currentTimeMillis() + TransportConstants.DESTINATION_TIMEOUT
+        tunnel.lastActivity = System.currentTimeMillis()
 
-        log("Created tunnel ${tunnelId.toHexString()} from synthesis request")
+        log("Path to ${destHash.toHexString()} associated with tunnel ${tunnelId.toHexString()}")
 
-        return true
+        // Cache the announce packet for later restoration
+        cacheAnnouncePacket(packet, interface_)
+    }
+
+    /**
+     * Cache an announce packet for tunnel path restoration.
+     *
+     * When caching packets to storage, they are written exactly as they arrived
+     * over their interface. This means they have not had their hop count increased yet!
+     * Take note of this when reading from the packet cache.
+     *
+     * @param packet The announce packet to cache
+     * @param interface_ The receiving interface
+     */
+    private fun cacheAnnouncePacket(packet: Packet, interface_: InterfaceRef) {
+        try {
+            // Create announces cache directory if needed
+            val announcesDir = File("$cachePath/announces")
+            if (!announcesDir.exists()) {
+                announcesDir.mkdirs()
+            }
+
+            // Get packet hash as hex for filename
+            val packetHash = packet.packetHash
+            val packetHashHex = packetHash.toHexString()
+            val cacheFile = File(announcesDir, packetHashHex)
+
+            // Pack: [raw_bytes, interface_name]
+            val output = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(output)
+            packer.packArrayHeader(2)
+
+            // Pack raw packet data
+            val raw = packet.raw ?: return
+            packer.packBinaryHeader(raw.size)
+            packer.writePayload(raw)
+
+            // Pack interface name (used to find interface on restore)
+            packer.packString(interface_.name)
+
+            packer.close()
+
+            // Write to file
+            cacheFile.writeBytes(output.toByteArray())
+
+            log("Cached announce packet ${packetHashHex.take(12)}")
+        } catch (e: Exception) {
+            log("Error caching announce packet: ${e.message}")
+        }
+    }
+
+    /**
+     * Retrieve a cached announce packet by hash.
+     *
+     * @param packetHash The packet hash to look up
+     * @return The raw packet bytes and interface name, or null if not found
+     */
+    fun getCachedAnnouncePacket(packetHash: ByteArray): Pair<ByteArray, String?>? {
+        try {
+            val packetHashHex = packetHash.toHexString()
+            val cacheFile = File("$cachePath/announces", packetHashHex)
+
+            if (!cacheFile.exists()) {
+                return null
+            }
+
+            val data = cacheFile.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 2) {
+                log("Invalid cached announce format")
+                return null
+            }
+
+            // Unpack raw packet data
+            val rawLen = unpacker.unpackBinaryHeader()
+            val raw = ByteArray(rawLen)
+            unpacker.readPayload(raw)
+
+            // Unpack interface name
+            val interfaceName = unpacker.unpackString()
+
+            unpacker.close()
+
+            return Pair(raw, interfaceName)
+        } catch (e: Exception) {
+            log("Error reading cached announce packet: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * Clean up expired announce packets from the cache.
+     * Removes cached announces that are no longer referenced by path table or tunnels.
+     */
+    private fun cleanAnnounceCache() {
+        try {
+            val announcesDir = File("$cachePath/announces")
+            if (!announcesDir.exists()) return
+
+            // Collect active packet hashes from path table
+            val activeHashes = mutableSetOf<String>()
+            for ((_, pathEntry) in pathTable) {
+                activeHashes.add(pathEntry.announcePacketHash.toHexString())
+            }
+
+            // Collect packet hashes from tunnel paths
+            for ((_, tunnel) in tunnels) {
+                for ((_, tunnelPath) in tunnel.paths) {
+                    activeHashes.add(tunnelPath.packetHash.toHexString())
+                }
+            }
+
+            // Remove files not in active set
+            var removed = 0
+            announcesDir.listFiles()?.forEach { file ->
+                if (!activeHashes.contains(file.name)) {
+                    if (file.delete()) {
+                        removed++
+                    }
+                }
+            }
+
+            if (removed > 0) {
+                log("Removed $removed expired cached announces")
+            }
+        } catch (e: Exception) {
+            log("Error cleaning announce cache: ${e.message}")
+        }
+    }
+
+    // ===== Tunnel Table Persistence =====
+
+    /** Maximum random blobs to persist per path */
+    private const val PERSIST_RANDOM_BLOBS = 32
+
+    /**
+     * Save tunnel table to persistent storage.
+     * Format: Array of [tunnel_id, interface_hash, paths_array, expires]
+     * Each path: [dest_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
+     */
+    fun saveTunnelTable() {
+        try {
+            val startTime = System.currentTimeMillis()
+            log("Saving tunnel table to storage...")
+
+            val output = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(output)
+
+            // Pack array of tunnels
+            packer.packArrayHeader(tunnels.size)
+
+            for ((_, tunnel) in tunnels) {
+                // Pack tunnel: [tunnel_id, interface_hash, paths, expires]
+                packer.packArrayHeader(4)
+
+                // tunnel_id
+                packer.packBinaryHeader(tunnel.tunnelId.size)
+                packer.writePayload(tunnel.tunnelId)
+
+                // interface_hash (or nil if no interface)
+                val interfaceHash = tunnel.interface_?.getInterfaceHash()
+                if (interfaceHash != null) {
+                    packer.packBinaryHeader(interfaceHash.size)
+                    packer.writePayload(interfaceHash)
+                } else {
+                    packer.packNil()
+                }
+
+                // paths array
+                packer.packArrayHeader(tunnel.paths.size)
+                for ((destKey, pathEntry) in tunnel.paths) {
+                    // Path: [dest_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
+                    packer.packArrayHeader(8)
+
+                    // dest_hash
+                    packer.packBinaryHeader(destKey.bytes.size)
+                    packer.writePayload(destKey.bytes)
+
+                    // timestamp
+                    packer.packLong(pathEntry.timestamp)
+
+                    // received_from
+                    packer.packBinaryHeader(pathEntry.receivedFrom.size)
+                    packer.writePayload(pathEntry.receivedFrom)
+
+                    // hops
+                    packer.packInt(pathEntry.hops)
+
+                    // expires
+                    packer.packLong(pathEntry.expires)
+
+                    // random_blobs (limit to last PERSIST_RANDOM_BLOBS)
+                    val blobsToSave = pathEntry.randomBlobs.takeLast(PERSIST_RANDOM_BLOBS)
+                    packer.packArrayHeader(blobsToSave.size)
+                    for (blob in blobsToSave) {
+                        packer.packBinaryHeader(blob.size)
+                        packer.writePayload(blob)
+                    }
+
+                    // interface_hash (same as tunnel's interface)
+                    if (interfaceHash != null) {
+                        packer.packBinaryHeader(interfaceHash.size)
+                        packer.writePayload(interfaceHash)
+                    } else {
+                        packer.packNil()
+                    }
+
+                    // packet_hash
+                    packer.packBinaryHeader(pathEntry.packetHash.size)
+                    packer.writePayload(pathEntry.packetHash)
+                }
+
+                // expires
+                packer.packLong(tunnel.expires)
+            }
+
+            packer.close()
+
+            // Write to file
+            val tunnelsFile = File("$storagePath/tunnels")
+            tunnelsFile.parentFile?.mkdirs()
+            tunnelsFile.writeBytes(output.toByteArray())
+
+            val saveTime = System.currentTimeMillis() - startTime
+            log("Saved ${tunnels.size} tunnel table entries in ${saveTime}ms")
+        } catch (e: Exception) {
+            log("Error saving tunnel table: ${e.message}")
+        }
+    }
+
+    /**
+     * Load tunnel table from persistent storage.
+     */
+    fun loadTunnelTable() {
+        try {
+            val tunnelsFile = File("$storagePath/tunnels")
+            if (!tunnelsFile.exists()) {
+                log("No tunnel table found in storage")
+                return
+            }
+
+            val data = tunnelsFile.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+
+            val tunnelCount = unpacker.unpackArrayHeader()
+
+            for (i in 0 until tunnelCount) {
+                val tunnelSize = unpacker.unpackArrayHeader()
+                if (tunnelSize != 4) {
+                    log("Invalid tunnel entry size: $tunnelSize")
+                    continue
+                }
+
+                // tunnel_id
+                val tunnelIdLen = unpacker.unpackBinaryHeader()
+                val tunnelId = ByteArray(tunnelIdLen)
+                unpacker.readPayload(tunnelId)
+
+                // interface_hash (may be nil)
+                val interfaceHash: ByteArray? = if (unpacker.tryUnpackNil()) {
+                    null
+                } else {
+                    val hashLen = unpacker.unpackBinaryHeader()
+                    ByteArray(hashLen).also { unpacker.readPayload(it) }
+                }
+
+                // paths array
+                val pathCount = unpacker.unpackArrayHeader()
+                val paths = mutableMapOf<ByteArrayKey, TunnelPathEntry>()
+
+                for (j in 0 until pathCount) {
+                    val pathSize = unpacker.unpackArrayHeader()
+                    if (pathSize != 8) {
+                        log("Invalid path entry size: $pathSize")
+                        continue
+                    }
+
+                    // dest_hash
+                    val destHashLen = unpacker.unpackBinaryHeader()
+                    val destHash = ByteArray(destHashLen)
+                    unpacker.readPayload(destHash)
+
+                    // timestamp
+                    val timestamp = unpacker.unpackLong()
+
+                    // received_from
+                    val receivedFromLen = unpacker.unpackBinaryHeader()
+                    val receivedFrom = ByteArray(receivedFromLen)
+                    unpacker.readPayload(receivedFrom)
+
+                    // hops
+                    val hops = unpacker.unpackInt()
+
+                    // expires
+                    val expires = unpacker.unpackLong()
+
+                    // random_blobs
+                    val blobCount = unpacker.unpackArrayHeader()
+                    val randomBlobs = mutableListOf<ByteArray>()
+                    for (k in 0 until blobCount) {
+                        val blobLen = unpacker.unpackBinaryHeader()
+                        val blob = ByteArray(blobLen)
+                        unpacker.readPayload(blob)
+                        randomBlobs.add(blob)
+                    }
+
+                    // interface_hash (skip, same as tunnel's)
+                    if (unpacker.tryUnpackNil()) {
+                        // nil, skip
+                    } else {
+                        val skipLen = unpacker.unpackBinaryHeader()
+                        val skipBytes = ByteArray(skipLen)
+                        unpacker.readPayload(skipBytes) // Skip the bytes
+                    }
+
+                    // packet_hash
+                    val packetHashLen = unpacker.unpackBinaryHeader()
+                    val packetHash = ByteArray(packetHashLen)
+                    unpacker.readPayload(packetHash)
+
+                    // Check if cached announce packet exists
+                    val cachedAnnounce = getCachedAnnouncePacket(packetHash)
+                    if (cachedAnnounce != null && !isPathExpired(expires)) {
+                        val pathEntry = TunnelPathEntry(
+                            timestamp = timestamp,
+                            receivedFrom = receivedFrom,
+                            hops = hops,
+                            expires = expires,
+                            randomBlobs = randomBlobs,
+                            packetHash = packetHash
+                        )
+                        paths[ByteArrayKey(destHash)] = pathEntry
+                    }
+                }
+
+                // expires
+                val tunnelExpires = unpacker.unpackLong()
+
+                // Only add tunnel if it has valid paths
+                if (paths.isNotEmpty()) {
+                    val tunnel = TunnelInfo(
+                        tunnelId = tunnelId,
+                        interface_ = null, // Will be reconnected when interface comes back
+                        expires = tunnelExpires
+                    )
+                    tunnel.paths.putAll(paths)
+                    tunnels[ByteArrayKey(tunnelId)] = tunnel
+                    log("Loaded tunnel ${tunnelId.toHexString().take(12)} with ${paths.size} paths")
+                }
+            }
+
+            unpacker.close()
+
+            log("Loaded ${tunnels.size} tunnels from storage")
+        } catch (e: Exception) {
+            log("Error loading tunnel table: ${e.message}")
+        }
+    }
+
+    /**
+     * Check if a path has expired.
+     */
+    private fun isPathExpired(expires: Long): Boolean {
+        return System.currentTimeMillis() > expires
+    }
+
+    /**
+     * Persist all transport data.
+     * Called during shutdown.
+     */
+    fun persistData() {
+        saveTunnelTable()
     }
 
     /**
@@ -2704,6 +3341,15 @@ object Transport {
      */
     fun hasTunnel(tunnelId: ByteArray): Boolean {
         return tunnels.containsKey(ByteArrayKey(tunnelId))
+    }
+
+    /**
+     * Get all active tunnels.
+     *
+     * @return Map of tunnel IDs to TunnelInfo
+     */
+    fun getTunnels(): Map<ByteArrayKey, TunnelInfo> {
+        return tunnels.toMap()
     }
 
     /**
@@ -2777,13 +3423,28 @@ interface InterfaceRef {
     val ifacIdentity: network.reticulum.identity.Identity?
         get() = null
 
+    // Tunnel properties
+    /** Tunnel ID associated with this interface, if any. */
+    var tunnelId: ByteArray?
+
+    /** Whether this interface wants to establish a tunnel. */
+    var wantsTunnel: Boolean
+
+    /**
+     * Get a hash uniquely identifying this interface.
+     * Used for tunnel ID calculation: hash(public_key + interface_hash).
+     */
+    fun getInterfaceHash(): ByteArray {
+        return Hashes.fullHash(name.toByteArray(Charsets.UTF_8))
+    }
+
     fun send(data: ByteArray)
 }
 
 /**
  * Wrapper for ByteArray to use as map key.
  */
-class ByteArrayKey(private val bytes: ByteArray) {
+class ByteArrayKey(val bytes: ByteArray) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is ByteArrayKey) return false

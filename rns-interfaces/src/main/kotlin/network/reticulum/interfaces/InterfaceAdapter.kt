@@ -15,6 +15,15 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val canReceive: Boolean = iface.canReceive
     override val online: Boolean get() = iface.online.get()
 
+    // Tunnel properties - delegate to underlying interface
+    override var tunnelId: ByteArray?
+        get() = iface.tunnelId
+        set(value) { iface.tunnelId = value }
+
+    override var wantsTunnel: Boolean
+        get() = iface.wantsTunnel
+        set(value) { iface.wantsTunnel = value }
+
     init {
         // Only set up the callback if one isn't already set
         // This prevents overwriting callbacks set by parent interfaces (e.g., TCPServerInterface)

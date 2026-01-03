@@ -78,6 +78,9 @@ class TCPClientInterface(
             online.set(true)
             neverConnected.set(false)
 
+            // Request tunnel synthesis for this connection
+            wantsTunnel = true
+
             if (initial) {
                 log("TCP connection established")
             }

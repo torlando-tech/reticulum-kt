@@ -62,6 +62,10 @@ abstract class Interface(
     /** Tunnel ID if this is a tunneled interface. */
     var tunnelId: ByteArray? = null
 
+    /** Whether this interface wants a tunnel synthesized. */
+    @Volatile
+    var wantsTunnel: Boolean = false
+
     /** Callback for received packets. */
     var onPacketReceived: ((data: ByteArray, fromInterface: Interface) -> Unit)? = null
 

@@ -226,14 +226,63 @@ data class QueuedAnnounce(
 }
 
 /**
+ * Entry storing a path discovered through a tunnel.
+ *
+ * When announces are received on tunnel interfaces, paths are stored
+ * in the tunnel so they can be restored if the tunnel reconnects.
+ */
+data class TunnelPathEntry(
+    /** When path was discovered (epoch millis). */
+    val timestamp: Long,
+
+    /** Next hop transport ID to reach the destination. */
+    val receivedFrom: ByteArray,
+
+    /** Number of hops to destination. */
+    val hops: Int,
+
+    /** When this path expires (epoch millis). */
+    val expires: Long,
+
+    /** Random blobs from announces for timing verification. */
+    val randomBlobs: MutableList<ByteArray>,
+
+    /** Hash of the announce packet that created this path (for cache lookup). */
+    val packetHash: ByteArray
+) {
+    /** Check if this path has expired. */
+    fun isExpired(): Boolean = System.currentTimeMillis() > expires
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is TunnelPathEntry) return false
+        return receivedFrom.contentEquals(other.receivedFrom) &&
+               hops == other.hops &&
+               packetHash.contentEquals(other.packetHash)
+    }
+
+    override fun hashCode(): Int {
+        var result = receivedFrom.contentHashCode()
+        result = 31 * result + hops
+        result = 31 * result + packetHash.contentHashCode()
+        return result
+    }
+}
+
+/**
  * Information about an active tunnel.
+ *
+ * Tunnels maintain routing paths across network disruptions. When a node
+ * receives announces through an interface with an associated tunnel, those
+ * paths are stored. If the connection drops and reconnects, the paths are
+ * automatically restored.
  */
 data class TunnelInfo(
-    /** Unique tunnel ID. */
+    /** Unique tunnel ID: SHA256(public_key + interface_hash). */
     val tunnelId: ByteArray,
 
-    /** Interface this tunnel operates on. */
-    val interface_: InterfaceRef,
+    /** Interface this tunnel operates on. Null when persisted/disconnected. */
+    var interface_: InterfaceRef?,
 
     /** When this tunnel was created (epoch millis). */
     val createdAt: Long = System.currentTimeMillis(),
@@ -241,15 +290,20 @@ data class TunnelInfo(
     /** Last activity timestamp (epoch millis). */
     var lastActivity: Long = System.currentTimeMillis(),
 
+    /** When this tunnel expires (epoch millis). */
+    var expires: Long = System.currentTimeMillis() + TransportConstants.DESTINATION_TIMEOUT,
+
     /** Total bytes transmitted through this tunnel. */
     var txBytes: Long = 0,
 
     /** Total bytes received through this tunnel. */
-    var rxBytes: Long = 0
+    var rxBytes: Long = 0,
+
+    /** Paths discovered through this tunnel: destHash -> TunnelPathEntry. */
+    val paths: MutableMap<ByteArrayKey, TunnelPathEntry> = mutableMapOf()
 ) {
     /** Check if this tunnel has expired. */
-    fun isExpired(): Boolean =
-        System.currentTimeMillis() - lastActivity > TransportConstants.TUNNEL_EXPIRY
+    fun isExpired(): Boolean = System.currentTimeMillis() > expires
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

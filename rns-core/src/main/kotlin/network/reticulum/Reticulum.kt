@@ -167,6 +167,10 @@ class Reticulum private constructor(
         // Load or create transport identity
         val transportIdentity = loadOrCreateTransportIdentity()
 
+        // Configure Transport paths
+        Transport.setCachePath(cachePath)
+        Transport.setStoragePath(storagePath)
+
         // Start Transport with identity
         Transport.start(transportIdentity = transportIdentity, enableTransport = enableTransport)
 
