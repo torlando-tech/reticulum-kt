@@ -129,7 +129,8 @@ class LXMRouter(
 
     /** Propagation transfer state */
     @Volatile
-    private var propagationTransferState: PropagationTransferState = PropagationTransferState.IDLE
+    var propagationTransferState: PropagationTransferState = PropagationTransferState.IDLE
+        private set
 
     /** Progress of current propagation transfer (0.0 to 1.0) */
     @Volatile
@@ -181,6 +182,17 @@ class LXMRouter(
             if (!dir.exists()) {
                 dir.mkdirs()
             }
+        }
+
+        // Register announce handler for propagation nodes
+        // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
+        // so we handle all announces and let handlePropagationAnnounce filter by appData format.
+        Transport.registerAnnounceHandler { destHash, identity, appData ->
+            // Only call handler if this looks like a propagation announce (has appData)
+            if (appData != null && appData.isNotEmpty()) {
+                handlePropagationAnnounce(destHash, identity, appData)
+            }
+            false // Don't consume - let other handlers see it too
         }
     }
 
@@ -1461,16 +1473,12 @@ class LXMRouter(
 
         try {
             // Send LIST request: [None, None]
-            val buffer = java.io.ByteArrayOutputStream()
-            val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
-            packer.packArrayHeader(2)
-            packer.packNil()  // wants = null (list mode)
-            packer.packNil()  // haves = null (list mode)
-            packer.close()
+            // Python sends [None, None] as data, which gets packed by Link.request
+            val requestData = listOf(null, null)
 
             link.request(
                 path = LXMFConstants.MESSAGE_GET_PATH,
-                data = buffer.toByteArray(),
+                data = requestData,
                 responseCallback = { receipt ->
                     val responseData = receipt.response
                     if (responseData != null) {
@@ -1507,16 +1515,15 @@ class LXMRouter(
                 return
             }
 
-            // Response is list of [transient_id, size] pairs
+            // Response is list of transient_ids (just the IDs, no sizes)
+            // Python's message_get_request returns [transient_id, transient_id, ...]
             val messageCount = unpacker.unpackArrayHeader()
             val wantedIds = mutableListOf<ByteArray>()
 
             for (i in 0 until messageCount) {
-                unpacker.unpackArrayHeader() // Each item is [id, size]
                 val idLen = unpacker.unpackBinaryHeader()
                 val transientId = ByteArray(idLen)
                 unpacker.readPayload(transientId)
-                unpacker.skipValue() // Skip size
 
                 // Check if we already have this message
                 val idHex = transientId.toHexString()
@@ -1551,30 +1558,17 @@ class LXMRouter(
         propagationTransferState = PropagationTransferState.REQUESTING_MESSAGES
 
         try {
-            val buffer = java.io.ByteArrayOutputStream()
-            val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
-
             // Send GET request: [wants, haves, limit]
-            packer.packArrayHeader(3)
-
-            // wants: list of transient IDs
-            packer.packArrayHeader(wantedIds.size)
-            for (id in wantedIds) {
-                packer.packBinaryHeader(id.size)
-                packer.writePayload(id)
-            }
-
-            // haves: empty list (we'll handle deletion later)
-            packer.packArrayHeader(0)
-
-            // limit: delivery limit
-            packer.packInt(LXMFConstants.DELIVERY_LIMIT_KB)
-
-            packer.close()
+            // Python expects: data[0]=wants (list of transient IDs), data[1]=haves (list), data[2]=limit (int KB)
+            val requestData = listOf(
+                wantedIds,                       // wants: list of transient IDs (ByteArray)
+                emptyList<ByteArray>(),          // haves: empty list
+                LXMFConstants.DELIVERY_LIMIT_KB  // limit: KB limit
+            )
 
             link.request(
                 path = LXMFConstants.MESSAGE_GET_PATH,
-                data = buffer.toByteArray(),
+                data = requestData,
                 responseCallback = { receipt ->
                     val responseData = receipt.response
                     if (responseData != null) {
@@ -1613,13 +1607,12 @@ class LXMRouter(
                 return
             }
 
-            // Response is list of message data
+            // Response is list of message data (raw bytes, no wrapper arrays)
+            // Python's message_get_request returns [lxmf_data, lxmf_data, ...]
             val messageCount = unpacker.unpackArrayHeader()
             var receivedCount = 0
 
             for (i in 0 until messageCount) {
-                // Each message is wrapped in an array
-                unpacker.unpackArrayHeader()
                 val dataLen = unpacker.unpackBinaryHeader()
                 val messageData = ByteArray(dataLen)
                 unpacker.readPayload(messageData)

@@ -198,8 +198,11 @@ class LxmfEchoBot {
         )
 
         // Send via coroutine
+        // Wait a bit before sending to give the sender time to set up backchannel
+        // (Python LXMF only sets up resource callbacks after receiving our proof)
         scope.launch {
             try {
+                delay(5000)  // Wait 5s for backchannel setup (Python LXMF has 4s job loop)
                 router.handleOutbound(reply)
                 log("Echo sent to <$senderHash>")
             } catch (e: Exception) {

@@ -34,4 +34,11 @@ tasks {
     build {
         dependsOn(shadowJar)
     }
+
+    register<JavaExec>("runPropagationTest") {
+        group = "application"
+        description = "Run propagation sync test"
+        mainClass.set("network.reticulum.lxmf.examples.PropagationSyncTestKt")
+        classpath = sourceSets["main"].runtimeClasspath
+    }
 }

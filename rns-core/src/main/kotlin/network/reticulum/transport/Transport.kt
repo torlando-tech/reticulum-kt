@@ -1768,6 +1768,14 @@ object Transport {
             } else {
                 data
             }
+            // Debug: log packet header bytes
+            if (data.size >= 19) {
+                val flags = data[0].toInt() and 0xFF
+                val hops = data[1].toInt() and 0xFF
+                val destHash = data.copyOfRange(2, 18).joinToString("") { "%02x".format(it) }
+                val context = data[18].toInt() and 0xFF
+                log("TX PACKET: flags=0x${"%02x".format(flags)} hops=$hops dest=${destHash.take(16)}... ctx=0x${"%02x".format(context)} size=${data.size}")
+            }
             interfaceRef.send(transmitData)
             trafficTxBytes += transmitData.size
             recordTxBytes(interfaceRef, transmitData.size)
@@ -2123,14 +2131,28 @@ object Transport {
                 // Mark link as validated
                 linkEntry.validated = true
                 return
-            } else {
-                // Debug: show what's in the link table
-                if (linkTable.isNotEmpty()) {
-                    val keys = linkTable.keys.take(3).map { it.toString().take(16) + "..." }
-                    log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table. Keys: $keys")
-                } else {
-                    log("LRPROOF dest=${packet.destinationHash.toHexString()} not found. Link table is empty")
+            }
+
+            // Check if we can deliver it to a local pending link
+            val pendingLink = pendingLinks[packet.destinationHash.toKey()]
+            if (pendingLink != null) {
+                log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
+                try {
+                    // Use reflection to call validateProof on the link
+                    val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
+                    validateMethod.invoke(pendingLink, packet)
+                } catch (e: Exception) {
+                    log("Error validating link proof: ${e.message}")
                 }
+                return
+            }
+
+            // Debug: show what's in the link table
+            if (linkTable.isNotEmpty()) {
+                val keys = linkTable.keys.take(3).map { it.toString().take(16) + "..." }
+                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table. Keys: $keys")
+            } else {
+                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table or pending_links")
             }
         }
 

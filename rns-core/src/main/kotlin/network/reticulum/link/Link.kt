@@ -563,6 +563,9 @@ class Link private constructor(
 
             updateKeepalive()
 
+            // Send RTT packet to server (Python expects this to activate the link on its side)
+            sendRttPacket()
+
             // Notify callback
             callbacks.linkEstablished?.let { callback ->
                 thread(isDaemon = true) {
@@ -850,25 +853,6 @@ class Link private constructor(
         // Calculate timeout if not provided
         val actualTimeout = timeout ?: calculateRequestTimeout()
 
-        // Generate request ID
-        val requestId = Hashes.truncatedHash(packedRequest)
-
-        // Create the RequestReceipt
-        val receipt = RequestReceipt(
-            link = this,
-            requestId = requestId,
-            requestSize = packedRequest.size,
-            responseCallback = responseCallback,
-            failedCallback = failedCallback,
-            progressCallback = progressCallback,
-            timeout = actualTimeout
-        )
-
-        // Add to pending requests
-        synchronized(pendingRequests) {
-            pendingRequests.add(receipt)
-        }
-
         // Decide whether to send as packet or resource
         if (packedRequest.size <= mdu) {
             // Send as packet
@@ -880,6 +864,26 @@ class Link private constructor(
                 context = PacketContext.REQUEST,
                 destinationType = DestinationType.LINK
             )
+
+            // Generate request ID from packet's truncated hash (like Python does)
+            // This must be calculated AFTER creating the packet with encrypted data
+            val requestId = packet.truncatedHash
+
+            // Create the RequestReceipt
+            val receipt = RequestReceipt(
+                link = this,
+                requestId = requestId,
+                requestSize = packedRequest.size,
+                responseCallback = responseCallback,
+                failedCallback = failedCallback,
+                progressCallback = progressCallback,
+                timeout = actualTimeout
+            )
+
+            // Add to pending requests
+            synchronized(pendingRequests) {
+                pendingRequests.add(receipt)
+            }
 
             if (!Transport.outbound(packet)) {
                 log("Failed to send request packet")
@@ -895,19 +899,18 @@ class Link private constructor(
             // TODO: Set up timeout monitoring thread
             // For now, the timeout will be handled by the watchdog or caller
 
+            return receipt
+
         } else {
             // Send as resource
+            // For large requests, use the truncated hash of the packed request as request_id
+            val requestId = Hashes.truncatedHash(packedRequest)
             log("Sending request ${requestId.toHexString()} as resource")
             // TODO: Implement large request sending via Resource
             // This requires Resource class to support request_id and is_response flags
             log("Large requests not yet fully implemented")
-            synchronized(pendingRequests) {
-                pendingRequests.remove(receipt)
-            }
             return null
         }
-
-        return receipt
     }
 
     /**
@@ -1300,6 +1303,36 @@ class Link private constructor(
     }
 
     /**
+     * Send RTT packet to the remote side.
+     * This is sent by the initiator after validating the link proof to
+     * let the server know the link is ready and what the measured RTT is.
+     */
+    private fun sendRttPacket() {
+        val linkRtt = rtt ?: return
+
+        // Pack RTT as a double (seconds) like Python does
+        val rttSeconds = linkRtt / 1000.0
+        val packer = MessagePack.newDefaultBufferPacker()
+        packer.packDouble(rttSeconds)
+        val rttData = packer.toByteArray()
+        packer.close()
+
+        // Encrypt and send
+        val encrypted = encrypt(rttData)
+        val packet = Packet.createRaw(
+            destinationHash = linkId,
+            data = encrypted,
+            packetType = PacketType.DATA,
+            context = PacketContext.LRRTT,
+            destinationType = DestinationType.LINK
+        )
+
+        Transport.outbound(packet)
+        hadOutbound()
+        log("Sent RTT packet to server (${rttSeconds}s)")
+    }
+
+    /**
      * Send a keepalive packet.
      */
     private fun sendKeepalive() {
@@ -1512,6 +1545,7 @@ class Link private constructor(
             val packedResponse = decrypt(packet.data) ?: return
 
             // Unpack msgpack response: [requestId, responseData]
+            // The responseData can be any msgpack type (binary, array, map, etc.)
             val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedResponse)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 2) {
@@ -1523,13 +1557,24 @@ class Link private constructor(
             val requestId = ByteArray(requestIdSize)
             unpacker.readPayload(requestId)
 
-            val responseDataSize = unpacker.unpackBinaryHeader()
-            val responseData = ByteArray(responseDataSize)
-            unpacker.readPayload(responseData)
+            // Get the position after request_id to extract raw responseData bytes
+            val positionAfterRequestId = unpacker.totalReadBytes.toInt()
+
+            // Read the response value (could be any type) and re-serialize it to bytes
+            // We use ImmutableValue to preserve the original structure
+            val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            // Calculate transfer size (size of msgpack-encoded response data)
-            val transferSize = responseDataSize + 2 // +2 for msgpack overhead
+            // Re-pack the response value to bytes so callbacks can unpack it
+            val responseBuffer = ByteArrayOutputStream()
+            val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
+            responseValue.writeTo(responsePacker)
+            responsePacker.close()
+            val responseData = responseBuffer.toByteArray()
+
+            // Calculate transfer size
+            val responseDataSize = responseData.size
+            val transferSize = responseDataSize
 
             // Pass to handleResponse
             handleResponse(requestId, responseData, responseDataSize, transferSize)
@@ -2324,12 +2369,57 @@ class Link private constructor(
      * @param resource The completed resource
      */
     fun responseResourceConcluded(resource: network.reticulum.resource.Resource) {
-        // TODO: Implement when Resource class is complete
-        // This should:
-        // 1. Check if resource.status == COMPLETE
-        // 2. Unpack the response data
-        // 3. Call handleResponse with the unpacked data
-        log("Response resource concluded (not yet fully implemented)")
+        if (resource.status != network.reticulum.resource.ResourceConstants.COMPLETE) {
+            log("Response resource failed with status: ${resource.status}")
+            // Notify pending request of failure
+            val requestId = resource.requestId
+            if (requestId != null) {
+                synchronized(pendingRequests) {
+                    pendingRequests.find { it.requestId.contentEquals(requestId) }?.let { pending ->
+                        pending.requestFailed()
+                    }
+                }
+            }
+            return
+        }
+
+        // Get the resource data
+        val packedResponse = resource.data
+        if (packedResponse == null) {
+            log("Response resource has no data")
+            return
+        }
+
+        try {
+            // Unpack response: [request_id, response_data]
+            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedResponse)
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 2) {
+                log("Invalid response format: expected 2 elements, got $arraySize")
+                return
+            }
+
+            val requestIdSize = unpacker.unpackBinaryHeader()
+            val requestId = ByteArray(requestIdSize)
+            unpacker.readPayload(requestId)
+
+            // Read the response value (could be any type) and re-serialize it to bytes
+            val responseValue = unpacker.unpackValue()
+            unpacker.close()
+
+            // Re-pack the response value to bytes so callbacks can unpack it
+            val responseBuffer = ByteArrayOutputStream()
+            val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
+            responseValue.writeTo(responsePacker)
+            responsePacker.close()
+            val responseData = responseBuffer.toByteArray()
+
+            // Pass to handleResponse
+            handleResponse(requestId, responseData, packedResponse.size, resource.totalSize)
+
+        } catch (e: Exception) {
+            log("Error processing response resource: ${e.message}")
+        }
     }
 
     /**
