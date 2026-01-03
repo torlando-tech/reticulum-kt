@@ -70,11 +70,9 @@ class TCPClientInterface(
             sock.tcpNoDelay = true
             sock.keepAlive = true
             sock.soTimeout = 0 // Block on read
-            log("Socket connected: local=${sock.localPort}, connected=${sock.isConnected}, closed=${sock.isClosed}")
 
             // Get input stream immediately while we have the socket reference
             val inputStream = sock.getInputStream()
-            log("Got input stream: $inputStream")
 
             socket = sock
             online.set(true)
@@ -91,9 +89,8 @@ class TCPClientInterface(
                 val keepaliveFrame = HDLC.frame(ByteArray(0))
                 sock.getOutputStream().write(keepaliveFrame)
                 sock.getOutputStream().flush()
-                log("Sent connection keepalive (${keepaliveFrame.size} bytes)")
             } catch (e: Exception) {
-                log("Failed to send keepalive: ${e.message}")
+                // Keepalive failure is not critical
             }
 
             // Small delay for Python to process
@@ -143,32 +140,17 @@ class TCPClientInterface(
     private fun startReadLoop(sock: Socket, inputStream: InputStream) {
         readThread = thread(name = "TCPClient-$name-read", isDaemon = true) {
             val buffer = ByteArray(4096)
-            log("Read loop started, online=${online.get()}, detached=${detached.get()}")
-            log("Using socket: connected=${sock.isConnected}, closed=${sock.isClosed}, inputShutdown=${sock.isInputShutdown}")
-            log("Input stream available bytes: ${inputStream.available()}")
 
             try {
                 while (online.get() && !detached.get()) {
-                    if (sock.isClosed) {
-                        log("Socket is closed, breaking")
-                        break
-                    }
-                    if (!sock.isConnected) {
-                        log("Socket is not connected, breaking")
-                        break
-                    }
-                    if (sock.isInputShutdown) {
-                        log("Socket input is shutdown, breaking")
+                    if (sock.isClosed || !sock.isConnected || sock.isInputShutdown) {
                         break
                     }
 
-                    log("Calling read()...")
                     val bytesRead = inputStream.read(buffer)
-                    log("read() returned: $bytesRead")
 
                     if (bytesRead > 0) {
                         val data = buffer.copyOf(bytesRead)
-                        log("Received $bytesRead bytes: ${data.take(32).joinToString(" ") { "%02x".format(it) }}")
                         if (useKissFraming) {
                             kissDeframer.process(data)
                         } else {
@@ -176,16 +158,12 @@ class TCPClientInterface(
                         }
                     } else if (bytesRead == -1) {
                         // Connection closed
-                        log("Read returned -1 (EOF), socket state: connected=${sock.isConnected}, closed=${sock.isClosed}, inputShutdown=${sock.isInputShutdown}")
                         online.set(false)
                         break
                     }
                 }
-                log("Read loop exited, online=${online.get()}, detached=${detached.get()}")
             } catch (e: IOException) {
                 if (!detached.get()) {
-                    log("Read error: ${e.message}")
-                    e.printStackTrace()
                     online.set(false)
                 }
             }

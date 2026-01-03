@@ -8,6 +8,7 @@ import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.auto.AutoInterface
+import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.lxmf.DeliveryMethod
 import network.reticulum.lxmf.LXMessage
@@ -33,6 +34,7 @@ import java.time.format.DateTimeFormatter
 private const val ANNOUNCE_INTERVAL_MS = 60_000L
 private const val DISPLAY_NAME = "Kotlin Echo Bot"
 private const val IDENTITY_FILE = "echobot_identity"
+private const val TCP_PORT = 4242
 
 fun main(args: Array<String>) {
     println("=".repeat(60))
@@ -51,6 +53,7 @@ class LxmfEchoBot {
     private lateinit var identity: Identity
     private lateinit var router: LXMRouter
     private lateinit var autoInterface: AutoInterface
+    private lateinit var tcpServer: TCPServerInterface
     private lateinit var myDestination: Destination
 
     @Volatile
@@ -92,6 +95,11 @@ class LxmfEchoBot {
         autoInterface = AutoInterface(name = "EchoBot AutoInterface")
         autoInterface.start()
         Transport.registerInterface(autoInterface.toRef())
+
+        log("Starting TCP server on port $TCP_PORT...")
+        tcpServer = TCPServerInterface(name = "EchoBot TCP", bindPort = TCP_PORT)
+        tcpServer.start()
+        Transport.registerInterface(tcpServer.toRef())
 
         log("Loading or creating identity...")
 
@@ -233,7 +241,9 @@ class LxmfEchoBot {
         println("Echo Bot Status:")
         println("  Address: <${myDestination.hexHash}>")
         println("  Display name: $DISPLAY_NAME")
-        println("  Interface: AutoInterface (peer discovery enabled)")
+        println("  Interfaces:")
+        println("    - AutoInterface (peer discovery)")
+        println("    - TCP Server on port $TCP_PORT")
         println("-".repeat(40))
         println()
     }
@@ -251,6 +261,10 @@ class LxmfEchoBot {
 
         if (::autoInterface.isInitialized) {
             autoInterface.detach()
+        }
+
+        if (::tcpServer.isInitialized) {
+            tcpServer.detach()
         }
 
         Reticulum.stop()

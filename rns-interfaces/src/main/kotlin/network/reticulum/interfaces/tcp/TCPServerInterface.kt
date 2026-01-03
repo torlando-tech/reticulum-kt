@@ -297,5 +297,12 @@ class TCPServerClientInterface internal constructor(
         parentServer.clientDisconnected(this)
     }
 
+    private fun log(message: String) {
+        val timestamp = java.time.LocalDateTime.now().format(
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        )
+        println("[$timestamp] [$name] $message")
+    }
+
     override fun toString(): String = "TCPServerClientInterface[$name]"
 }

@@ -395,6 +395,8 @@ class Packet private constructor(
         // Create receipt if requested
         if (createReceipt) {
             receipt = PacketReceipt(this)
+            // Register with Transport for proof handling
+            Transport.registerReceipt(receipt!!)
         }
 
         // Send via Transport

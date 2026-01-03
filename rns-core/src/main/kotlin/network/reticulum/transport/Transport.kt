@@ -363,11 +363,18 @@ object Transport {
     // ===== Receipt Tracking =====
 
     /**
-     * Register a packet receipt for timeout tracking.
+     * Register a packet receipt for timeout tracking and proof handling.
      * Called automatically when packets are sent with createReceipt=true.
      */
     fun registerReceipt(receipt: PacketReceipt) {
         receipts.add(receipt)
+        // Also register for proof handling
+        pendingReceipts[receipt.hash.toKey()] = object : ProofCallback {
+            override fun onProofReceived(proofPacket: Packet): Boolean {
+                return receipt.validateProofPacket(proofPacket)
+            }
+        }
+        log("Registered receipt for ${receipt.hash.toHexString()}")
     }
 
     /**
@@ -2119,8 +2126,19 @@ object Transport {
         }
 
         // Check if there's a pending receipt for this proof (local destination)
-        val receiptKey = packet.destinationHash.toKey()
-        val callback = pendingReceipts.remove(receiptKey)
+        // Try multiple lookups:
+        // 1. By proof destination hash (truncated hash)
+        // 2. By full packet hash from proof data (for explicit proofs)
+        var callback = pendingReceipts.remove(packet.destinationHash.toKey())
+
+        if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
+            // Extract full packet hash from explicit proof data
+            val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
+            callback = pendingReceipts.remove(fullHash.toKey())
+            if (callback != null) {
+                log("Found pending receipt by full hash from proof data")
+            }
+        }
 
         if (callback != null) {
             try {
@@ -2185,6 +2203,9 @@ object Transport {
             log("Ignoring empty packet for ${destination.hexHash}")
             return
         }
+
+        // Set the destination on the packet so it can be proved
+        packet.destination = destination
 
         try {
             // Handle based on packet type
