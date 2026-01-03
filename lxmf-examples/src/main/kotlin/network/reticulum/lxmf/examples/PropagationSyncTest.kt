@@ -9,6 +9,7 @@ import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMRouter.PropagationTransferState
 import network.reticulum.transport.Transport
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Test propagation sync from a Python propagation node.
@@ -39,11 +40,15 @@ class PropagationSyncTest {
     private lateinit var router: LXMRouter
     private lateinit var tcpClient: TCPClientInterface
     private var messagesReceived = 0
+    private var signaturesValid = AtomicInteger(0)
+    private var signaturesInvalid = AtomicInteger(0)
+    private var senderHash: String? = null
 
     fun run() {
         try {
             initialize()
             waitForPropagationNode()
+            waitForSenderAnnounce()
             syncMessages()
             printResults()
         } catch (e: Exception) {
@@ -98,13 +103,25 @@ class PropagationSyncTest {
         // Register message callback
         router.registerDeliveryCallback { message ->
             messagesReceived++
+            val msgSenderHash = message.sourceHash?.toHexString() ?: "unknown"
+            if (senderHash == null) senderHash = msgSenderHash
+
+            if (message.signatureValidated) {
+                signaturesValid.incrementAndGet()
+            } else {
+                signaturesInvalid.incrementAndGet()
+            }
+
             println("\n${"=".repeat(50)}")
             println("MESSAGE RECEIVED (#$messagesReceived)")
             println("${"=".repeat(50)}")
-            println("From: ${message.sourceHash?.toHexString() ?: "unknown"}")
+            println("From: $msgSenderHash")
             println("Title: ${message.title}")
             println("Content: ${message.content}")
             println("Signature valid: ${message.signatureValidated}")
+            if (!message.signatureValidated) {
+                println("Unverified reason: ${message.unverifiedReason}")
+            }
             println("${"=".repeat(50)}\n")
         }
 
@@ -144,6 +161,42 @@ class PropagationSyncTest {
         println()
     }
 
+    private fun waitForSenderAnnounce() {
+        println("Waiting for sender identity announce...")
+        println("(This allows signature validation)")
+
+        // The sender announces with app_name "lxmf.delivery"
+        // We'll wait up to 15 seconds for an lxmf.delivery announce to arrive
+        // We detect it by checking if Identity.recall can find an lxmf.delivery destination
+
+        var waited = 0
+        var foundSender = false
+
+        // We'll look for any lxmf.delivery announces by checking if announces arrived
+        // We can use the announce handler or just wait and check Identity.knownDestinations
+        while (waited < 15 && !foundSender) {
+            Thread.sleep(1000)
+            waited++
+            print(".")
+            System.out.flush()
+
+            // Check if we've received any announces by checking the known destinations count
+            // This is a simple heuristic - in practice we'd want to check for specific announces
+            val knownCount = Identity.knownDestinationCount()
+            if (knownCount > 0) {
+                foundSender = true
+            }
+        }
+        println()
+
+        if (foundSender) {
+            println("Received identity announce(s) - signatures can be validated")
+        } else {
+            println("Warning: No sender announce received - signatures may not validate")
+        }
+        println()
+    }
+
     private fun syncMessages() {
         println("Requesting messages from propagation node...")
         router.requestMessagesFromPropagationNode()
@@ -171,6 +224,34 @@ class PropagationSyncTest {
         println("Final state: ${router.propagationTransferState}")
         println("Messages received: ${router.propagationTransferLastResult}")
         println("Callback messages: $messagesReceived")
+        println()
+        println("Signature Validation:")
+        println("  Valid signatures: ${signaturesValid.get()}")
+        println("  Invalid signatures: ${signaturesInvalid.get()}")
+
+        val allValid = signaturesValid.get() > 0 && signaturesInvalid.get() == 0
+        if (allValid) {
+            println()
+            println("✓ ALL SIGNATURES VALIDATED SUCCESSFULLY")
+        } else if (signaturesInvalid.get() > 0) {
+            println()
+            println("✗ SOME SIGNATURES FAILED VALIDATION")
+            if (senderHash != null) {
+                val senderIdentity = Identity.recall(hexToBytes(senderHash!!))
+                if (senderIdentity == null) {
+                    println("  Note: Sender identity not in known destinations")
+                    println("  Sender hash: $senderHash")
+                }
+            }
+        }
         println("=".repeat(60))
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val result = ByteArray(hex.length / 2)
+        for (i in result.indices) {
+            result[i] = hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+        return result
     }
 }

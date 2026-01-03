@@ -95,9 +95,18 @@ loglevel = 5
     print(f"Client destination hash: {client_dest_hash}")
     print(f"Client identity hash: {client_identity.hash.hex()}")
 
-    # Create a sender identity
+    # Create a sender identity and register it
     sender_identity = RNS.Identity()
     sender_dest = router.register_delivery_identity(sender_identity, display_name="TestSender")
+    sender_dest_hash = sender_dest.hash.hex()
+
+    print(f"\n=== Sender Identity ===")
+    print(f"Sender destination hash: {sender_dest_hash}")
+    print(f"Sender identity hash: {sender_identity.hash.hex()}")
+
+    # Announce the sender identity so Kotlin can verify signatures
+    print(f"Announcing sender identity...")
+    sender_dest.announce()
 
     # Create receiver destination for storing messages
     receiver_dest = RNS.Destination(
@@ -181,8 +190,9 @@ loglevel = 5
         while True:
             time.sleep(1)
             if time.time() - last_announce >= announce_interval:
-                print(f"[{time.strftime('%H:%M:%S')}] Re-announcing propagation node...")
+                print(f"[{time.strftime('%H:%M:%S')}] Re-announcing propagation node and sender...")
                 router.announce_propagation_node()
+                sender_dest.announce()  # Re-announce sender so Kotlin can verify signatures
                 last_announce = time.time()
     except KeyboardInterrupt:
         print("\nShutting down...")
