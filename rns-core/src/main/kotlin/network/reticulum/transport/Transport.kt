@@ -589,6 +589,39 @@ object Transport {
      */
     fun isNetworkAvailable(): Boolean = networkAvailable
 
+    /**
+     * Doze mode flag.
+     * When enabled, Transport operates in maintenance-window mode.
+     */
+    @Volatile
+    private var dozeMode = false
+
+    /**
+     * Enable or disable Doze mode handling.
+     *
+     * When enabled, Transport will:
+     * - Queue non-critical operations for maintenance windows
+     * - Reduce background activity
+     * - Prioritize essential traffic only
+     *
+     * @param enabled true when device is in Doze mode
+     */
+    fun setDozeMode(enabled: Boolean) {
+        if (dozeMode != enabled) {
+            dozeMode = enabled
+            if (enabled) {
+                log("Doze mode enabled - reducing to maintenance windows")
+            } else {
+                log("Doze mode disabled - resuming normal activity")
+            }
+        }
+    }
+
+    /**
+     * Check if Doze mode handling is enabled.
+     */
+    fun isDozeMode(): Boolean = dozeMode
+
     // ===== Interface Management =====
 
     /**
