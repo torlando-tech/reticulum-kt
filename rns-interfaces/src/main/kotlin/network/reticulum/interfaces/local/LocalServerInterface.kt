@@ -1,5 +1,14 @@
 package network.reticulum.interfaces.local
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.File
@@ -16,7 +25,6 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.concurrent.thread
 
 /**
  * Local server interface for shared daemon IPC.
@@ -88,7 +96,10 @@ class LocalServerInterface : Interface {
 
     private var serverChannel: ServerSocketChannel? = null
     private var serverSocket: ServerSocket? = null
-    private var acceptThread: Thread? = null
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var acceptJob: Job? = null
 
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<LocalClientInterface>()
@@ -195,7 +206,7 @@ class LocalServerInterface : Interface {
 
             online.set(true)
 
-            acceptThread = thread(name = "LocalServer-$name-accept", isDaemon = true) {
+            acceptJob = ioScope.launch {
                 acceptLoop()
             }
         } catch (e: Exception) {
@@ -250,20 +261,28 @@ class LocalServerInterface : Interface {
         log("Listening on TCP: 127.0.0.1:$port")
     }
 
-    private fun acceptLoop() {
+    private suspend fun acceptLoop() {
         while (online.get() && !detached.get()) {
             try {
-                val socket = if ((useUnixSocket || useAbstractSocket) && serverChannel != null) {
-                    acceptUnixSocket()
-                } else if (serverSocket != null) {
-                    acceptTcpSocket()
-                } else {
-                    break
+                // Blocking accept wrapped in IO dispatcher
+                val socket = withContext(Dispatchers.IO) {
+                    if ((useUnixSocket || useAbstractSocket) && serverChannel != null) {
+                        acceptUnixSocket()
+                    } else if (serverSocket != null) {
+                        acceptTcpSocket()
+                    } else {
+                        null
+                    }
                 }
 
                 if (socket != null) {
                     handleNewClient(socket)
+                } else {
+                    break
                 }
+            } catch (e: CancellationException) {
+                // Normal cancellation, exit loop
+                break
             } catch (e: SocketException) {
                 if (!detached.get()) {
                     log("Accept error: ${e.message}")
@@ -359,6 +378,10 @@ class LocalServerInterface : Interface {
 
     override fun detach() {
         super.detach()
+
+        // Cancel coroutines first
+        acceptJob?.cancel()
+        ioScope.cancel()
 
         // Disconnect all clients
         for (client in clients.toList()) {

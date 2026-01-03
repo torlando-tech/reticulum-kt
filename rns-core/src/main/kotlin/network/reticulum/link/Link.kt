@@ -17,8 +17,18 @@ import network.reticulum.packet.PacketReceipt
 import network.reticulum.transport.Transport
 import network.reticulum.channel.Channel
 import network.reticulum.channel.ChannelOutlet
+import network.reticulum.common.ByteArrayKey
+import network.reticulum.common.toKey
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -71,6 +81,18 @@ class Link private constructor(
 ) {
     companion object {
         private val linkCounter = AtomicInteger(0)
+
+        // Shared coroutine scope for all link watchdogs (battery efficient on Android)
+        private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        private val activeWatchdogs = ConcurrentHashMap<ByteArrayKey, Job>()
+
+        /**
+         * Cancel all watchdog coroutines. Used during shutdown.
+         */
+        internal fun cancelAllWatchdogs() {
+            activeWatchdogs.values.forEach { it.cancel() }
+            activeWatchdogs.clear()
+        }
 
         // Resource strategy constants
         const val ACCEPT_NONE = 0x00
@@ -328,9 +350,7 @@ class Link private constructor(
     private var derivedKey: ByteArray? = null
     private var token: Token? = null
 
-    // Watchdog
-    private var watchdogThread: Thread? = null
-    @Volatile private var watchdogActive = false
+    // Watchdog uses shared coroutine scope (see companion object)
 
     // Resource tracking
     private val outgoingResources = mutableListOf<network.reticulum.resource.Resource>()
@@ -1099,7 +1119,7 @@ class Link private constructor(
             reason
         }
 
-        watchdogActive = false
+        stopWatchdog()
 
         if (previousStatus == LinkConstants.ACTIVE) {
             // Send close packet
@@ -1203,29 +1223,41 @@ class Link private constructor(
     }
 
     /**
-     * Start the watchdog thread.
+     * Start the watchdog coroutine using shared scope.
+     * This is more battery-efficient than per-link threads on Android.
      */
     private fun startWatchdog() {
-        watchdogActive = true
-        watchdogThread = thread(name = "Link-watchdog-${linkCounter.incrementAndGet()}", isDaemon = true) {
-            watchdogLoop()
+        val id = linkId ?: return
+        val key = id.toKey()
+
+        // Cancel existing watchdog if any
+        activeWatchdogs[key]?.cancel()
+
+        // Start new watchdog coroutine in shared scope
+        val job = watchdogScope.launch {
+            while (isActive && status != LinkConstants.CLOSED) {
+                try {
+                    delay(minOf(keepalive / 4, LinkConstants.WATCHDOG_MAX_SLEEP))
+                    checkTimeout()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // Normal cancellation, exit loop
+                    break
+                } catch (e: Exception) {
+                    log("Watchdog error: ${e.message}")
+                }
+            }
         }
+
+        activeWatchdogs[key] = job
     }
 
     /**
-     * Watchdog loop for timeout detection.
+     * Stop the watchdog coroutine for this link.
      */
-    private fun watchdogLoop() {
-        while (watchdogActive && status != LinkConstants.CLOSED) {
-            try {
-                Thread.sleep(minOf(keepalive / 4, LinkConstants.WATCHDOG_MAX_SLEEP))
-                checkTimeout()
-            } catch (e: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                log("Watchdog error: ${e.message}")
-            }
-        }
+    private fun stopWatchdog() {
+        val id = linkId ?: return
+        val key = id.toKey()
+        activeWatchdogs.remove(key)?.cancel()
     }
 
     /**

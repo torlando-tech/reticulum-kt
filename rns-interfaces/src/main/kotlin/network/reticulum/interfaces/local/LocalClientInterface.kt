@@ -1,5 +1,15 @@
 package network.reticulum.interfaces.local
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.IOException
@@ -12,7 +22,6 @@ import java.nio.channels.SocketChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * Local client interface for connecting to shared daemon.
@@ -66,12 +75,15 @@ class LocalClientInterface : Interface {
     private val tcpPort: Int?
 
     private var socket: Socket? = null
-    private var readThread: Thread? = null
 
     private val writing = AtomicBoolean(false)
     private val reconnecting = AtomicBoolean(false)
     private val neverConnected = AtomicBoolean(true)
     private val isSharedInstanceClient = AtomicBoolean(false)
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var readJob: Job? = null
 
     private val hdlcDeframer = HDLC.createDeframer { data ->
         processIncoming(data)
@@ -179,7 +191,7 @@ class LocalClientInterface : Interface {
 
         online.set(true)
 
-        readThread = thread(name = "LocalClient-$name-read", isDaemon = true) {
+        readJob = ioScope.launch {
             readLoop()
         }
     }
@@ -237,7 +249,7 @@ class LocalClientInterface : Interface {
     /**
      * Attempt to reconnect to the shared instance.
      */
-    private fun reconnect() {
+    private suspend fun reconnect() {
         if (!isSharedInstanceClient.get()) {
             log("Attempt to reconnect on server-spawned interface, ignoring")
             return
@@ -253,11 +265,14 @@ class LocalClientInterface : Interface {
 
             while (!online.get()) {
                 attempts++
-                Thread.sleep(RECONNECT_WAIT)
+                delay(RECONNECT_WAIT)
 
                 try {
                     log("Reconnection attempt $attempts...")
                     connect()
+                    break
+                } catch (e: CancellationException) {
+                    // Scope was cancelled, stop reconnecting
                     break
                 } catch (e: Exception) {
                     // Continue loop
@@ -272,7 +287,7 @@ class LocalClientInterface : Interface {
         }
     }
 
-    private fun readLoop() {
+    private suspend fun readLoop() {
         val buffer = ByteArray(4096)
 
         log("Read loop started")
@@ -280,7 +295,10 @@ class LocalClientInterface : Interface {
         try {
             while (online.get() && !detached.get()) {
                 val sock = socket ?: break
-                val bytesRead = sock.getInputStream().read(buffer)
+                // Blocking read wrapped in IO dispatcher
+                val bytesRead = withContext(Dispatchers.IO) {
+                    sock.getInputStream().read(buffer)
+                }
 
                 if (bytesRead > 0) {
                     val data = buffer.copyOf(bytesRead)
@@ -301,6 +319,8 @@ class LocalClientInterface : Interface {
                 }
             }
             log("Read loop exited normally (online=${online.get()}, detached=${detached.get()})")
+        } catch (e: CancellationException) {
+            // Normal cancellation, don't log as error
         } catch (e: IOException) {
             if (!detached.get()) {
                 log("IOException in read loop: ${e.message}")
@@ -351,7 +371,7 @@ class LocalClientInterface : Interface {
             if (isSharedInstanceClient.get() && !detached.get()) {
                 log("Send error: ${e.message}, will reconnect...")
                 // Start reconnection in background
-                thread(name = "LocalClient-$name-reconnect", isDaemon = true) {
+                ioScope.launch {
                     reconnect()
                 }
             } else {
@@ -367,6 +387,10 @@ class LocalClientInterface : Interface {
     override fun detach() {
         if (detached.getAndSet(true)) return
         online.set(false)
+
+        // Cancel coroutines first
+        readJob?.cancel()
+        ioScope.cancel()
 
         try {
             socket?.close()

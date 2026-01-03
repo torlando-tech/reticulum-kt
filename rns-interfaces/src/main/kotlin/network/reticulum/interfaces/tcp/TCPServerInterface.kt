@@ -1,5 +1,14 @@
 package network.reticulum.interfaces.tcp
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
@@ -11,7 +20,6 @@ import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.concurrent.thread
 
 /**
  * TCP server interface for Reticulum.
@@ -42,7 +50,10 @@ class TCPServerInterface(
     private var serverSocket: ServerSocket? = null
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<TCPServerClientInterface>()
-    private var acceptThread: Thread? = null
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var acceptJob: Job? = null
 
     init {
         spawnedInterfaces = mutableListOf()
@@ -56,7 +67,7 @@ class TCPServerInterface(
             online.set(true)
             log("Listening on $bindAddress:$bindPort")
 
-            acceptThread = thread(name = "TCPServer-$name-accept", isDaemon = true) {
+            acceptJob = ioScope.launch {
                 acceptLoop()
             }
         } catch (e: Exception) {
@@ -65,11 +76,14 @@ class TCPServerInterface(
         }
     }
 
-    private fun acceptLoop() {
+    private suspend fun acceptLoop() {
         while (online.get() && !detached.get()) {
             try {
                 val server = serverSocket ?: break
-                val clientSocket = server.accept()
+                // Blocking accept wrapped in IO dispatcher
+                val clientSocket = withContext(Dispatchers.IO) {
+                    server.accept()
+                }
 
                 if (clients.size >= maxClients) {
                     log("Max clients ($maxClients) reached, rejecting connection")
@@ -111,6 +125,9 @@ class TCPServerInterface(
                 val clientAddr = clientSocket.remoteSocketAddress
                 log("Client connected: $clientAddr ($clientName)")
 
+            } catch (e: CancellationException) {
+                // Normal cancellation, exit loop
+                break
             } catch (e: SocketException) {
                 if (!detached.get()) {
                     log("Accept error: ${e.message}")
@@ -158,6 +175,10 @@ class TCPServerInterface(
     override fun detach() {
         super.detach()
 
+        // Cancel coroutines first
+        acceptJob?.cancel()
+        ioScope.cancel()
+
         // Disconnect all clients
         for (client in clients.toList()) {
             client.detach()
@@ -203,7 +224,10 @@ class TCPServerClientInterface internal constructor(
     override val hwMtu: Int = TCPServerInterface.HW_MTU
 
     private val writing = AtomicBoolean(false)
-    private var readThread: Thread? = null
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var readJob: Job? = null
 
     private val hdlcDeframer = HDLC.createDeframer { data ->
         processIncoming(data)
@@ -218,17 +242,20 @@ class TCPServerClientInterface internal constructor(
         socket.soTimeout = 0
         online.set(true)
 
-        readThread = thread(name = "TCPServerClient-$name-read", isDaemon = true) {
+        readJob = ioScope.launch {
             readLoop()
         }
     }
 
-    private fun readLoop() {
+    private suspend fun readLoop() {
         val buffer = ByteArray(4096)
 
         try {
             while (online.get() && !detached.get()) {
-                val bytesRead = socket.getInputStream().read(buffer)
+                // Blocking read wrapped in IO dispatcher
+                val bytesRead = withContext(Dispatchers.IO) {
+                    socket.getInputStream().read(buffer)
+                }
 
                 if (bytesRead > 0) {
                     val data = buffer.copyOf(bytesRead)
@@ -242,6 +269,8 @@ class TCPServerClientInterface internal constructor(
                     break
                 }
             }
+        } catch (e: CancellationException) {
+            // Normal cancellation, don't log as error
         } catch (e: IOException) {
             if (!detached.get()) {
                 // Client disconnected
@@ -288,6 +317,10 @@ class TCPServerClientInterface internal constructor(
     override fun detach() {
         if (detached.getAndSet(true)) return
         online.set(false)
+
+        // Cancel coroutines first
+        readJob?.cancel()
+        ioScope.cancel()
 
         try {
             socket.close()

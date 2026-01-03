@@ -1,12 +1,20 @@
 package network.reticulum.interfaces.udp
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import java.io.IOException
 import java.net.*
 import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * UDP interface for Reticulum.
@@ -73,8 +81,11 @@ class UDPInterface(
     private var receiveChannel: DatagramChannel? = null
     private var sendSocket: DatagramSocket? = null
     private var multicastSocket: MulticastSocket? = null
-    private var readThread: Thread? = null
     private val running = AtomicBoolean(false)
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var readJob: Job? = null
 
     override fun start() {
         if (running.getAndSet(true)) {
@@ -199,15 +210,18 @@ class UDPInterface(
     }
 
     private fun startReadLoop() {
-        readThread = thread(name = "UDP-$name-read", isDaemon = true) {
+        readJob = ioScope.launch {
             val buffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE)
 
             try {
-                while (running.get() && !detached.get()) {
+                while (isActive && running.get() && !detached.get()) {
                     buffer.clear()
                     val channel = receiveChannel ?: break
 
-                    val sourceAddress = channel.receive(buffer)
+                    // Blocking receive wrapped in IO dispatcher
+                    val sourceAddress = withContext(Dispatchers.IO) {
+                        channel.receive(buffer)
+                    }
                     if (sourceAddress != null) {
                         buffer.flip()
                         val data = ByteArray(buffer.remaining())
@@ -217,6 +231,8 @@ class UDPInterface(
                         processIncoming(data)
                     }
                 }
+            } catch (e: CancellationException) {
+                // Normal cancellation, don't log as error
             } catch (e: IOException) {
                 if (running.get() && !detached.get()) {
                     log("Read error: ${e.message}")
@@ -228,20 +244,25 @@ class UDPInterface(
     }
 
     private fun startMulticastReadLoop() {
-        readThread = thread(name = "UDP-$name-multicast-read", isDaemon = true) {
+        readJob = ioScope.launch {
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             val packet = DatagramPacket(buffer, buffer.size)
 
             try {
-                while (running.get() && !detached.get()) {
+                while (isActive && running.get() && !detached.get()) {
                     val mSocket = multicastSocket ?: break
 
-                    mSocket.receive(packet)
+                    // Blocking receive wrapped in IO dispatcher
+                    withContext(Dispatchers.IO) {
+                        mSocket.receive(packet)
+                    }
                     val data = packet.data.copyOf(packet.length)
 
                     // Process the received datagram
                     processIncoming(data)
                 }
+            } catch (e: CancellationException) {
+                // Normal cancellation, don't log as error
             } catch (e: IOException) {
                 if (running.get() && !detached.get()) {
                     log("Multicast read error: ${e.message}")
@@ -292,6 +313,10 @@ class UDPInterface(
         running.set(false)
         online.set(false)
 
+        // Cancel coroutines first
+        readJob?.cancel()
+        ioScope.cancel()
+
         cleanup()
     }
 
@@ -323,10 +348,6 @@ class UDPInterface(
             // Ignore
         }
         sendSocket = null
-
-        // Wait for read thread to finish
-        readThread?.join(1000)
-        readThread = null
     }
 
     private fun log(message: String) {

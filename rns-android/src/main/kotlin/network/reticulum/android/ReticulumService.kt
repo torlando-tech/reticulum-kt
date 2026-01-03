@@ -118,10 +118,22 @@ class ReticulumService : LifecycleService() {
             // Ensure config directory exists
             File(configDir).mkdirs()
 
+            // Configure Transport for coroutine-based job loop on Android
+            network.reticulum.transport.Transport.configureCoroutineJobLoop(
+                scope = serviceScope,
+                intervalMs = config.getEffectiveJobInterval()
+            )
+
             reticulum = Reticulum.start(
                 configDir = configDir,
                 enableTransport = config.mode == ReticulumConfig.Mode.ROUTING && config.enableTransport
             )
+
+            // In ROUTING mode, schedule WorkManager for periodic maintenance
+            // This survives Doze mode and app backgrounding
+            if (config.mode == ReticulumConfig.Mode.ROUTING) {
+                ReticulumWorker.schedule(this@ReticulumService, intervalMinutes = 15)
+            }
 
             updateNotification("Connected")
         } catch (e: Exception) {
@@ -131,6 +143,9 @@ class ReticulumService : LifecycleService() {
 
     private fun shutdownReticulum() {
         try {
+            // Cancel WorkManager maintenance if scheduled
+            ReticulumWorker.cancel(this)
+
             Reticulum.stop()
             reticulum = null
         } catch (e: Exception) {

@@ -1,5 +1,15 @@
 package network.reticulum.interfaces.tcp
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
@@ -10,7 +20,6 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * TCP client interface for Reticulum.
@@ -41,7 +50,11 @@ class TCPClientInterface(
     private val reconnecting = AtomicBoolean(false)
     private val neverConnected = AtomicBoolean(true)
     private val writing = AtomicBoolean(false)
-    private var readThread: Thread? = null
+
+    // Coroutine scope for I/O operations (battery-efficient on Android)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var readJob: Job? = null
+    private var connectJob: Job? = null
 
     private val hdlcDeframer = HDLC.createDeframer { data ->
         processIncoming(data)
@@ -52,7 +65,7 @@ class TCPClientInterface(
     }
 
     override fun start() {
-        thread(name = "TCPClient-$name-connect", isDaemon = true) {
+        connectJob = ioScope.launch {
             if (!connect(initial = true)) {
                 reconnect()
             }
@@ -111,12 +124,12 @@ class TCPClientInterface(
         }
     }
 
-    private fun reconnect() {
+    private suspend fun reconnect() {
         if (reconnecting.getAndSet(true)) return
 
         var attempts = 0
         while (!online.get() && !detached.get()) {
-            Thread.sleep(RECONNECT_WAIT_MS)
+            delay(RECONNECT_WAIT_MS)
             attempts++
 
             if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
@@ -132,6 +145,9 @@ class TCPClientInterface(
                     }
                     break
                 }
+            } catch (e: CancellationException) {
+                // Scope was cancelled, stop reconnecting
+                break
             } catch (e: Exception) {
                 log("Reconnection attempt $attempts failed: ${e.message}")
             }
@@ -141,16 +157,19 @@ class TCPClientInterface(
     }
 
     private fun startReadLoop(sock: Socket, inputStream: InputStream) {
-        readThread = thread(name = "TCPClient-$name-read", isDaemon = true) {
+        readJob = ioScope.launch {
             val buffer = ByteArray(4096)
 
             try {
-                while (online.get() && !detached.get()) {
+                while (isActive && online.get() && !detached.get()) {
                     if (sock.isClosed || !sock.isConnected || sock.isInputShutdown) {
                         break
                     }
 
-                    val bytesRead = inputStream.read(buffer)
+                    // Blocking read wrapped in IO dispatcher
+                    val bytesRead = withContext(Dispatchers.IO) {
+                        inputStream.read(buffer)
+                    }
 
                     if (bytesRead > 0) {
                         val data = buffer.copyOf(bytesRead)
@@ -165,6 +184,8 @@ class TCPClientInterface(
                         break
                     }
                 }
+            } catch (e: CancellationException) {
+                // Normal cancellation, don't log as error
             } catch (e: IOException) {
                 if (!detached.get()) {
                     online.set(false)
@@ -172,11 +193,9 @@ class TCPClientInterface(
             }
 
             // Connection lost, try to reconnect
-            if (!detached.get()) {
+            if (!detached.get() && isActive) {
                 log("Connection lost, attempting to reconnect...")
-                thread(name = "TCPClient-$name-reconnect", isDaemon = true) {
-                    reconnect()
-                }
+                reconnect()
             }
         }
     }
@@ -219,6 +238,10 @@ class TCPClientInterface(
 
     override fun detach() {
         super.detach()
+        // Cancel all coroutines first
+        readJob?.cancel()
+        connectJob?.cancel()
+        ioScope.cancel()
         closeSocket()
     }
 
@@ -227,7 +250,7 @@ class TCPClientInterface(
         closeSocket()
 
         if (!detached.get()) {
-            thread(name = "TCPClient-$name-reconnect", isDaemon = true) {
+            ioScope.launch {
                 reconnect()
             }
         }

@@ -1,11 +1,17 @@
 package network.reticulum.transport
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import network.reticulum.common.ContextFlag
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.HeaderType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
+import network.reticulum.common.Platform
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.TransportType
 import network.reticulum.common.concatBytes
@@ -98,6 +104,22 @@ object Transport {
 
     /** Whether jobs are currently running. */
     private val jobsRunning = AtomicBoolean(false)
+
+    // ===== Coroutine Support (for Android) =====
+
+    /** Coroutine scope for job loop (null when using thread-based loop). */
+    private var jobLoopScope: CoroutineScope? = null
+
+    /** Coroutine job for job loop (null when using thread-based loop). */
+    private var jobLoopJob: Job? = null
+
+    /** Custom job interval in milliseconds (null uses default). */
+    @Volatile
+    var customJobIntervalMs: Long? = null
+
+    /** Whether to use coroutine-based job loop instead of thread-based. */
+    @Volatile
+    var useCoroutineJobLoop: Boolean = false
 
     // ===== Tables =====
 
@@ -260,12 +282,18 @@ object Transport {
             loadTunnelTable()
         }
 
-        // Start background job thread
-        thread(name = "Transport-jobs", isDaemon = true) {
-            jobLoop()
+        // Start background job loop
+        // On Android with coroutine scope provided, use coroutines
+        // Otherwise, use traditional thread-based approach
+        if (useCoroutineJobLoop && jobLoopScope != null) {
+            startCoroutineJobLoop()
+            log("Transport started with coroutine job loop (transport=${if (enableTransport) "enabled" else "disabled"})")
+        } else {
+            thread(name = "Transport-jobs", isDaemon = true) {
+                jobLoop()
+            }
+            log("Transport started with thread job loop (transport=${if (enableTransport) "enabled" else "disabled"})")
         }
-
-        log("Transport started (transport=${if (enableTransport) "enabled" else "disabled"})")
     }
 
     /**
@@ -302,6 +330,14 @@ object Transport {
         if (!started.getAndSet(false)) {
             return
         }
+
+        // Stop coroutine job loop if active
+        stopCoroutineJobLoop()
+        jobLoopScope = null
+        useCoroutineJobLoop = false
+
+        // Cancel all link watchdog coroutines
+        network.reticulum.link.Link.cancelAllWatchdogs()
 
         // Clear all tables
         pathTable.clear()
@@ -2488,16 +2524,97 @@ object Transport {
 
     // ===== Background Jobs =====
 
+    /**
+     * Get the effective job interval.
+     * Uses custom interval if set, platform-appropriate default otherwise.
+     */
+    private fun getJobInterval(): Long {
+        return customJobIntervalMs ?: if (Platform.isAndroid) {
+            Platform.recommendedJobIntervalMs
+        } else {
+            TransportConstants.JOB_INTERVAL
+        }
+    }
+
+    /**
+     * Thread-based job loop (legacy, for JVM).
+     */
     private fun jobLoop() {
+        val interval = getJobInterval()
         while (started.get()) {
             try {
-                Thread.sleep(TransportConstants.JOB_INTERVAL)
+                Thread.sleep(interval)
                 runJobs()
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 log("Job error: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Start coroutine-based job loop.
+     * Called internally when useCoroutineJobLoop is true and scope is set.
+     */
+    private fun startCoroutineJobLoop() {
+        val scope = jobLoopScope ?: return
+        val interval = getJobInterval()
+
+        jobLoopJob = scope.launch {
+            while (isActive && started.get()) {
+                try {
+                    delay(interval)
+                    runJobs()
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    log("Coroutine job error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Configure coroutine-based job loop for Android.
+     * Call this before start() to use coroutines instead of threads.
+     *
+     * @param scope The coroutine scope to use for the job loop
+     * @param intervalMs Custom job interval in milliseconds (default: platform-appropriate)
+     */
+    fun configureCoroutineJobLoop(scope: CoroutineScope, intervalMs: Long? = null) {
+        jobLoopScope = scope
+        customJobIntervalMs = intervalMs
+        useCoroutineJobLoop = true
+    }
+
+    /**
+     * Stop the coroutine job loop.
+     * Called automatically when Transport stops.
+     */
+    private fun stopCoroutineJobLoop() {
+        jobLoopJob?.cancel()
+        jobLoopJob = null
+    }
+
+    /**
+     * Run maintenance jobs.
+     * This is the subset of runJobs() suitable for periodic WorkManager execution.
+     * Does not include time-critical operations.
+     */
+    fun runMaintenanceJobs() {
+        val now = System.currentTimeMillis()
+
+        // Cull stale table entries
+        cullTables()
+        tablesLastCulled = now
+
+        // Clean hashlist
+        packetHashlistPrev.clear()
+        hashlistLastCleaned = now
+
+        // Save tunnel table if transport is enabled
+        if (transportEnabled) {
+            saveTunnelTable()
         }
     }
 
