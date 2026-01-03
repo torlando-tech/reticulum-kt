@@ -36,6 +36,12 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests.all {
+            it.useJUnit()
+        }
+    }
 }
 
 dependencies {
@@ -55,6 +61,7 @@ dependencies {
 
     // Unit testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.11.1")
 
     // Android instrumented tests
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
