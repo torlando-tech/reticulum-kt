@@ -45,6 +45,7 @@ fun HomeScreen(
 ) {
     val serviceState by viewModel.serviceState.collectAsState()
     val interfaces by viewModel.interfaces.collectAsState()
+    val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
 
     Column(
         modifier = Modifier
@@ -123,17 +124,16 @@ fun HomeScreen(
                     }
                 }
 
-                if (serviceState.isRunning) {
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Transport: ${if (serviceState.enableTransport) "Enabled" else "Disabled"}",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Text(
-                        text = "Interfaces: ${interfaces.size} configured",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
+                Spacer(modifier = Modifier.height(16.dp))
+                val onlineCount = interfaceStatuses.values.count { it.isOnline }
+                Text(
+                    text = "Transport: ${if (serviceState.enableTransport) "Enabled" else "Disabled"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = "Interfaces: $onlineCount online / ${interfaces.size} configured",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
 

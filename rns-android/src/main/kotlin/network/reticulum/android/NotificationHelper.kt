@@ -17,7 +17,7 @@ import androidx.core.app.NotificationCompat
  * Usage:
  * ```kotlin
  * val helper = NotificationHelper(context)
- * val notification = helper.createServiceNotification(mode, stats)
+ * val notification = helper.createServiceNotification(enableTransport, stats)
  * startForeground(NOTIFICATION_ID, notification)
  * ```
  */
@@ -46,20 +46,17 @@ class NotificationHelper(private val context: Context) {
     /**
      * Create the foreground service notification.
      *
-     * @param mode Current operating mode (CLIENT_ONLY or ROUTING)
+     * @param enableTransport Whether transport routing is enabled
      * @param status Status text to display
      * @param contentIntent Optional intent to launch when notification is tapped
      * @return The notification to display
      */
     fun createServiceNotification(
-        mode: ReticulumConfig.Mode,
+        enableTransport: Boolean,
         status: String = "Running",
         contentIntent: PendingIntent? = null
     ): Notification {
-        val modeText = when (mode) {
-            ReticulumConfig.Mode.CLIENT_ONLY -> "Client"
-            ReticulumConfig.Mode.ROUTING -> "Routing"
-        }
+        val modeText = if (enableTransport) "Transport" else "Client"
 
         val builder = NotificationCompat.Builder(context, ReticulumService.CHANNEL_ID)
             .setContentTitle("Reticulum $modeText")
@@ -80,18 +77,18 @@ class NotificationHelper(private val context: Context) {
     /**
      * Create a notification with network statistics.
      *
-     * @param mode Current operating mode
+     * @param enableTransport Whether transport routing is enabled
      * @param stats Network statistics to display
      * @param contentIntent Optional intent to launch when notification is tapped
      * @return The notification to display
      */
     fun createServiceNotification(
-        mode: ReticulumConfig.Mode,
+        enableTransport: Boolean,
         stats: NetworkStats,
         contentIntent: PendingIntent? = null
     ): Notification {
         return createServiceNotification(
-            mode = mode,
+            enableTransport = enableTransport,
             status = formatStats(stats),
             contentIntent = contentIntent
         )
@@ -101,15 +98,15 @@ class NotificationHelper(private val context: Context) {
      * Update the existing notification with new status.
      *
      * @param notificationId The notification ID to update
-     * @param mode Current operating mode
+     * @param enableTransport Whether transport routing is enabled
      * @param status Status text to display
      */
     fun updateNotification(
         notificationId: Int,
-        mode: ReticulumConfig.Mode,
+        enableTransport: Boolean,
         status: String
     ) {
-        val notification = createServiceNotification(mode, status)
+        val notification = createServiceNotification(enableTransport, status)
         notificationManager.notify(notificationId, notification)
     }
 
@@ -117,15 +114,15 @@ class NotificationHelper(private val context: Context) {
      * Update the existing notification with network statistics.
      *
      * @param notificationId The notification ID to update
-     * @param mode Current operating mode
+     * @param enableTransport Whether transport routing is enabled
      * @param stats Network statistics to display
      */
     fun updateNotification(
         notificationId: Int,
-        mode: ReticulumConfig.Mode,
+        enableTransport: Boolean,
         stats: NetworkStats
     ) {
-        val notification = createServiceNotification(mode, stats)
+        val notification = createServiceNotification(enableTransport, stats)
         notificationManager.notify(notificationId, notification)
     }
 

@@ -19,6 +19,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.interfaces.InterfaceAdapter
+import network.reticulum.interfaces.local.LocalClientInterface
+import network.reticulum.interfaces.local.LocalServerInterface
 import java.io.File
 
 /**
@@ -43,7 +46,7 @@ import java.io.File
 class ReticulumService : LifecycleService() {
 
     private var reticulum: Reticulum? = null
-    private var config: ReticulumConfig = ReticulumConfig.CLIENT_ONLY
+    private var config: ReticulumConfig = ReticulumConfig.DEFAULT
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val binder = LocalBinder()
@@ -130,20 +133,72 @@ class ReticulumService : LifecycleService() {
                 intervalMs = config.getEffectiveJobInterval()
             )
 
+            // Check if another shared instance is already running
+            val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
+
             reticulum = Reticulum.start(
                 configDir = configDir,
-                enableTransport = config.mode == ReticulumConfig.Mode.ROUTING && config.enableTransport
+                enableTransport = config.enableTransport,
+                shareInstance = config.shareInstance && !sharedInstanceExists,
+                sharedInstancePort = config.sharedInstancePort,
+                connectToSharedInstance = sharedInstanceExists
             )
 
-            // In ROUTING mode, schedule WorkManager for periodic maintenance
+            // If shareInstance is enabled but server hasn't started yet,
+            // set up factories and start the local server now
+            reticulum?.let { rns ->
+                if (config.shareInstance && !sharedInstanceExists && !rns.isSharedInstance) {
+                    // Start the local server manually
+                    startLocalServer(rns, config.sharedInstancePort)
+                }
+            }
+
+            // When transport is enabled, schedule WorkManager for periodic maintenance
             // This survives Doze mode and app backgrounding
-            if (config.mode == ReticulumConfig.Mode.ROUTING) {
+            if (config.enableTransport) {
                 ReticulumWorker.schedule(this@ReticulumService, intervalMinutes = 15)
             }
 
-            updateNotification("Connected")
+            val statusText = when {
+                reticulum?.isSharedInstance == true -> "Shared Instance (port ${config.sharedInstancePort})"
+                reticulum?.isConnectedToSharedInstance == true -> "Connected to shared instance"
+                else -> "Connected"
+            }
+            updateNotification(statusText)
         } catch (e: Exception) {
             updateNotification("Error: ${e.message}")
+        }
+    }
+
+    private fun startLocalServer(rns: Reticulum, port: Int) {
+        try {
+            val server = LocalServerInterface(name = "SharedInstance", tcpPort = port)
+
+            // Set up packet callback to forward to Transport
+            server.onPacketReceived = { data, fromInterface ->
+                network.reticulum.transport.Transport.inbound(
+                    data,
+                    network.reticulum.interfaces.InterfaceAdapter.getOrCreate(fromInterface)
+                )
+            }
+
+            server.start()
+            network.reticulum.transport.Transport.registerInterface(
+                network.reticulum.interfaces.InterfaceAdapter.getOrCreate(server)
+            )
+
+            // Update the Reticulum instance state via reflection (since isSharedInstance is private set)
+            try {
+                val field = rns::class.java.getDeclaredField("isSharedInstance")
+                field.isAccessible = true
+                field.setBoolean(rns, true)
+            } catch (e: Exception) {
+                // Ignore if reflection fails
+            }
+
+            android.util.Log.i("ReticulumService", "Started shared instance server on port $port")
+        } catch (e: Exception) {
+            android.util.Log.e("ReticulumService", "Failed to start shared instance server: ${e.message}")
         }
     }
 
@@ -200,10 +255,7 @@ class ReticulumService : LifecycleService() {
     }
 
     private fun createNotification(status: String = "Starting..."): Notification {
-        val modeText = when (config.mode) {
-            ReticulumConfig.Mode.CLIENT_ONLY -> "Client"
-            ReticulumConfig.Mode.ROUTING -> "Routing"
-        }
+        val modeText = if (config.enableTransport) "Transport" else "Client"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Reticulum $modeText")
@@ -247,7 +299,7 @@ class ReticulumService : LifecycleService() {
          * Start the Reticulum service with default client-only configuration.
          */
         fun start(context: Context) {
-            start(context, ReticulumConfig.CLIENT_ONLY)
+            start(context, ReticulumConfig.DEFAULT)
         }
 
         /**

@@ -12,20 +12,16 @@ import kotlinx.parcelize.Parcelize
 @Parcelize
 data class ReticulumConfig(
     /**
-     * Operating mode for this Reticulum instance.
-     * CLIENT_ONLY mode uses significantly less battery.
-     */
-    val mode: Mode = Mode.CLIENT_ONLY,
-
-    /**
-     * Enable transport routing (only effective in ROUTING mode).
+     * Enable transport routing.
      * When enabled, this node will participate in the mesh by forwarding
-     * packets and announces for other nodes.
+     * packets and announces for other nodes. Uses more battery.
+     * When disabled (default), this is a "client only" node that can still
+     * send/receive its own traffic but doesn't route for others.
      */
     val enableTransport: Boolean = false,
 
     /**
-     * Job interval in milliseconds (only for ROUTING mode).
+     * Job interval in milliseconds.
      * Lower values increase responsiveness but drain more battery.
      * Default: 60000 (60 seconds). Was 250ms in original implementation.
      */
@@ -72,31 +68,23 @@ data class ReticulumConfig(
      * Path to the Reticulum configuration directory.
      * If null, uses the app's default files directory.
      */
-    val configDir: String? = null
-) : Parcelable {
+    val configDir: String? = null,
+
     /**
-     * Operating mode for the Reticulum instance.
+     * Share this Reticulum instance with other apps via local TCP.
+     * When enabled, starts a LocalServerInterface that other apps can connect to.
+     * This allows multiple apps to share a single Reticulum instance.
+     * Default: true (recommended for Android to save battery)
      */
-    enum class Mode {
-        /**
-         * Client-only mode: minimal battery usage.
-         * - No routing/forwarding
-         * - No announce rebroadcasting
-         * - No tunnel synthesis
-         * - Can still send/receive messages, establish links, use resources
-         */
-        CLIENT_ONLY,
+    val shareInstance: Boolean = true,
 
-        /**
-         * Full routing mode: participate in mesh network.
-         * - Routes packets for other nodes
-         * - Rebroadcasts announces
-         * - Can synthesize tunnels
-         * - Higher battery usage (3-5% per hour vs <1% for client-only)
-         */
-        ROUTING
-    }
-
+    /**
+     * Port for shared instance communication.
+     * Must match between server and clients.
+     * Default: 37428 (same as Python RNS)
+     */
+    val sharedInstancePort: Int = 37428
+) : Parcelable {
     /**
      * Battery optimization levels.
      */
@@ -148,21 +136,16 @@ data class ReticulumConfig(
 
     companion object {
         /**
-         * Default configuration for client-only mode.
+         * Default configuration: client-only mode.
          * Optimized for battery life with minimal background activity.
          */
-        val CLIENT_ONLY = ReticulumConfig(
-            mode = Mode.CLIENT_ONLY,
-            enableTransport = false,
-            batteryOptimization = BatteryMode.BALANCED
-        )
+        val DEFAULT = ReticulumConfig()
 
         /**
-         * Default configuration for routing mode.
-         * Participates in mesh network with balanced battery usage.
+         * Configuration with transport enabled.
+         * Participates in mesh network by routing for other nodes.
          */
-        val ROUTING = ReticulumConfig(
-            mode = Mode.ROUTING,
+        val WITH_TRANSPORT = ReticulumConfig(
             enableTransport = true,
             batteryOptimization = BatteryMode.BALANCED
         )
@@ -172,7 +155,6 @@ data class ReticulumConfig(
          * Use when battery life is critical.
          */
         val BATTERY_SAVER = ReticulumConfig(
-            mode = Mode.CLIENT_ONLY,
             enableTransport = false,
             batteryOptimization = BatteryMode.MAXIMUM_BATTERY,
             tcpKeepAlive = false
@@ -183,7 +165,6 @@ data class ReticulumConfig(
          * Use when plugged in or for real-time applications.
          */
         val PERFORMANCE = ReticulumConfig(
-            mode = Mode.ROUTING,
             enableTransport = true,
             batteryOptimization = BatteryMode.PERFORMANCE,
             tcpKeepAlive = true,

@@ -47,6 +47,8 @@ fun MonitorScreen(
 ) {
     val monitorState by viewModel.monitorState.collectAsState()
     val serviceState by viewModel.serviceState.collectAsState()
+    val interfaces by viewModel.interfaces.collectAsState()
+    val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
 
     Scaffold(
         topBar = {
@@ -69,6 +71,7 @@ fun MonitorScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             // Service Status
+            val onlineCount = interfaceStatuses.values.count { it.isOnline }
             MonitorCard(
                 title = "Service",
                 icon = Icons.Filled.Router
@@ -76,7 +79,8 @@ fun MonitorScreen(
                 StatusRow("Status", if (serviceState.isRunning) "Running" else "Stopped",
                     if (serviceState.isRunning) StatusConnected else null)
                 StatusRow("Transport", if (serviceState.enableTransport) "Enabled" else "Disabled", null)
-                StatusRow("Active Interfaces", "${serviceState.activeInterfaces}", null)
+                StatusRow("Interfaces", "$onlineCount online / ${interfaces.size} configured",
+                    if (onlineCount > 0) StatusConnected else null)
                 StatusRow("Known Peers", "${serviceState.knownPeers}", null)
                 StatusRow("Active Links", "${serviceState.activeLinks}", null)
                 StatusRow("Known Paths", "${serviceState.knownPaths}", null)

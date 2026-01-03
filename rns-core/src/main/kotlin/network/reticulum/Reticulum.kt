@@ -5,6 +5,8 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.transport.Transport
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -24,6 +26,18 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     enableTransport = true
  * )
  *
+ * // Start as shared instance (other apps can connect)
+ * val reticulum = Reticulum.start(
+ *     shareInstance = true,
+ *     sharedInstancePort = 37428
+ * )
+ *
+ * // Connect to existing shared instance
+ * val reticulum = Reticulum.start(
+ *     connectToSharedInstance = true,
+ *     sharedInstancePort = 37428
+ * )
+ *
  * // Create identity and destination
  * val identity = Identity.create()
  * val destination = Destination.create(identity, ...)
@@ -34,7 +48,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class Reticulum private constructor(
     val configDir: String,
-    val enableTransport: Boolean
+    val enableTransport: Boolean,
+    val shareInstance: Boolean,
+    val sharedInstancePort: Int,
+    val connectToSharedInstance: Boolean
 ) {
     companion object {
         /**
@@ -73,6 +90,11 @@ class Reticulum private constructor(
          */
         const val DEFAULT_PER_HOP_TIMEOUT = 6
 
+        /**
+         * Default TCP port for shared instance communication.
+         */
+        const val DEFAULT_SHARED_INSTANCE_PORT = 37428
+
         private var instance: Reticulum? = null
         private val started = AtomicBoolean(false)
 
@@ -94,20 +116,47 @@ class Reticulum private constructor(
          *
          * @param configDir Directory for configuration and storage
          * @param enableTransport Whether to enable transport layer (routing)
+         * @param shareInstance Whether to share this instance with other apps (starts local server)
+         * @param sharedInstancePort TCP port for shared instance communication
+         * @param connectToSharedInstance Whether to connect to an existing shared instance
          * @return The Reticulum instance
          */
         fun start(
             configDir: String? = null,
-            enableTransport: Boolean = false
+            enableTransport: Boolean = false,
+            shareInstance: Boolean = false,
+            sharedInstancePort: Int = DEFAULT_SHARED_INSTANCE_PORT,
+            connectToSharedInstance: Boolean = false
         ): Reticulum {
             if (started.compareAndSet(false, true)) {
                 val dir = configDir ?: getDefaultConfigDir()
-                val rns = Reticulum(dir, enableTransport)
+                val rns = Reticulum(dir, enableTransport, shareInstance, sharedInstancePort, connectToSharedInstance)
                 instance = rns
                 rns.initialize()
                 return rns
             }
             return instance!!
+        }
+
+        /**
+         * Check if a shared instance is already running on the given port.
+         *
+         * @param port TCP port to check
+         * @param host Host to check (default: localhost)
+         * @return true if a shared instance is responding on that port
+         */
+        fun isSharedInstanceRunning(
+            port: Int = DEFAULT_SHARED_INSTANCE_PORT,
+            host: String = "127.0.0.1"
+        ): Boolean {
+            return try {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(host, port), 1000)
+                    true
+                }
+            } catch (e: Exception) {
+                false
+            }
         }
 
         /**
@@ -155,6 +204,23 @@ class Reticulum private constructor(
     private val interfaces = mutableListOf<Any>()
     private val shutdownHooks = mutableListOf<() -> Unit>()
 
+    /** Whether this instance is the shared instance (has the local server running). */
+    var isSharedInstance: Boolean = false
+        private set
+
+    /** Whether this instance is connected to a shared instance. */
+    var isConnectedToSharedInstance: Boolean = false
+        private set
+
+    /** The shared instance interface (LocalServerInterface or LocalClientInterface). */
+    private var sharedInterface: Any? = null
+
+    /** Callback to create LocalServerInterface (set by rns-interfaces module). */
+    var localServerInterfaceFactory: ((Int) -> Any)? = null
+
+    /** Callback to create LocalClientInterface (set by rns-interfaces module). */
+    var localClientInterfaceFactory: ((Int, String) -> Any)? = null
+
     /**
      * Initialize the Reticulum instance.
      */
@@ -163,6 +229,16 @@ class Reticulum private constructor(
 
         // Ensure directories exist
         ensureDirectories()
+
+        // Check if we should connect to an existing shared instance
+        if (connectToSharedInstance) {
+            if (tryConnectToSharedInstance()) {
+                log("Connected to shared instance on port $sharedInstancePort")
+                return
+            } else {
+                log("No shared instance found, starting standalone")
+            }
+        }
 
         // Load or create transport identity
         val transportIdentity = loadOrCreateTransportIdentity()
@@ -174,7 +250,78 @@ class Reticulum private constructor(
         // Start Transport with identity
         Transport.start(transportIdentity = transportIdentity, enableTransport = enableTransport)
 
-        log("Reticulum started (transport=${if (enableTransport) "enabled" else "disabled"})")
+        // If shareInstance is enabled, start the local server
+        if (shareInstance) {
+            startLocalServer()
+        }
+
+        log("Reticulum started (transport=${if (enableTransport) "enabled" else "disabled"}, shared=$isSharedInstance)")
+    }
+
+    /**
+     * Try to connect to an existing shared instance.
+     *
+     * @return true if connected successfully
+     */
+    private fun tryConnectToSharedInstance(): Boolean {
+        val factory = localClientInterfaceFactory
+        if (factory == null) {
+            log("LocalClientInterface factory not set, cannot connect to shared instance")
+            return false
+        }
+
+        if (!isSharedInstanceRunning(sharedInstancePort)) {
+            return false
+        }
+
+        try {
+            val clientInterface = factory(sharedInstancePort, "127.0.0.1")
+            sharedInterface = clientInterface
+            isConnectedToSharedInstance = true
+
+            // Start the interface if it has a start method
+            clientInterface::class.java.getMethod("start").invoke(clientInterface)
+
+            log("Connected to shared instance")
+            return true
+        } catch (e: Exception) {
+            log("Failed to connect to shared instance: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Start the local server interface for sharing this instance.
+     */
+    private fun startLocalServer() {
+        val factory = localServerInterfaceFactory
+        if (factory == null) {
+            log("LocalServerInterface factory not set, cannot share instance")
+            return
+        }
+
+        try {
+            val serverInterface = factory(sharedInstancePort)
+            sharedInterface = serverInterface
+            isSharedInstance = true
+
+            // Start the interface
+            serverInterface::class.java.getMethod("start").invoke(serverInterface)
+
+            // Register with Transport if possible
+            try {
+                val toRefMethod = serverInterface::class.java.getMethod("toRef")
+                val interfaceRef = toRefMethod.invoke(serverInterface)
+                Transport.registerInterface(interfaceRef as network.reticulum.transport.InterfaceRef)
+            } catch (e: Exception) {
+                // May not have toRef method, that's OK
+                log("Could not register shared interface with Transport: ${e.message}")
+            }
+
+            log("Started shared instance server on port $sharedInstancePort")
+        } catch (e: Exception) {
+            log("Failed to start shared instance server: ${e.message}")
+        }
     }
 
     /**
@@ -286,12 +433,40 @@ class Reticulum private constructor(
         }
         shutdownHooks.clear()
 
+        // Detach shared interface
+        sharedInterface?.let { iface ->
+            try {
+                iface::class.java.getMethod("detach").invoke(iface)
+            } catch (e: Exception) {
+                log("Error detaching shared interface: ${e.message}")
+            }
+        }
+        sharedInterface = null
+        isSharedInstance = false
+        isConnectedToSharedInstance = false
+
         // Detach interfaces
         interfaces.clear()
 
-        // Stop Transport
-        Transport.stop()
+        // Stop Transport (only if we're not just a client)
+        if (!connectToSharedInstance || !isConnectedToSharedInstance) {
+            Transport.stop()
+        }
 
         log("Reticulum stopped")
+    }
+
+    /**
+     * Get the number of clients connected to this shared instance.
+     *
+     * @return number of connected clients, or 0 if not a shared instance
+     */
+    fun getSharedInstanceClientCount(): Int {
+        val server = sharedInterface ?: return 0
+        return try {
+            server::class.java.getMethod("clientCount").invoke(server) as Int
+        } catch (e: Exception) {
+            0
+        }
     }
 }

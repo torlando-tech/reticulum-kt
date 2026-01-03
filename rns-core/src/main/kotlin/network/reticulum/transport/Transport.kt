@@ -634,9 +634,17 @@ object Transport {
 
     /**
      * Deregister an interface.
+     * Cleans up associated statistics and announce queues.
      */
     fun deregisterInterface(interfaceRef: InterfaceRef) {
         interfaces.remove(interfaceRef)
+
+        // Clean up interface-related data
+        val interfaceHash = ByteArrayKey(interfaceRef.hash)
+        interfaceStats.remove(interfaceHash)
+        interfaceAnnounceQueues.remove(interfaceHash)
+        interfaceAnnounceAllowedAt.remove(interfaceHash)
+
         log("Deregistered interface: ${interfaceRef.name}")
     }
 

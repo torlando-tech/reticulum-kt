@@ -80,6 +80,7 @@ fun InterfacesScreen(
 ) {
     val interfaces by viewModel.interfaces.collectAsState()
     val serviceState by viewModel.serviceState.collectAsState()
+    val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
     var navigation by remember { mutableStateOf<InterfaceNavigation>(InterfaceNavigation.None) }
 
     Scaffold(
@@ -126,9 +127,13 @@ fun InterfacesScreen(
             ) {
                 item { Spacer(modifier = Modifier.height(8.dp)) }
                 items(interfaces, key = { it.id }) { iface ->
+                    // Get actual online status from running interface, not just service state
+                    val actualStatus = interfaceStatuses[iface.id]
+                    val isActuallyOnline = actualStatus?.isOnline ?: false
+
                     InterfaceCard(
                         config = iface,
-                        isOnline = serviceState.isRunning,
+                        isOnline = isActuallyOnline,
                         onDelete = { viewModel.removeInterface(iface.id) },
                         onEdit = {
                             val type = try {

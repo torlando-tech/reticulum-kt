@@ -3,17 +3,22 @@ package tech.torlando.reticulumkt.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
 import network.reticulum.android.ReticulumConfig
 import network.reticulum.android.ReticulumService
 import tech.torlando.reticulumkt.data.PreferencesManager
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
+import tech.torlando.reticulumkt.service.InterfaceManager
+import tech.torlando.reticulumkt.service.InterfaceStatus
 import tech.torlando.reticulumkt.ui.screens.BatteryMode
 import tech.torlando.reticulumkt.ui.screens.DarkModeOption
 import tech.torlando.reticulumkt.ui.theme.PresetTheme
@@ -69,6 +74,16 @@ sealed class SharedInstanceStatus {
 class ReticulumViewModel(application: Application) : AndroidViewModel(application) {
 
     private val preferencesManager = PreferencesManager(application)
+
+    // Interface manager for hot-reload support
+    private var interfaceManager: InterfaceManager? = null
+
+    // Periodic status refresh job
+    private var statusRefreshJob: Job? = null
+
+    // Actual interface statuses (from running interfaces, not config)
+    private val _interfaceStatuses = MutableStateFlow<Map<String, InterfaceStatus>>(emptyMap())
+    val interfaceStatuses: StateFlow<Map<String, InterfaceStatus>> = _interfaceStatuses.asStateFlow()
 
     // Service state
     private val _serviceState = MutableStateFlow(ServiceState())
@@ -150,10 +165,25 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             _serviceState.value = _serviceState.value.copy(isRunning = true, enableTransport = transport)
             _sharedInstanceStatus.value = SharedInstanceStatus.Starting
 
-            // Check status after a delay
+            // Wait for Reticulum to initialize
             kotlinx.coroutines.delay(2000)
-            updateServiceStatus()
-            updateMonitorState()
+
+            // Start interface manager for hot-reload support
+            // This observes interface config changes and dynamically starts/stops interfaces
+            interfaceManager = InterfaceManager(
+                scope = viewModelScope,
+                interfacesFlow = preferencesManager.interfaces,
+            ).also { it.startObserving() }
+
+            // Start periodic status refresh (every 2 seconds)
+            statusRefreshJob = viewModelScope.launch {
+                while (isActive) {
+                    updateServiceStatus()
+                    updateMonitorState()
+                    delay(2000)
+                }
+            }
+
             addLogEntry("Service", "TX", "System", "ServiceStart", 0)
         }
     }
@@ -161,6 +191,17 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     fun stopService() {
         viewModelScope.launch {
             val context = getApplication<Application>()
+
+            // Stop periodic status refresh
+            statusRefreshJob?.cancel()
+            statusRefreshJob = null
+
+            // Stop interface manager first (gracefully shuts down all interfaces)
+            interfaceManager?.stopAll()
+            interfaceManager = null
+
+            // Clear interface statuses
+            _interfaceStatuses.value = emptyMap()
 
             // Stop the actual service
             ReticulumService.stop(context)
@@ -189,15 +230,31 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                     else -> SharedInstanceStatus.Running(0)
                 }
 
-                // Update service state with actual values
+                // Update service state with actual values from Transport
                 val pathCount = network.reticulum.transport.Transport.pathTable.size
                 val linkCount = network.reticulum.transport.Transport.linkTable.size
-                val interfaceCount = network.reticulum.transport.Transport.getInterfaces().size
+                val transportInterfaces = network.reticulum.transport.Transport.getInterfaces()
+
+                // Get actual interface statuses from InterfaceManager
+                val manager = interfaceManager
+                val onlineCount = manager?.getOnlineCount() ?: 0
+                val statuses = manager?.getInterfaceStatuses() ?: emptyMap()
+
+                // Debug: log interface statuses
+                if (statuses.isNotEmpty()) {
+                    android.util.Log.d("ReticulumViewModel", "Interface statuses: ${statuses.map { "${it.key}=${it.value.isOnline}" }}")
+                } else {
+                    android.util.Log.d("ReticulumViewModel", "No interface statuses from InterfaceManager (manager=${manager != null}, running=${manager?.getRunningCount() ?: -1})")
+                }
+
+                _interfaceStatuses.value = statuses
 
                 _serviceState.value = _serviceState.value.copy(
-                    activeInterfaces = interfaceCount,
+                    activeInterfaces = transportInterfaces.size,
                     knownPaths = pathCount,
                     activeLinks = linkCount,
+                    // Update enableTransport from actual Reticulum state
+                    enableTransport = rns.enableTransport,
                 )
             }
         } catch (e: Exception) {
@@ -265,7 +322,10 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Monitor
     fun refreshMonitor() {
-        viewModelScope.launch { updateMonitorState() }
+        viewModelScope.launch {
+            updateServiceStatus()  // Refresh interface statuses from actual state
+            updateMonitorState()
+        }
     }
 
     private fun updateMonitorState() {
