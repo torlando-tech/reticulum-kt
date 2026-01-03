@@ -1,3 +1,19 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
 rootProject.name = "reticulum-kt"
 
 include(":rns-core")
@@ -7,5 +23,5 @@ include(":rns-cli")
 include(":lxmf-core")
 include(":lxmf-examples")
 
-// Android module deferred until later phases
-// include(":rns-android")
+// Android module for battery-optimized mobile deployment
+include(":rns-android")

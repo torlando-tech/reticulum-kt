@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Reticulum notification icon.
+    Simple mesh/network symbol representing interconnected nodes.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Outer hexagon representing the mesh network -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,2L2,7l0,10l10,5l10,-5l0,-10L12,2zM12,4.5l7,3.5l0,8l-7,3.5l-7,-3.5l0,-8L12,4.5z"/>
+    <!-- Center node -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,9a3,3 0,1 0,0 6a3,3 0,0 0,0 -6z"/>
+    <!-- Connection lines radiating from center -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,6l0,3M12,15l0,3M6.5,9l3,1.5M14.5,13.5l3,1.5M6.5,15l3,-1.5M14.5,10.5l3,-1.5"
+        android:strokeWidth="1.5"
+        android:strokeColor="#FFFFFF"/>
+</vector>
