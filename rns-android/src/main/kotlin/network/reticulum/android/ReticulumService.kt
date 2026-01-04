@@ -189,9 +189,14 @@ class ReticulumService : LifecycleService() {
 
             // Update the Reticulum instance state via reflection (since isSharedInstance is private set)
             try {
-                val field = rns::class.java.getDeclaredField("isSharedInstance")
-                field.isAccessible = true
-                field.setBoolean(rns, true)
+                val isSharedField = rns::class.java.getDeclaredField("isSharedInstance")
+                isSharedField.isAccessible = true
+                isSharedField.setBoolean(rns, true)
+
+                // Also set sharedInterface so getSharedInstanceClientCount() works
+                val sharedInterfaceField = rns::class.java.getDeclaredField("sharedInterface")
+                sharedInterfaceField.isAccessible = true
+                sharedInterfaceField.set(rns, server)
             } catch (e: Exception) {
                 // Ignore if reflection fails
             }
