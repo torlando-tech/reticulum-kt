@@ -2354,6 +2354,17 @@ object Transport {
             if (outboundInterface != null && !outboundInterface.hash.contentEquals(interfaceRef.hash)) {
                 log("Forwarding data packet for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
                 transmit(outboundInterface, packet.raw ?: packet.pack())
+
+                // Create reverse entry for proof routing back to sender
+                // This is critical for shared instance clients to receive delivery proofs
+                val reverseEntry = ReverseEntry(
+                    receivingInterfaceHash = interfaceRef.hash,
+                    outboundInterfaceHash = outboundInterface.hash,
+                    timestamp = System.currentTimeMillis()
+                )
+                reverseTable[packet.truncatedHash.toKey()] = reverseEntry
+                log("Created reverse entry for proof routing: ${packet.truncatedHash.toHexString()} -> ${interfaceRef.name}")
+
                 return
             }
         }
