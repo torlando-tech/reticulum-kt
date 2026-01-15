@@ -354,6 +354,7 @@ object Transport {
         pathRequests.clear()
         discoveryPrTags.clear()
         pendingReceipts.clear()
+        announceHandlers.clear()
 
         // Persist data before clearing
         if (transportEnabled) {
@@ -2772,6 +2773,18 @@ object Transport {
             packetHashlistPrev.clear()
             packetHashlistPrev.addAll(packetHashlist)
             packetHashlist.clear()
+        }
+    }
+
+    /**
+     * Clear the packet hashlist. Used for testing only.
+     * WARNING: This will cause duplicate packets to be processed.
+     */
+    @JvmStatic
+    fun clearPacketHashlist() {
+        jobsLock.withLock {
+            packetHashlist.clear()
+            packetHashlistPrev.clear()
         }
     }
 

@@ -148,8 +148,20 @@ class TunnelIntegrationTest {
         val clientRef = client.toRef()
         Transport.registerInterface(clientRef)
 
+        // Flag to clear hashlist only once (to avoid infinite loop)
+        var shouldClearHashlist = true
+
         // Hook up client to transport
         client.onPacketReceived = { data, iface ->
+            println("CLIENT RECEIVED: ${data.size} bytes from ${iface.name}")
+            // In this single-Transport test setup, the broadcast adds the packet hash
+            // to the hashlist before transmission. Clear it ONCE so the first incoming
+            // packet isn't filtered as a duplicate. In a real network, server and client
+            // would have separate Transport instances with independent hashlists.
+            if (shouldClearHashlist) {
+                shouldClearHashlist = false
+                Transport.clearPacketHashlist()
+            }
             Transport.inbound(data, iface.toRef())
         }
 
