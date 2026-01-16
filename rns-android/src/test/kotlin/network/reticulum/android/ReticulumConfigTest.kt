@@ -18,19 +18,18 @@ import org.robolectric.annotation.Config
 class ReticulumConfigTest {
 
     @Test
-    fun `CLIENT_ONLY preset has correct defaults`() {
-        val config = ReticulumConfig.CLIENT_ONLY
+    fun `DEFAULT preset has correct defaults`() {
+        val config = ReticulumConfig.DEFAULT
 
-        assertEquals(ReticulumConfig.Mode.CLIENT_ONLY, config.mode)
         assertFalse(config.enableTransport)
         assertEquals(ReticulumConfig.BatteryMode.BALANCED, config.batteryOptimization)
+        assertEquals(60_000L, config.jobIntervalMs)
     }
 
     @Test
-    fun `ROUTING preset has correct defaults`() {
-        val config = ReticulumConfig.ROUTING
+    fun `WITH_TRANSPORT preset has correct defaults`() {
+        val config = ReticulumConfig.WITH_TRANSPORT
 
-        assertEquals(ReticulumConfig.Mode.ROUTING, config.mode)
         assertTrue(config.enableTransport)
         assertEquals(ReticulumConfig.BatteryMode.BALANCED, config.batteryOptimization)
     }
@@ -38,13 +37,11 @@ class ReticulumConfigTest {
     @Test
     fun `custom config can override defaults`() {
         val config = ReticulumConfig(
-            mode = ReticulumConfig.Mode.ROUTING,
             enableTransport = true,
             jobIntervalMs = 30_000,
             batteryOptimization = ReticulumConfig.BatteryMode.PERFORMANCE
         )
 
-        assertEquals(ReticulumConfig.Mode.ROUTING, config.mode)
         assertTrue(config.enableTransport)
         assertEquals(30_000L, config.jobIntervalMs)
         assertEquals(ReticulumConfig.BatteryMode.PERFORMANCE, config.batteryOptimization)
@@ -114,15 +111,9 @@ class ReticulumConfigTest {
     }
 
     @Test
-    fun `config modes have correct count`() {
-        assertEquals(2, ReticulumConfig.Mode.entries.size)
-    }
-
-    @Test
     fun `BATTERY_SAVER preset has correct configuration`() {
         val config = ReticulumConfig.BATTERY_SAVER
 
-        assertEquals(ReticulumConfig.Mode.CLIENT_ONLY, config.mode)
         assertFalse(config.enableTransport)
         assertEquals(ReticulumConfig.BatteryMode.MAXIMUM_BATTERY, config.batteryOptimization)
         assertFalse(config.tcpKeepAlive)
@@ -132,7 +123,6 @@ class ReticulumConfigTest {
     fun `PERFORMANCE preset has correct configuration`() {
         val config = ReticulumConfig.PERFORMANCE
 
-        assertEquals(ReticulumConfig.Mode.ROUTING, config.mode)
         assertTrue(config.enableTransport)
         assertEquals(ReticulumConfig.BatteryMode.PERFORMANCE, config.batteryOptimization)
         assertTrue(config.tcpKeepAlive)

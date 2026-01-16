@@ -67,11 +67,12 @@ class AnnounceValidationTest {
             "ratchet"
         )
 
-        // Add a ratchet
-        val ratchetPrivate = network.reticulum.crypto.defaultCryptoProvider().randomBytes(32)
-        destination.addRatchet(ratchetPrivate)
+        // Enable ratchets with a non-existent temp file path (this sets ratchetsEnabled=true and auto-generates ratchets)
+        val tempDir = System.getProperty("java.io.tmpdir")
+        val tempRatchetPath = "$tempDir/ratchet_test_${System.nanoTime()}.dat"
+        destination.enableRatchets(tempRatchetPath)
 
-        // Create announce packet
+        // Create announce packet (will include the auto-generated ratchet)
         val announcePacket = destination.announce(send = false)
 
         announcePacket shouldNotBe null
