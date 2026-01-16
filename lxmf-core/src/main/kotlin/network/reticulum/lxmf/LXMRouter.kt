@@ -581,8 +581,10 @@ class LXMRouter(
         println("[LXMRouter] processDirectDelivery: directLinks keys=${directLinks.keys}")
         println("[LXMRouter] processDirectDelivery: backchannelLinks keys=${backchannelLinks.keys}")
 
-        // Check for existing active link
-        var link = directLinks[destHashHex] ?: backchannelLinks[destHashHex]
+        // Check for existing active link that WE initiated (directLinks only)
+        // Note: We don't use backchannelLinks because the remote peer may not have set up
+        // resource receive callbacks on links THEY initiated. We need to establish our own link.
+        var link = directLinks[destHashHex]
         println("[LXMRouter] processDirectDelivery: found link=${link != null}, status=${link?.status}")
 
         when {

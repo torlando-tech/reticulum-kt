@@ -21,22 +21,26 @@ import java.time.format.DateTimeFormatter
  * LXMF Sender - Sends a message to a destination and waits for echo reply.
  *
  * Usage:
- *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfSenderKt <dest_hash> [opportunistic|direct] [host] [port]
+ *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfSenderKt <dest_hash> [opportunistic|direct|resource] [host] [port]
  *
  * Examples:
  *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfSenderKt abc123... opportunistic
  *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfSenderKt abc123... direct 127.0.0.1 4243
+ *   java -cp lxmf-node.jar network.reticulum.lxmf.examples.LxmfSenderKt abc123... resource 127.0.0.1 4243
+ *
+ * The "resource" mode sends a large message (>500 bytes) to trigger resource-based transfer.
  */
 
 private const val DISPLAY_NAME = "Kotlin Test Sender"
 
 fun main(args: Array<String>) {
     if (args.isEmpty()) {
-        println("Usage: LxmfSenderKt <dest_hash> [opportunistic|direct] [host] [port]")
+        println("Usage: LxmfSenderKt <dest_hash> [opportunistic|direct|resource] [host] [port]")
         println()
         println("Examples:")
         println("  LxmfSenderKt abc123def456... opportunistic")
         println("  LxmfSenderKt abc123def456... direct 127.0.0.1 4243")
+        println("  LxmfSenderKt abc123def456... resource 127.0.0.1 4243  (large message >319 bytes)")
         return
     }
 
@@ -202,12 +206,33 @@ class LxmfSender(
             aspects = arrayOf("delivery")
         )
 
-        // Create message
-        val content = "Hello from Kotlin! This is a test message."
-        val title = "Kotlin Test"
+        // Create message - for resource test, send large content (>319 bytes triggers resource transfer)
+        val content = if (method == "resource") {
+            """This is a test message designed to exceed the LINK_PACKET_MAX_CONTENT limit.
+When an LXMF message is larger than 319 bytes, it must be sent as a Resource over a Link.
+This triggers the Resource transfer protocol which handles:
+- Splitting data into segments
+- Windowed flow control
+- Compression (optional)
+- Reliable delivery with acknowledgments
 
-        val deliveryMethod = if (method == "direct") {
-            log("\nSending DIRECT message (link will be established)...")
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt
+ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation
+ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in
+reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
+
+This message is approximately 800 bytes to ensure resource transfer is triggered.
+End of test message from Kotlin!
+""".trimIndent()
+        } else {
+            "Hello from Kotlin! This is a test message."
+        }
+        val title = if (method == "resource") "Kotlin Resource Test" else "Kotlin Test"
+
+        val deliveryMethod = if (method == "direct" || method == "resource") {
+            val modeDesc = if (method == "resource") "RESOURCE (large message over link)" else "DIRECT (link)"
+            log("\nSending $modeDesc message...")
+            log("  Content size: ${content.length} bytes")
             DeliveryMethod.DIRECT
         } else {
             log("\nSending OPPORTUNISTIC message (single packet)...")
@@ -232,16 +257,17 @@ class LxmfSender(
     }
 
     private fun waitForEcho() {
-        log("\nWaiting for echo reply (30 seconds)...")
+        // Longer timeout for resource transfers
+        val timeout = if (method == "resource") 60 else 30
+        log("\nWaiting for echo reply ($timeout seconds)...")
 
-        val timeout = 30
         for (i in timeout downTo 0) {
             if (echoReceived) {
                 log("Echo received successfully!")
                 return
             }
             Thread.sleep(1000)
-            if (i % 5 == 0 && i > 0) {
+            if (i % 10 == 0 && i > 0) {
                 log("  $i seconds remaining...")
             }
         }
