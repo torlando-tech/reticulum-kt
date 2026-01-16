@@ -2421,6 +2421,82 @@ def cmd_hashmap_pack(params):
     }
 
 
+def cmd_resource_map_hash(params):
+    """Compute map hash for a single resource part.
+
+    Map hash = SHA256(part_data + random_hash)[:4]
+    This matches Resource.get_map_hash() in Python RNS.
+    """
+    part_data = hex_to_bytes(params['part_data'])
+    random_hash = hex_to_bytes(params['random_hash'])
+
+    hash_material = part_data + random_hash
+    map_hash = hashlib.sha256(hash_material).digest()[:4]
+
+    return {
+        'map_hash': bytes_to_hex(map_hash)
+    }
+
+
+def cmd_resource_build_hashmap(params):
+    """Build complete hashmap from list of parts.
+
+    Each part hash = SHA256(part_data + random_hash)[:4]
+    Hashmap = concatenation of all part hashes.
+    """
+    parts = params.get('parts', [])
+    random_hash = hex_to_bytes(params['random_hash'])
+
+    part_data_list = [hex_to_bytes(p) for p in parts]
+
+    hashmap = b""
+    for part_data in part_data_list:
+        hash_material = part_data + random_hash
+        map_hash = hashlib.sha256(hash_material).digest()[:4]
+        hashmap += map_hash
+
+    return {
+        'hashmap': bytes_to_hex(hashmap),
+        'num_parts': len(part_data_list)
+    }
+
+
+def cmd_resource_proof(params):
+    """Compute expected proof for resource completion.
+
+    Expected proof = SHA256(uncompressed_data + resource_hash)[:16]
+    This is what the receiver sends to prove successful receipt.
+    """
+    data = hex_to_bytes(params['data'])
+    resource_hash = hex_to_bytes(params['resource_hash'])
+
+    hash_material = data + resource_hash
+    proof = hashlib.sha256(hash_material).digest()[:16]
+
+    return {
+        'proof': bytes_to_hex(proof)
+    }
+
+
+def cmd_resource_find_part(params):
+    """Find part index in hashmap by its map hash.
+
+    Searches hashmap for matching 4-byte hash and returns index.
+    Returns index=-1 and found=False if not found.
+    """
+    hashmap = hex_to_bytes(params['hashmap'])
+    map_hash = hex_to_bytes(params['map_hash'])
+
+    if len(map_hash) != 4:
+        return {'index': -1, 'found': False, 'error': 'map_hash must be 4 bytes'}
+
+    for i in range(0, len(hashmap), 4):
+        if hashmap[i:i+4] == map_hash:
+            return {'index': i // 4, 'found': True}
+
+    return {'index': -1, 'found': False}
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2505,6 +2581,10 @@ COMMANDS = {
     'resource_hash': cmd_resource_hash,
     'resource_flags': cmd_resource_flags,
     'hashmap_pack': cmd_hashmap_pack,
+    'resource_map_hash': cmd_resource_map_hash,
+    'resource_build_hashmap': cmd_resource_build_hashmap,
+    'resource_proof': cmd_resource_proof,
+    'resource_find_part': cmd_resource_find_part,
 }
 
 
