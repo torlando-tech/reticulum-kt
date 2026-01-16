@@ -155,7 +155,7 @@ class EmulatorLinkTest {
         println("Path found, recalling identity...")
 
         // Recall identity
-        val identity = Transport.recallIdentity(destHash)
+        val identity = Identity.recall(destHash)
         assertNotNull(identity, "Should be able to recall identity from announce")
 
         // Create destination
