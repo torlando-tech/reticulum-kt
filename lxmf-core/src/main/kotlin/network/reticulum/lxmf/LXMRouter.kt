@@ -846,14 +846,11 @@ class LXMRouter(
         message.method = DeliveryMethod.DIRECT
 
         if (message.representation == MessageRepresentation.PACKET) {
-            // For packet delivery over link, Python strips destination hash (see __as_packet for DIRECT)
-            // Actually, Python sends full packed for DIRECT: return RNS.Packet(self.__delivery_destination, self.packed)
-            // But the receiver uses Link.callbacks.packet which receives decrypted data
-            // The destination hash is implicit from the link, so we strip it
-            val lxmfData = packed.copyOfRange(
-                LXMFConstants.DESTINATION_LENGTH,  // Skip destination hash
-                packed.size
-            )
+            // For DIRECT delivery over link, Python's __as_packet sends full self.packed (WITH dest hash):
+            //   elif self.method == LXMessage.DIRECT:
+            //       return RNS.Packet(self.__delivery_destination, self.packed)
+            // And unpack_from_bytes expects the destination hash at the start.
+            val lxmfData = packed  // Full packed message including destination hash
             // Send as packet over link with receipt tracking
             try {
                 val receipt = link.sendWithReceipt(lxmfData)
