@@ -2497,6 +2497,120 @@ def cmd_resource_find_part(params):
     return {'index': -1, 'found': False}
 
 
+# IFAC (Interface Access Code) operations
+IFAC_SALT = bytes.fromhex("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
+
+
+def cmd_ifac_derive_key(params):
+    """Derive IFAC key from network name/passphrase.
+
+    Uses HKDF with IFAC_SALT to derive a 64-byte key.
+    """
+    ifac_origin = hex_to_bytes(params['ifac_origin'])
+
+    # Derive 64-byte key using HKDF (matches RNS interface authentication)
+    ifac_key = HKDF.hkdf(length=64, derive_from=ifac_origin, salt=IFAC_SALT, context=None)
+
+    return {
+        'ifac_key': bytes_to_hex(ifac_key),
+        'ifac_salt': bytes_to_hex(IFAC_SALT)
+    }
+
+
+def cmd_ifac_compute(params):
+    """Compute IFAC tag for a packet.
+
+    IFAC = last N bytes of Ed25519 signature of packet data.
+    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
+    """
+    from pure25519.ed25519_oop import SigningKey
+
+    ifac_key = hex_to_bytes(params['ifac_key'])
+    packet_data = hex_to_bytes(params['packet_data'])
+    ifac_size = int(params.get('ifac_size', 16))
+
+    # Ed25519 signing key is the second half (bytes 32-63)
+    ed25519_key = ifac_key[32:]
+    sk = SigningKey(ed25519_key)
+
+    # Sign the packet data
+    signature = sk.sign(packet_data)
+
+    # IFAC is the last ifac_size bytes of the signature
+    ifac = signature[-ifac_size:]
+
+    return {
+        'ifac': bytes_to_hex(ifac),
+        'signature': bytes_to_hex(signature)
+    }
+
+
+def cmd_ifac_verify(params):
+    """Verify IFAC tag matches expected.
+
+    Recomputes IFAC and compares.
+    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
+    """
+    from pure25519.ed25519_oop import SigningKey
+
+    ifac_key = hex_to_bytes(params['ifac_key'])
+    packet_data = hex_to_bytes(params['packet_data'])
+    expected_ifac = hex_to_bytes(params['expected_ifac'])
+    ifac_size = len(expected_ifac)
+
+    # Ed25519 signing key is the second half (bytes 32-63)
+    ed25519_key = ifac_key[32:]
+    sk = SigningKey(ed25519_key)
+
+    # Sign the packet data
+    signature = sk.sign(packet_data)
+
+    # IFAC is the last ifac_size bytes of the signature
+    computed_ifac = signature[-ifac_size:]
+
+    return {
+        'valid': computed_ifac == expected_ifac,
+        'computed_ifac': bytes_to_hex(computed_ifac)
+    }
+
+
+# Compression operations
+def cmd_bz2_compress(params):
+    """Compress data using BZ2.
+
+    Returns compressed data and compression ratio.
+    """
+    import bz2
+
+    data = hex_to_bytes(params['data'])
+
+    compressed = bz2.compress(data)
+
+    return {
+        'compressed': bytes_to_hex(compressed),
+        'original_size': len(data),
+        'compressed_size': len(compressed),
+        'ratio': len(compressed) / len(data) if len(data) > 0 else 0
+    }
+
+
+def cmd_bz2_decompress(params):
+    """Decompress BZ2 data.
+
+    Returns decompressed data.
+    """
+    import bz2
+
+    compressed = hex_to_bytes(params['compressed'])
+
+    decompressed = bz2.decompress(compressed)
+
+    return {
+        'decompressed': bytes_to_hex(decompressed),
+        'size': len(decompressed)
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2585,6 +2699,13 @@ COMMANDS = {
     'resource_build_hashmap': cmd_resource_build_hashmap,
     'resource_proof': cmd_resource_proof,
     'resource_find_part': cmd_resource_find_part,
+    # IFAC operations
+    'ifac_derive_key': cmd_ifac_derive_key,
+    'ifac_compute': cmd_ifac_compute,
+    'ifac_verify': cmd_ifac_verify,
+    # Compression operations
+    'bz2_compress': cmd_bz2_compress,
+    'bz2_decompress': cmd_bz2_decompress,
 }
 
 
