@@ -13,6 +13,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cloud
@@ -35,6 +37,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.ui.components.CustomSettingsCard
@@ -97,12 +101,17 @@ fun TcpClientWizardScreen(
     var interfaceName by remember { mutableStateOf(editingInterface?.name ?: "") }
     var targetHost by remember { mutableStateOf(editingInterface?.host ?: "") }
     var targetPort by remember { mutableStateOf(editingInterface?.port?.toString() ?: "4965") }
+    // IFAC (Interface Access Code) for network isolation
+    var networkName by remember { mutableStateOf(editingInterface?.networkName ?: "") }
+    var passphrase by remember { mutableStateOf(editingInterface?.passphrase ?: "") }
 
     // Initialize from editing interface
     if (editingInterface != null && interfaceName.isEmpty()) {
         interfaceName = editingInterface.name
         targetHost = editingInterface.host ?: ""
         targetPort = editingInterface.port?.toString() ?: "4965"
+        networkName = editingInterface.networkName ?: ""
+        passphrase = editingInterface.passphrase ?: ""
         isCustom = true
         currentStep = 1 // Skip to review/configure
     }
@@ -143,6 +152,8 @@ fun TcpClientWizardScreen(
                 type = InterfaceType.TCP_CLIENT.name,
                 host = targetHost,
                 port = targetPort.toIntOrNull() ?: 4965,
+                networkName = networkName.ifBlank { null },
+                passphrase = passphrase.ifBlank { null },
             )
             onSave(config)
         }
@@ -192,9 +203,13 @@ fun TcpClientWizardScreen(
                 interfaceName = interfaceName,
                 targetHost = targetHost,
                 targetPort = targetPort,
+                networkName = networkName,
+                passphrase = passphrase,
                 onNameChange = { interfaceName = it },
                 onHostChange = { targetHost = it },
                 onPortChange = { targetPort = it },
+                onNetworkNameChange = { networkName = it },
+                onPassphraseChange = { passphrase = it },
                 modifier = Modifier.padding(padding)
             )
         }
@@ -274,11 +289,17 @@ private fun ReviewConfigureStep(
     interfaceName: String,
     targetHost: String,
     targetPort: String,
+    networkName: String,
+    passphrase: String,
     onNameChange: (String) -> Unit,
     onHostChange: (String) -> Unit,
     onPortChange: (String) -> Unit,
+    onNetworkNameChange: (String) -> Unit,
+    onPassphraseChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var passphraseVisible by remember { mutableStateOf(false) }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -356,6 +377,47 @@ private fun ReviewConfigureStep(
             placeholder = { Text("4965") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        // IFAC Section
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = "Network Isolation (Optional)",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Text(
+            text = "Configure a network name and/or passphrase to restrict this interface to nodes with matching credentials.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        OutlinedTextField(
+            value = networkName,
+            onValueChange = onNetworkNameChange,
+            label = { Text("Network Name") },
+            placeholder = { Text("Optional") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        OutlinedTextField(
+            value = passphrase,
+            onValueChange = onPassphraseChange,
+            label = { Text("Passphrase") },
+            placeholder = { Text("Optional") },
+            singleLine = true,
+            visualTransformation = if (passphraseVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = { passphraseVisible = !passphraseVisible }) {
+                    Icon(
+                        imageVector = if (passphraseVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        contentDescription = if (passphraseVisible) "Hide passphrase" else "Show passphrase"
+                    )
+                }
+            },
             modifier = Modifier.fillMaxWidth(),
         )
     }

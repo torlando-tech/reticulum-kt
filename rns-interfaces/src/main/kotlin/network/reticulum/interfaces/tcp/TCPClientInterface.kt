@@ -10,6 +10,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import network.reticulum.identity.Identity
+import network.reticulum.interfaces.IfacCredentials
+import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
@@ -35,7 +38,10 @@ class TCPClientInterface(
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Disabled by default for battery efficiency on mobile. */
-    private val keepAlive: Boolean = false
+    private val keepAlive: Boolean = false,
+    // IFAC (Interface Access Code) parameters for network isolation
+    override val ifacNetname: String? = null,
+    override val ifacNetkey: String? = null,
 ) : Interface(name) {
 
     companion object {
@@ -47,6 +53,20 @@ class TCPClientInterface(
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
+
+    // IFAC credentials - derived lazily from network name/passphrase
+    private val _ifacCredentials: IfacCredentials? by lazy {
+        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
+    }
+
+    override val ifacSize: Int
+        get() = if (_ifacCredentials != null) 16 else 0
+
+    override val ifacKey: ByteArray?
+        get() = _ifacCredentials?.key
+
+    override val ifacIdentity: Identity?
+        get() = _ifacCredentials?.identity
 
     private var socket: Socket? = null
     private val reconnecting = AtomicBoolean(false)

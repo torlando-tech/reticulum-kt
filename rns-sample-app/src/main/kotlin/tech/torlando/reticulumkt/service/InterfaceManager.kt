@@ -149,6 +149,8 @@ class InterfaceManager(
                         name = config.name,
                         targetHost = host,
                         targetPort = port,
+                        ifacNetname = config.networkName,
+                        ifacNetkey = config.passphrase,
                     )
 
                     // Set up packet callback to forward to Transport
@@ -160,7 +162,8 @@ class InterfaceManager(
                     iface.start()
                     Transport.registerInterface(InterfaceAdapter.getOrCreate(iface))
 
-                    Log.i(TAG, "Started TCP interface: ${config.name} -> $host:$port")
+                    val ifacInfo = if (config.networkName != null || config.passphrase != null) " (IFAC enabled)" else ""
+                    Log.i(TAG, "Started TCP interface: ${config.name} -> $host:$port$ifacInfo")
                     iface
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start TCP interface ${config.name}: ${e.message}")

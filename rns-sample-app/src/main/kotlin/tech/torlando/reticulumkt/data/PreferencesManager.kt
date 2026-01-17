@@ -36,6 +36,9 @@ data class StoredInterfaceConfig(
     // Auto Interface
     val groupId: String? = null,
     val discoveryPort: Int? = null,
+    // IFAC (Interface Access Code) - network isolation (all interface types)
+    val networkName: String? = null,
+    val passphrase: String? = null,
 )
 
 class PreferencesManager(private val context: Context) {

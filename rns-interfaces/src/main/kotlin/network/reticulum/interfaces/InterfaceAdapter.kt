@@ -34,6 +34,16 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val parentInterface: InterfaceRef?
         get() = iface.parentInterface?.toRef()
 
+    // IFAC properties - delegate to underlying interface
+    override val ifacSize: Int
+        get() = iface.ifacSize
+
+    override val ifacKey: ByteArray?
+        get() = iface.ifacKey
+
+    override val ifacIdentity: network.reticulum.identity.Identity?
+        get() = iface.ifacIdentity
+
     init {
         // Only set up the callback if one isn't already set
         // This prevents overwriting callbacks set by parent interfaces (e.g., TCPServerInterface)

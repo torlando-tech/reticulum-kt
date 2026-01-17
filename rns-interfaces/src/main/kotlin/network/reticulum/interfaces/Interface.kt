@@ -17,6 +17,27 @@ abstract class Interface(
     /** Human-readable name for this interface. */
     val name: String
 ) {
+    // IFAC (Interface Access Code) properties for network isolation
+
+    /** IFAC network name for access control. */
+    open val ifacNetname: String? = null
+
+    /** IFAC network passphrase for access control. */
+    open val ifacNetkey: String? = null
+
+    /**
+     * IFAC size in bytes. 0 = disabled.
+     * When ifacNetname or ifacNetkey is set, defaults to 16 bytes.
+     */
+    open val ifacSize: Int
+        get() = if (ifacNetname != null || ifacNetkey != null) 16 else 0
+
+    /** IFAC key derived from network name/key. Null if IFAC disabled. */
+    open val ifacKey: ByteArray? = null
+
+    /** IFAC identity for signing packets. Null if IFAC disabled. */
+    open val ifacIdentity: network.reticulum.identity.Identity? = null
+
     /** Whether this interface can receive packets. */
     open val canReceive: Boolean = true
 
