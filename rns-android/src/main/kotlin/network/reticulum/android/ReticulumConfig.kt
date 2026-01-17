@@ -116,15 +116,6 @@ data class ReticulumConfig(
     }
 
     /**
-     * Get the effective job interval based on battery mode.
-     */
-    fun getEffectiveJobInterval(): Long = when (batteryOptimization) {
-        BatteryMode.MAXIMUM_BATTERY -> maxOf(jobIntervalMs, 120_000L) // At least 2 minutes
-        BatteryMode.BALANCED -> jobIntervalMs
-        BatteryMode.PERFORMANCE -> minOf(jobIntervalMs, 30_000L) // At most 30 seconds
-    }
-
-    /**
      * Get the effective hashlist size based on battery mode.
      * Performance mode allows larger hashlists; battery mode uses smaller.
      */
@@ -132,6 +123,26 @@ data class ReticulumConfig(
         BatteryMode.MAXIMUM_BATTERY -> minOf(maxHashlistSize, 25_000)
         BatteryMode.BALANCED -> maxHashlistSize
         BatteryMode.PERFORMANCE -> maxHashlistSize * 2
+    }
+
+    /**
+     * Get the effective tables cull interval based on battery mode.
+     * This controls how often path/link/reverse tables are cleaned.
+     */
+    fun getEffectiveTablesCullInterval(): Long = when (batteryOptimization) {
+        BatteryMode.PERFORMANCE -> 5_000L       // 5s (Python default)
+        BatteryMode.BALANCED -> 10_000L         // 10s
+        BatteryMode.MAXIMUM_BATTERY -> 30_000L  // 30s
+    }
+
+    /**
+     * Get the effective announces check interval based on battery mode.
+     * This controls how often announce rebroadcasts are processed.
+     */
+    fun getEffectiveAnnouncesCheckInterval(): Long = when (batteryOptimization) {
+        BatteryMode.PERFORMANCE -> 1_000L       // 1s (Python default)
+        BatteryMode.BALANCED -> 5_000L          // 5s
+        BatteryMode.MAXIMUM_BATTERY -> 10_000L  // 10s
     }
 
     companion object {

@@ -117,6 +117,14 @@ object Transport {
     @Volatile
     var customJobIntervalMs: Long? = null
 
+    /** Custom tables cull interval in milliseconds (null uses default). */
+    @Volatile
+    var customTablesCullIntervalMs: Long? = null
+
+    /** Custom announces check interval in milliseconds (null uses default). */
+    @Volatile
+    var customAnnouncesCheckIntervalMs: Long? = null
+
     /** Whether to use coroutine-based job loop instead of thread-based. */
     @Volatile
     var useCoroutineJobLoop: Boolean = false
@@ -2969,11 +2977,20 @@ object Transport {
      * Call this before start() to use coroutines instead of threads.
      *
      * @param scope The coroutine scope to use for the job loop
-     * @param intervalMs Custom job interval in milliseconds (default: platform-appropriate)
+     * @param intervalMs Custom job interval in milliseconds (default: 250ms)
+     * @param tablesCullIntervalMs Custom tables cull interval (default: 5000ms)
+     * @param announcesCheckIntervalMs Custom announces check interval (default: 1000ms)
      */
-    fun configureCoroutineJobLoop(scope: CoroutineScope, intervalMs: Long? = null) {
+    fun configureCoroutineJobLoop(
+        scope: CoroutineScope,
+        intervalMs: Long? = null,
+        tablesCullIntervalMs: Long? = null,
+        announcesCheckIntervalMs: Long? = null
+    ) {
         jobLoopScope = scope
         customJobIntervalMs = intervalMs
+        customTablesCullIntervalMs = tablesCullIntervalMs
+        customAnnouncesCheckIntervalMs = announcesCheckIntervalMs
         useCoroutineJobLoop = true
     }
 
@@ -3023,25 +3040,26 @@ object Transport {
         // Update traffic speed
         updateTrafficSpeed(now)
 
-        // Check receipt timeouts
+        // Check receipt timeouts (cheap operation, always use 1s interval)
         if (now - receiptsLastChecked > TransportConstants.RECEIPTS_CHECK_INTERVAL) {
             checkReceiptTimeouts()
             receiptsLastChecked = now
         }
 
-        // Cull stale table entries
-        if (now - tablesLastCulled > TransportConstants.TABLES_CULL_INTERVAL) {
+        // Cull stale table entries (expensive, use battery-adjusted interval)
+        val tablesCullInterval = customTablesCullIntervalMs ?: TransportConstants.TABLES_CULL_INTERVAL
+        if (now - tablesLastCulled > tablesCullInterval) {
             cullTables()
             tablesLastCulled = now
         }
 
-        // Clean hashlist
+        // Clean hashlist (size-based, run every 5 minutes regardless of battery mode)
         if (now - hashlistLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             packetHashlistPrev.clear()
             hashlistLastCleaned = now
         }
 
-        // Clean announce cache periodically
+        // Clean announce cache periodically (run every 5 minutes regardless of battery mode)
         if (now - cacheLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             cleanAnnounceCache()
             cacheLastCleaned = now

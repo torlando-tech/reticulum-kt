@@ -129,9 +129,12 @@ class ReticulumService : LifecycleService() {
             File(configDir).mkdirs()
 
             // Configure Transport for coroutine-based job loop on Android
+            // Use 250ms loop (matches Python) with battery-adjusted intervals for expensive operations
             network.reticulum.transport.Transport.configureCoroutineJobLoop(
                 scope = serviceScope,
-                intervalMs = config.getEffectiveJobInterval()
+                intervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL, // 250ms
+                tablesCullIntervalMs = config.getEffectiveTablesCullInterval(),
+                announcesCheckIntervalMs = config.getEffectiveAnnouncesCheckInterval()
             )
 
             // Check if another shared instance is already running
