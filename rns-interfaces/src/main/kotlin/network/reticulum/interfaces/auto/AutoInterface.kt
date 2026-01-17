@@ -221,6 +221,7 @@ class AutoInterface(
                     joinGroup(multicastGroup, netIf)
                 }
                 discoverySocketsIn[ifName] = discoveryIn
+                log("Successfully joined multicast group ${multicastGroup.address.hostAddress} on $ifName")
 
                 // Create discovery output socket (for sending announcements)
                 // Must use MulticastSocket and set the outgoing interface
@@ -241,13 +242,24 @@ class AutoInterface(
                 }
                 dataSockets[ifName] = dataChannel.socket()
 
+            } catch (e: java.io.IOException) {
+                log("I/O error setting up sockets for $ifName: ${e.message}", "ERROR")
+                e.printStackTrace()
+            } catch (e: SecurityException) {
+                log("Permission denied for multicast on $ifName: ${e.message}", "ERROR")
+                log("AutoInterface requires INTERNET and MULTICAST permissions", "ERROR")
             } catch (e: Exception) {
-                log("Failed to setup sockets for $ifName: ${e.message}")
+                log("Unexpected error setting up sockets for $ifName: ${e.message}", "ERROR")
+                e.printStackTrace()
             }
         }
 
         if (linkLocalAddresses.isEmpty()) {
-            throw IllegalStateException("No suitable network interfaces found")
+            log("No suitable network interfaces found - AutoInterface will not be functional", "WARNING")
+            log("This interface currently provides no connectivity", "WARNING")
+            // Don't throw - allow interface to exist but not function
+            // This matches Python behavior (AutoInterface.py:297-300)
+            return
         }
     }
 
@@ -313,7 +325,9 @@ class AutoInterface(
                     continue
                 }
 
-                val senderAddrStr = senderAddrRaw
+                // Strip scope ID if present (e.g., "fe80::1%eth0" -> "fe80::1")
+                // This ensures consistent address handling across all interfaces
+                val senderAddrStr = senderAddrRaw.substringBefore('%')
 
                 // Skip our own announcements
                 if (isOwnAddress(senderAddrStr)) {
@@ -484,8 +498,8 @@ class AutoInterface(
      */
     private fun compressIPv6(address: String): String {
         return try {
-            // Parse and re-format to get compressed form
-            val inet = InetAddress.getByName(address) as Inet6Address
+            // Parse to validate address format
+            InetAddress.getByName(address) as Inet6Address
             // Java's getHostAddress returns expanded form, so we need to compress manually
             val parts = address.split(":")
             if (parts.size != 8) return address
@@ -679,9 +693,27 @@ class AutoInterface(
         }
     }
 
-    private fun log(message: String) {
+    private fun log(message: String, level: String = "INFO") {
         val timestamp = java.time.LocalTime.now().toString().take(12)
-        println("[$timestamp] [$name] $message")
+        val logMessage = "[$timestamp] [$name] $message"
+
+        // Try Android logging first
+        try {
+            val logClass = Class.forName("android.util.Log")
+            when (level) {
+                "ERROR" -> logClass.getMethod("e", String::class.java, String::class.java)
+                    .invoke(null, "AutoInterface", logMessage)
+                "WARNING", "WARN" -> logClass.getMethod("w", String::class.java, String::class.java)
+                    .invoke(null, "AutoInterface", logMessage)
+                "DEBUG" -> logClass.getMethod("d", String::class.java, String::class.java)
+                    .invoke(null, "AutoInterface", logMessage)
+                else -> logClass.getMethod("i", String::class.java, String::class.java)
+                    .invoke(null, "AutoInterface", logMessage)
+            }
+        } catch (e: Exception) {
+            // Fall back to println for non-Android platforms
+            println(logMessage)
+        }
     }
 
     override fun toString(): String = "AutoInterface[$name, ${peerCount()} peers]"

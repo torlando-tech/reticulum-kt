@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.InterfaceAdapter
+import network.reticulum.interfaces.auto.AutoInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.transport.Transport
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
@@ -168,10 +169,37 @@ class InterfaceManager(
             }
 
             InterfaceType.AUTO -> {
-                // Auto interface would use multicast discovery
-                // Not implemented yet
-                Log.w(TAG, "Auto interface not yet implemented")
-                null
+                try {
+                    // Use config fields, with defaults matching Python RNS
+                    val groupIdString = config.groupId ?: "reticulum"
+                    val groupId = groupIdString.toByteArray(Charsets.UTF_8)
+                    val discoveryPort = config.discoveryPort ?: 29716
+
+                    val iface = AutoInterface(
+                        name = config.name,
+                        groupId = groupId,
+                        discoveryScope = "2", // Link-local (default)
+                        discoveryPort = discoveryPort,
+                        dataPort = 42671, // Default data port
+                        allowedDevices = null, // Use all available interfaces
+                        ignoredDevices = emptyList()
+                    )
+
+                    // Set up packet callback to forward to Transport
+                    iface.onPacketReceived = { data, fromInterface ->
+                        Transport.inbound(data, InterfaceAdapter.getOrCreate(fromInterface))
+                    }
+
+                    // Start and register
+                    iface.start()
+                    Transport.registerInterface(InterfaceAdapter.getOrCreate(iface))
+
+                    Log.i(TAG, "Created AutoInterface: ${config.name}")
+                    iface
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to create AutoInterface: ${e.message}", e)
+                    null
+                }
             }
 
             InterfaceType.BLE -> {
