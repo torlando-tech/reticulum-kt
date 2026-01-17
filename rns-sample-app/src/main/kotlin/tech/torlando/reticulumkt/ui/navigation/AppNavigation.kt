@@ -64,6 +64,7 @@ fun AppNavigation(
     val navBackStackEntry = navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry.value?.destination
 
+    @Suppress("UnusedMaterial3ScaffoldPaddingParameter")
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -85,11 +86,11 @@ fun AppNavigation(
                 }
             }
         }
-    ) { innerPadding ->
+    ) { _ ->
+        // Inner screens have their own Scaffolds with TopAppBars that handle content padding
         NavHost(
             navController = navController,
-            startDestination = Screen.Home.route,
-            modifier = Modifier.padding(innerPadding)
+            startDestination = Screen.Home.route
         ) {
             // Main screens
             composable(Screen.Home.route) {
