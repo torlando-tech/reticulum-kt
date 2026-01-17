@@ -88,6 +88,9 @@ dependencies {
     // JSON serialization for interface configs
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
 
+    // Accompanist for permissions
+    implementation("com.google.accompanist:accompanist-permissions:0.34.0")
+
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

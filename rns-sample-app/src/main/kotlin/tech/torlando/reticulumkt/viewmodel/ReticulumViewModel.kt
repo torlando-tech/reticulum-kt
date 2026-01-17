@@ -328,9 +328,130 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun updateMonitorState() {
+        val context = getApplication<Application>()
         val runtime = Runtime.getRuntime()
+
+        // Get system services
+        val connectivityManager = context.getSystemService(android.net.ConnectivityManager::class.java)
+        val wifiManager = context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+        val telephonyManager = context.getSystemService(android.telephony.TelephonyManager::class.java)
+        val batteryManager = context.getSystemService(android.os.BatteryManager::class.java)
+        val powerManager = context.getSystemService(android.os.PowerManager::class.java)
+
+        // Network info
+        val activeNetwork = connectivityManager?.activeNetwork
+        val capabilities = connectivityManager?.getNetworkCapabilities(activeNetwork)
+        val networkAvailable = capabilities != null
+        val isWifi = capabilities?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        val isCellular = capabilities?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        val isMetered = connectivityManager?.isActiveNetworkMetered == true
+
+        val connectionType = when {
+            isWifi -> "WiFi"
+            isCellular -> "Cellular"
+            networkAvailable -> "Other"
+            else -> "None"
+        }
+
+        // WiFi info (requires ACCESS_WIFI_STATE and location permissions)
+        val (wifiSsid, wifiSignalStrength, wifiLinkSpeed) = try {
+            val wifiInfo = wifiManager?.connectionInfo
+            android.util.Log.i("ReticulumViewModel", "WiFi SSID raw: ${wifiInfo?.ssid}")
+            android.util.Log.i("ReticulumViewModel", "WiFi RSSI: ${wifiInfo?.rssi}")
+            android.util.Log.i("ReticulumViewModel", "WiFi Link Speed: ${wifiInfo?.linkSpeed}")
+
+            val rawSsid = wifiInfo?.ssid?.removeSurrounding("\"")
+            val ssid = when {
+                rawSsid == null -> "Unknown"
+                rawSsid == "<unknown ssid>" -> "Unknown"
+                rawSsid.isBlank() -> "Unknown"
+                else -> rawSsid
+            }
+            val rssi = wifiInfo?.rssi ?: -100
+            val signalStrength = when {
+                rssi >= -50 -> "Excellent ($rssi dBm)"
+                rssi >= -60 -> "Good ($rssi dBm)"
+                rssi >= -70 -> "Fair ($rssi dBm)"
+                rssi >= -80 -> "Weak ($rssi dBm)"
+                else -> "Very Weak ($rssi dBm)"
+            }
+            val linkSpeed = if (wifiInfo != null && wifiInfo.linkSpeed > 0) {
+                "${wifiInfo.linkSpeed} Mbps"
+            } else {
+                "Unknown"
+            }
+            android.util.Log.i("ReticulumViewModel", "WiFi SSID processed: $ssid, signal: $signalStrength, speed: $linkSpeed")
+            Triple(ssid, signalStrength, linkSpeed)
+        } catch (e: SecurityException) {
+            android.util.Log.e("ReticulumViewModel", "SecurityException reading WiFi info", e)
+            Triple("Permission denied", "Permission denied", "Permission denied")
+        } catch (e: Exception) {
+            android.util.Log.e("ReticulumViewModel", "Error reading WiFi info", e)
+            Triple("Error", "Error", "Error")
+        }
+
+        // Cellular info (requires READ_PHONE_STATE permission which we don't request)
+        val (cellularStatus, cellularType, cellularSignal) = try {
+            val status = if (isCellular) "Connected" else "Not connected"
+            val type = when (telephonyManager?.dataNetworkType) {
+                android.telephony.TelephonyManager.NETWORK_TYPE_LTE -> "LTE"
+                android.telephony.TelephonyManager.NETWORK_TYPE_NR -> "5G"
+                android.telephony.TelephonyManager.NETWORK_TYPE_HSDPA,
+                android.telephony.TelephonyManager.NETWORK_TYPE_HSUPA,
+                android.telephony.TelephonyManager.NETWORK_TYPE_HSPA -> "HSPA"
+                android.telephony.TelephonyManager.NETWORK_TYPE_UMTS -> "3G"
+                android.telephony.TelephonyManager.NETWORK_TYPE_EDGE -> "EDGE"
+                android.telephony.TelephonyManager.NETWORK_TYPE_GPRS -> "GPRS"
+                else -> "Unknown"
+            }
+            val signal = "N/A" // Signal strength requires phone state permission
+            Triple(status, type, signal)
+        } catch (e: SecurityException) {
+            // Don't have READ_PHONE_STATE permission - show minimal info
+            val status = if (isCellular) "Connected" else "Not connected"
+            Triple(status, "Permission required", "N/A")
+        }
+
+        // Battery info
+        val batteryLevel = batteryManager?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 0
+        val batteryStatus = when (batteryManager?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_STATUS)) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING -> "Charging"
+            android.os.BatteryManager.BATTERY_STATUS_FULL -> "Full"
+            android.os.BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
+            android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Not charging"
+            else -> "Unknown"
+        }
+        val powerSaveMode = powerManager?.isPowerSaveMode == true
+
+        // Doze info
+        val inDoze = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            powerManager?.isDeviceIdleMode == true
+        } else {
+            false
+        }
+        val batteryExempt = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        } else {
+            true
+        }
+
         _monitorState.value = _monitorState.value.copy(
+            networkAvailable = networkAvailable,
+            connectionType = connectionType,
+            isMetered = isMetered,
+            wifiSsid = if (isWifi) wifiSsid else "Not connected",
+            wifiSignalStrength = if (isWifi) wifiSignalStrength else "Not connected",
+            wifiLinkSpeed = if (isWifi) wifiLinkSpeed else "Not connected",
+            cellularStatus = cellularStatus,
+            cellularType = cellularType,
+            cellularSignal = cellularSignal,
+            batteryLevel = batteryLevel,
+            batteryStatus = batteryStatus,
+            powerSaveMode = powerSaveMode,
+            inDoze = inDoze,
+            batteryExempt = batteryExempt,
             heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024,
             heapMaxMb = runtime.maxMemory() / 1024 / 1024,
         )

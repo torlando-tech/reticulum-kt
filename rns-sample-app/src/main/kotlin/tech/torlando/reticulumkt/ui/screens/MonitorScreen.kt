@@ -30,17 +30,22 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.isGranted
+import com.google.accompanist.permissions.rememberPermissionState
 import tech.torlando.reticulumkt.ui.theme.StatusConnected
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
 @Composable
 fun MonitorScreen(
     viewModel: ReticulumViewModel,
@@ -49,6 +54,19 @@ fun MonitorScreen(
     val serviceState by viewModel.serviceState.collectAsState()
     val interfaces by viewModel.interfaces.collectAsState()
     val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
+
+    // Request location permission for WiFi SSID access
+    val locationPermissionState = rememberPermissionState(
+        android.Manifest.permission.ACCESS_FINE_LOCATION
+    )
+
+    LaunchedEffect(Unit) {
+        if (!locationPermissionState.status.isGranted) {
+            locationPermissionState.launchPermissionRequest()
+        }
+        // Refresh monitor data when screen loads
+        viewModel.refreshMonitor()
+    }
 
     Scaffold(
         topBar = {
