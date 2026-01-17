@@ -121,9 +121,33 @@ fun AppNavigation(
             composable(Screen.Home.route) {
                 HomeScreen(
                     viewModel = viewModel,
-                    onNavigateToMode = { navController.navigate(Screen.Mode.route) },
-                    onNavigateToInterfaces = { navController.navigate(Screen.Interfaces.route) },
-                    onNavigateToPerformance = { navController.navigate(Screen.Performance.route) },
+                    onNavigateToMode = {
+                        navController.navigate(Screen.Mode.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    },
+                    onNavigateToInterfaces = {
+                        navController.navigate(Screen.Interfaces.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    },
+                    onNavigateToPerformance = {
+                        navController.navigate(Screen.Performance.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    },
                 )
             }
             composable(Screen.Mode.route) {
