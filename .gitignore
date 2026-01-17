@@ -35,3 +35,6 @@ venv/
 
 # Local configuration
 local.properties
+
+# Test identity files (binary keys)
+*_identity
