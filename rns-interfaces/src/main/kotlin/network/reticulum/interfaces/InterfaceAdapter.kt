@@ -24,6 +24,16 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
         get() = iface.wantsTunnel
         set(value) { iface.wantsTunnel = value }
 
+    // Shared instance properties (Python RNS compatibility)
+    override val isLocalSharedInstance: Boolean
+        get() = iface.isLocalSharedInstance
+
+    override val isConnectedToSharedInstance: Boolean
+        get() = (iface as? network.reticulum.interfaces.local.LocalClientInterface)?.isConnectedToSharedInstance() ?: false
+
+    override val parentInterface: InterfaceRef?
+        get() = iface.parentInterface?.toRef()
+
     init {
         // Only set up the callback if one isn't already set
         // This prevents overwriting callbacks set by parent interfaces (e.g., TCPServerInterface)

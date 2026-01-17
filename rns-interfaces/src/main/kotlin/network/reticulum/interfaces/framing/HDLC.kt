@@ -118,7 +118,9 @@ object HDLC {
                         val frameData = buffer.toByteArray()
                         buffer.reset()
                         val unescaped = unescape(frameData)
-                        if (unescaped.isNotEmpty()) {
+                        // Python RNS: Only accept frames larger than HEADER_MINSIZE (19 bytes)
+                        // Rejects malformed/tiny frames that can't contain a valid packet
+                        if (unescaped.size > network.reticulum.common.RnsConstants.HEADER_MIN_SIZE) {
                             onFrame(unescaped)
                         }
                     }

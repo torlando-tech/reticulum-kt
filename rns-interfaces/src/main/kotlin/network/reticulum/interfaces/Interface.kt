@@ -38,6 +38,9 @@ abstract class Interface(
     /** Hardware MTU (if different from standard MTU). */
     open val hwMtu: Int? = null
 
+    /** Whether this is a local shared instance server (Python RNS compatibility). */
+    open val isLocalSharedInstance: Boolean = false
+
     /** Creation timestamp in milliseconds. */
     val createdAt: Long = System.currentTimeMillis()
 

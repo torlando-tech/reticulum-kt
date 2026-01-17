@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
 import network.reticulum.interfaces.InterfaceAdapter
@@ -186,6 +187,26 @@ class ReticulumService : LifecycleService() {
             network.reticulum.transport.Transport.registerInterface(
                 network.reticulum.interfaces.InterfaceAdapter.getOrCreate(server)
             )
+
+            // Monitor and register spawned client interfaces
+            serviceScope.launch {
+                val registeredClients = mutableSetOf<network.reticulum.interfaces.Interface>()
+                while (this.isActive) {
+                    val spawned = server.spawnedInterfaces ?: emptyList()
+                    for (client in spawned) {
+                        if (!registeredClients.contains(client)) {
+                            network.reticulum.transport.Transport.registerInterface(
+                                network.reticulum.interfaces.InterfaceAdapter.getOrCreate(client)
+                            )
+                            registeredClients.add(client)
+                            android.util.Log.i("ReticulumService", "Registered spawned client interface: ${client.name}")
+                        }
+                    }
+                    // Remove disconnected clients
+                    registeredClients.retainAll(spawned.toSet())
+                    kotlinx.coroutines.delay(1000) // Check every second
+                }
+            }
 
             // Update the Reticulum instance state via reflection (since isSharedInstance is private set)
             try {

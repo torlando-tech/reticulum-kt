@@ -627,10 +627,22 @@ object Transport {
 
     /**
      * Register an interface with transport.
+     * Automatically detects and tracks local client interfaces (Python RNS compatibility).
      */
     fun registerInterface(interfaceRef: InterfaceRef) {
         interfaces.add(interfaceRef)
-        log("Registered interface: ${interfaceRef.name}")
+
+        // Python: Track interfaces spawned by local shared instance server
+        // Matches Python logic: if interface.parent_interface?.is_local_shared_instance
+        if (interfaceRef.parentInterface?.isLocalSharedInstance == true) {
+            localClientInterfaces.add(interfaceRef)
+            log("Registered local client interface: ${interfaceRef.name}")
+        } else if (interfaceRef.isConnectedToSharedInstance) {
+            // Client connecting TO shared instance (not spawned BY server)
+            log("Registered interface connected to shared instance: ${interfaceRef.name}")
+        } else {
+            log("Registered interface: ${interfaceRef.name}")
+        }
     }
 
     /**
@@ -639,6 +651,7 @@ object Transport {
      */
     fun deregisterInterface(interfaceRef: InterfaceRef) {
         interfaces.remove(interfaceRef)
+        localClientInterfaces.remove(interfaceRef)
 
         // Clean up interface-related data
         val interfaceHash = ByteArrayKey(interfaceRef.hash)
@@ -1964,8 +1977,25 @@ object Transport {
             return
         }
 
+        // DEBUG: Log packet type from external interface
+        if (interfaceRef.name == "Beleth RNS Hub") {
+            log("DEBUG: Unpacked ${packet.packetType} from ${interfaceRef.name} (destType=${packet.destinationType}, transport=${packet.transportType})")
+        }
+
         // Track which interface this packet was received on
         packet.receivingInterfaceHash = interfaceRef.hash
+
+        // Python RNS: Decrement hops for packets from local client interfaces
+        // This makes destinations behind shared instance appear more reachable
+        // Matches Python Transport.inbound():1253-1258
+        if (localClientInterfaces.isNotEmpty()) {
+            if (interfaceRef.parentInterface?.isLocalSharedInstance == true) {
+                packet.hops = maxOf(0, packet.hops - 1)
+            }
+        } else if (interfaceRef.isConnectedToSharedInstance) {
+            // Client connected to shared instance (not server-spawned)
+            packet.hops = maxOf(0, packet.hops - 1)
+        }
 
         // Increment hop count
         packet.hops++
@@ -1989,6 +2019,47 @@ object Transport {
 
         trafficRxBytes += raw.size
         recordRxBytes(interfaceRef, raw.size)
+
+        // Python RNS: Smart broadcast routing for shared instances
+        // Matches Python Transport.inbound():1300-1308
+        // Applies to ALL broadcast packets (including announces which are SINGLE destination + BROADCAST transport)
+        if (packet.transportType == TransportType.BROADCAST) {
+            log("BROADCAST ROUTING: packet from ${interfaceRef.name}, localClients=${localClientInterfaces.size}")
+
+            // Check if packet is from a local client interface
+            val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
+            log("BROADCAST ROUTING: fromLocalClient=$fromLocalClient")
+
+            if (fromLocalClient) {
+                // FROM local client → rebroadcast to ALL interfaces EXCEPT originator
+                log("BROADCAST ROUTING: FROM local client, forwarding to ${interfaces.size - 1} interfaces")
+                for (iface in interfaces) {
+                    if (!iface.hash.contentEquals(interfaceRef.hash) && iface.canSend && iface.online) {
+                        try {
+                            log("BROADCAST ROUTING: Forwarding from local client to ${iface.name}")
+                            iface.send(raw)
+                        } catch (e: Exception) {
+                            log("Error forwarding from local client to ${iface.name}: ${e.message}")
+                        }
+                    }
+                }
+            } else if (localClientInterfaces.isNotEmpty()) {
+                // FROM external interface → rebroadcast to ALL local clients
+                log("BROADCAST ROUTING: FROM external, forwarding to ${localClientInterfaces.size} local clients")
+                for (iface in localClientInterfaces) {
+                    if (iface.canSend && iface.online) {
+                        try {
+                            log("BROADCAST ROUTING: Forwarding ${packet.packetType} (destType=${packet.destinationType}, transport=${packet.transportType}) to local client ${iface.name}")
+                            iface.send(raw)
+                        } catch (e: Exception) {
+                            log("Error forwarding from external to local client ${iface.name}: ${e.message}")
+                        }
+                    }
+                }
+            } else {
+                log("BROADCAST ROUTING: No local clients to forward to")
+            }
+        }
 
         // Route based on packet type
         when (packet.packetType) {
@@ -2245,6 +2316,27 @@ object Transport {
             }
         }
 
+        // Python RNS: Immediately retransmit announces to local clients
+        // Matches Python Transport.py:1697-1742
+        // Local clients get instant visibility without queue delays
+        if (localClientInterfaces.isNotEmpty()) {
+            log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
+            val rawData = packet.raw ?: packet.pack()
+
+            for (localInterface in localClientInterfaces) {
+                // Don't send back to the interface it came from
+                if (!localInterface.hash.contentEquals(interfaceRef.hash)) {
+                    try {
+                        // Send the raw announce packet immediately (bypasses queue)
+                        localInterface.send(rawData)
+                        log("Sent announce for ${destHash.toHexString()} to local client ${localInterface.name}")
+                    } catch (e: Exception) {
+                        log("Error sending announce to local client ${localInterface.name}: ${e.message}")
+                    }
+                }
+            }
+        }
+
         // Retransmit if transport is enabled and under hop limit
         if (transportEnabled && packet.hops < TransportConstants.PATHFINDER_M) {
             queueAnnounceRetransmit(destHash, packet, interfaceRef)
@@ -2262,6 +2354,26 @@ object Transport {
         val destKey = destinationHash.toKey()
         val now = System.currentTimeMillis()
 
+        // Python RNS: Check for local rebroadcast limiting
+        // Matches Python Transport.py:1493-1500
+        val existingEntry = announceTable[destKey]
+        if (existingEntry != null) {
+            // If same hop count, this is likely a local rebroadcast (bouncing in shared instance)
+            if (packet.hops - 1 == existingEntry.hops) {
+                existingEntry.localRebroadcasts++
+
+                // If exceeded max local rebroadcasts, stop retransmitting
+                if (existingEntry.localRebroadcasts >= TransportConstants.LOCAL_REBROADCASTS_MAX) {
+                    log("Max local rebroadcasts (${TransportConstants.LOCAL_REBROADCASTS_MAX}) reached for ${destinationHash.toHexString()}, stopping")
+                    announceTable.remove(destKey)
+                    return
+                }
+            } else {
+                // Different hop count - reset local rebroadcast counter
+                existingEntry.localRebroadcasts = 0
+            }
+        }
+
         // Check rate limiting
         val rateTimestamps = announceRateTable.getOrPut(destKey) { mutableListOf() }
 
@@ -2276,8 +2388,12 @@ object Transport {
 
         rateTimestamps.add(now)
 
-        // Store in announce table for potential path request responses
-        val announceEntry = AnnounceEntry(
+        // Store/update in announce table for potential path request responses
+        val announceEntry = existingEntry?.copy(
+            timestamp = now,
+            raw = packet.raw ?: packet.pack(),
+            receivingInterfaceHash = receivingInterface.hash
+        ) ?: AnnounceEntry(
             destinationHash = destinationHash.copyOf(),
             timestamp = now,
             retransmits = 0,
@@ -2760,6 +2876,14 @@ object Transport {
     // ===== Packet Filter (Duplicate Detection) =====
 
     private fun packetFilter(packet: Packet): Boolean {
+        // Python RNS: Bypass local filtering if connected to shared instance
+        // Let the shared instance server handle centralized duplicate filtering
+        // Matches Python Transport.packet_filter():1091-1094
+        if (interfaces.any { it.isConnectedToSharedInstance }) {
+            return true  // Accept all packets, let server filter
+        }
+
+        // Normal duplicate detection for standalone instances or servers
         val key = packet.packetHash.toKey()
         return !packetHashlist.contains(key) && !packetHashlistPrev.contains(key)
     }
@@ -3812,6 +3936,19 @@ interface InterfaceRef {
 
     /** Whether this interface wants to establish a tunnel. */
     var wantsTunnel: Boolean
+
+    // Shared instance properties (Python RNS compatibility)
+    /** Whether this is a local shared instance server (Python: is_local_shared_instance). */
+    val isLocalSharedInstance: Boolean
+        get() = false
+
+    /** Whether this is a client connected to a shared instance (Python: is_connected_to_shared_instance). */
+    val isConnectedToSharedInstance: Boolean
+        get() = false
+
+    /** Parent interface for spawned interfaces (Python: parent_interface). */
+    val parentInterface: InterfaceRef?
+        get() = null
 
     /**
      * Get a hash uniquely identifying this interface.

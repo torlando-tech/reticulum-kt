@@ -108,6 +108,7 @@ class LocalServerInterface : Interface {
     override val hwMtu: Int = HW_MTU
     override val canReceive: Boolean = true
     override val canSend: Boolean = true // Broadcasts to all connected clients
+    override val isLocalSharedInstance: Boolean = true // Python RNS compatibility
 
     /**
      * Create a LocalServerInterface with Unix domain socket (file-based).
@@ -344,26 +345,24 @@ class LocalServerInterface : Interface {
     internal fun clientDisconnected(client: LocalClientInterface) {
         clients.remove(client)
         spawnedInterfaces?.remove(client)
+
         log("Client disconnected: ${client.name} (remaining: ${clients.size})")
     }
 
     /**
-     * Send data to all connected clients.
+     * No-op for server interface.
      *
-     * This is called by Transport when broadcasting packets to local clients.
+     * Transport calls each spawned client's processOutgoing() directly.
+     * If the server also broadcasts here, clients would receive packets TWICE,
+     * causing data corruption.
+     *
+     * Python reference: LocalInterface.py:454-455
+     * def process_outgoing(self, data):
+     *     pass
      */
     override fun processOutgoing(data: ByteArray) {
-        // Broadcast to all connected clients
-        for (client in clients) {
-            try {
-                if (client.online.get()) {
-                    client.processOutgoing(data)
-                }
-            } catch (e: Exception) {
-                // Client will be cleaned up by its own error handling
-                log("Error sending to client ${client.name}: ${e.message}")
-            }
-        }
+        // No-op: Server interface is just a listener, not a transmitter
+        // Spawned client interfaces handle transmission when called by Transport
     }
 
     /**
