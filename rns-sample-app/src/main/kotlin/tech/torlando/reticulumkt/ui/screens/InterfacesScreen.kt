@@ -91,7 +91,8 @@ fun InterfacesScreen(
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { navigation = InterfaceNavigation.TypeSelector }
+                onClick = { navigation = InterfaceNavigation.TypeSelector },
+                modifier = Modifier.padding(bottom = 80.dp)
             ) {
                 Icon(Icons.Filled.Add, contentDescription = "Add Interface")
             }

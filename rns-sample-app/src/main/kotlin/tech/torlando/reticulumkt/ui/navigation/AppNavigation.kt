@@ -64,10 +64,20 @@ fun AppNavigation(
     val navBackStackEntry = navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry.value?.destination
 
+    // Screens that should hide the bottom navigation bar
+    val hideBottomNavScreens = listOf(
+        Screen.Mode.route,
+        Screen.Performance.route,
+        Screen.TcpWizard.route,
+        Screen.RNodeWizard.route,
+    )
+    val shouldShowBottomNav = currentDestination?.route !in hideBottomNavScreens
+
     @Suppress("UnusedMaterial3ScaffoldPaddingParameter")
     Scaffold(
         bottomBar = {
-            NavigationBar {
+            if (shouldShowBottomNav) {
+                NavigationBar {
                 mainNavigationItems.forEach { screen ->
                     NavigationBarItem(
                         icon = { Icon(screen.icon, contentDescription = screen.title) },
@@ -83,6 +93,7 @@ fun AppNavigation(
                             }
                         }
                     )
+                }
                 }
             }
         }
