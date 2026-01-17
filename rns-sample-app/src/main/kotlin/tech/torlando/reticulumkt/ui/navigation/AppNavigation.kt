@@ -2,13 +2,11 @@ package tech.torlando.reticulumkt.ui.navigation
 
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Monitor
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -29,9 +27,6 @@ import tech.torlando.reticulumkt.ui.screens.ModeScreen
 import tech.torlando.reticulumkt.ui.screens.MonitorScreen
 import tech.torlando.reticulumkt.ui.screens.PerformanceScreen
 import tech.torlando.reticulumkt.ui.screens.SettingsScreen
-import tech.torlando.reticulumkt.ui.screens.dev.DiagnosticsScreen
-import tech.torlando.reticulumkt.ui.screens.dev.LogsScreen
-import tech.torlando.reticulumkt.ui.screens.dev.TablesScreen
 import tech.torlando.reticulumkt.ui.screens.wizard.RNodeWizardScreen
 import tech.torlando.reticulumkt.ui.screens.wizard.TcpClientWizardScreen
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
@@ -40,7 +35,6 @@ sealed class Screen(
     val route: String,
     val title: String,
     val icon: ImageVector,
-    val isDeveloperMode: Boolean = false,
 ) {
     data object Home : Screen("home", "Home", Icons.Filled.Home)
     data object Mode : Screen("mode", "Mode", Icons.Filled.Settings)
@@ -48,11 +42,6 @@ sealed class Screen(
     data object Performance : Screen("performance", "Performance", Icons.Filled.Memory)
     data object Monitor : Screen("monitor", "Monitor", Icons.Filled.Monitor)
     data object Settings : Screen("settings", "Settings", Icons.Filled.Settings)
-
-    // Developer mode screens
-    data object Logs : Screen("logs", "Logs", Icons.Filled.BugReport, isDeveloperMode = true)
-    data object Tables : Screen("tables", "Tables", Icons.Filled.TableChart, isDeveloperMode = true)
-    data object Diagnostics : Screen("diagnostics", "Diag", Icons.Filled.Memory, isDeveloperMode = true)
 
     // Wizard screens (not shown in bottom nav)
     data object TcpWizard : Screen("tcp_wizard", "TCP Wizard", Icons.Filled.Router)
@@ -67,33 +56,18 @@ val mainNavigationItems = listOf(
     Screen.Settings,
 )
 
-// Developer mode navigation items
-val developerNavigationItems = listOf(
-    Screen.Logs,
-    Screen.Tables,
-    Screen.Diagnostics,
-)
-
 @Composable
 fun AppNavigation(
     viewModel: ReticulumViewModel,
-    developerModeEnabled: Boolean = false,
 ) {
     val navController = rememberNavController()
     val navBackStackEntry = navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry.value?.destination
 
-    // Determine which navigation items to show
-    val navigationItems = if (developerModeEnabled) {
-        mainNavigationItems + developerNavigationItems
-    } else {
-        mainNavigationItems
-    }
-
     Scaffold(
         bottomBar = {
             NavigationBar {
-                navigationItems.forEach { screen ->
+                mainNavigationItems.forEach { screen ->
                     NavigationBarItem(
                         icon = { Icon(screen.icon, contentDescription = screen.title) },
                         label = { Text(screen.title) },
@@ -192,17 +166,6 @@ fun AppNavigation(
             }
             composable(Screen.Settings.route) {
                 SettingsScreen(viewModel = viewModel)
-            }
-
-            // Developer mode screens
-            composable(Screen.Logs.route) {
-                LogsScreen(viewModel = viewModel)
-            }
-            composable(Screen.Tables.route) {
-                TablesScreen(viewModel = viewModel)
-            }
-            composable(Screen.Diagnostics.route) {
-                DiagnosticsScreen(viewModel = viewModel)
             }
         }
     }

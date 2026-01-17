@@ -63,7 +63,6 @@ fun SettingsScreen(
 ) {
     val selectedTheme by viewModel.theme.collectAsState()
     val darkModeOption by viewModel.darkMode.collectAsState()
-    val developerModeEnabled by viewModel.developerMode.collectAsState()
     val autoStartOnBoot by viewModel.autoStart.collectAsState()
     val showNotification by viewModel.showNotification.collectAsState()
     val shareInstance by viewModel.shareInstance.collectAsState()
@@ -185,16 +184,6 @@ fun SettingsScreen(
                         }
                     )
                 }
-            }
-
-            // Developer Mode
-            SettingsSection(title = "Developer", icon = null) {
-                SettingsToggleRow(
-                    title = "Developer Mode",
-                    description = "Enable advanced debugging features and logs",
-                    checked = developerModeEnabled,
-                    onCheckedChange = { viewModel.setDeveloperMode(it) }
-                )
             }
 
             // About Section

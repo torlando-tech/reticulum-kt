@@ -43,7 +43,6 @@ class PreferencesManager(private val context: Context) {
     private object Keys {
         val THEME = stringPreferencesKey("theme")
         val DARK_MODE = stringPreferencesKey("dark_mode")
-        val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
         val AUTO_START = booleanPreferencesKey("auto_start")
         val SHOW_NOTIFICATION = booleanPreferencesKey("show_notification")
         val ENABLE_TRANSPORT = booleanPreferencesKey("enable_transport")
@@ -77,15 +76,6 @@ class PreferencesManager(private val context: Context) {
 
     suspend fun setDarkMode(mode: DarkModeOption) {
         context.dataStore.edit { it[Keys.DARK_MODE] = mode.name }
-    }
-
-    // Developer Mode
-    val developerMode: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        prefs[Keys.DEVELOPER_MODE] ?: false
-    }
-
-    suspend fun setDeveloperMode(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.DEVELOPER_MODE] = enabled }
     }
 
     // Auto Start

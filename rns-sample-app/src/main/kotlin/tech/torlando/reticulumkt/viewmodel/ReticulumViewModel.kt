@@ -104,9 +104,6 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     val darkMode: StateFlow<DarkModeOption> = preferencesManager.darkMode
         .stateIn(viewModelScope, SharingStarted.Eagerly, DarkModeOption.SYSTEM)
 
-    val developerMode: StateFlow<Boolean> = preferencesManager.developerMode
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
-
     val autoStart: StateFlow<Boolean> = preferencesManager.autoStart
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
@@ -269,10 +266,6 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setDarkMode(mode: DarkModeOption) {
         viewModelScope.launch { preferencesManager.setDarkMode(mode) }
-    }
-
-    fun setDeveloperMode(enabled: Boolean) {
-        viewModelScope.launch { preferencesManager.setDeveloperMode(enabled) }
     }
 
     fun setAutoStart(enabled: Boolean) {

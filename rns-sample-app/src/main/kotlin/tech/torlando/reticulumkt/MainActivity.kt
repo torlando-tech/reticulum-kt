@@ -25,7 +25,6 @@ class MainActivity : ComponentActivity() {
             val viewModel: ReticulumViewModel = viewModel()
             val theme by viewModel.theme.collectAsState()
             val darkModeOption by viewModel.darkMode.collectAsState()
-            val developerMode by viewModel.developerMode.collectAsState()
 
             val isDarkTheme = when (darkModeOption) {
                 DarkModeOption.SYSTEM -> isSystemInDarkTheme()
@@ -41,10 +40,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    AppNavigation(
-                        viewModel = viewModel,
-                        developerModeEnabled = developerMode
-                    )
+                    AppNavigation(viewModel = viewModel)
                 }
             }
         }
