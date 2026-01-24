@@ -46,11 +46,11 @@ Plans:
   2. LXMessage created in Python unpacks in Kotlin with all base fields preserved
   3. Message source/destination hashes match across implementations
   4. Timestamp and content fields survive round-trip intact
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: Kotlin-to-Python message round-trip tests
-- [ ] 02-02: Python-to-Kotlin message round-trip tests
+- [ ] 02-01-PLAN.md - Kotlin-to-Python message round-trip tests (shared fixtures + K2P tests)
+- [ ] 02-02-PLAN.md - Python-to-Kotlin message round-trip tests (P2K tests + full suite verification)
 
 ### Phase 3: LXMF Field Interop
 **Goal**: All LXMF field types (attachments, images, custom) survive Kotlin-Python round-trip
@@ -163,7 +163,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Python Bridge Extension | 1/1 | ✓ Complete | 2026-01-23 |
-| 2. LXMF Message Round-Trip | 0/2 | Not started | - |
+| 2. LXMF Message Round-Trip | 0/2 | Planned | - |
 | 3. LXMF Field Interop | 0/3 | Not started | - |
 | 4. LXMF Cryptographic Interop | 0/2 | Not started | - |
 | 5. Stamp Interop | 0/1 | Not started | - |
