@@ -32,10 +32,10 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
   3. Bridge server can deserialize LXMessage bytes and return fields
   4. Bridge server can compute LXMF message hash from bytes
   5. Bridge server can generate stamps with configurable difficulty
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 01-01: LXMF bridge commands
+- [ ] 01-01-PLAN.md - Add LXMF commands to Python bridge
 
 ### Phase 2: LXMF Message Round-Trip
 **Goal**: Kotlin-packed LXMessage unpacks correctly in Python and vice versa
