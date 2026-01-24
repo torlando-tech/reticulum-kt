@@ -805,35 +805,65 @@ class LXMRouter(
 
     /**
      * Process propagated message delivery.
+     *
+     * Matches Python LXMF LXMRouter.py lines 2669-2720:
+     * - If link exists and ACTIVE -> send message
+     * - If link exists and CLOSED -> clear link, set retry wait
+     * - If link exists but PENDING -> just wait (no retry delay)
+     * - If link is null -> establish new link (with retry wait check)
      */
     private suspend fun processPropagatedDelivery(message: LXMessage) {
-        message.deliveryAttempts++
+        // Check for active propagation node
+        val node = getActivePropagationNode()
+        if (node == null) {
+            message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            return
+        }
 
+        // Check max delivery attempts (Python line 2673)
         if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
             message.state = MessageState.FAILED
             return
         }
 
-        // Check for active propagation node
-        val node = getActivePropagationNode()
-        if (node == null) {
-            message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
-            println("No active propagation node for message delivery")
-            return
-        }
-
-        // Check if we have an active link
         val link = outboundPropagationLink
-        if (link != null && link.status == LinkConstants.ACTIVE) {
-            sendViaPropagation(message, link)
-        } else {
-            // Need to establish link
-            message.state = MessageState.OUTBOUND
-            message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
 
-            // Try to establish link for delivery (forRetrieval = false)
-            if (outboundPropagationLink == null) {
-                establishPropagationLink(node, forRetrieval = false)
+        when {
+            // Link exists and is ACTIVE -> send message (Python line 2678-2682)
+            link != null && link.status == LinkConstants.ACTIVE -> {
+                if (message.state != MessageState.SENDING) {
+                    sendViaPropagation(message, link)
+                }
+                // If already SENDING, just wait for transfer to complete
+            }
+
+            // Link exists and is CLOSED -> clear and retry later (Python line 2688-2691)
+            link != null && link.status == LinkConstants.CLOSED -> {
+                outboundPropagationLink = null
+                message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            }
+
+            // Link exists but is PENDING or other state -> just wait (Python line 2692-2695)
+            link != null -> {
+                // Don't set nextDeliveryAttempt - the established callback will trigger processOutbound
+            }
+
+            // No link exists -> establish one (Python line 2696-2715)
+            else -> {
+                // Only establish if we haven't tried recently (Python line 2700)
+                val nextAttempt = message.nextDeliveryAttempt ?: 0L
+                val now = System.currentTimeMillis()
+
+                if (nextAttempt == 0L || now >= nextAttempt) {
+                    message.deliveryAttempts++
+                    message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
+
+                    if (message.deliveryAttempts <= MAX_DELIVERY_ATTEMPTS) {
+                        establishPropagationLink(node, forRetrieval = false)
+                    } else {
+                        message.state = MessageState.FAILED
+                    }
+                }
             }
         }
     }
@@ -1521,8 +1551,18 @@ class LXMRouter(
                         requestMessageList(establishedLink)
                     } else {
                         // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
-                        // processOutbound() is a suspend function, so launch in coroutine
                         processingScope?.launch {
+                            // Reset nextDeliveryAttempt for pending PROPAGATED messages so they get processed immediately.
+                            // This matches Python's behavior where process_outbound sends immediately when link is active,
+                            // without checking next_delivery_attempt (which was set when we initiated link establishment).
+                            pendingOutboundMutex.withLock {
+                                val now = System.currentTimeMillis()
+                                for (message in pendingOutbound) {
+                                    if (message.desiredMethod == DeliveryMethod.PROPAGATED && message.state == MessageState.OUTBOUND) {
+                                        message.nextDeliveryAttempt = now - 1  // Make eligible for immediate processing
+                                    }
+                                }
+                            }
                             processOutbound()
                         }
                     }

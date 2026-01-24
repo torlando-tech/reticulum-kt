@@ -132,27 +132,27 @@ class PropagatedDeliveryTest : PropagatedDeliveryTestBase() {
 
         println("[KT] Final message state: ${message.state}")
 
-        // TCP transport layer is verified working at HDLC/framing level (Plans 01 and 02)
-        // Higher-level protocol (LXMF propagation) may still have issues:
-        // - Link establishment to propagation node
-        // - Message transfer acknowledgment
-        //
-        // Progress assertion: message should at least reach OUTBOUND (link establishment started)
-        // Full delivery: SENT (accepted by node) or DELIVERED (fully confirmed)
-        val validStates = listOf(MessageState.OUTBOUND, MessageState.SENDING, MessageState.SENT, MessageState.DELIVERED)
-        if (message.state !in validStates) {
-            println("[KT] ERROR: Expected progress state but got ${message.state}")
+        // TCP transport layer verified working (Plans 01-02)
+        // LXMF propagation link now triggers processOutbound on establishment (Plan 04)
+        // Message should progress past OUTBOUND to SENDING (transfer started), SENT, or DELIVERED
+        // Note: Full delivery to SENT requires Python propagation node to acknowledge the Resource
+        // which may have separate protocol issues. The key validation is that we're no longer stuck at OUTBOUND.
+        val progressStates = listOf(MessageState.SENDING, MessageState.SENT, MessageState.DELIVERED)
+        if (message.state !in progressStates) {
+            println("[KT] ERROR: Expected SENDING/SENT/DELIVERED but got ${message.state}")
             println("[KT] Message hash: ${message.hash?.toHex()}")
         }
-        validStates shouldContain message.state
+        progressStates shouldContain message.state
 
-        // Log if we didn't reach full delivery (for future investigation)
-        if (message.state == MessageState.OUTBOUND || message.state == MessageState.SENDING) {
-            println("[KT] Note: Message is in-flight (${message.state}), full delivery not confirmed")
-            println("[KT] This may indicate LXMF propagation protocol issues beyond TCP layer")
+        // Log delivery state for tracking
+        when (message.state) {
+            MessageState.SENDING -> println("[KT] Note: Message is being transferred, awaiting node acknowledgment")
+            MessageState.SENT -> println("[KT] Message accepted by propagation node")
+            MessageState.DELIVERED -> println("[KT] Message fully delivered and confirmed")
+            else -> {}
         }
 
-        println("\n=== Test passed (Kotlin submission logic verified) ===")
+        println("\n=== Test passed (link establishment callback fix verified) ===")
         Unit
     }
 
