@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 6 - Direct Delivery infrastructure complete, ready for message tests.
+**Current focus:** Phase 6 - Direct Delivery message format tests complete. Ready for propagation delivery.
 
 ## Current Position
 
 Phase: 6 of 9 (Direct Delivery)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-01-24 - Completed 06-01-PLAN.md (Direct Delivery Test Infrastructure)
+Last activity: 2026-01-24 - Completed 06-02-PLAN.md (Direct Delivery Message Tests)
 
-Progress: [██████░░░░] ~60%
+Progress: [██████░░░░] ~63%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 11
-- Average duration: 5.0 min
-- Total execution time: 59 min
+- Total plans completed: 12
+- Average duration: 6.2 min
+- Total execution time: 80 min
 
 **By Phase:**
 
@@ -32,11 +32,11 @@ Progress: [██████░░░░] ~60%
 | 03-lxmf-field-interop | 3 | 10 min | 3.3 min |
 | 04-lxmf-cryptographic-interop | 2 | 7 min | 3.5 min |
 | 05-stamp-interop | 2 | 8 min | 4 min |
-| 06-direct-delivery | 1 | 11 min | 11 min |
+| 06-direct-delivery | 2 | 32 min | 16 min |
 
 **Recent Trend:**
-- Last 5 plans: 3, 4, 5, 3, 11 min
-- Trend: Infrastructure plan took longer (expected)
+- Last 5 plans: 4, 5, 3, 11, 21 min
+- Trend: Direct delivery plans involve more complex infrastructure
 
 *Updated after each plan completion*
 
@@ -65,6 +65,8 @@ Recent decisions affecting current work:
 - Patch multiprocessing.set_start_method to handle LXMF reimport
 - Cache RNS module and clear LXMF on reimport for consistent isinstance checks
 - Add 10 second timeout for TCP connection wait (async connection needs time)
+- Use InteropTestBase for format tests instead of DirectDeliveryTestBase (simpler)
+- Python-to-Kotlin message construction requires lxmf_pack + identity_sign + manual assembly
 
 ### Pending Todos
 
@@ -72,10 +74,10 @@ None yet.
 
 ### Blockers/Concerns
 
-None - Plan 06-01 complete. Direct delivery infrastructure ready for message tests.
+- TCP interface compatibility issue between Kotlin and Python RNS - connections drop after packet transmission. Does not block message format verification but affects live delivery testing.
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 06-01-PLAN.md (Direct Delivery Test Infrastructure)
+Stopped at: Completed 06-02-PLAN.md (Direct Delivery Message Tests)
 Resume file: None
