@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-01-23)
 ## Current Position
 
 Phase: 7 of 9 (Opportunistic Delivery)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase (COMPLETE)
 Status: In progress
-Last activity: 2026-01-24 - Completed 07-01-PLAN.md (Opportunistic Delivery Constants)
+Last activity: 2026-01-24 - Completed 07-02-PLAN.md (Test Infrastructure and K->P Tests)
 
-Progress: [███████░░░] ~72%
+Progress: [███████░░░] ~74%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 14
-- Average duration: 5.8 min
-- Total execution time: 89 min
+- Total plans completed: 15
+- Average duration: 5.7 min
+- Total execution time: 96 min
 
 **By Phase:**
 
@@ -33,11 +33,11 @@ Progress: [███████░░░] ~72%
 | 04-lxmf-cryptographic-interop | 2 | 7 min | 3.5 min |
 | 05-stamp-interop | 2 | 8 min | 4 min |
 | 06-direct-delivery | 3 | 36 min | 12 min |
-| 07-opportunistic-delivery | 1 | 5 min | 5 min |
+| 07-opportunistic-delivery | 2 | 12 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 3, 11, 21, 4, 5 min
-- Trend: Constants alignment plan was fast (5 min) - well-scoped refactoring
+- Last 5 plans: 11, 21, 4, 5, 7 min
+- Trend: Stable execution times for Phase 7 tests
 
 *Updated after each plan completion*
 
@@ -73,6 +73,9 @@ Recent decisions affecting current work:
 - Parse fields from Python bridge with hex decoding for binary values
 - Use Transport.expirePath() for path removal (equivalent to Python's drop_path)
 - Match Python's 0.5s delay before requesting new path during rediscovery
+- Added open modifier to DirectDeliveryTestBase.setupDirectDelivery() for test inheritance
+- Opportunistic delivery sends immediately via broadcast when identity known (no queueing)
+- Announce provides path optimization, not delivery enablement for opportunistic
 
 ### Pending Todos
 
@@ -85,5 +88,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 07-01-PLAN.md (Opportunistic Delivery Constants)
+Stopped at: Completed 07-02-PLAN.md (Test Infrastructure and K->P Tests)
 Resume file: None
