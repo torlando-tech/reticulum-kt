@@ -831,9 +831,9 @@ class LXMRouter(
             message.state = MessageState.OUTBOUND
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
 
-            // Try to establish link
+            // Try to establish link for delivery (forRetrieval = false)
             if (outboundPropagationLink == null) {
-                establishPropagationLink(node)
+                establishPropagationLink(node, forRetrieval = false)
             }
         }
     }
@@ -1487,8 +1487,16 @@ class LXMRouter(
 
     /**
      * Establish a link to a propagation node.
+     *
+     * @param node The propagation node to connect to
+     * @param forRetrieval True for message retrieval (calls requestMessageList),
+     *                     False for message delivery (calls processOutbound).
+     *                     Matches Python's architecture where delivery path (line 2709) uses
+     *                     established_callback=self.process_outbound, while retrieval path
+     *                     (line 512) uses msg_request_established_callback that calls
+     *                     request_messages_from_propagation_node.
      */
-    private fun establishPropagationLink(node: PropagationNode) {
+    private fun establishPropagationLink(node: PropagationNode, forRetrieval: Boolean = true) {
         try {
             // Create destination for the propagation node
             val destination = Destination.create(
@@ -1508,8 +1516,16 @@ class LXMRouter(
                     // Identify ourselves on the link
                     identifyOnLink(establishedLink)
 
-                    // Request message list
-                    requestMessageList(establishedLink)
+                    if (forRetrieval) {
+                        // Retrieval path: request message list (Python line 510)
+                        requestMessageList(establishedLink)
+                    } else {
+                        // Delivery path: re-trigger outbound processing for pending messages (Python line 2709)
+                        // processOutbound() is a suspend function, so launch in coroutine
+                        processingScope?.launch {
+                            processOutbound()
+                        }
+                    }
                 },
                 closedCallback = { _ ->
                     if (propagationTransferState != PropagationTransferState.COMPLETE) {
