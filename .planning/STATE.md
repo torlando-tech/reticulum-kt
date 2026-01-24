@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 7 - Opportunistic Delivery COMPLETE
+**Current focus:** Phase 7 - Opportunistic Delivery COMPLETE. Ready for Phase 8: Propagated Delivery.
 
 ## Current Position
 
-Phase: 7 of 9 (Opportunistic Delivery)
+Phase: 7 of 9 (Opportunistic Delivery) - COMPLETE
 Plan: 3 of 3 in current phase (COMPLETE)
-Status: Phase complete
-Last activity: 2026-01-24 - Completed 07-03-PLAN.md (Extended Test Coverage)
+Status: Phase verified and complete
+Last activity: 2026-01-24 - Phase 7 verified (4/4 must-haves passed)
 
 Progress: [████████░░] ~78%
 
@@ -89,5 +89,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 07-03-PLAN.md (Extended Test Coverage)
+Stopped at: Phase 7 complete and verified - ready for Phase 8 (Propagated Delivery)
 Resume file: None

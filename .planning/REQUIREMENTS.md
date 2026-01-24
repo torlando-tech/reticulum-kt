@@ -27,7 +27,7 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 - [x] **E2E-01**: DIRECT delivery Kotlin->Python over established Link
 - [x] **E2E-02**: DIRECT delivery Python->Kotlin over established Link
-- [ ] **E2E-03**: OPPORTUNISTIC delivery when path available
+- [x] **E2E-03**: OPPORTUNISTIC delivery when path available
 - [ ] **E2E-04**: PROPAGATED delivery via Python propagation node
 
 ### Resource Transfer (Large Messages)
@@ -83,7 +83,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | STAMP-03 | Phase 5 | Complete |
 | E2E-01 | Phase 6 | Complete |
 | E2E-02 | Phase 6 | Complete |
-| E2E-03 | Phase 7 | Pending |
+| E2E-03 | Phase 7 | Complete |
 | E2E-04 | Phase 8 | Pending |
 | RES-01 | Phase 9 | Pending |
 | RES-02 | Phase 9 | Pending |
