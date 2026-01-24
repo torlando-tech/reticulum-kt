@@ -156,12 +156,13 @@ Plans:
   3. Packets sent from Python are received correctly by Kotlin
   4. Direct delivery tests pass with strict assertions (DELIVERED state, not just OUTBOUND)
   5. Propagated delivery tests can verify actual message submission/retrieval
-**Plans**: 3 plans
+**Plans**: 4 plans
 
 Plans:
-- [ ] 08.1-01-PLAN.md - Diagnostic logging + minimal Python TCP interop test
-- [ ] 08.1-02-PLAN.md - Socket options alignment and write safeguards
-- [ ] 08.1-03-PLAN.md - Tighten E2E test assertions (strict DELIVERED state)
+- [x] 08.1-01-PLAN.md - Diagnostic logging + minimal Python TCP interop test
+- [x] 08.1-02-PLAN.md - Socket options alignment and write safeguards
+- [x] 08.1-03-PLAN.md - Tighten E2E test assertions (strict DELIVERED state)
+- [ ] 08.1-04-PLAN.md - Gap closure: LXMF propagation link callback fix
 
 ### Phase 9: Resource Transfer
 **Goal**: Large LXMF messages (>500 bytes) transfer correctly as Resources
@@ -193,7 +194,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 8.1 -> 
 | 6. Direct Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 7. Opportunistic Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 8. Propagated Delivery | 2/2 | ⚠ Gaps found | - |
-| 8.1 TCP Interface Interop | 0/3 | Planned | - |
+| 8.1 TCP Interface Interop | 3/4 | Gap closure | - |
 | 9. Resource Transfer | 0/2 | Not started | - |
 
 ---
