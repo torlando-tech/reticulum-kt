@@ -1,5 +1,6 @@
 package network.reticulum.lxmf.interop
 
+import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import kotlinx.coroutines.delay
@@ -7,11 +8,15 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import network.reticulum.interop.getString
 import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.MessageState
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -172,5 +177,165 @@ class LiveDeliveryTest : DirectDeliveryTestBase() {
         println("   ✅ Python -> Kotlin: received")
 
         println("\n✅ Bidirectional delivery verified!")
+    }
+
+    @Test
+    @Timeout(60, unit = TimeUnit.SECONDS)
+    fun `delivery callback fires on successful K to P delivery`() = runBlocking {
+        println("\n=== DELIVERY CALLBACK TEST ===\n")
+
+        // Clear any existing messages
+        clearPythonMessages()
+
+        // Create destination for Python
+        val pythonDest = createPythonDestination()
+        pythonDest shouldNotBe null
+
+        // Track callback invocation
+        val callbackFired = AtomicBoolean(false)
+        val callbackMessage = AtomicReference<LXMessage?>(null)
+
+        // Create message with delivery callback
+        val message = LXMessage.create(
+            destination = pythonDest!!,
+            source = kotlinDestination,
+            content = "Testing delivery callback",
+            title = "Callback Test",
+            desiredMethod = DeliveryMethod.DIRECT
+        )
+
+        // Register delivery callback BEFORE sending
+        message.deliveryCallback = { msg ->
+            println("[KT] Delivery callback fired! Message state: ${msg.state}")
+            callbackFired.set(true)
+            callbackMessage.set(msg)
+        }
+
+        // Capture initial state
+        val initialState = message.state
+        println("[KT] Initial state: $initialState")
+        initialState shouldBe MessageState.GENERATING
+
+        // Send message
+        println("[KT] Sending message with callback...")
+        kotlinRouter.handleOutbound(message)
+
+        // Wait for Python to receive it
+        val received = withTimeoutOrNull(10.seconds) {
+            var messages = getPythonMessages()
+            while (messages.isEmpty()) {
+                delay(100)
+                messages = getPythonMessages()
+            }
+            messages
+        }
+
+        received shouldNotBe null
+        received!!.size shouldBe 1
+        println("[KT] Python received message")
+
+        // Wait a bit for delivery confirmation (callback may fire after receipt)
+        delay(2000)
+
+        // Verify callback fired
+        callbackFired.get() shouldBe true
+        println("[KT] Callback was fired: ${callbackFired.get()}")
+
+        // Verify message state is DELIVERED or SENT
+        val finalState = callbackMessage.get()?.state ?: message.state
+        println("[KT] Final state: $finalState")
+        listOf(MessageState.SENT, MessageState.DELIVERED) shouldContain finalState
+
+        println("\n✅ Delivery callback test passed!")
+        println("   Initial state: $initialState")
+        println("   Final state: $finalState")
+        println("   Callback fired: ${callbackFired.get()}")
+    }
+
+    @Test
+    @Timeout(60, unit = TimeUnit.SECONDS)
+    fun `MessageState transitions correctly during delivery lifecycle`() = runBlocking {
+        println("\n=== MESSAGE STATE LIFECYCLE TEST ===\n")
+
+        // Clear any existing messages
+        clearPythonMessages()
+
+        // Create destination for Python
+        val pythonDest = createPythonDestination()
+        pythonDest shouldNotBe null
+
+        // Track state transitions
+        val stateTransitions = CopyOnWriteArrayList<MessageState>()
+
+        // Create message
+        val message = LXMessage.create(
+            destination = pythonDest!!,
+            source = kotlinDestination,
+            content = "Testing state transitions",
+            title = "State Test",
+            desiredMethod = DeliveryMethod.DIRECT
+        )
+
+        // Capture initial state
+        stateTransitions.add(message.state)
+        println("[KT] State 1 (creation): ${message.state}")
+
+        // Register delivery callback to capture final state
+        message.deliveryCallback = { msg ->
+            stateTransitions.add(msg.state)
+            println("[KT] State (callback): ${msg.state}")
+        }
+
+        // Send message - this should transition state to OUTBOUND
+        println("[KT] Sending message...")
+        kotlinRouter.handleOutbound(message)
+
+        // Capture state after outbound
+        delay(100) // Brief delay to let state update
+        stateTransitions.add(message.state)
+        println("[KT] State 2 (after handleOutbound): ${message.state}")
+
+        // Wait for Python to receive it
+        val received = withTimeoutOrNull(10.seconds) {
+            var messages = getPythonMessages()
+            while (messages.isEmpty()) {
+                delay(100)
+                messages = getPythonMessages()
+            }
+            messages
+        }
+
+        received shouldNotBe null
+        println("[KT] Python received message")
+
+        // Wait for delivery confirmation
+        delay(2000)
+
+        // Capture final state
+        stateTransitions.add(message.state)
+        println("[KT] State 3 (final): ${message.state}")
+
+        // Verify state transitions
+        println("\n[KT] All state transitions: $stateTransitions")
+
+        // Initial state should be GENERATING
+        stateTransitions[0] shouldBe MessageState.GENERATING
+
+        // After handleOutbound, state should progress (OUTBOUND or beyond)
+        // State after handleOutbound should be at least OUTBOUND
+        val afterOutboundState = stateTransitions[1]
+        listOf(
+            MessageState.OUTBOUND,
+            MessageState.SENDING,
+            MessageState.SENT,
+            MessageState.DELIVERED
+        ) shouldContain afterOutboundState
+
+        // Final state should be SENT or DELIVERED
+        val finalState = stateTransitions.last()
+        listOf(MessageState.SENT, MessageState.DELIVERED) shouldContain finalState
+
+        println("\n✅ MessageState lifecycle test passed!")
+        println("   Transitions: ${stateTransitions.joinToString(" -> ")}")
     }
 }
