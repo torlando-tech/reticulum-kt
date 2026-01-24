@@ -67,15 +67,15 @@ abstract class PropagatedDeliveryTestBase : DirectDeliveryTestBase() {
                     isActive = true
                 )
 
-                // Set as active propagation node
-                // Note: setActivePropagationNode requires the node to be in propagationNodes map
-                // We need to manually add it since we're not receiving a real announce
-                // Use reflection or the handlePropagationAnnounce method with fake appData
-                try {
-                    kotlinRouter.setActivePropagationNode(propagationNodeHash!!.toHex())
-                } catch (e: Exception) {
-                    println("  [Setup] Note: Could not set active propagation node via setActivePropagationNode")
-                    println("  [Setup] Propagation node hash: ${propagationNodeHash!!.toHex()}")
+                // Add the propagation node to the router's known nodes
+                kotlinRouter.addPropagationNode(node)
+
+                // Now set it as active (this will succeed because node is in map)
+                val nodeSet = kotlinRouter.setActivePropagationNode(propagationNodeHash!!.toHex())
+                if (nodeSet) {
+                    println("  [Setup] Active propagation node set: ${propagationNodeHash!!.toHex()}")
+                } else {
+                    println("  [Setup] WARNING: Failed to set active propagation node")
                 }
             }
 
