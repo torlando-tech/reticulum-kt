@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 6 - Direct Delivery message format tests complete. Ready for propagation delivery.
+**Current focus:** Phase 6 - Direct Delivery complete with gap closure. Ready for propagation delivery.
 
 ## Current Position
 
 Phase: 6 of 9 (Direct Delivery)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-01-24 - Completed 06-02-PLAN.md (Direct Delivery Message Tests)
+Plan: 3 of 3 in current phase (COMPLETE)
+Status: Phase complete
+Last activity: 2026-01-24 - Completed 06-03-PLAN.md (Gap Closure - Callbacks and Fields)
 
-Progress: [██████░░░░] ~63%
+Progress: [███████░░░] ~68%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 12
-- Average duration: 6.2 min
-- Total execution time: 80 min
+- Total plans completed: 13
+- Average duration: 6.0 min
+- Total execution time: 84 min
 
 **By Phase:**
 
@@ -32,11 +32,11 @@ Progress: [██████░░░░] ~63%
 | 03-lxmf-field-interop | 3 | 10 min | 3.3 min |
 | 04-lxmf-cryptographic-interop | 2 | 7 min | 3.5 min |
 | 05-stamp-interop | 2 | 8 min | 4 min |
-| 06-direct-delivery | 2 | 32 min | 16 min |
+| 06-direct-delivery | 3 | 36 min | 12 min |
 
 **Recent Trend:**
-- Last 5 plans: 4, 5, 3, 11, 21 min
-- Trend: Direct delivery plans involve more complex infrastructure
+- Last 5 plans: 5, 3, 11, 21, 4 min
+- Trend: Gap closure plan was fast (4 min) - well-scoped test additions
 
 *Updated after each plan completion*
 
@@ -67,6 +67,9 @@ Recent decisions affecting current work:
 - Add 10 second timeout for TCP connection wait (async connection needs time)
 - Use InteropTestBase for format tests instead of DirectDeliveryTestBase (simpler)
 - Python-to-Kotlin message construction requires lxmf_pack + identity_sign + manual assembly
+- Use AtomicBoolean for callback tracking in async test scenarios
+- Accept SENT or DELIVERED as valid final states (delivery confirmation timing varies)
+- Parse fields from Python bridge with hex decoding for binary values
 
 ### Pending Todos
 
@@ -79,5 +82,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 06-02-PLAN.md (Direct Delivery Message Tests)
+Stopped at: Completed 06-03-PLAN.md (Gap Closure - Callbacks and Fields) - Phase 6 complete
 Resume file: None
