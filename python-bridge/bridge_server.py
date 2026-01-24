@@ -3266,6 +3266,202 @@ def cmd_lxmf_send_opportunistic(params):
     }
 
 
+def cmd_propagation_node_start(params):
+    """Start propagation node with configurable stamp cost.
+
+    params:
+        stamp_cost (int, optional): Required stamp cost (default 8 for fast tests)
+        stamp_flexibility (int, optional): Stamp cost flexibility (default 0)
+
+    Returns:
+        propagation_hash (hex): Hash of the propagation destination
+        stamp_cost (int): Configured stamp cost
+        stamp_flexibility (int): Configured flexibility
+        identity_hash (hex): Hash of the router identity
+        identity_public_key (hex): Public key of the router identity
+    """
+    global _lxmf_router
+
+    if _lxmf_router is None:
+        return {'error': 'LXMF router not started'}
+
+    stamp_cost = int(params.get('stamp_cost', 8))
+    stamp_flexibility = int(params.get('stamp_flexibility', 0))
+
+    # Configure stamp cost before enabling propagation
+    _lxmf_router.propagation_stamp_cost = stamp_cost
+    _lxmf_router.propagation_stamp_cost_flexibility = stamp_flexibility
+
+    # Enable propagation node functionality
+    _lxmf_router.enable_propagation()
+
+    # Get the propagation destination hash
+    propagation_hash = _lxmf_router.propagation_destination.hash
+
+    return {
+        'propagation_hash': bytes_to_hex(propagation_hash),
+        'stamp_cost': stamp_cost,
+        'stamp_flexibility': stamp_flexibility,
+        'identity_hash': bytes_to_hex(_lxmf_router.identity.hash),
+        'identity_public_key': bytes_to_hex(_lxmf_router.identity.get_public_key())
+    }
+
+
+def cmd_propagation_node_get_messages(params):
+    """Get list of messages stored on propagation node.
+
+    Returns:
+        messages (list): List of stored messages with transient_id, destination_hash, etc.
+        count (int): Number of messages stored
+    """
+    global _lxmf_router
+
+    if _lxmf_router is None:
+        return {'error': 'LXMF router not started'}
+
+    if not _lxmf_router.propagation_node:
+        return {'error': 'Propagation not enabled'}
+
+    messages = []
+    for transient_id, entry in _lxmf_router.propagation_entries.items():
+        # entry = [dest_hash, filepath, received_time, size, handled_peers, unhandled_peers, stamp_value]
+        messages.append({
+            'transient_id': bytes_to_hex(transient_id),
+            'destination_hash': bytes_to_hex(entry[0]),
+            'received_time': entry[2],
+            'size': entry[3],
+            'stamp_value': entry[6] if len(entry) > 6 else 0
+        })
+
+    return {'messages': messages, 'count': len(messages)}
+
+
+def cmd_propagation_node_submit_for_recipient(params):
+    """Store a test message for a recipient on the propagation node.
+
+    This creates an LXMF message from the router's identity addressed to the
+    specified recipient and stores it directly in the propagation node's
+    message store for retrieval testing.
+
+    params:
+        recipient_hash (hex): Destination hash of the recipient (16 bytes)
+        content (str): Message content
+        title (str, optional): Message title
+
+    Returns:
+        submitted (bool): True if message was stored
+        transient_id (hex): Transient ID of the stored message
+    """
+    global _lxmf_router, _lxmf_identity, _lxmf_destination
+
+    if _lxmf_router is None:
+        return {'error': 'LXMF router not started', 'submitted': False}
+
+    if not _lxmf_router.propagation_node:
+        return {'error': 'Propagation not enabled', 'submitted': False}
+
+    RNS = _get_full_rns()
+    import LXMF
+
+    recipient_hash = hex_to_bytes(params['recipient_hash'])
+    content = params.get('content', 'Test message for propagation')
+    title = params.get('title', '')
+
+    # Recall identity for the recipient or create a fake destination
+    # For test purposes, we need to create a message that can be stored
+    recipient_identity = RNS.Identity.recall(recipient_hash)
+
+    if recipient_identity is None:
+        # Create a temporary identity for encryption if recipient not known
+        # This is a test scenario - in production the recipient would be announced
+        return {
+            'error': f'Cannot recall identity for recipient {recipient_hash.hex()}. Announce the recipient first.',
+            'submitted': False
+        }
+
+    # Create destination for recipient
+    recipient_destination = RNS.Destination(
+        recipient_identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery"
+    )
+
+    # Create LXMF message with PROPAGATED method
+    message = LXMF.LXMessage(
+        destination=recipient_destination,
+        source=_lxmf_destination,
+        content=content,
+        title=title,
+        desired_method=LXMF.LXMessage.PROPAGATED
+    )
+
+    # Pack the message for propagation format
+    # This encrypts it for the recipient and creates the propagation format
+    message.pack()
+
+    # Get the propagation-formatted data
+    # For propagation, the message is encrypted for the destination
+    lxmf_data = message.propagation_packed
+    if lxmf_data is None:
+        # Fallback: manually create propagation format
+        # propagation format = dest_hash + encrypted(source_hash + sig + payload)
+        encrypted_data = recipient_destination.encrypt(message.packed[LXMF.LXMessage.DESTINATION_LENGTH:])
+        lxmf_data = message.packed[:LXMF.LXMessage.DESTINATION_LENGTH] + encrypted_data
+
+    # Extract just the message data (without timebase wrapper)
+    # lxmf_propagation expects raw lxmf_data, not the propagation_packed wrapper
+    import time
+    transient_id = RNS.Identity.full_hash(lxmf_data)
+
+    # Store directly using lxmf_propagation method
+    # This handles all the storage logic including peer distribution
+    result = _lxmf_router.lxmf_propagation(
+        lxmf_data,
+        stamp_value=0,  # No stamp required for test messages
+        stamp_data=b''
+    )
+
+    if result:
+        return {
+            'submitted': True,
+            'transient_id': bytes_to_hex(transient_id),
+            'message_hash': bytes_to_hex(message.hash) if message.hash else None
+        }
+    else:
+        return {
+            'submitted': False,
+            'error': 'Failed to store message in propagation node'
+        }
+
+
+def cmd_propagation_node_announce(params):
+    """Announce the propagation node destination.
+
+    This makes the propagation node discoverable on the network.
+
+    Returns:
+        announced (bool): True if announced
+        propagation_hash (hex): Hash of the propagation destination
+    """
+    global _lxmf_router
+
+    if _lxmf_router is None:
+        return {'error': 'LXMF router not started', 'announced': False}
+
+    if not _lxmf_router.propagation_node:
+        return {'error': 'Propagation not enabled', 'announced': False}
+
+    # Announce the propagation destination
+    _lxmf_router.announce_propagation_node()
+
+    return {
+        'announced': True,
+        'propagation_hash': bytes_to_hex(_lxmf_router.propagation_destination.hash)
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -3378,6 +3574,11 @@ COMMANDS = {
     'lxmf_announce': cmd_lxmf_announce,
     'lxmf_send_direct': cmd_lxmf_send_direct,
     'lxmf_send_opportunistic': cmd_lxmf_send_opportunistic,
+    # Propagation node operations
+    'propagation_node_start': cmd_propagation_node_start,
+    'propagation_node_get_messages': cmd_propagation_node_get_messages,
+    'propagation_node_submit_for_recipient': cmd_propagation_node_submit_for_recipient,
+    'propagation_node_announce': cmd_propagation_node_announce,
 }
 
 
