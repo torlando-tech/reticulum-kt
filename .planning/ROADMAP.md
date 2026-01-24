@@ -61,12 +61,12 @@ Plans:
   2. FIELD_IMAGE with binary image data survives round-trip with correct bytes
   3. Custom fields (renderer, thread ID) survive round-trip with correct values
   4. Empty/null field handling matches between implementations
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 03-01: File attachment interop tests
-- [ ] 03-02: Image attachment interop tests
-- [ ] 03-03: Custom field interop tests
+- [ ] 03-01-PLAN.md - File attachment interop tests (bridge extension + AttachmentFieldInteropTest)
+- [ ] 03-02-PLAN.md - Image field interop tests (ImageFieldInteropTest with WebP)
+- [ ] 03-03-PLAN.md - Custom field interop tests (renderer, thread, arbitrary fields)
 
 ### Phase 4: LXMF Cryptographic Interop
 **Goal**: LXMF message hash and signature computed identically across implementations
