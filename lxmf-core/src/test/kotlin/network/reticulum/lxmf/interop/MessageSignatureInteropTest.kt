@@ -2,6 +2,7 @@ package network.reticulum.lxmf.interop
 
 import io.kotest.matchers.shouldBe
 import network.reticulum.interop.getBoolean
+import network.reticulum.interop.getBytes
 import network.reticulum.interop.toHex
 import network.reticulum.lxmf.LXMFConstants
 import org.junit.jupiter.api.DisplayName
@@ -163,6 +164,124 @@ class MessageSignatureInteropTest : LXMFInteropTestBase() {
 
             pyResult.getBoolean("valid") shouldBe false
             println("  SUCCESS: Python correctly rejected signature with wrong key")
+        }
+    }
+
+    @Nested
+    @DisplayName("Python Signs, Kotlin Verifies")
+    inner class PythonSignsKotlinVerifies {
+
+        @Test
+        @DisplayName("Python signed message validates in Kotlin")
+        fun `Python signed message validates in Kotlin`() {
+            println("\n=== Test: Python signed message validates in Kotlin ===")
+
+            // Create message components
+            val content = "Python signed message"
+            val title = ""
+            val timestamp = System.currentTimeMillis() / 1000.0
+
+            // Get Python to compute signed_part via lxmf_pack
+            val packResult = python(
+                "lxmf_pack",
+                "destination_hash" to destDestination.hash.toHex(),
+                "source_hash" to sourceDestination.hash.toHex(),
+                "timestamp" to timestamp,
+                "title" to title,
+                "content" to content
+            )
+            val signedPart = packResult.getBytes("signed_part")
+
+            println("  [Python] signed_part size: ${signedPart.size} bytes")
+
+            // Sign with Python using identity_sign
+            val signResult = python(
+                "identity_sign",
+                "private_key" to testSourceIdentity.getPrivateKey(),
+                "message" to signedPart
+            )
+            val signature = signResult.getBytes("signature")
+
+            println("  [Python] signature: ${signature.toHex().take(32)}...")
+
+            // Verify in Kotlin
+            val valid = testSourceIdentity.validate(signature, signedPart)
+            valid shouldBe true
+            println("  SUCCESS: Kotlin validated Python signature")
+        }
+
+        @Test
+        @DisplayName("Tampered Python signature rejected by Kotlin")
+        fun `tampered Python signature rejected by Kotlin`() {
+            println("\n=== Test: Tampered Python signature rejected by Kotlin ===")
+
+            val timestamp = System.currentTimeMillis() / 1000.0
+            val packResult = python(
+                "lxmf_pack",
+                "destination_hash" to destDestination.hash.toHex(),
+                "source_hash" to sourceDestination.hash.toHex(),
+                "timestamp" to timestamp,
+                "title" to "",
+                "content" to "Test content for tamper detection"
+            )
+            val signedPart = packResult.getBytes("signed_part")
+
+            val signResult = python(
+                "identity_sign",
+                "private_key" to testSourceIdentity.getPrivateKey(),
+                "message" to signedPart
+            )
+            val signature = signResult.getBytes("signature")
+
+            // Tamper with signature (flip first bit)
+            val tamperedSignature = signature.copyOf()
+            tamperedSignature[0] = (tamperedSignature[0].toInt() xor 0x01).toByte()
+
+            println("  [Python] Original signature[0]: ${signature[0].toInt() and 0xFF}")
+            println("  [Kotlin] Tampered signature[0]: ${tamperedSignature[0].toInt() and 0xFF}")
+
+            // Kotlin should reject tampered signature
+            val valid = testSourceIdentity.validate(tamperedSignature, signedPart)
+            valid shouldBe false
+            println("  SUCCESS: Kotlin correctly rejected tampered Python signature")
+        }
+
+        @Test
+        @DisplayName("Python signed message with fields validates in Kotlin")
+        fun `Python signed message with fields validates in Kotlin`() {
+            println("\n=== Test: Python signed message with fields validates in Kotlin ===")
+
+            val timestamp = System.currentTimeMillis() / 1000.0
+
+            // Create fields map with FIELD_RENDERER
+            val fields = mapOf(
+                LXMFConstants.FIELD_RENDERER.toString() to LXMFConstants.RENDERER_PLAIN
+            )
+
+            val packResult = python(
+                "lxmf_pack",
+                "destination_hash" to destDestination.hash.toHex(),
+                "source_hash" to sourceDestination.hash.toHex(),
+                "timestamp" to timestamp,
+                "title" to "Field Test Title",
+                "content" to "Message with fields for Python-to-Kotlin signature test",
+                "fields" to fields
+            )
+            val signedPart = packResult.getBytes("signed_part")
+
+            println("  [Python] signed_part with fields size: ${signedPart.size} bytes")
+
+            val signResult = python(
+                "identity_sign",
+                "private_key" to testSourceIdentity.getPrivateKey(),
+                "message" to signedPart
+            )
+            val signature = signResult.getBytes("signature")
+
+            // Verify in Kotlin
+            val valid = testSourceIdentity.validate(signature, signedPart)
+            valid shouldBe true
+            println("  SUCCESS: Kotlin validated Python signature with fields")
         }
     }
 }
