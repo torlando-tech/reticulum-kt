@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 8 - Propagated Delivery (Plan 01 complete)
+**Current focus:** Phase 8 - Propagated Delivery (Plan 02 complete)
 
 ## Current Position
 
 Phase: 8 of 9 (Propagated Delivery)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-01-24 - Completed 08-01-PLAN.md (Propagated Delivery Foundation)
+Last activity: 2026-01-24 - Completed 08-02-PLAN.md (Gap Closure - Propagation Node Registration)
 
-Progress: [████████░░] ~80%
+Progress: [████████░░] ~83%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 17
-- Average duration: 5.6 min
-- Total execution time: 106 min
+- Total plans completed: 18
+- Average duration: 5.5 min
+- Total execution time: 110 min
 
 **By Phase:**
 
@@ -34,10 +34,10 @@ Progress: [████████░░] ~80%
 | 05-stamp-interop | 2 | 8 min | 4 min |
 | 06-direct-delivery | 3 | 36 min | 12 min |
 | 07-opportunistic-delivery | 3 | 16 min | 5.3 min |
-| 08-propagated-delivery | 1 | 6 min | 6 min |
+| 08-propagated-delivery | 2 | 10 min | 5 min |
 
 **Recent Trend:**
-- Last 5 plans: 4, 5, 7, 4, 6 min
+- Last 5 plans: 5, 7, 4, 6, 4 min
 - Trend: Consistent fast execution
 
 *Updated after each plan completion*
@@ -81,6 +81,8 @@ Recent decisions affecting current work:
 - Use stamp_cost=8 for fast tests (lower than production default of 16)
 - PropagatedDeliveryTestBase extends DirectDeliveryTestBase for code reuse
 - Use WORKBLOCK_EXPAND_ROUNDS_PN (1000) for propagation stamps
+- Add addPropagationNode() to bypass announce parsing for test scenarios
+- Call addPropagationNode() before setActivePropagationNode() for reliable setup
 
 ### Pending Todos
 
@@ -93,5 +95,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 08-01-PLAN.md - ready for 08-02-PLAN.md (Extended Propagation Tests)
+Stopped at: Completed 08-02-PLAN.md - ready for 08-03-PLAN.md (Extended Propagation Tests)
 Resume file: None
