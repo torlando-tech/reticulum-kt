@@ -10,11 +10,12 @@ See: .planning/PROJECT.md (updated 2026-01-23)
 ## Current Position
 
 Phase: 8 of 9 (Propagated Delivery)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-01-24 - Completed 08-02-PLAN.md (Gap Closure - Propagation Node Registration)
+Plan: 2 of 2 complete (gap closure done)
+Status: GAPS FOUND - TCP interop between Kotlin and Python RNS needs fixing
+Last activity: 2026-01-24 - Verified Phase 8, found TCP interop gap
+Next action: Insert Phase 8.1 to fix TCP interface interoperability
 
-Progress: [████████░░] ~83%
+Progress: [████████░░] ~85%
 
 ## Performance Metrics
 
@@ -90,10 +91,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- TCP interface compatibility issue between Kotlin and Python RNS - connections drop after packet transmission. Does not block message format verification but affects live delivery testing.
+- **[ACTIVE]** TCP interface compatibility issue between Kotlin and Python RNS - connections drop after packet transmission. Being addressed via Phase 8.1 insertion.
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 08-02-PLAN.md - ready for 08-03-PLAN.md (Extended Propagation Tests)
+Stopped at: Phase 8 verification found TCP interop gap - inserting Phase 8.1 to fix
 Resume file: None
