@@ -123,10 +123,12 @@ Plans:
   2. Message sends automatically when announce received
   3. Message content preserved after opportunistic delivery
   4. Failed delivery after timeout triggers appropriate callback
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 07-01: Opportunistic delivery with path discovery tests
+- [ ] 07-01-PLAN.md — Align constants and enhance opportunistic delivery logic
+- [ ] 07-02-PLAN.md — Test infrastructure and basic K->P opportunistic tests
+- [ ] 07-03-PLAN.md — Advanced scenarios: batch, timeout, bidirectional P->K
 
 ### Phase 8: Propagated Delivery
 **Goal**: LXMF messages delivered via PROPAGATED method through Python propagation node
@@ -170,7 +172,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 6. Direct Delivery | 3/3 | ✓ Complete | 2026-01-24 |
-| 7. Opportunistic Delivery | 0/1 | Not started | - |
+| 7. Opportunistic Delivery | 0/3 | Not started | - |
 | 8. Propagated Delivery | 0/1 | Not started | - |
 | 9. Resource Transfer | 0/2 | Not started | - |
 
