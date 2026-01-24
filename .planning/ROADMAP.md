@@ -139,10 +139,10 @@ Plans:
   2. Python propagation node accepts Kotlin-generated stamp
   3. Message retrieved by recipient from propagation node
   4. End-to-end content integrity verified
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 08-01: Propagated delivery via Python node tests
+- [ ] 08-01-PLAN.md - Bridge commands + PropagatedDeliveryTestBase + E2E tests
 
 ### Phase 9: Resource Transfer
 **Goal**: Large LXMF messages (>500 bytes) transfer correctly as Resources
