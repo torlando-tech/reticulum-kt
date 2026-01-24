@@ -23,12 +23,15 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * TCP client interface for Reticulum.
  *
  * Connects to a remote TCP server and exchanges packets using
  * HDLC or KISS framing.
+ *
+ * Debug logging can be enabled via system property: -Dreticulum.tcp.debug=true
  */
 class TCPClientInterface(
     name: String,
@@ -49,6 +52,9 @@ class TCPClientInterface(
         const val HW_MTU = 262144
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
         const val RECONNECT_WAIT_MS = 5000L // 5 seconds
+
+        /** Enable verbose debug logging via -Dreticulum.tcp.debug=true */
+        private val DEBUG = System.getProperty("reticulum.tcp.debug", "false").toBoolean()
     }
 
     override val bitrate: Int = BITRATE_GUESS
@@ -73,16 +79,32 @@ class TCPClientInterface(
     private val neverConnected = AtomicBoolean(true)
     private val writing = AtomicBoolean(false)
 
+    // Debug counters
+    private val framesSent = AtomicLong(0)
+    private val framesReceived = AtomicLong(0)
+
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readJob: Job? = null
     private var connectJob: Job? = null
 
     private val hdlcDeframer = HDLC.createDeframer { data ->
+        val frameNum = framesReceived.incrementAndGet()
+        if (DEBUG) {
+            val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
+            val suffix = if (data.size > 16) "..." else ""
+            debugLog("RECV frame #$frameNum: ${data.size} bytes, data=[$hexPreview$suffix]")
+        }
         processIncoming(data)
     }
 
     private val kissDeframer = KISS.createDeframer { _, data ->
+        val frameNum = framesReceived.incrementAndGet()
+        if (DEBUG) {
+            val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
+            val suffix = if (data.size > 16) "..." else ""
+            debugLog("RECV frame #$frameNum (KISS): ${data.size} bytes, data=[$hexPreview$suffix]")
+        }
         processIncoming(data)
     }
 
@@ -118,6 +140,20 @@ class TCPClientInterface(
 
             if (initial) {
                 log("TCP connection established")
+            }
+
+            // Debug: Log socket state after connection
+            if (DEBUG) {
+                debugLog("Socket connected - state dump:")
+                debugLog("  localAddress: ${sock.localSocketAddress}")
+                debugLog("  remoteAddress: ${sock.remoteSocketAddress}")
+                debugLog("  tcpNoDelay: ${sock.tcpNoDelay}")
+                debugLog("  keepAlive: ${sock.keepAlive}")
+                debugLog("  soTimeout: ${sock.soTimeout}")
+                debugLog("  receiveBufferSize: ${sock.receiveBufferSize}")
+                debugLog("  sendBufferSize: ${sock.sendBufferSize}")
+                debugLog("  soLinger: ${sock.soLinger}")
+                debugLog("  reuseAddress: ${sock.reuseAddress}")
             }
 
             // Send an empty HDLC frame to "activate" the connection
@@ -202,13 +238,32 @@ class TCPClientInterface(
                         }
                     } else if (bytesRead == -1) {
                         // Connection closed
+                        if (DEBUG) {
+                            debugLog("Read loop: EOF received (bytesRead=-1), connection closed by peer")
+                            debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")
+                            debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
+                            debugLog("  socket state: isInputShutdown=${sock.isInputShutdown}, isOutputShutdown=${sock.isOutputShutdown}")
+                        }
                         online.set(false)
                         break
                     }
                 }
             } catch (e: CancellationException) {
                 // Normal cancellation, don't log as error
+                if (DEBUG) {
+                    debugLog("Read loop: CancellationException (normal shutdown)")
+                }
             } catch (e: IOException) {
+                if (DEBUG) {
+                    debugLog("Read loop: IOException - ${e.javaClass.name}: ${e.message}")
+                    debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")
+                    try {
+                        debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
+                        debugLog("  socket state: isInputShutdown=${sock.isInputShutdown}, isOutputShutdown=${sock.isOutputShutdown}")
+                    } catch (ex: Exception) {
+                        debugLog("  socket state: unavailable (${ex.message})")
+                    }
+                }
                 if (!detached.get()) {
                     online.set(false)
                 }
@@ -246,11 +301,27 @@ class TCPClientInterface(
             sock.getOutputStream().write(framedData)
             sock.getOutputStream().flush()
 
+            val frameNum = framesSent.incrementAndGet()
+            if (DEBUG) {
+                val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
+                val suffix = if (data.size > 16) "..." else ""
+                debugLog("SENT frame #$frameNum: ${data.size} bytes (framed: ${framedData.size}), data=[$hexPreview$suffix]")
+                debugLog("  socket.isConnected: ${sock.isConnected}, socket.isClosed: ${sock.isClosed}")
+            }
+
             txBytes.addAndGet(framedData.size.toLong())
             parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
 
         } catch (e: IOException) {
             log("Write error: ${e.message}")
+            if (DEBUG) {
+                debugLog("Write IOException - full details:")
+                debugLog("  exception: ${e.javaClass.name}: ${e.message}")
+                debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
+                debugLog("  socket state: isInputShutdown=${sock.isInputShutdown}, isOutputShutdown=${sock.isOutputShutdown}")
+                debugLog("  frames sent before error: ${framesSent.get()}")
+                debugLog("  frames received before error: ${framesReceived.get()}")
+            }
             teardown()
             throw e
         } finally {
@@ -268,6 +339,11 @@ class TCPClientInterface(
     }
 
     private fun teardown() {
+        if (DEBUG) {
+            debugLog("Teardown called - transitioning to OFFLINE")
+            debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")
+            debugLog("  detached: ${detached.get()}")
+        }
         online.set(false)
         closeSocket()
 
@@ -292,6 +368,15 @@ class TCPClientInterface(
             java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
         )
         println("[$timestamp] [$name] $message")
+    }
+
+    private fun debugLog(message: String) {
+        if (DEBUG) {
+            val timestamp = java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            )
+            println("[$timestamp] [$name] [DEBUG] $message")
+        }
     }
 
     override fun toString(): String = "TCPClientInterface[$name -> $targetHost:$targetPort]"
