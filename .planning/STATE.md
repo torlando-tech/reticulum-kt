@@ -5,24 +5,24 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 8 - Propagated Delivery (Plan 02 complete)
+**Current focus:** Phase 8.1 - TCP Interface Interop (Plan 01 complete)
 
 ## Current Position
 
-Phase: 8 of 9 (Propagated Delivery)
-Plan: 2 of 2 complete (gap closure done)
-Status: GAPS FOUND - TCP interop between Kotlin and Python RNS needs fixing
-Last activity: 2026-01-24 - Verified Phase 8, found TCP interop gap
-Next action: Insert Phase 8.1 to fix TCP interface interoperability
+Phase: 8.1 of 10 (TCP Interface Interop) - INSERTED
+Plan: 1 of 3
+Status: In progress
+Last activity: 2026-01-24 - Completed 08.1-01-PLAN.md (diagnostics and minimal interop test)
+Next action: Execute 08.1-02-PLAN.md
 
-Progress: [████████░░] ~85%
+Progress: [████████░░] ~86%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 18
+- Total plans completed: 19
 - Average duration: 5.5 min
-- Total execution time: 110 min
+- Total execution time: 115 min
 
 **By Phase:**
 
@@ -36,9 +36,10 @@ Progress: [████████░░] ~85%
 | 06-direct-delivery | 3 | 36 min | 12 min |
 | 07-opportunistic-delivery | 3 | 16 min | 5.3 min |
 | 08-propagated-delivery | 2 | 10 min | 5 min |
+| 08.1-tcp-interface-interop | 1 | 5 min | 5 min |
 
 **Recent Trend:**
-- Last 5 plans: 5, 7, 4, 6, 4 min
+- Last 5 plans: 7, 4, 6, 4, 5 min
 - Trend: Consistent fast execution
 
 *Updated after each plan completion*
@@ -84,6 +85,13 @@ Recent decisions affecting current work:
 - Use WORKBLOCK_EXPAND_ROUNDS_PN (1000) for propagation stamps
 - Add addPropagationNode() to bypass announce parsing for test scenarios
 - Call addPropagationNode() before setActivePropagationNode() for reliable setup
+- Use system property reticulum.tcp.debug for debug logging (no runtime overhead when disabled)
+- Minimal Python server bypasses RNS stack to isolate TCP/HDLC layer
+- 20-byte minimum packet size to pass HEADER_MINSIZE check in deframer
+
+### Roadmap Evolution
+
+- Phase 8.1 inserted after Phase 8: TCP Interface Interop (URGENT) - connections drop after packet transmission between Kotlin TCPClientInterface and Python RNS TCPServerInterface. Required for proper E2E delivery verification.
 
 ### Pending Todos
 
@@ -91,10 +99,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- **[ACTIVE]** TCP interface compatibility issue between Kotlin and Python RNS - connections drop after packet transmission. Being addressed via Phase 8.1 insertion.
+- **[INVESTIGATING]** TCP interface compatibility issue between Kotlin and Python RNS - connections drop after packet transmission. Plan 01 completed: basic TCP/HDLC layer works correctly (all 4 tests pass). Issue may be at higher layer (RNS Transport, LXMF, or test infrastructure).
 
 ## Session Continuity
 
-Last session: 2026-01-24
-Stopped at: Phase 8 verification found TCP interop gap - inserting Phase 8.1 to fix
+Last session: 2026-01-24 22:34 UTC
+Stopped at: Completed 08.1-01-PLAN.md
 Resume file: None
