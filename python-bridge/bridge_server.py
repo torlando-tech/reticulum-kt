@@ -25,11 +25,18 @@ rns_path = os.path.abspath(rns_path)
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'Cryptography'))
 sys.path.insert(0, rns_path)
 
+# Add LXMF to path
+lxmf_path = os.path.abspath(os.environ.get('PYTHON_LXMF_PATH', '../../../LXMF'))
+sys.path.insert(0, lxmf_path)
+
 import hashlib
 
 # Import umsgpack from RNS vendor
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'vendor'))
 import umsgpack
+
+# Import LXMF stamper (used for stamp generation/validation)
+import LXMF.LXStamper as LXStamper
 
 # Import cryptography modules directly from the Cryptography directory
 # This bypasses RNS/__init__.py which would load all interfaces
