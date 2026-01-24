@@ -673,4 +673,127 @@ class StampInteropTest : LXMFInteropTestBase() {
             println("  SUCCESS: Random bytes rejected as stamp by both implementations")
         }
     }
+
+    @Nested
+    @DisplayName("EdgeCases")
+    inner class EdgeCases {
+
+        @Test
+        fun `over-qualified stamp (higher value than required) accepted by both`() {
+            println("\n=== Test: over-qualified stamp accepted by both ===")
+
+            // Generate 8-bit stamp, validate at 4-bit cost (should pass)
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+
+            println("  Generating 8-bit stamp...")
+            val result = runBlocking { LXStamper.generateStamp(workblock, 8) }
+
+            println("  Generated stamp with value=${result.value}, testing at cost=4")
+            assertTrue(result.value >= 8, "Stamp value should be at least 8")
+
+            // Kotlin accepts at lower cost
+            val kotlinValid = LXStamper.isStampValid(result.stamp!!, 4, workblock)
+            println("  [Kotlin] isStampValid at cost=4: $kotlinValid")
+            kotlinValid shouldBe true
+
+            // Python also accepts at lower cost
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to result.stamp!!.toHex(),
+                "target_cost" to 4,
+                "workblock" to workblock.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid at cost=4: $pythonValid")
+            pythonValid shouldBe true
+
+            println("  SUCCESS: Over-qualified stamp (8-bit) accepted at 4-bit requirement")
+        }
+
+        @Test
+        fun `difficulty 0 stamp is trivially valid`() {
+            println("\n=== Test: difficulty 0 stamp is trivially valid ===")
+
+            // Any stamp should be valid at cost 0
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+            val randomStamp = ByteArray(32).also { SecureRandom().nextBytes(it) }
+
+            val value = LXStamper.stampValue(workblock, randomStamp)
+            println("  Random stamp value: $value")
+            println("  Testing at cost=0 (any stamp should pass)")
+
+            // Kotlin accepts at cost 0
+            val kotlinValid = LXStamper.isStampValid(randomStamp, 0, workblock)
+            println("  [Kotlin] isStampValid at cost=0: $kotlinValid")
+            kotlinValid shouldBe true
+
+            // Python also accepts at cost 0
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to randomStamp.toHex(),
+                "target_cost" to 0,
+                "workblock" to workblock.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid at cost=0: $pythonValid")
+            pythonValid shouldBe true
+
+            println("  SUCCESS: Any stamp is trivially valid at cost=0")
+        }
+
+        @Test
+        fun `stamp value is consistent across multiple validations`() {
+            println("\n=== Test: stamp value is consistent across multiple validations ===")
+
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+            val result = runBlocking { LXStamper.generateStamp(workblock, 4) }
+
+            println("  Computing stamp value 3 times...")
+
+            // Multiple calls should return same value
+            val value1 = LXStamper.stampValue(workblock, result.stamp!!)
+            val value2 = LXStamper.stampValue(workblock, result.stamp!!)
+            val value3 = LXStamper.stampValue(workblock, result.stamp!!)
+
+            println("  Value 1: $value1")
+            println("  Value 2: $value2")
+            println("  Value 3: $value3")
+
+            value1 shouldBe value2
+            value2 shouldBe value3
+
+            println("  SUCCESS: Stamp value consistently computed as $value1")
+        }
+
+        @Test
+        fun `different expand rounds produce different workblocks`() {
+            println("\n=== Test: different expand rounds produce different workblocks ===")
+
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+
+            println("  Generating workblocks with 25 and 50 expand rounds...")
+            val workblock25 = LXStamper.generateWorkblock(messageId, 25)
+            val workblock50 = LXStamper.generateWorkblock(messageId, 50)
+
+            println("  Workblock 25 size: ${workblock25.size} bytes (expected: ${25 * 256})")
+            println("  Workblock 50 size: ${workblock50.size} bytes (expected: ${50 * 256})")
+
+            workblock25.size shouldBe 25 * 256
+            workblock50.size shouldBe 50 * 256
+
+            // First 25*256 bytes should match (same material, same first 25 rounds)
+            val first25Rounds = workblock50.take(25 * 256)
+            val workblock25List = workblock25.toList()
+
+            val match = workblock25List == first25Rounds
+            println("  First 25*256 bytes of workblock50 match workblock25: $match")
+
+            workblock25List shouldBe first25Rounds
+
+            println("  SUCCESS: Workblock expansion is deterministic and additive")
+        }
+    }
 }
