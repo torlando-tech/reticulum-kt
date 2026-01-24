@@ -2949,8 +2949,9 @@ def cmd_rns_start(params):
         config
     )
 
-    # Register the interface
-    RNS.Transport.interfaces.append(tcp_interface)
+    # Use _add_interface() to properly initialize all required attributes
+    # This is the same method Reticulum uses when loading interfaces from config
+    _rns_instance._add_interface(tcp_interface)
 
     # Get transport identity hash
     identity_hash = RNS.Transport.identity.hash if RNS.Transport.identity else b'\x00' * 16
@@ -3121,6 +3122,7 @@ def cmd_lxmf_send_direct(params):
     Returns:
         sent (bool): True if message was queued
         message_hash (hex): Hash of the sent message
+        status (str): Status of the send operation
 
     Note: This command requires that the destination has been announced
     and is known to the transport layer. For testing, announce the
@@ -3131,6 +3133,7 @@ def cmd_lxmf_send_direct(params):
     if not _lxmf_router:
         return {
             'sent': False,
+            'status': 'error',
             'error': 'LXMF router not started'
         }
 
@@ -3146,17 +3149,37 @@ def cmd_lxmf_send_direct(params):
     if fields:
         fields = {int(k): v for k, v in fields.items()}
 
+    # Try to find the identity for this destination from recalled identities
+    # This is needed because LXMF requires a proper Destination object
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        # Check if we have a path at least
+        has_path = RNS.Transport.has_path(destination_hash)
+        return {
+            'sent': False,
+            'status': 'no_identity',
+            'error': f'No identity recalled for destination {destination_hash.hex()}',
+            'has_path': has_path
+        }
+
+    # Create an LXMF delivery destination from the recalled identity
+    # LXMF uses "lxmf" app name and "delivery" aspect
+    destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery"
+    )
+
     # Create a message with DIRECT method
-    # Using None destination with destination_hash parameter
-    # The source needs to be a proper Destination for signing
     message = LXMF.LXMessage(
-        destination=None,
+        destination=destination,
         source=_lxmf_destination,  # Our delivery destination as source
         content=content,
         title=title,
         fields=fields if fields else None,
-        desired_method=LXMF.LXMessage.DIRECT,
-        destination_hash=destination_hash
+        desired_method=LXMF.LXMessage.DIRECT
     )
 
     # Send via router
@@ -3164,6 +3187,7 @@ def cmd_lxmf_send_direct(params):
 
     return {
         'sent': True,
+        'status': 'queued',
         'message_hash': bytes_to_hex(message.hash) if message.hash else None
     }
 
