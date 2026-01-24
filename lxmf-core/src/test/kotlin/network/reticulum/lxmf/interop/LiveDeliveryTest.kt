@@ -234,19 +234,29 @@ class LiveDeliveryTest : DirectDeliveryTestBase() {
         received!!.size shouldBe 1
         println("[KT] Python received message")
 
-        // Wait a bit for delivery confirmation (callback may fire after receipt)
-        delay(2000)
+        // Wait for delivery confirmation (callback may fire after receipt)
+        // Increased from 2s to 3s based on TCP timing alignment in Plan 02
+        delay(3000)
 
         // Verify callback fired
         callbackFired.get() shouldBe true
         println("[KT] Callback was fired: ${callbackFired.get()}")
 
-        // Verify message state is DELIVERED or SENT
+        // Get final state with diagnostic output
         val finalState = callbackMessage.get()?.state ?: message.state
         println("[KT] Final state: $finalState")
-        listOf(MessageState.SENT, MessageState.DELIVERED) shouldContain finalState
+        println("[KT] Message hash: ${message.hash?.toHex()}")
 
-        println("\n✅ Delivery callback test passed!")
+        // Strict assertion: successful direct delivery MUST reach DELIVERED state
+        // TCP transport layer is now verified working (Plans 01 and 02)
+        if (finalState != MessageState.DELIVERED) {
+            println("[KT] ERROR: Expected DELIVERED but got $finalState")
+            println("[KT] Callback message state: ${callbackMessage.get()?.state}")
+            println("[KT] Direct message state: ${message.state}")
+        }
+        finalState shouldBe MessageState.DELIVERED
+
+        println("\n[OK] Delivery callback test passed!")
         println("   Initial state: $initialState")
         println("   Final state: $finalState")
         println("   Callback fired: ${callbackFired.get()}")
@@ -309,7 +319,8 @@ class LiveDeliveryTest : DirectDeliveryTestBase() {
         println("[KT] Python received message")
 
         // Wait for delivery confirmation
-        delay(2000)
+        // Increased from 2s to 3s based on TCP timing alignment in Plan 02
+        delay(3000)
 
         // Capture final state
         stateTransitions.add(message.state)
@@ -331,11 +342,17 @@ class LiveDeliveryTest : DirectDeliveryTestBase() {
             MessageState.DELIVERED
         ) shouldContain afterOutboundState
 
-        // Final state should be SENT or DELIVERED
+        // Strict assertion: successful direct delivery MUST reach DELIVERED state
+        // TCP transport layer is now verified working (Plans 01 and 02)
         val finalState = stateTransitions.last()
-        listOf(MessageState.SENT, MessageState.DELIVERED) shouldContain finalState
+        if (finalState != MessageState.DELIVERED) {
+            println("[KT] ERROR: Expected DELIVERED but got $finalState")
+            println("[KT] All transitions: ${stateTransitions.joinToString(" -> ")}")
+            println("[KT] Message hash: ${message.hash?.toHex()}")
+        }
+        finalState shouldBe MessageState.DELIVERED
 
-        println("\n✅ MessageState lifecycle test passed!")
+        println("\n[OK] MessageState lifecycle test passed!")
         println("   Transitions: ${stateTransitions.joinToString(" -> ")}")
     }
 
