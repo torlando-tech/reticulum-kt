@@ -12,6 +12,7 @@ import network.reticulum.interfaces.toRef
 import network.reticulum.interop.InteropTestBase
 import network.reticulum.interop.getBytes
 import network.reticulum.interop.getString
+import network.reticulum.interop.hexToByteArray
 import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.transport.Transport
@@ -187,12 +188,36 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
         return when (messagesJson) {
             is JsonArray -> messagesJson.map { elem ->
                 val obj = elem as JsonObject
+                // Parse fields if present
+                val fieldsJson = obj["fields"]
+                val fields: Map<Int, Any> = if (fieldsJson is JsonObject) {
+                    fieldsJson.entries.mapNotNull { (key, value) ->
+                        val fieldKey = key.toIntOrNull() ?: return@mapNotNull null
+                        val fieldValue: Any = when {
+                            value is kotlinx.serialization.json.JsonPrimitive -> {
+                                val content = value.content
+                                // Hex-encoded bytes from Python (binary fields)
+                                if (content.matches(Regex("^[0-9a-fA-F]+$")) && content.length >= 2) {
+                                    content.hexToByteArray()
+                                } else {
+                                    content
+                                }
+                            }
+                            else -> value.toString()
+                        }
+                        fieldKey to fieldValue
+                    }.toMap()
+                } else {
+                    emptyMap()
+                }
+
                 ReceivedMessage(
                     sourceHash = obj.getBytes("source_hash"),
                     destinationHash = obj.getBytes("destination_hash"),
                     content = obj.getString("content"),
                     title = obj.getString("title"),
-                    timestamp = obj.getString("timestamp").toDouble()
+                    timestamp = obj.getString("timestamp").toDouble(),
+                    fields = fields
                 )
             }
             else -> emptyList()
@@ -228,7 +253,8 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
         val destinationHash: ByteArray,
         val content: String,
         val title: String,
-        val timestamp: Double
+        val timestamp: Double,
+        val fields: Map<Int, Any> = emptyMap()
     ) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -241,6 +267,7 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
             if (content != other.content) return false
             if (title != other.title) return false
             if (timestamp != other.timestamp) return false
+            if (fields != other.fields) return false
 
             return true
         }
@@ -251,6 +278,7 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
             result = 31 * result + content.hashCode()
             result = 31 * result + title.hashCode()
             result = 31 * result + timestamp.hashCode()
+            result = 31 * result + fields.hashCode()
             return result
         }
     }
