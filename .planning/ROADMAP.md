@@ -77,11 +77,11 @@ Plans:
   2. Signature generated in Kotlin validates in Python
   3. Signature generated in Python validates in Kotlin
   4. Invalid signatures are rejected by both implementations
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 04-01: Message hash interop tests
-- [ ] 04-02: Message signature interop tests
+- [ ] 04-01-PLAN.md - Message hash interop tests (hash matches Python, idempotency, edge cases)
+- [ ] 04-02-PLAN.md - Message signature interop tests (bidirectional validation, error handling)
 
 ### Phase 5: Stamp Interop
 **Goal**: LXMF stamps generated in Kotlin are accepted by Python and vice versa
