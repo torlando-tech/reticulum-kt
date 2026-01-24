@@ -3054,7 +3054,8 @@ def cmd_lxmf_start_router(params):
 
     return {
         'identity_hash': bytes_to_hex(_lxmf_identity.hash),
-        'destination_hash': bytes_to_hex(_lxmf_destination.hash)
+        'destination_hash': bytes_to_hex(_lxmf_destination.hash),
+        'identity_public_key': bytes_to_hex(_lxmf_identity.get_public_key())
     }
 
 
@@ -3078,6 +3079,33 @@ def cmd_lxmf_clear_messages(params):
 
     return {
         'cleared': True
+    }
+
+
+def cmd_lxmf_announce(params):
+    """Announce the LXMF delivery destination.
+
+    This makes the LXMF destination known on the network so other nodes
+    can discover it and send messages.
+
+    Returns:
+        announced (bool): True if announced successfully
+        destination_hash (hex): Hash of the announced destination
+    """
+    global _lxmf_router, _lxmf_destination
+
+    if not _lxmf_router or not _lxmf_destination:
+        return {
+            'announced': False,
+            'error': 'LXMF router not started'
+        }
+
+    # Announce the delivery destination
+    _lxmf_router.announce(_lxmf_destination.hash)
+
+    return {
+        'announced': True,
+        'destination_hash': bytes_to_hex(_lxmf_destination.hash)
     }
 
 
@@ -3249,6 +3277,7 @@ COMMANDS = {
     'lxmf_start_router': cmd_lxmf_start_router,
     'lxmf_get_messages': cmd_lxmf_get_messages,
     'lxmf_clear_messages': cmd_lxmf_clear_messages,
+    'lxmf_announce': cmd_lxmf_announce,
     'lxmf_send_direct': cmd_lxmf_send_direct,
 }
 

@@ -36,6 +36,7 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
     // Python-side state
     protected var pythonDestHash: ByteArray? = null
     protected var pythonIdentityHash: ByteArray? = null
+    protected var pythonIdentityPublicKey: ByteArray? = null
 
     // Kotlin-side state
     protected lateinit var kotlinIdentity: Identity
@@ -61,6 +62,7 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
         val routerResult = python("lxmf_start_router")
         pythonDestHash = routerResult.getBytes("destination_hash")
         pythonIdentityHash = routerResult.getBytes("identity_hash")
+        pythonIdentityPublicKey = routerResult.getBytes("identity_public_key")
         println("  [Setup] Python LXMF router started, dest_hash: ${pythonDestHash?.toHex()}")
 
         // 3. Start Kotlin Reticulum
@@ -113,6 +115,38 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
         if (!kotlinTcpClient!!.online.get()) {
             println("  [Setup] WARNING: TCP connection not established within timeout")
         }
+
+        // 8. Register Python's identity with Kotlin so we can create destinations
+        if (pythonDestHash != null && pythonIdentityPublicKey != null) {
+            println("  [Setup] Registering Python identity with Kotlin...")
+            Identity.remember(
+                packetHash = pythonDestHash!!,  // Use dest hash as packet hash for simplicity
+                destHash = pythonDestHash!!,
+                publicKey = pythonIdentityPublicKey!!,
+                appData = null
+            )
+            println("  [Setup] Python identity registered")
+        }
+
+        // 9. Have Python announce its LXMF destination so Kotlin can learn the path
+        println("  [Setup] Having Python announce its LXMF destination...")
+        val announceResult = python("lxmf_announce")
+        println("  [Setup] Python announced: ${announceResult.getString("announced")}")
+
+        // Wait for announce to propagate and connection to stabilize
+        println("  [Setup] Waiting for network to stabilize...")
+        Thread.sleep(2000)
+
+        // Re-check connection status
+        val finalDeadline = System.currentTimeMillis() + 10000
+        while (System.currentTimeMillis() < finalDeadline) {
+            if (kotlinTcpClient!!.online.get()) {
+                break
+            }
+            Thread.sleep(100)
+        }
+        println("  [Setup] Final connection status: online=${kotlinTcpClient!!.online.get()}")
+        println("  [Setup] Direct delivery infrastructure ready")
     }
 
     @AfterAll
@@ -225,4 +259,31 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
      * Helper extension to convert ByteArray to hex string.
      */
     protected fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    /**
+     * Create an outbound destination for Python's LXMF router.
+     * This is used for sending messages from Kotlin to Python.
+     */
+    protected fun createPythonDestination(): Destination? {
+        val pythonIdentity = Identity.recall(pythonDestHash!!)
+        if (pythonIdentity == null) {
+            println("[Test] Cannot recall Python identity from dest hash")
+            return null
+        }
+
+        return Destination.create(
+            identity = pythonIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+    }
+
+    /**
+     * Announce Kotlin's LXMF destination so Python can discover it.
+     */
+    protected fun announceKotlinDestination() {
+        kotlinDestination.announce()
+    }
 }
