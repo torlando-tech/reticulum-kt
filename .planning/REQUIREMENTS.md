@@ -11,8 +11,8 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 - [ ] **LXMF-01**: Kotlin-packed LXMessage unpacks correctly in Python (round-trip verified)
 - [ ] **LXMF-02**: Python-packed LXMessage unpacks correctly in Kotlin (enhance existing tests)
-- [ ] **LXMF-03**: FIELD_FILE_ATTACHMENTS survives Kotlin↔Python round-trip
-- [ ] **LXMF-04**: FIELD_IMAGE survives Kotlin↔Python round-trip
+- [ ] **LXMF-03**: FIELD_FILE_ATTACHMENTS survives Kotlin<->Python round-trip
+- [ ] **LXMF-04**: FIELD_IMAGE survives Kotlin<->Python round-trip
 - [ ] **LXMF-05**: Custom fields (renderer, thread ID, etc.) survive round-trip
 - [ ] **LXMF-06**: Message hash computed identically in Kotlin and Python
 - [ ] **LXMF-07**: Message signature validates across implementations
@@ -25,8 +25,8 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 ### End-to-End Delivery
 
-- [ ] **E2E-01**: DIRECT delivery Kotlin→Python over established Link
-- [ ] **E2E-02**: DIRECT delivery Python→Kotlin over established Link
+- [ ] **E2E-01**: DIRECT delivery Kotlin->Python over established Link
+- [ ] **E2E-02**: DIRECT delivery Python->Kotlin over established Link
 - [ ] **E2E-03**: OPPORTUNISTIC delivery when path available
 - [ ] **E2E-04**: PROPAGATED delivery via Python propagation node
 
@@ -71,29 +71,29 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| LXMF-01 | TBD | Pending |
-| LXMF-02 | TBD | Pending |
-| LXMF-03 | TBD | Pending |
-| LXMF-04 | TBD | Pending |
-| LXMF-05 | TBD | Pending |
-| LXMF-06 | TBD | Pending |
-| LXMF-07 | TBD | Pending |
-| STAMP-01 | TBD | Pending |
-| STAMP-02 | TBD | Pending |
-| STAMP-03 | TBD | Pending |
-| E2E-01 | TBD | Pending |
-| E2E-02 | TBD | Pending |
-| E2E-03 | TBD | Pending |
-| E2E-04 | TBD | Pending |
-| RES-01 | TBD | Pending |
-| RES-02 | TBD | Pending |
-| RES-03 | TBD | Pending |
+| LXMF-01 | Phase 2 | Pending |
+| LXMF-02 | Phase 2 | Pending |
+| LXMF-03 | Phase 3 | Pending |
+| LXMF-04 | Phase 3 | Pending |
+| LXMF-05 | Phase 3 | Pending |
+| LXMF-06 | Phase 4 | Pending |
+| LXMF-07 | Phase 4 | Pending |
+| STAMP-01 | Phase 5 | Pending |
+| STAMP-02 | Phase 5 | Pending |
+| STAMP-03 | Phase 5 | Pending |
+| E2E-01 | Phase 6 | Pending |
+| E2E-02 | Phase 6 | Pending |
+| E2E-03 | Phase 7 | Pending |
+| E2E-04 | Phase 8 | Pending |
+| RES-01 | Phase 9 | Pending |
+| RES-02 | Phase 9 | Pending |
+| RES-03 | Phase 9 | Pending |
 
 **Coverage:**
 - v1 requirements: 17 total
-- Mapped to phases: 0
-- Unmapped: 17 ⚠️
+- Mapped to phases: 17
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-01-23*
-*Last updated: 2026-01-23 after initial definition*
+*Traceability updated: 2026-01-23 after roadmap creation*
