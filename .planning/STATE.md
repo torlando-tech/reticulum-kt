@@ -10,29 +10,29 @@ See: .planning/PROJECT.md (updated 2026-01-23)
 ## Current Position
 
 Phase: 2 of 9 (LXMF Message Round-Trip)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-01-24 - Completed 02-01-PLAN.md
+Last activity: 2026-01-24 - Completed 02-02-PLAN.md
 
-Progress: [██░░░░░░░░] ~12%
+Progress: [███░░░░░░░] ~18%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: 10 min
-- Total execution time: 20 min
+- Total plans completed: 3
+- Average duration: 8 min
+- Total execution time: 23 min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-python-bridge-extension | 1 | 8 min | 8 min |
-| 02-lxmf-message-round-trip | 1 | 12 min | 12 min |
+| 02-lxmf-message-round-trip | 2 | 15 min | 7.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 8, 12 min
-- Trend: Consistent
+- Last 5 plans: 8, 12, 3 min
+- Trend: Improving
 
 *Updated after each plan completion*
 
@@ -47,6 +47,8 @@ Recent decisions affecting current work:
 - Import only LXStamper module, not LXMessage class
 - Move InteropTestBase and PythonBridge to main source for cross-module reuse
 - Use api() dependencies for test infrastructure exposed to other modules
+- Use Identity.sigPrv (32-byte Ed25519 seed) for Python ed25519_sign, not getPrivateKey()
+- Add Map serialization to PythonBridge for fields parameter support
 
 ### Pending Todos
 
@@ -54,10 +56,10 @@ None yet.
 
 ### Blockers/Concerns
 
-None - Plan 02-01 complete, ready for 02-02 (Python-to-Kotlin tests).
+None - Plan 02-02 complete. Bidirectional LXMF interoperability verified.
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 02-01-PLAN.md
+Stopped at: Completed 02-02-PLAN.md
 Resume file: None
