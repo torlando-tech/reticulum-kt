@@ -2618,6 +2618,182 @@ def cmd_bz2_decompress(params):
     }
 
 
+# LXMF operations
+
+def cmd_lxmf_pack(params):
+    """Pack LXMF message from components.
+
+    Follows LXMessage.pack() logic but works with raw hashes instead of Destination objects.
+    Hash is computed WITHOUT stamp, then stamp can be added to payload separately.
+    """
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    source_hash = hex_to_bytes(params['source_hash'])
+    timestamp = float(params['timestamp'])
+    title = params.get('title', '')
+    content = params.get('content', '')
+    fields = params.get('fields', {})
+
+    # Convert string field keys to int (JSON only supports string keys)
+    if fields:
+        fields = {int(k): v for k, v in fields.items()}
+
+    # Encode title and content as bytes
+    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
+    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
+
+    # Build payload: [timestamp, title, content, fields]
+    payload = [timestamp, title_bytes, content_bytes, fields]
+    packed_payload = umsgpack.packb(payload)
+
+    # Compute hash: SHA256(dest_hash + source_hash + packed_payload)
+    hashed_part = destination_hash + source_hash + packed_payload
+    message_hash = hashlib.sha256(hashed_part).digest()
+
+    # Signed part: hashed_part + hash
+    signed_part = hashed_part + message_hash
+
+    return {
+        'packed_payload': bytes_to_hex(packed_payload),
+        'hashed_part': bytes_to_hex(hashed_part),
+        'message_hash': bytes_to_hex(message_hash),
+        'signed_part': bytes_to_hex(signed_part)
+    }
+
+
+def cmd_lxmf_unpack(params):
+    """Unpack LXMF message bytes to components.
+
+    Follows LXMessage.unpack_from_bytes() logic.
+    Extracts stamp from payload if present, recomputes hash without stamp.
+    """
+    lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
+
+    DEST_LEN = 16  # LXMessage.DESTINATION_LENGTH
+    SIG_LEN = 64   # LXMessage.SIGNATURE_LENGTH
+
+    destination_hash = lxmf_bytes[:DEST_LEN]
+    source_hash = lxmf_bytes[DEST_LEN:2*DEST_LEN]
+    signature = lxmf_bytes[2*DEST_LEN:2*DEST_LEN+SIG_LEN]
+    packed_payload = lxmf_bytes[2*DEST_LEN+SIG_LEN:]
+
+    unpacked_payload = umsgpack.unpackb(packed_payload)
+
+    # Extract stamp if present (5th element)
+    stamp = None
+    if len(unpacked_payload) > 4:
+        stamp = unpacked_payload[4]
+        unpacked_payload = unpacked_payload[:4]
+        # Repack without stamp for hash computation
+        packed_payload = umsgpack.packb(unpacked_payload)
+
+    # Compute hash (always without stamp)
+    hashed_part = destination_hash + source_hash + packed_payload
+    message_hash = hashlib.sha256(hashed_part).digest()
+
+    # Decode title/content
+    title_bytes = unpacked_payload[1]
+    content_bytes = unpacked_payload[2]
+    title = title_bytes.decode('utf-8') if isinstance(title_bytes, bytes) else title_bytes
+    content = content_bytes.decode('utf-8') if isinstance(content_bytes, bytes) else content_bytes
+
+    return {
+        'destination_hash': bytes_to_hex(destination_hash),
+        'source_hash': bytes_to_hex(source_hash),
+        'signature': bytes_to_hex(signature),
+        'timestamp': unpacked_payload[0],
+        'title': title,
+        'content': content,
+        'fields': unpacked_payload[3],
+        'stamp': bytes_to_hex(stamp) if stamp else None,
+        'message_hash': bytes_to_hex(message_hash)
+    }
+
+
+def cmd_lxmf_hash(params):
+    """Compute LXMF message hash from components.
+
+    Hash = SHA256(destination_hash + source_hash + packed_payload)
+    This is the message_id used for stamp generation.
+    """
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    source_hash = hex_to_bytes(params['source_hash'])
+    timestamp = float(params['timestamp'])
+    title = params.get('title', '')
+    content = params.get('content', '')
+    fields = params.get('fields', {})
+
+    # Convert string field keys to int
+    if fields:
+        fields = {int(k): v for k, v in fields.items()}
+
+    # Encode title and content
+    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
+    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
+
+    # Build payload and hash
+    payload = [timestamp, title_bytes, content_bytes, fields]
+    packed_payload = umsgpack.packb(payload)
+    hashed_part = destination_hash + source_hash + packed_payload
+    message_hash = hashlib.sha256(hashed_part).digest()
+
+    return {
+        'message_hash': bytes_to_hex(message_hash)
+    }
+
+
+def cmd_lxmf_stamp_workblock(params):
+    """Generate stamp workblock from message ID.
+
+    Uses LXStamper.stamp_workblock() for exact Python compatibility.
+    Default expand_rounds=3000 for standard LXMF stamps.
+    """
+    message_id = hex_to_bytes(params['message_id'])
+    expand_rounds = int(params.get('expand_rounds', 3000))
+
+    workblock = LXStamper.stamp_workblock(message_id, expand_rounds=expand_rounds)
+
+    return {
+        'workblock': bytes_to_hex(workblock),
+        'size': len(workblock)
+    }
+
+
+def cmd_lxmf_stamp_valid(params):
+    """Validate stamp against target cost and workblock.
+
+    Uses LXStamper.stamp_valid() and stamp_value() for exact Python compatibility.
+    """
+    stamp = hex_to_bytes(params['stamp'])
+    target_cost = int(params['target_cost'])
+    workblock = hex_to_bytes(params['workblock'])
+
+    valid = LXStamper.stamp_valid(stamp, target_cost, workblock)
+    value = LXStamper.stamp_value(workblock, stamp) if valid else 0
+
+    return {
+        'valid': valid,
+        'value': value
+    }
+
+
+def cmd_lxmf_stamp_generate(params):
+    """Generate stamp meeting target cost.
+
+    Uses LXStamper.generate_stamp() for exact Python compatibility.
+    WARNING: Can be slow for high costs. Use expand_rounds=25 for quick tests.
+    """
+    message_id = hex_to_bytes(params['message_id'])
+    stamp_cost = int(params['stamp_cost'])
+    expand_rounds = int(params.get('expand_rounds', 3000))
+
+    stamp, value = LXStamper.generate_stamp(message_id, stamp_cost, expand_rounds=expand_rounds)
+
+    return {
+        'stamp': bytes_to_hex(stamp) if stamp else None,
+        'value': value
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2713,6 +2889,13 @@ COMMANDS = {
     # Compression operations
     'bz2_compress': cmd_bz2_compress,
     'bz2_decompress': cmd_bz2_decompress,
+    # LXMF operations
+    'lxmf_pack': cmd_lxmf_pack,
+    'lxmf_unpack': cmd_lxmf_unpack,
+    'lxmf_hash': cmd_lxmf_hash,
+    'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
+    'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
+    'lxmf_stamp_generate': cmd_lxmf_stamp_generate,
 }
 
 
