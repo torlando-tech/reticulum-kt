@@ -3192,6 +3192,80 @@ def cmd_lxmf_send_direct(params):
     }
 
 
+def cmd_lxmf_send_opportunistic(params):
+    """Send LXMF message via OPPORTUNISTIC delivery.
+
+    params:
+        destination_hash (hex): Destination hash (16 bytes)
+        content (str): Message content
+        title (str, optional): Message title
+        fields (dict, optional): Additional fields
+
+    Returns:
+        sent (bool): True if message was queued
+        message_hash (hex): Hash of the sent message
+        method (str): "opportunistic"
+
+    Note: This command requires that the destination has been announced
+    and the identity is known to the transport layer.
+    """
+    global _lxmf_router, _lxmf_identity, _lxmf_destination
+
+    if not _lxmf_router:
+        return {
+            'sent': False,
+            'error': 'LXMF router not started'
+        }
+
+    RNS = _get_full_rns()
+    import LXMF
+
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    content = params['content']
+    title = params.get('title', '')
+    fields = params.get('fields', {})
+
+    # Convert string field keys to int
+    if fields:
+        fields = {int(k): v for k, v in fields.items()}
+
+    # Recall identity from destination hash
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        return {
+            'sent': False,
+            'error': f'Cannot recall identity for {destination_hash.hex()}'
+        }
+
+    # Create outbound destination
+    destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery"
+    )
+
+    # Create LXMF message with OPPORTUNISTIC method
+    message = LXMF.LXMessage(
+        destination=destination,
+        source=_lxmf_destination,
+        content=content,
+        title=title,
+        fields=fields if fields else None,
+        desired_method=LXMF.LXMessage.OPPORTUNISTIC
+    )
+
+    # Handle outbound
+    _lxmf_router.handle_outbound(message)
+
+    return {
+        'sent': True,
+        'message_hash': bytes_to_hex(message.hash) if message.hash else None,
+        'method': 'opportunistic'
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -3303,6 +3377,7 @@ COMMANDS = {
     'lxmf_clear_messages': cmd_lxmf_clear_messages,
     'lxmf_announce': cmd_lxmf_announce,
     'lxmf_send_direct': cmd_lxmf_send_direct,
+    'lxmf_send_opportunistic': cmd_lxmf_send_opportunistic,
 }
 
 
