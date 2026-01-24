@@ -26,4 +26,8 @@ dependencies {
     testImplementation("io.kotest:kotest-runner-junit5:$kotestVersion")
     testImplementation("io.kotest:kotest-assertions-core:$kotestVersion")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
+
+    // Interop testing - reuse Python bridge infrastructure from rns-test
+    testImplementation(project(":rns-test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
 }
