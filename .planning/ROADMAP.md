@@ -12,7 +12,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 
 - [x] **Phase 1: Python Bridge Extension** - Add LXMF commands to existing Python bridge
 - [x] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
-- [ ] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
+- [x] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
 - [ ] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
 - [ ] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
 - [ ] **Phase 6: Direct Delivery** - LXMF messages over established Links
@@ -64,9 +64,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 03-01-PLAN.md - File attachment interop tests (bridge extension + AttachmentFieldInteropTest)
-- [ ] 03-02-PLAN.md - Image field interop tests (ImageFieldInteropTest with WebP)
-- [ ] 03-03-PLAN.md - Custom field interop tests (renderer, thread, arbitrary fields)
+- [x] 03-01-PLAN.md - File attachment interop tests (bridge extension + AttachmentFieldInteropTest)
+- [x] 03-02-PLAN.md - Image field interop tests (ImageFieldInteropTest with WebP)
+- [x] 03-03-PLAN.md - Custom field interop tests (renderer, thread, arbitrary fields)
 
 ### Phase 4: LXMF Cryptographic Interop
 **Goal**: LXMF message hash and signature computed identically across implementations
@@ -164,7 +164,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 |-------|----------------|--------|-----------|
 | 1. Python Bridge Extension | 1/1 | ✓ Complete | 2026-01-23 |
 | 2. LXMF Message Round-Trip | 2/2 | ✓ Complete | 2026-01-24 |
-| 3. LXMF Field Interop | 0/3 | Not started | - |
+| 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
 | 4. LXMF Cryptographic Interop | 0/2 | Not started | - |
 | 5. Stamp Interop | 0/1 | Not started | - |
 | 6. Direct Delivery | 0/2 | Not started | - |
