@@ -2709,6 +2709,49 @@ def cmd_lxmf_unpack(params):
     }
 
 
+def serialize_field_value(value):
+    """Recursively serialize field values for JSON transport.
+
+    Binary data is hex-encoded with type annotation.
+    Lists/tuples are recursively serialized.
+    """
+    if isinstance(value, bytes):
+        return {'type': 'bytes', 'hex': value.hex()}
+    elif isinstance(value, (list, tuple)):
+        return {'type': 'list', 'items': [serialize_field_value(v) for v in value]}
+    elif isinstance(value, dict):
+        return {'type': 'dict', 'items': {str(k): serialize_field_value(v) for k, v in value.items()}}
+    elif isinstance(value, int):
+        return {'type': 'int', 'value': value}
+    elif isinstance(value, float):
+        return {'type': 'float', 'value': value}
+    elif isinstance(value, str):
+        return {'type': 'str', 'value': value}
+    else:
+        return {'type': type(value).__name__, 'value': str(value)}
+
+
+def cmd_lxmf_unpack_with_fields(params):
+    """Unpack LXMF message with deep field serialization.
+
+    Like lxmf_unpack but returns fields_hex with all nested binary data hex-encoded.
+    Replaces 'fields' with 'fields_hex' to ensure JSON serializability.
+    """
+    result = cmd_lxmf_unpack(params)
+
+    # Serialize all field values for JSON transport
+    fields = result.get('fields', {})
+    fields_hex = {}
+    if fields:
+        for key, value in fields.items():
+            fields_hex[str(key)] = serialize_field_value(value)
+
+    # Replace fields with serialized version for JSON transport
+    result['fields_hex'] = fields_hex
+    del result['fields']  # Remove raw fields to avoid JSON serialization issues
+    return result
+
+
 def cmd_lxmf_hash(params):
     """Compute LXMF message hash from components.
 
@@ -2892,6 +2935,7 @@ COMMANDS = {
     # LXMF operations
     'lxmf_pack': cmd_lxmf_pack,
     'lxmf_unpack': cmd_lxmf_unpack,
+    'lxmf_unpack_with_fields': cmd_lxmf_unpack_with_fields,
     'lxmf_hash': cmd_lxmf_hash,
     'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
     'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
