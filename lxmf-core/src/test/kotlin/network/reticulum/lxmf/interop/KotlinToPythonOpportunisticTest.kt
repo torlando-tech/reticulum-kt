@@ -6,11 +6,18 @@ import io.kotest.matchers.shouldNotBe
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import network.reticulum.common.DestinationDirection
+import network.reticulum.common.DestinationType
+import network.reticulum.destination.Destination
+import network.reticulum.identity.Identity
+import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMessage
 import network.reticulum.lxmf.MessageState
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -183,6 +190,107 @@ class KotlinToPythonOpportunisticTest : OpportunisticDeliveryTestBase() {
         // Note: callback may or may not fire depending on delivery confirmation
         // mechanism for opportunistic delivery. Log the result.
         println("[Test] Final: received=$received, callbackFired=${callbackFired.get()}, state=${message.state}")
+        Unit
+    }
+
+    @Test
+    @Timeout(60, unit = TimeUnit.SECONDS)
+    fun `batch delivery - multiple messages delivered after single announce`() = runBlocking {
+        clearPythonMessages()
+
+        // Queue multiple messages BEFORE Python announces
+        val messages = listOf(
+            createOpportunisticMessage("Message 1", "Batch Test 1"),
+            createOpportunisticMessage("Message 2", "Batch Test 2"),
+            createOpportunisticMessage("Message 3", "Batch Test 3")
+        )
+
+        val deliveryCount = AtomicInteger(0)
+        messages.forEach { msg ->
+            msg.deliveryCallback = { deliveryCount.incrementAndGet() }
+            kotlinRouter.handleOutbound(msg)
+        }
+
+        delay(2000) // Allow queue processing
+
+        // Note: Since identity is known from setup step 8, opportunistic delivery
+        // sends immediately via broadcast. Messages should already be sent.
+        // Python may have received them already.
+
+        // Check if messages already received (identity was known)
+        val initialMessages = getPythonMessages()
+        println("[Test] Initial message count: ${initialMessages.size}")
+
+        if (initialMessages.size < 3) {
+            // If not all received yet, trigger announce for path optimization
+            triggerPythonAnnounce()
+
+            // Wait for all messages
+            val allDelivered = withTimeoutOrNull(30.seconds) {
+                while (getPythonMessages().size < 3) {
+                    delay(200)
+                }
+                true
+            } ?: false
+
+            allDelivered shouldBe true
+        }
+
+        val pythonMessages = getPythonMessages()
+        pythonMessages.size shouldBe 3
+
+        // Verify content (order may vary due to async processing)
+        val contents = pythonMessages.map { it.content }.toSet()
+        contents shouldContain "Message 1"
+        contents shouldContain "Message 2"
+        contents shouldContain "Message 3"
+        Unit
+    }
+
+    @Test
+    @Timeout(120, unit = TimeUnit.SECONDS)  // Long timeout for failure scenario
+    fun `delivery failure after max attempts triggers callback`() = runBlocking {
+        // Create message to a destination that will never respond
+        // We create a fake identity/destination that doesn't exist
+        val fakeIdentity = Identity.create()
+        val fakeDest = Destination.create(
+            identity = fakeIdentity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val message = LXMessage.create(
+            destination = fakeDest,
+            source = kotlinDestination,
+            content = "This should fail",
+            title = "Failure Test",
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC
+        )
+
+        val failedFired = AtomicBoolean(false)
+        message.failedCallback = { failedFired.set(true) }
+
+        kotlinRouter.handleOutbound(message)
+
+        // Wait for failure (5 attempts * ~10s each + path request waits)
+        // This could take up to 50+ seconds per CONTEXT.md
+        val failed = withTimeoutOrNull(90.seconds) {
+            while (!failedFired.get() && message.state != MessageState.FAILED) {
+                delay(1000)
+            }
+            true
+        } ?: false
+
+        // Verify failure
+        if (!failed) {
+            println("[Test] Timeout waiting for failure, state=${message.state}, attempts=${message.deliveryAttempts}")
+        }
+
+        // Either callback fired or state is FAILED
+        val failureDetected = failedFired.get() || message.state == MessageState.FAILED
+        failureDetected shouldBe true
         Unit
     }
 }
