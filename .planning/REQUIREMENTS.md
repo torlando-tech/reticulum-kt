@@ -14,8 +14,8 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 - [x] **LXMF-03**: FIELD_FILE_ATTACHMENTS survives Kotlin<->Python round-trip
 - [x] **LXMF-04**: FIELD_IMAGE survives Kotlin<->Python round-trip
 - [x] **LXMF-05**: Custom fields (renderer, thread ID, etc.) survive round-trip
-- [ ] **LXMF-06**: Message hash computed identically in Kotlin and Python
-- [ ] **LXMF-07**: Message signature validates across implementations
+- [x] **LXMF-06**: Message hash computed identically in Kotlin and Python
+- [x] **LXMF-07**: Message signature validates across implementations
 
 ### Stamp/Ticket Interop
 
@@ -76,8 +76,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LXMF-03 | Phase 3 | Complete |
 | LXMF-04 | Phase 3 | Complete |
 | LXMF-05 | Phase 3 | Complete |
-| LXMF-06 | Phase 4 | Pending |
-| LXMF-07 | Phase 4 | Pending |
+| LXMF-06 | Phase 4 | Complete |
+| LXMF-07 | Phase 4 | Complete |
 | STAMP-01 | Phase 5 | Pending |
 | STAMP-02 | Phase 5 | Pending |
 | STAMP-03 | Phase 5 | Pending |

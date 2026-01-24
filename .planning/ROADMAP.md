@@ -13,7 +13,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 1: Python Bridge Extension** - Add LXMF commands to existing Python bridge
 - [x] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
 - [x] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
-- [ ] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
+- [x] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
 - [ ] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
 - [ ] **Phase 6: Direct Delivery** - LXMF messages over established Links
 - [ ] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
@@ -80,8 +80,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md - Message hash interop tests (hash matches Python, idempotency, edge cases)
-- [ ] 04-02-PLAN.md - Message signature interop tests (bidirectional validation, error handling)
+- [x] 04-01-PLAN.md - Message hash interop tests (hash matches Python, idempotency, edge cases)
+- [x] 04-02-PLAN.md - Message signature interop tests (bidirectional validation, error handling)
 
 ### Phase 5: Stamp Interop
 **Goal**: LXMF stamps generated in Kotlin are accepted by Python and vice versa
@@ -165,7 +165,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 1. Python Bridge Extension | 1/1 | ✓ Complete | 2026-01-23 |
 | 2. LXMF Message Round-Trip | 2/2 | ✓ Complete | 2026-01-24 |
 | 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
-| 4. LXMF Cryptographic Interop | 0/2 | Not started | - |
+| 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 5. Stamp Interop | 0/1 | Not started | - |
 | 6. Direct Delivery | 0/2 | Not started | - |
 | 7. Opportunistic Delivery | 0/1 | Not started | - |
