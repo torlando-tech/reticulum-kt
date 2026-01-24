@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 7 - Opportunistic Delivery COMPLETE. Ready for Phase 8: Propagated Delivery.
+**Current focus:** Phase 8 - Propagated Delivery (Plan 01 complete)
 
 ## Current Position
 
-Phase: 7 of 9 (Opportunistic Delivery) - COMPLETE
-Plan: 3 of 3 in current phase (COMPLETE)
-Status: Phase verified and complete
-Last activity: 2026-01-24 - Phase 7 verified (4/4 must-haves passed)
+Phase: 8 of 9 (Propagated Delivery)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-01-24 - Completed 08-01-PLAN.md (Propagated Delivery Foundation)
 
-Progress: [████████░░] ~78%
+Progress: [████████░░] ~80%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 16
-- Average duration: 5.5 min
-- Total execution time: 100 min
+- Total plans completed: 17
+- Average duration: 5.6 min
+- Total execution time: 106 min
 
 **By Phase:**
 
@@ -34,10 +34,11 @@ Progress: [████████░░] ~78%
 | 05-stamp-interop | 2 | 8 min | 4 min |
 | 06-direct-delivery | 3 | 36 min | 12 min |
 | 07-opportunistic-delivery | 3 | 16 min | 5.3 min |
+| 08-propagated-delivery | 1 | 6 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 21, 4, 5, 7, 4 min
-- Trend: Consistent fast execution for Phase 7 plans
+- Last 5 plans: 4, 5, 7, 4, 6 min
+- Trend: Consistent fast execution
 
 *Updated after each plan completion*
 
@@ -77,6 +78,9 @@ Recent decisions affecting current work:
 - Opportunistic delivery sends immediately via broadcast when identity known (no queueing)
 - Announce provides path optimization, not delivery enablement for opportunistic
 - Use registerDeliveryCallback for incoming message handling in LXMRouter
+- Use stamp_cost=8 for fast tests (lower than production default of 16)
+- PropagatedDeliveryTestBase extends DirectDeliveryTestBase for code reuse
+- Use WORKBLOCK_EXPAND_ROUNDS_PN (1000) for propagation stamps
 
 ### Pending Todos
 
@@ -89,5 +93,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Phase 7 complete and verified - ready for Phase 8 (Propagated Delivery)
+Stopped at: Completed 08-01-PLAN.md - ready for 08-02-PLAN.md (Extended Propagation Tests)
 Resume file: None
