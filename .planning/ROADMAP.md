@@ -107,11 +107,12 @@ Plans:
   2. Python client can send LXMessage to Kotlin client over Link
   3. Message content and fields preserved end-to-end
   4. Delivery receipts/confirmations work bidirectionally
-**Plans**: 2 plans
+**Plans**: 3 plans
 
 Plans:
-- [ ] 06-01-PLAN.md - Test infrastructure with live Reticulum instances
-- [ ] 06-02-PLAN.md - Bidirectional direct delivery tests
+- [x] 06-01-PLAN.md - Test infrastructure with live Reticulum instances
+- [x] 06-02-PLAN.md - Bidirectional direct delivery tests
+- [ ] 06-03-PLAN.md - Gap closure: delivery callbacks and field preservation (gap_closure)
 
 ### Phase 7: Opportunistic Delivery
 **Goal**: LXMF messages delivered via OPPORTUNISTIC method when path available
@@ -168,7 +169,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
 | 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
-| 6. Direct Delivery | 0/2 | Planned | - |
+| 6. Direct Delivery | 2/3 | In Progress (gap closure) | - |
 | 7. Opportunistic Delivery | 0/1 | Not started | - |
 | 8. Propagated Delivery | 0/1 | Not started | - |
 | 9. Resource Transfer | 0/2 | Not started | - |
