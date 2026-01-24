@@ -17,6 +17,23 @@ import sys
 import os
 import json
 import traceback
+import multiprocessing
+
+# Patch multiprocessing.set_start_method to be no-op after first call
+# This is needed because LXMF.LXStamper calls it without force=True,
+# which fails on Python 3.14+ if context is already set
+_original_set_start_method = multiprocessing.set_start_method
+_start_method_set = False
+
+def _patched_set_start_method(method, force=False):
+    global _start_method_set
+    if _start_method_set and not force:
+        return  # Silently ignore if already set
+    _original_set_start_method(method, force=True)
+    _start_method_set = True
+
+multiprocessing.set_start_method = _patched_set_start_method
+multiprocessing.set_start_method("fork")  # Pre-set to fork
 
 # Add RNS Cryptography to path directly (bypass RNS __init__.py)
 rns_path = os.environ.get('PYTHON_RNS_PATH', '../../../Reticulum')
@@ -2850,23 +2867,36 @@ _lxmf_router = None
 _lxmf_identity = None
 _lxmf_destination = None
 _received_messages = []
+_rns_module = None  # Cached RNS module
 
 
 def _get_full_rns():
     """Import full RNS module for networking.
 
-    This replaces the fake RNS module we set up earlier for crypto-only testing.
+    Returns the cached RNS module, or imports it if not already done.
+    IMPORTANT: This clears ALL RNS-related modules and reimports cleanly.
     """
+    global _rns_module
+
+    if _rns_module is not None:
+        return _rns_module
+
     import importlib
     import sys
 
-    # Remove fake RNS modules
-    modules_to_remove = [k for k in sys.modules.keys() if k.startswith('RNS')]
+    # Remove ALL RNS-related modules to get a clean slate
+    # This includes fake modules (RNS_HMAC, etc.) and any partial imports
+    modules_to_remove = [k for k in list(sys.modules.keys())
+                         if k.startswith('RNS') or k.startswith('LXMF')]
     for mod in modules_to_remove:
-        del sys.modules[mod]
+        try:
+            del sys.modules[mod]
+        except KeyError:
+            pass
 
-    # Import real RNS
+    # Import real RNS fresh
     import RNS
+    _rns_module = RNS
     return RNS
 
 
@@ -2894,10 +2924,14 @@ def cmd_rns_start(params):
     # Get full RNS
     RNS = _get_full_rns()
 
-    # Start Reticulum with transport enabled
+    # Suppress RNS logging to avoid polluting JSON output on stdout
+    # RNS logs go to stdout by default which breaks the bridge protocol
+    RNS.loglevel = RNS.LOG_CRITICAL
+
+    # Start Reticulum with transport enabled (minimal logging)
     _rns_instance = RNS.Reticulum(
         configdir=config_path,
-        loglevel=RNS.LOG_DEBUG
+        loglevel=RNS.LOG_CRITICAL  # Only log critical errors
     )
 
     # Create TCP server interface using configuration dict

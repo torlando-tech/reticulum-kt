@@ -99,15 +99,19 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
         kotlinRouter.start()
         println("  [Setup] Kotlin LXMF router started, dest_hash: ${kotlinDestination.hexHash}")
 
-        // 7. Wait for connection to establish
+        // 7. Wait for TCP connection to establish
         println("  [Setup] Waiting for TCP connection to establish...")
-        Thread.sleep(500)
+        val connectionDeadline = System.currentTimeMillis() + 10000 // 10 second timeout
+        while (System.currentTimeMillis() < connectionDeadline) {
+            if (kotlinTcpClient!!.online.get()) {
+                println("  [Setup] TCP connection established successfully")
+                break
+            }
+            Thread.sleep(100)
+        }
 
-        // Verify connection
-        if (kotlinTcpClient!!.online.get()) {
-            println("  [Setup] TCP connection established successfully")
-        } else {
-            println("  [Setup] WARNING: TCP connection may not be fully established")
+        if (!kotlinTcpClient!!.online.get()) {
+            println("  [Setup] WARNING: TCP connection not established within timeout")
         }
     }
 
