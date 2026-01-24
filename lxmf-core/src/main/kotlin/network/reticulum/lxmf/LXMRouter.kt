@@ -52,8 +52,8 @@ class LXMRouter(
         /** Wait time for path discovery in milliseconds */
         const val PATH_REQUEST_WAIT = 7000L
 
-        /** Pathless delivery attempts before requesting path */
-        const val PATHLESS_DELIVERY_ATTEMPTS = 3
+        /** Maximum pathless delivery attempts before requesting path */
+        const val MAX_PATHLESS_TRIES = 1
 
         /** Message expiry time in milliseconds (30 days) */
         const val MESSAGE_EXPIRY = 30L * 24 * 60 * 60 * 1000
