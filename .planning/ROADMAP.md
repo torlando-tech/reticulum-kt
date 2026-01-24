@@ -92,10 +92,11 @@ Plans:
   2. Stamp generated in Python validates in Kotlin
   3. Difficulty calculation matches between implementations for same message
   4. Invalid stamps (wrong difficulty, corrupted) rejected by both implementations
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 05-01: Stamp generation and validation interop tests
+- [ ] 05-01-PLAN.md - Core stamp interop (workblock, K->P, P->K, difficulty levels)
+- [ ] 05-02-PLAN.md - Edge cases and invalid stamp rejection
 
 ### Phase 6: Direct Delivery
 **Goal**: LXMF messages delivered via DIRECT method over established Links
@@ -166,7 +167,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 2. LXMF Message Round-Trip | 2/2 | ✓ Complete | 2026-01-24 |
 | 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
 | 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
-| 5. Stamp Interop | 0/1 | Not started | - |
+| 5. Stamp Interop | 0/2 | Not started | - |
 | 6. Direct Delivery | 0/2 | Not started | - |
 | 7. Opportunistic Delivery | 0/1 | Not started | - |
 | 8. Propagated Delivery | 0/1 | Not started | - |
