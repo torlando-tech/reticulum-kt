@@ -18,6 +18,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 6: Direct Delivery** - LXMF messages over established Links
 - [x] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
 - [ ] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
+- [ ] **Phase 8.1: TCP Interface Interop** - Fix TCP transport between Kotlin and Python RNS (INSERTED)
 - [ ] **Phase 9: Resource Transfer** - Large LXMF messages as Resources
 
 ## Phase Details
@@ -143,7 +144,24 @@ Plans:
 
 Plans:
 - [x] 08-01-PLAN.md - Bridge commands + PropagatedDeliveryTestBase + E2E tests
-- [ ] 08-02-PLAN.md - Gap closure: addPropagationNode method for proper node registration
+- [x] 08-02-PLAN.md - Gap closure: addPropagationNode method for proper node registration
+
+### Phase 8.1: TCP Interface Interop (INSERTED)
+**Goal**: Fix TCP transport between Kotlin TCPClientInterface and Python RNS TCPServerInterface so E2E delivery tests don't need flexible assertions
+**Depends on**: Phase 8
+**Requirements**: Enables proper verification of E2E-01, E2E-02, E2E-03, E2E-04
+**Success Criteria** (what must be TRUE):
+  1. Kotlin TCPClientInterface maintains stable connection to Python RNS TCPServerInterface
+  2. Packets sent from Kotlin are received correctly by Python (no drops after transmission)
+  3. Packets sent from Python are received correctly by Kotlin
+  4. Direct delivery tests pass with strict assertions (DELIVERED state, not just OUTBOUND)
+  5. Propagated delivery tests can verify actual message submission/retrieval
+**Plans**: 3 plans
+
+Plans:
+- [ ] 08.1-01-PLAN.md - Diagnostic logging + minimal Python TCP interop test
+- [ ] 08.1-02-PLAN.md - Socket options alignment and write safeguards
+- [ ] 08.1-03-PLAN.md - Tighten E2E test assertions (strict DELIVERED state)
 
 ### Phase 9: Resource Transfer
 **Goal**: Large LXMF messages (>500 bytes) transfer correctly as Resources
@@ -163,7 +181,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 8.1 -> 9
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -174,7 +192,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 6. Direct Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 7. Opportunistic Delivery | 3/3 | ✓ Complete | 2026-01-24 |
-| 8. Propagated Delivery | 0/1 | Not started | - |
+| 8. Propagated Delivery | 2/2 | ⚠ Gaps found | - |
+| 8.1 TCP Interface Interop | 0/3 | Planned | - |
 | 9. Resource Transfer | 0/2 | Not started | - |
 
 ---
