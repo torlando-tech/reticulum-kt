@@ -15,7 +15,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
 - [x] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
 - [x] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
-- [ ] **Phase 6: Direct Delivery** - LXMF messages over established Links
+- [x] **Phase 6: Direct Delivery** - LXMF messages over established Links
 - [ ] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
 - [ ] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
 - [ ] **Phase 9: Resource Transfer** - Large LXMF messages as Resources
@@ -112,7 +112,7 @@ Plans:
 Plans:
 - [x] 06-01-PLAN.md - Test infrastructure with live Reticulum instances
 - [x] 06-02-PLAN.md - Bidirectional direct delivery tests
-- [ ] 06-03-PLAN.md - Gap closure: delivery callbacks and field preservation (gap_closure)
+- [x] 06-03-PLAN.md - Gap closure: delivery callbacks and field preservation (gap_closure)
 
 ### Phase 7: Opportunistic Delivery
 **Goal**: LXMF messages delivered via OPPORTUNISTIC method when path available
@@ -169,7 +169,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
 | 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
-| 6. Direct Delivery | 2/3 | In Progress (gap closure) | - |
+| 6. Direct Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 7. Opportunistic Delivery | 0/1 | Not started | - |
 | 8. Propagated Delivery | 0/1 | Not started | - |
 | 9. Resource Transfer | 0/2 | Not started | - |
