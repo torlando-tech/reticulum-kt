@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 6 - Direct Delivery complete with gap closure. Ready for propagation delivery.
+**Current focus:** Phase 7 - Opportunistic Delivery alignment with Python LXMF
 
 ## Current Position
 
-Phase: 6 of 9 (Direct Delivery)
-Plan: 3 of 3 in current phase (COMPLETE)
-Status: Phase complete
-Last activity: 2026-01-24 - Completed 06-03-PLAN.md (Gap Closure - Callbacks and Fields)
+Phase: 7 of 9 (Opportunistic Delivery)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-01-24 - Completed 07-01-PLAN.md (Opportunistic Delivery Constants)
 
-Progress: [███████░░░] ~68%
+Progress: [███████░░░] ~72%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 13
-- Average duration: 6.0 min
-- Total execution time: 84 min
+- Total plans completed: 14
+- Average duration: 5.8 min
+- Total execution time: 89 min
 
 **By Phase:**
 
@@ -33,10 +33,11 @@ Progress: [███████░░░] ~68%
 | 04-lxmf-cryptographic-interop | 2 | 7 min | 3.5 min |
 | 05-stamp-interop | 2 | 8 min | 4 min |
 | 06-direct-delivery | 3 | 36 min | 12 min |
+| 07-opportunistic-delivery | 1 | 5 min | 5 min |
 
 **Recent Trend:**
-- Last 5 plans: 5, 3, 11, 21, 4 min
-- Trend: Gap closure plan was fast (4 min) - well-scoped test additions
+- Last 5 plans: 3, 11, 21, 4, 5 min
+- Trend: Constants alignment plan was fast (5 min) - well-scoped refactoring
 
 *Updated after each plan completion*
 
@@ -70,6 +71,8 @@ Recent decisions affecting current work:
 - Use AtomicBoolean for callback tracking in async test scenarios
 - Accept SENT or DELIVERED as valid final states (delivery confirmation timing varies)
 - Parse fields from Python bridge with hex decoding for binary values
+- Use Transport.expirePath() for path removal (equivalent to Python's drop_path)
+- Match Python's 0.5s delay before requesting new path during rediscovery
 
 ### Pending Todos
 
@@ -82,5 +85,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 06-03-PLAN.md (Gap Closure - Callbacks and Fields) - Phase 6 complete
+Stopped at: Completed 07-01-PLAN.md (Opportunistic Delivery Constants)
 Resume file: None
