@@ -19,9 +19,9 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 ### Stamp/Ticket Interop
 
-- [ ] **STAMP-01**: Kotlin-generated stamp accepted by Python propagation node
-- [ ] **STAMP-02**: Python-generated stamp validates in Kotlin
-- [ ] **STAMP-03**: Stamp difficulty level matches Python computation
+- [x] **STAMP-01**: Kotlin-generated stamp accepted by Python propagation node
+- [x] **STAMP-02**: Python-generated stamp validates in Kotlin
+- [x] **STAMP-03**: Stamp difficulty level matches Python computation
 
 ### End-to-End Delivery
 
@@ -78,9 +78,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LXMF-05 | Phase 3 | Complete |
 | LXMF-06 | Phase 4 | Complete |
 | LXMF-07 | Phase 4 | Complete |
-| STAMP-01 | Phase 5 | Pending |
-| STAMP-02 | Phase 5 | Pending |
-| STAMP-03 | Phase 5 | Pending |
+| STAMP-01 | Phase 5 | Complete |
+| STAMP-02 | Phase 5 | Complete |
+| STAMP-03 | Phase 5 | Complete |
 | E2E-01 | Phase 6 | Pending |
 | E2E-02 | Phase 6 | Pending |
 | E2E-03 | Phase 7 | Pending |

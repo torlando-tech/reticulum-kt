@@ -14,7 +14,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
 - [x] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
 - [x] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
-- [ ] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
+- [x] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
 - [ ] **Phase 6: Direct Delivery** - LXMF messages over established Links
 - [ ] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
 - [ ] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
@@ -95,8 +95,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 05-01-PLAN.md - Core stamp interop (workblock, K->P, P->K, difficulty levels)
-- [ ] 05-02-PLAN.md - Edge cases and invalid stamp rejection
+- [x] 05-01-PLAN.md - Core stamp interop (workblock, K->P, P->K, difficulty levels)
+- [x] 05-02-PLAN.md - Edge cases and invalid stamp rejection
 
 ### Phase 6: Direct Delivery
 **Goal**: LXMF messages delivered via DIRECT method over established Links
@@ -167,7 +167,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | 2. LXMF Message Round-Trip | 2/2 | ✓ Complete | 2026-01-24 |
 | 3. LXMF Field Interop | 3/3 | ✓ Complete | 2026-01-24 |
 | 4. LXMF Cryptographic Interop | 2/2 | ✓ Complete | 2026-01-24 |
-| 5. Stamp Interop | 0/2 | Not started | - |
+| 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 6. Direct Delivery | 0/2 | Not started | - |
 | 7. Opportunistic Delivery | 0/1 | Not started | - |
 | 8. Propagated Delivery | 0/1 | Not started | - |
