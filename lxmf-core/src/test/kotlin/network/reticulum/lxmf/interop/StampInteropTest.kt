@@ -497,4 +497,180 @@ class StampInteropTest : LXMFInteropTestBase() {
             println("  SUCCESS: Over-qualified stamp validates at lower cost")
         }
     }
+
+    @Nested
+    @DisplayName("InvalidStampRejection")
+    inner class InvalidStampRejection {
+
+        @Test
+        fun `wrong difficulty rejected by both implementations`() {
+            println("\n=== Test: wrong difficulty rejected by both implementations ===")
+
+            // Generate 4-bit stamp, try to validate as 8-bit
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+
+            println("  Generating 4-bit stamp...")
+            val stamp = runBlocking { LXStamper.generateStamp(workblock, 4) }.stamp!!
+
+            println("  Validating as 8-bit (should fail)...")
+
+            // Kotlin rejects
+            val kotlinValid = LXStamper.isStampValid(stamp, 8, workblock)
+            println("  [Kotlin] isStampValid at cost=8: $kotlinValid")
+            kotlinValid shouldBe false
+
+            // Python also rejects
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to stamp.toHex(),
+                "target_cost" to 8,
+                "workblock" to workblock.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid at cost=8: $pythonValid")
+            pythonValid shouldBe false
+
+            println("  SUCCESS: Both implementations reject under-qualified stamp")
+        }
+
+        @Test
+        fun `corrupted stamp rejected by both implementations`() {
+            println("\n=== Test: corrupted stamp rejected by both implementations ===")
+
+            // Generate valid stamp, corrupt one byte
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+
+            println("  Generating valid 4-bit stamp...")
+            val validStamp = runBlocking { LXStamper.generateStamp(workblock, 4) }.stamp!!
+            val originalValue = LXStamper.stampValue(workblock, validStamp)
+            println("  Original stamp value: $originalValue")
+
+            val corruptedStamp = validStamp.copyOf()
+            corruptedStamp[0] = (corruptedStamp[0].toInt() xor 0xFF).toByte()
+            val corruptedValue = LXStamper.stampValue(workblock, corruptedStamp)
+            println("  Corrupted stamp (byte 0 XOR 0xFF), new value: $corruptedValue")
+
+            // Kotlin rejects
+            val kotlinValid = LXStamper.isStampValid(corruptedStamp, 4, workblock)
+            println("  [Kotlin] isStampValid: $kotlinValid")
+            kotlinValid shouldBe false
+
+            // Python also rejects
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to corruptedStamp.toHex(),
+                "target_cost" to 4,
+                "workblock" to workblock.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid: $pythonValid")
+            pythonValid shouldBe false
+
+            println("  SUCCESS: Both implementations reject corrupted stamp")
+        }
+
+        @Test
+        fun `wrong workblock (message hash) rejected by both implementations`() {
+            println("\n=== Test: wrong workblock (message hash) rejected by both ===")
+
+            // Generate stamp for message A, validate against workblock for message B
+            val messageIdA = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val messageIdB = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblockA = LXStamper.generateWorkblock(messageIdA, 25)
+            val workblockB = LXStamper.generateWorkblock(messageIdB, 25)
+
+            println("  Message A: ${messageIdA.toHex().take(16)}...")
+            println("  Message B: ${messageIdB.toHex().take(16)}...")
+
+            println("  Generating stamp for message A...")
+            val stampForA = runBlocking { LXStamper.generateStamp(workblockA, 4) }.stamp!!
+            val valueOnA = LXStamper.stampValue(workblockA, stampForA)
+            val valueOnB = LXStamper.stampValue(workblockB, stampForA)
+            println("  Stamp value on workblock A: $valueOnA")
+            println("  Stamp value on workblock B: $valueOnB")
+
+            // Kotlin rejects with wrong workblock
+            val kotlinValid = LXStamper.isStampValid(stampForA, 4, workblockB)
+            println("  [Kotlin] isStampValid with wrong workblock: $kotlinValid")
+            kotlinValid shouldBe false
+
+            // Python also rejects with wrong workblock
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to stampForA.toHex(),
+                "target_cost" to 4,
+                "workblock" to workblockB.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid with wrong workblock: $pythonValid")
+            pythonValid shouldBe false
+
+            println("  SUCCESS: Both reject stamp validated against wrong workblock")
+        }
+
+        @Test
+        fun `truncated stamp rejected by Kotlin`() {
+            println("\n=== Test: truncated stamp rejected by Kotlin ===")
+
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val truncatedStamp = ByteArray(16) // Should be 32
+
+            println("  Stamp size: ${truncatedStamp.size} bytes (expected: 32)")
+
+            // validateStamp checks size first
+            val valid = LXStamper.validateStamp(truncatedStamp, messageId, 4, 25)
+            println("  [Kotlin] validateStamp: $valid")
+            valid shouldBe false
+
+            println("  SUCCESS: Truncated stamp rejected")
+        }
+
+        @Test
+        fun `empty stamp rejected by Kotlin`() {
+            println("\n=== Test: empty stamp rejected by Kotlin ===")
+
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val emptyStamp = ByteArray(0)
+
+            println("  Stamp size: ${emptyStamp.size} bytes")
+
+            val valid = LXStamper.validateStamp(emptyStamp, messageId, 4, 25)
+            println("  [Kotlin] validateStamp: $valid")
+            valid shouldBe false
+
+            println("  SUCCESS: Empty stamp rejected")
+        }
+
+        @Test
+        fun `random bytes rejected as stamp by both implementations`() {
+            println("\n=== Test: random bytes rejected as stamp by both ===")
+
+            val messageId = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val workblock = LXStamper.generateWorkblock(messageId, 25)
+            val randomBytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+
+            val value = LXStamper.stampValue(workblock, randomBytes)
+            println("  Random bytes stamp value: $value (need >=8 to pass)")
+
+            // Random bytes very unlikely to be valid at cost >= 1
+            // (probability 2^-cost that random bytes pass)
+            val kotlinValid = LXStamper.isStampValid(randomBytes, 8, workblock)
+            println("  [Kotlin] isStampValid at cost=8: $kotlinValid")
+            kotlinValid shouldBe false
+
+            val pythonResult = python(
+                "lxmf_stamp_valid",
+                "stamp" to randomBytes.toHex(),
+                "target_cost" to 8,
+                "workblock" to workblock.toHex()
+            )
+            val pythonValid = pythonResult.getBoolean("valid")
+            println("  [Python] valid at cost=8: $pythonValid")
+            pythonValid shouldBe false
+
+            println("  SUCCESS: Random bytes rejected as stamp by both implementations")
+        }
+    }
 }
