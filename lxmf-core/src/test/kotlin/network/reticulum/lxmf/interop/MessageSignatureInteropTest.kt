@@ -1,10 +1,16 @@
 package network.reticulum.lxmf.interop
 
 import io.kotest.matchers.shouldBe
+import network.reticulum.common.DestinationDirection
+import network.reticulum.common.DestinationType
+import network.reticulum.destination.Destination
+import network.reticulum.identity.Identity
 import network.reticulum.interop.getBoolean
 import network.reticulum.interop.getBytes
 import network.reticulum.interop.toHex
 import network.reticulum.lxmf.LXMFConstants
+import network.reticulum.lxmf.LXMessage
+import network.reticulum.lxmf.UnverifiedReason
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -282,6 +288,174 @@ class MessageSignatureInteropTest : LXMFInteropTestBase() {
             val valid = testSourceIdentity.validate(signature, signedPart)
             valid shouldBe true
             println("  SUCCESS: Kotlin validated Python signature with fields")
+        }
+    }
+
+    @Nested
+    @DisplayName("Edge Cases")
+    inner class EdgeCases {
+
+        @Test
+        @DisplayName("Empty content message signature validates")
+        fun `empty content message signature validates`() {
+            println("\n=== Test: Empty content message signature validates ===")
+
+            // Create message with empty content
+            val message = createTestMessage(content = "", title = "")
+            val packed = message.pack()
+
+            println("  [Kotlin] Empty message packed, size=${packed.size} bytes")
+
+            // Reconstruct signed_part
+            val headerSize = 2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH
+            val payloadBytes = packed.copyOfRange(headerSize, packed.size)
+            val hashedPart = message.destinationHash + message.sourceHash + payloadBytes
+            val signedPart = hashedPart + message.hash!!
+
+            // Verify in Python
+            val pyResult = python(
+                "identity_verify",
+                "public_key" to testSourceIdentity.getPublicKey(),
+                "message" to signedPart,
+                "signature" to message.signature!!
+            )
+
+            pyResult.getBoolean("valid") shouldBe true
+            println("  SUCCESS: Empty content message signature validates in Python")
+        }
+
+        @Test
+        @DisplayName("Unicode content message signature validates")
+        fun `Unicode content message signature validates`() {
+            println("\n=== Test: Unicode content message signature validates ===")
+
+            // Create message with emoji and CJK characters
+            val unicodeContent = "Hello \uD83D\uDE80 World \u4E2D\u6587 \u0420\u0443\u0441\u0441\u043A\u0438\u0439"
+            val unicodeTitle = "\u2764\uFE0F \uD83D\uDC99 \uD83D\uDC9A"
+
+            val message = createTestMessage(content = unicodeContent, title = unicodeTitle)
+            val packed = message.pack()
+
+            println("  [Kotlin] Unicode message packed, size=${packed.size} bytes")
+            println("  [Kotlin] Content: $unicodeContent")
+            println("  [Kotlin] Title: $unicodeTitle")
+
+            // Reconstruct signed_part
+            val headerSize = 2 * LXMFConstants.DESTINATION_LENGTH + LXMFConstants.SIGNATURE_LENGTH
+            val payloadBytes = packed.copyOfRange(headerSize, packed.size)
+            val hashedPart = message.destinationHash + message.sourceHash + payloadBytes
+            val signedPart = hashedPart + message.hash!!
+
+            // Verify in Python
+            val pyResult = python(
+                "identity_verify",
+                "public_key" to testSourceIdentity.getPublicKey(),
+                "message" to signedPart,
+                "signature" to message.signature!!
+            )
+
+            pyResult.getBoolean("valid") shouldBe true
+            println("  SUCCESS: Unicode content message signature validates in Python")
+        }
+
+        @Test
+        @DisplayName("Signature length is always 64 bytes")
+        fun `signature length is always 64 bytes`() {
+            println("\n=== Test: Signature length is always 64 bytes ===")
+
+            // Test multiple messages to ensure consistent signature length
+            val messages = listOf(
+                createTestMessage(content = ""),
+                createTestMessage(content = "Short"),
+                createTestMessage(content = "A".repeat(1000)),
+                createTestMessage(content = "Unicode \uD83D\uDE00", title = "\u4E2D\u6587")
+            )
+
+            for ((index, message) in messages.withIndex()) {
+                message.pack()
+                val signatureLength = message.signature?.size ?: 0
+                println("  [Message $index] Signature length: $signatureLength bytes")
+                signatureLength shouldBe 64
+            }
+
+            println("  SUCCESS: All signatures are exactly 64 bytes (Ed25519)")
+        }
+    }
+
+    @Nested
+    @DisplayName("Error Handling")
+    inner class ErrorHandling {
+
+        @Test
+        @DisplayName("Missing source identity causes SOURCE_UNKNOWN")
+        fun `missing source identity causes SOURCE_UNKNOWN`() {
+            println("\n=== Test: Missing source identity causes SOURCE_UNKNOWN ===")
+
+            // Create a fresh identity that is NOT remembered in the cache
+            val freshSourceIdentity = Identity.create()
+            val freshSourceDest = Destination.create(
+                identity = freshSourceIdentity,
+                direction = DestinationDirection.IN,
+                type = DestinationType.SINGLE,
+                appName = LXMFConstants.APP_NAME,
+                "delivery"
+            )
+
+            // Create message with fresh source (not remembered)
+            val unrememberedMessage = LXMessage.create(
+                destination = destDestination,
+                source = freshSourceDest,
+                content = "Message from unremembered source"
+            )
+            val unrememberedPacked = unrememberedMessage.pack()
+
+            println("  [Kotlin] Packed message with fresh source, size=${unrememberedPacked.size} bytes")
+            println("  [Kotlin] Fresh source hash: ${freshSourceDest.hash.toHex()}")
+
+            // Clear the fresh identity from cache if it was accidentally added
+            // (The Identity.create() doesn't add to cache, but let's be explicit)
+
+            // Attempt to unpack - should have SOURCE_UNKNOWN because we didn't remember the source
+            val unpacked = LXMessage.unpackFromBytes(unrememberedPacked)
+
+            if (unpacked != null) {
+                println("  [Kotlin] Unpacked message: signatureValidated=${unpacked.signatureValidated}")
+                println("  [Kotlin] Unverified reason: ${unpacked.unverifiedReason}")
+
+                unpacked.signatureValidated shouldBe false
+                unpacked.unverifiedReason shouldBe UnverifiedReason.SOURCE_UNKNOWN
+                println("  SUCCESS: Missing source identity correctly causes SOURCE_UNKNOWN")
+            } else {
+                throw AssertionError("Message unpacking returned null (unexpected)")
+            }
+        }
+
+        @Test
+        @DisplayName("Known source identity validates signature on unpack")
+        fun `known source identity validates signature on unpack`() {
+            println("\n=== Test: Known source identity validates signature on unpack ===")
+
+            // Create and pack a message using remembered source identity
+            // (testSourceIdentity is remembered in LXMFInteropTestBase.setupLXMFFixtures)
+            val message = createTestMessage(content = "Message for unpack validation test")
+            val packed = message.pack()
+
+            println("  [Kotlin] Packed message, size=${packed.size} bytes")
+            println("  [Kotlin] Source hash: ${sourceDestination.hash.toHex()}")
+
+            // Unpack the message - should validate signature because source is known
+            val unpacked = LXMessage.unpackFromBytes(packed)
+
+            if (unpacked != null) {
+                println("  [Kotlin] Unpacked message: signatureValidated=${unpacked.signatureValidated}")
+                println("  [Kotlin] Unverified reason: ${unpacked.unverifiedReason}")
+
+                unpacked.signatureValidated shouldBe true
+                unpacked.unverifiedReason shouldBe null
+                println("  SUCCESS: Known source identity correctly validates signature on unpack")
+            } else {
+                throw AssertionError("Message unpacking returned null (unexpected)")
+            }
         }
     }
 }
