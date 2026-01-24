@@ -13,6 +13,9 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
 
+    // Test dependencies for live networking tests
+    testImplementation(project(":rns-interfaces"))
+
     // MessagePack for serialization (already in rns-core, but explicit)
     implementation("org.msgpack:msgpack-core:0.9.8")
 
