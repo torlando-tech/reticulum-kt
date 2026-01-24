@@ -10,7 +10,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 1: Python Bridge Extension** - Add LXMF commands to existing Python bridge
+- [x] **Phase 1: Python Bridge Extension** - Add LXMF commands to existing Python bridge
 - [ ] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
 - [ ] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
 - [ ] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
@@ -35,7 +35,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 **Plans**: 1 plan
 
 Plans:
-- [ ] 01-01-PLAN.md - Add LXMF commands to Python bridge
+- [x] 01-01-PLAN.md - Add LXMF commands to Python bridge
 
 ### Phase 2: LXMF Message Round-Trip
 **Goal**: Kotlin-packed LXMessage unpacks correctly in Python and vice versa
@@ -162,7 +162,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Python Bridge Extension | 0/1 | Not started | - |
+| 1. Python Bridge Extension | 1/1 | ✓ Complete | 2026-01-23 |
 | 2. LXMF Message Round-Trip | 0/2 | Not started | - |
 | 3. LXMF Field Interop | 0/3 | Not started | - |
 | 4. LXMF Cryptographic Interop | 0/2 | Not started | - |
