@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 4 - LXMF Cryptographic Interop (message hash verification complete)
+**Current focus:** Phase 4 complete - LXMF Cryptographic Interop
 
 ## Current Position
 
 Phase: 4 of 9 (LXMF Cryptographic Interop)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-01-24 - Completed 04-01-PLAN.md (Message Hash Interop)
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-01-24 - Completed 04-02-PLAN.md (Message Signature Interop)
 
-Progress: [████▒░░░░░] ~39%
+Progress: [████▒░░░░░] ~44%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
-- Average duration: 5.7 min
-- Total execution time: 36 min
+- Total plans completed: 8
+- Average duration: 5.4 min
+- Total execution time: 40 min
 
 **By Phase:**
 
@@ -30,10 +30,10 @@ Progress: [████▒░░░░░] ~39%
 | 01-python-bridge-extension | 1 | 8 min | 8 min |
 | 02-lxmf-message-round-trip | 2 | 15 min | 7.5 min |
 | 03-lxmf-field-interop | 3 | 10 min | 3.3 min |
-| 04-lxmf-cryptographic-interop | 1 | 3 min | 3 min |
+| 04-lxmf-cryptographic-interop | 2 | 7 min | 3.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 3, 6, 2, 2, 3 min
+- Last 5 plans: 6, 2, 2, 3, 4 min
 - Trend: Stable/Fast
 
 *Updated after each plan completion*
@@ -53,6 +53,8 @@ Recent decisions affecting current work:
 - Add Map serialization to PythonBridge for fields parameter support
 - Use fields_hex instead of fields in lxmf_unpack_with_fields response (avoids JSON serialization issues)
 - Kotlin strings serialized as msgpack binary (bytes) to match Python LXMF behavior
+- Use testSourceIdentity.getPrivateKey() for Python identity_sign (64-byte full key)
+- Reconstruct signed_part by extracting payload from packed message
 
 ### Pending Todos
 
@@ -60,10 +62,10 @@ None yet.
 
 ### Blockers/Concerns
 
-None - Plan 04-01 complete. Ready for 04-02 (signature interop).
+None - Phase 4 complete. Ready for Phase 5 (LXMF Stamp Verification).
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 04-01-PLAN.md (Message Hash Interop)
+Stopped at: Completed 04-02-PLAN.md (Message Signature Interop)
 Resume file: None
