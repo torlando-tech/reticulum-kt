@@ -474,24 +474,74 @@ class LXMRouter(
 
     /**
      * Process opportunistic message delivery.
+     *
+     * Matches Python LXMF LXMRouter opportunistic outbound handling (lines 2554-2581):
+     * - After MAX_PATHLESS_TRIES attempts without path, request path
+     * - At MAX_PATHLESS_TRIES+1 with path but still failing, rediscover path
+     * - Normal delivery attempt otherwise
      */
     private suspend fun processOpportunisticDelivery(message: LXMessage) {
-        message.deliveryAttempts++
-
+        // Check max delivery attempts FIRST (matching Python's <= check)
         if (message.deliveryAttempts > MAX_DELIVERY_ATTEMPTS) {
+            // Max attempts reached - fail the message
             message.state = MessageState.FAILED
+            message.failedCallback?.invoke(message)
             return
         }
 
-        // Try to send the message
-        val sent = sendOpportunisticMessage(message)
-
-        if (sent) {
-            message.state = MessageState.SENT
-            message.method = DeliveryMethod.OPPORTUNISTIC
-        } else {
-            // Schedule retry
+        val dest = message.destination
+        if (dest == null) {
+            // No destination, can't check path - schedule retry
             message.nextDeliveryAttempt = System.currentTimeMillis() + DELIVERY_RETRY_WAIT
+            return
+        }
+
+        val hasPath = Transport.hasPath(dest.hash)
+
+        when {
+            // After MAX_PATHLESS_TRIES attempts without path, request path
+            // Python: if delivery_attempts >= MAX_PATHLESS_TRIES and not has_path()
+            message.deliveryAttempts >= MAX_PATHLESS_TRIES && !hasPath -> {
+                println("[LXMRouter] Requesting path after ${message.deliveryAttempts} pathless tries for ${message.destinationHash.toHexString()}")
+                message.deliveryAttempts++
+                Transport.requestPath(dest.hash)
+                message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
+                message.progress = 0.01
+            }
+
+            // At MAX_PATHLESS_TRIES+1 with path but still failing, rediscover path
+            // Python: elif delivery_attempts == MAX_PATHLESS_TRIES+1 and has_path()
+            message.deliveryAttempts == MAX_PATHLESS_TRIES + 1 && hasPath -> {
+                println("[LXMRouter] Opportunistic delivery still unsuccessful after ${message.deliveryAttempts} attempts, trying to rediscover path")
+                message.deliveryAttempts++
+                // Drop existing path and re-request (Python does this via Reticulum.drop_path + request_path)
+                Transport.expirePath(dest.hash)
+                // Small delay then request new path (matching Python's 0.5s sleep in thread)
+                processingScope?.launch {
+                    delay(500)
+                    Transport.requestPath(dest.hash)
+                }
+                message.nextDeliveryAttempt = System.currentTimeMillis() + PATH_REQUEST_WAIT
+                message.progress = 0.01
+            }
+
+            // Normal delivery attempt
+            // Python: else: if time.time() > next_delivery_attempt
+            else -> {
+                val now = System.currentTimeMillis()
+                val nextAttempt = message.nextDeliveryAttempt ?: 0L
+                if (nextAttempt == 0L || now > nextAttempt) {
+                    message.deliveryAttempts++
+                    message.nextDeliveryAttempt = now + DELIVERY_RETRY_WAIT
+                    println("[LXMRouter] Opportunistic delivery attempt ${message.deliveryAttempts} for ${message.destinationHash.toHexString()}")
+
+                    val sent = sendOpportunisticMessage(message)
+                    if (sent) {
+                        message.state = MessageState.SENT
+                        message.method = DeliveryMethod.OPPORTUNISTIC
+                    }
+                }
+            }
         }
     }
 
