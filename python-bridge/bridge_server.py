@@ -2837,6 +2837,275 @@ def cmd_lxmf_stamp_generate(params):
     }
 
 
+# ============================================================================
+# Live Reticulum/LXMF Networking Commands
+# ============================================================================
+# These commands start actual Reticulum instances and LXMF routers for
+# end-to-end interoperability testing. Unlike the crypto-only commands above,
+# these use the full RNS import and manage network state.
+
+# Global state for live networking
+_rns_instance = None
+_lxmf_router = None
+_lxmf_identity = None
+_lxmf_destination = None
+_received_messages = []
+
+
+def _get_full_rns():
+    """Import full RNS module for networking.
+
+    This replaces the fake RNS module we set up earlier for crypto-only testing.
+    """
+    import importlib
+    import sys
+
+    # Remove fake RNS modules
+    modules_to_remove = [k for k in sys.modules.keys() if k.startswith('RNS')]
+    for mod in modules_to_remove:
+        del sys.modules[mod]
+
+    # Import real RNS
+    import RNS
+    return RNS
+
+
+def cmd_rns_start(params):
+    """Start Reticulum with TCP server interface.
+
+    params:
+        tcp_port (int): Port for TCP server interface
+        config_path (str, optional): Config directory path (default: temp dir)
+
+    Returns:
+        identity_hash (hex): Hash of the transport identity
+        ready (bool): True if started successfully
+    """
+    global _rns_instance
+
+    import tempfile
+
+    tcp_port = int(params['tcp_port'])
+    config_path = params.get('config_path')
+
+    if not config_path:
+        config_path = tempfile.mkdtemp(prefix='rns_test_')
+
+    # Get full RNS
+    RNS = _get_full_rns()
+
+    # Start Reticulum with transport enabled
+    _rns_instance = RNS.Reticulum(
+        configdir=config_path,
+        loglevel=RNS.LOG_DEBUG
+    )
+
+    # Create TCP server interface using configuration dict
+    # This matches how RNS loads interfaces from config
+    config = {
+        "name": "TestTCPServer",
+        "listen_ip": "127.0.0.1",
+        "listen_port": tcp_port,
+        "i2p_tunneled": False,
+        "prefer_ipv6": False
+    }
+
+    tcp_interface = RNS.Interfaces.TCPInterface.TCPServerInterface(
+        RNS.Transport,
+        config
+    )
+
+    # Register the interface
+    RNS.Transport.interfaces.append(tcp_interface)
+
+    # Get transport identity hash
+    identity_hash = RNS.Transport.identity.hash if RNS.Transport.identity else b'\x00' * 16
+
+    return {
+        'identity_hash': bytes_to_hex(identity_hash),
+        'ready': 'true',
+        'config_path': config_path
+    }
+
+
+def cmd_rns_stop(params):
+    """Stop Reticulum instance.
+
+    Performs clean shutdown of Transport and interfaces.
+    """
+    global _rns_instance
+
+    RNS = _get_full_rns()
+
+    try:
+        RNS.Transport.exit_handler()
+    except:
+        pass
+
+    _rns_instance = None
+
+    return {
+        'stopped': True
+    }
+
+
+def cmd_lxmf_start_router(params):
+    """Start LXMF router with delivery destination.
+
+    params:
+        identity_hex (str, optional): 64-byte private key hex (X25519 + Ed25519)
+        display_name (str, optional): Display name for announcements
+
+    Returns:
+        identity_hash (hex): Hash of the router identity
+        destination_hash (hex): Hash of the delivery destination
+    """
+    global _lxmf_router, _lxmf_identity, _lxmf_destination, _received_messages
+
+    import tempfile
+
+    identity_hex = params.get('identity_hex')
+    display_name = params.get('display_name')
+
+    RNS = _get_full_rns()
+    import LXMF
+
+    # Create or restore identity
+    if identity_hex:
+        private_key = hex_to_bytes(identity_hex)
+        _lxmf_identity = RNS.Identity.from_bytes(private_key)
+    else:
+        _lxmf_identity = RNS.Identity()
+
+    # Create storage path
+    storage_path = tempfile.mkdtemp(prefix='lxmf_test_')
+
+    # Create LXMF router
+    _lxmf_router = LXMF.LXMRouter(
+        identity=_lxmf_identity,
+        storagepath=storage_path
+    )
+
+    # Register delivery identity
+    _lxmf_destination = _lxmf_router.register_delivery_identity(
+        _lxmf_identity,
+        display_name=display_name
+    )
+
+    # Clear received messages
+    _received_messages = []
+
+    # Set delivery callback
+    def delivery_callback(message):
+        global _received_messages
+        msg_data = {
+            'source_hash': bytes_to_hex(message.source_hash),
+            'destination_hash': bytes_to_hex(message.destination_hash),
+            'content': message.content.decode('utf-8') if isinstance(message.content, bytes) else message.content,
+            'title': message.title.decode('utf-8') if isinstance(message.title, bytes) else message.title,
+            'timestamp': message.timestamp,
+            'fields': {}
+        }
+        if hasattr(message, 'hash') and message.hash:
+            msg_data['hash'] = bytes_to_hex(message.hash)
+        if hasattr(message, 'fields') and message.fields:
+            for k, v in message.fields.items():
+                if isinstance(v, bytes):
+                    msg_data['fields'][str(k)] = bytes_to_hex(v)
+                else:
+                    msg_data['fields'][str(k)] = v
+        _received_messages.append(msg_data)
+
+    _lxmf_router.register_delivery_callback(delivery_callback)
+
+    return {
+        'identity_hash': bytes_to_hex(_lxmf_identity.hash),
+        'destination_hash': bytes_to_hex(_lxmf_destination.hash)
+    }
+
+
+def cmd_lxmf_get_messages(params):
+    """Get received LXMF messages.
+
+    Returns list of received messages with decoded content.
+    """
+    global _received_messages
+
+    return {
+        'messages': _received_messages,
+        'count': len(_received_messages)
+    }
+
+
+def cmd_lxmf_clear_messages(params):
+    """Clear received messages list."""
+    global _received_messages
+    _received_messages = []
+
+    return {
+        'cleared': True
+    }
+
+
+def cmd_lxmf_send_direct(params):
+    """Send LXMF message via DIRECT delivery.
+
+    params:
+        destination_hash (hex): Destination hash (16 bytes)
+        content (str): Message content
+        title (str, optional): Message title
+        fields (dict, optional): Additional fields
+
+    Returns:
+        sent (bool): True if message was queued
+        message_hash (hex): Hash of the sent message
+
+    Note: This command requires that the destination has been announced
+    and is known to the transport layer. For testing, announce the
+    destination first before trying to send.
+    """
+    global _lxmf_router, _lxmf_identity, _lxmf_destination
+
+    if not _lxmf_router:
+        return {
+            'sent': False,
+            'error': 'LXMF router not started'
+        }
+
+    RNS = _get_full_rns()
+    import LXMF
+
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    content = params['content']
+    title = params.get('title', '')
+    fields = params.get('fields', {})
+
+    # Convert string field keys to int
+    if fields:
+        fields = {int(k): v for k, v in fields.items()}
+
+    # Create a message with DIRECT method
+    # Using None destination with destination_hash parameter
+    # The source needs to be a proper Destination for signing
+    message = LXMF.LXMessage(
+        destination=None,
+        source=_lxmf_destination,  # Our delivery destination as source
+        content=content,
+        title=title,
+        fields=fields if fields else None,
+        desired_method=LXMF.LXMessage.DIRECT,
+        destination_hash=destination_hash
+    )
+
+    # Send via router
+    _lxmf_router.handle_outbound(message)
+
+    return {
+        'sent': True,
+        'message_hash': bytes_to_hex(message.hash) if message.hash else None
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2940,6 +3209,13 @@ COMMANDS = {
     'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
     'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
     'lxmf_stamp_generate': cmd_lxmf_stamp_generate,
+    # Live Reticulum/LXMF networking
+    'rns_start': cmd_rns_start,
+    'rns_stop': cmd_rns_stop,
+    'lxmf_start_router': cmd_lxmf_start_router,
+    'lxmf_get_messages': cmd_lxmf_get_messages,
+    'lxmf_clear_messages': cmd_lxmf_clear_messages,
+    'lxmf_send_direct': cmd_lxmf_send_direct,
 }
 
 
