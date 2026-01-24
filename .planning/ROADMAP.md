@@ -11,7 +11,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 - [x] **Phase 1: Python Bridge Extension** - Add LXMF commands to existing Python bridge
-- [ ] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
+- [x] **Phase 2: LXMF Message Round-Trip** - Core message pack/unpack across implementations
 - [ ] **Phase 3: LXMF Field Interop** - Attachments and custom fields survive round-trip
 - [ ] **Phase 4: LXMF Cryptographic Interop** - Hash and signature validation across implementations
 - [ ] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
@@ -49,8 +49,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md - Kotlin-to-Python message round-trip tests (shared fixtures + K2P tests)
-- [ ] 02-02-PLAN.md - Python-to-Kotlin message round-trip tests (P2K tests + full suite verification)
+- [x] 02-01-PLAN.md - Kotlin-to-Python message round-trip tests (shared fixtures + K2P tests)
+- [x] 02-02-PLAN.md - Python-to-Kotlin message round-trip tests (P2K tests + full suite verification)
 
 ### Phase 3: LXMF Field Interop
 **Goal**: All LXMF field types (attachments, images, custom) survive Kotlin-Python round-trip
@@ -163,7 +163,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Python Bridge Extension | 1/1 | ✓ Complete | 2026-01-23 |
-| 2. LXMF Message Round-Trip | 0/2 | Planned | - |
+| 2. LXMF Message Round-Trip | 2/2 | ✓ Complete | 2026-01-24 |
 | 3. LXMF Field Interop | 0/3 | Not started | - |
 | 4. LXMF Cryptographic Interop | 0/2 | Not started | - |
 | 5. Stamp Interop | 0/1 | Not started | - |

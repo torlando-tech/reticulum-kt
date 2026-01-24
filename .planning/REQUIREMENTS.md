@@ -9,8 +9,8 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 ### LXMF Message Interop
 
-- [ ] **LXMF-01**: Kotlin-packed LXMessage unpacks correctly in Python (round-trip verified)
-- [ ] **LXMF-02**: Python-packed LXMessage unpacks correctly in Kotlin (enhance existing tests)
+- [x] **LXMF-01**: Kotlin-packed LXMessage unpacks correctly in Python (round-trip verified)
+- [x] **LXMF-02**: Python-packed LXMessage unpacks correctly in Kotlin (enhance existing tests)
 - [ ] **LXMF-03**: FIELD_FILE_ATTACHMENTS survives Kotlin<->Python round-trip
 - [ ] **LXMF-04**: FIELD_IMAGE survives Kotlin<->Python round-trip
 - [ ] **LXMF-05**: Custom fields (renderer, thread ID, etc.) survive round-trip
@@ -71,8 +71,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| LXMF-01 | Phase 2 | Pending |
-| LXMF-02 | Phase 2 | Pending |
+| LXMF-01 | Phase 2 | Complete |
+| LXMF-02 | Phase 2 | Complete |
 | LXMF-03 | Phase 3 | Pending |
 | LXMF-04 | Phase 3 | Pending |
 | LXMF-05 | Phase 3 | Pending |
