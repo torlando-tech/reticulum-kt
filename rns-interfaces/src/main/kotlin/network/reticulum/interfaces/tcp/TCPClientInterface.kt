@@ -40,8 +40,8 @@ class TCPClientInterface(
     private val useKissFraming: Boolean = false,
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
     private val maxReconnectAttempts: Int? = null,
-    /** Enable TCP keep-alive. Disabled by default for battery efficiency on mobile. */
-    private val keepAlive: Boolean = false,
+    /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
+    private val keepAlive: Boolean = true,
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
@@ -127,6 +127,7 @@ class TCPClientInterface(
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
             sock.soTimeout = 0 // Block on read
+            sock.setSoLinger(true, 5) // Clean shutdown with 5s linger (prevents RST on close)
 
             // Get input stream immediately while we have the socket reference
             val inputStream = sock.getInputStream()
@@ -167,8 +168,9 @@ class TCPClientInterface(
                 // Keepalive failure is not critical
             }
 
-            // Small delay for Python to process
-            Thread.sleep(50)
+            // Delay for Python's ThreadingMixIn to spawn handler and enter read_loop()
+            // 100ms gives time for the handler thread to start blocking on recv()
+            Thread.sleep(100)
 
             // Pass socket and stream directly to avoid race conditions
             startReadLoop(sock, inputStream)
