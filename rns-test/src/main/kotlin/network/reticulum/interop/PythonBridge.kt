@@ -120,6 +120,20 @@ class PythonBridge private constructor(
                         }
                         append("]")
                     }
+                    is Map<*, *> -> {
+                        append("{")
+                        value.entries.forEachIndexed { i, (k, v) ->
+                            if (i > 0) append(",")
+                            append("\"$k\":")
+                            when (v) {
+                                is String -> append("\"$v\"")
+                                is Number -> append(v)
+                                is Boolean -> append(v)
+                                else -> append("\"$v\"")
+                            }
+                        }
+                        append("}")
+                    }
                     is Number -> append(value)
                     is Boolean -> append(value)
                     else -> append("\"$value\"")

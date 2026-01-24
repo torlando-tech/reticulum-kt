@@ -46,6 +46,7 @@ abstract class InteropTestBase {
                 null -> null  // Skip null values
                 is ByteArray -> key to value.toHex()
                 is List<*> -> key to value  // Keep lists as-is
+                is Map<*, *> -> key to value  // Keep maps as-is for JSON serialization
                 is String -> key to value
                 is Int -> key to value
                 is Long -> key to value
