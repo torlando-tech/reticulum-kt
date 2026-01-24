@@ -50,7 +50,7 @@ abstract class DirectDeliveryTestBase : InteropTestBase() {
     protected val tcpPort: Int = 14242 + (System.currentTimeMillis() % 1000).toInt()
 
     @BeforeAll
-    fun setupDirectDelivery() {
+    open fun setupDirectDelivery() {
         // 1. Start Python Reticulum with TCP server
         println("  [Setup] Starting Python RNS on port $tcpPort...")
         val rnsResult = python("rns_start", "tcp_port" to tcpPort)
