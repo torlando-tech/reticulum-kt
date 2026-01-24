@@ -1426,6 +1426,19 @@ class LXMRouter(
     }
 
     /**
+     * Add a propagation node directly to the known nodes map.
+     *
+     * This method bypasses the announce flow and is useful for testing
+     * or when the propagation node details are known through other means.
+     *
+     * @param node The propagation node to add
+     */
+    fun addPropagationNode(node: PropagationNode) {
+        propagationNodes[node.hexHash] = node
+        println("Added propagation node: ${node.hexHash} (${node.displayName ?: "unnamed"})")
+    }
+
+    /**
      * Get the stamp cost required for the active propagation node.
      *
      * @return The minimum stamp cost, or null if no active node
