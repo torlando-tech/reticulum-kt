@@ -5,24 +5,24 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 8.1 - TCP Interface Interop (Plan 02 complete)
+**Current focus:** Phase 8.1 - TCP Interface Interop (COMPLETE)
 
 ## Current Position
 
-Phase: 8.1 of 10 (TCP Interface Interop) - INSERTED
-Plan: 2 of 3
-Status: In progress
-Last activity: 2026-01-24 - Completed 08.1-02-PLAN.md (socket options and write safeguards)
-Next action: Execute 08.1-03-PLAN.md
+Phase: 8.1 of 10 (TCP Interface Interop) - COMPLETE
+Plan: 3 of 3 (all complete)
+Status: Phase complete, ready for Phase 9
+Last activity: 2026-01-24 - Completed 08.1-03-PLAN.md (E2E test assertion tightening)
+Next action: Resume Phase 9 execution
 
-Progress: [████████░░] ~87%
+Progress: [████████░░] ~88%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 20
-- Average duration: 5.5 min
-- Total execution time: 120 min
+- Total plans completed: 21
+- Average duration: 5.4 min
+- Total execution time: 126 min
 
 **By Phase:**
 
@@ -36,10 +36,10 @@ Progress: [████████░░] ~87%
 | 06-direct-delivery | 3 | 36 min | 12 min |
 | 07-opportunistic-delivery | 3 | 16 min | 5.3 min |
 | 08-propagated-delivery | 2 | 10 min | 5 min |
-| 08.1-tcp-interface-interop | 2 | 10 min | 5 min |
+| 08.1-tcp-interface-interop | 3 | 16 min | 5.3 min |
 
 **Recent Trend:**
-- Last 5 plans: 4, 6, 4, 5, 5 min
+- Last 5 plans: 4, 5, 5, 5, 6 min
 - Trend: Consistent fast execution
 
 *Updated after each plan completion*
@@ -91,10 +91,29 @@ Recent decisions affecting current work:
 - keepAlive defaults to true for Python RNS compatibility (was false for mobile battery)
 - SO_LINGER set to 5 seconds for clean shutdown (prevents RST on close)
 - Connection delay increased to 100ms (was 50ms) for Python handler readiness
+- LiveDeliveryTest requires DELIVERED state (strict) since direct delivery over TCP works
+- PropagatedDeliveryTest keeps flexible assertions since LXMF propagation protocol has higher-layer issues
+- Layer separation: TCP/HDLC works, LXMF propagation protocol needs separate investigation
 
 ### Roadmap Evolution
 
 - Phase 8.1 inserted after Phase 8: TCP Interface Interop (URGENT) - connections drop after packet transmission between Kotlin TCPClientInterface and Python RNS TCPServerInterface. Required for proper E2E delivery verification.
+
+### Phase 8.1 Findings
+
+**TCP/HDLC Layer:** Working correctly
+- All 4 TcpPythonInteropTest tests pass (connection, K->P, P->K, bidirectional)
+- Socket options aligned with Python RNS (keepAlive, SO_LINGER, timing)
+- Write safeguards added for connection state verification
+
+**Direct Delivery:** Working
+- LiveDeliveryTest passes with strict DELIVERED assertions
+- All 6 tests pass reliably
+
+**LXMF Propagation Protocol:** Has higher-layer issues
+- PropagatedDeliveryTest submission reaches OUTBOUND but not SENT/DELIVERED within timeout
+- Issue is in link establishment to propagation node or message transfer acknowledgment
+- This is beyond TCP layer scope, needs separate investigation
 
 ### Pending Todos
 
@@ -102,10 +121,11 @@ None yet.
 
 ### Blockers/Concerns
 
-- **[RESOLVED at TCP layer]** TCP interface compatibility issue between Kotlin and Python RNS. Plan 01 discovered basic TCP/HDLC layer works correctly (all 4 interop tests pass). Plan 02 added socket option alignment for robustness. If connection issues persist, they're at higher layer (RNS Transport, LXMF).
+- **[RESOLVED at TCP layer]** TCP interface compatibility issue between Kotlin and Python RNS. Plan 01 discovered basic TCP/HDLC layer works correctly. Plan 02 added socket option alignment. Plan 03 confirmed direct delivery works with strict assertions.
+- **[NEW - beyond Phase 8.1 scope]** LXMF propagation protocol has issues at higher layer. Propagated message submission stalls at OUTBOUND state. Needs separate investigation.
 
 ## Session Continuity
 
-Last session: 2026-01-24 22:42 UTC
-Stopped at: Completed 08.1-02-PLAN.md
+Last session: 2026-01-24 22:58 UTC
+Stopped at: Completed 08.1-03-PLAN.md (Phase 8.1 complete)
 Resume file: None
