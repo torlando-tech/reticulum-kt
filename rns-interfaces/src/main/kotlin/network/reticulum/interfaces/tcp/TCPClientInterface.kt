@@ -286,6 +286,14 @@ class TCPClientInterface(
 
         val sock = socket ?: throw IllegalStateException("Socket is null")
 
+        // Verify connection state before attempting write
+        if (!sock.isConnected || sock.isClosed || sock.isOutputShutdown) {
+            val state = "isConnected=${sock.isConnected}, isClosed=${sock.isClosed}, isOutputShutdown=${sock.isOutputShutdown}"
+            log("Socket not in valid state for write: $state")
+            teardown()
+            throw IOException("Socket not in valid state for write: $state")
+        }
+
         // Wait for any pending write to complete
         while (writing.get()) {
             Thread.sleep(10)
@@ -300,8 +308,24 @@ class TCPClientInterface(
                 HDLC.frame(data)
             }
 
-            sock.getOutputStream().write(framedData)
-            sock.getOutputStream().flush()
+            // Get output stream once for atomic write+flush
+            val outputStream = sock.getOutputStream()
+
+            // Write and flush atomically - if either fails, teardown
+            try {
+                outputStream.write(framedData)
+                outputStream.flush()
+            } catch (e: java.net.SocketTimeoutException) {
+                // Specific timeout handling with diagnostic info
+                log("Write timeout: ${e.message}")
+                if (DEBUG) {
+                    debugLog("SocketTimeoutException during write:")
+                    debugLog("  data size: ${framedData.size} bytes")
+                    debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
+                }
+                teardown()
+                throw e
+            }
 
             val frameNum = framesSent.incrementAndGet()
             if (DEBUG) {
