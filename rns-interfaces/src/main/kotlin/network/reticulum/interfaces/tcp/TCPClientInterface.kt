@@ -90,7 +90,16 @@ class TCPClientInterface(
     private val framesReceived = AtomicLong(0)
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope: CoroutineScope = createScope(parentScope)
+    private val ioScope: CoroutineScope = createScope(parentScope).also {
+        // Listen for parent cancellation AFTER scope is created (avoids race condition)
+        // When parent scope is cancelled, trigger graceful shutdown
+        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { cause ->
+            if (cause != null) {
+                // Parent was cancelled - trigger graceful shutdown
+                detach()
+            }
+        }
+    }
     private var readJob: Job? = null
     private var connectJob: Job? = null
 
@@ -375,6 +384,16 @@ class TCPClientInterface(
         } finally {
             writing.set(false)
         }
+    }
+
+    /**
+     * Stop the interface gracefully.
+     * Cancels all coroutines and closes the socket.
+     * This is the explicit cleanup path - called directly in JVM usage
+     * or triggered automatically when parent scope is cancelled.
+     */
+    fun stop() {
+        detach()
     }
 
     override fun detach() {
