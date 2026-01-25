@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 10 of 17 (Android Lifecycle Foundation)
-Plan: 4 of 4 in current phase (gap closure pending)
-Status: Gap closure needed
-Last activity: 2026-01-25 — Created 10-04-PLAN.md (Gap closure: wire observers into lifecycle)
+Phase: 10 of 17 (Android Lifecycle Foundation) - COMPLETE
+Plan: 4 of 4 in current phase - COMPLETE
+Status: Phase complete, ready for Phase 11
+Last activity: 2026-01-25 - Completed 10-04-PLAN.md (Observer lifecycle integration)
 
-Progress: v2 [███░░░░░░░] 30%
+Progress: v2 [████░░░░░░] 40%
 
 ## Milestone Goals
 
@@ -30,15 +30,15 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3 (v2)
+- Total plans completed: 4 (v2)
 - Average duration: 2min
-- Total execution time: 6min
+- Total execution time: 8min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 10 | 3/3 | 6min | 2min |
+| 10 | 4/4 | 8min | 2min |
 
 *Updated after each plan completion*
 
@@ -60,6 +60,8 @@ Recent decisions affecting current work:
 - [10-03]: 500ms debounce for network state changes to coalesce rapid handoffs
 - [10-03]: String constant for hidden PowerManager API (POWER_SAVE_WHITELIST_CHANGED)
 - [10-03]: No history buffer for battery status (rare, user-initiated changes)
+- [10-04]: Observers stopped before serviceScope.cancel() for clean shutdown
+- [10-04]: StateFlow collectors use placeholder logging - reactions deferred to Phase 12/15
 
 ### From v1
 
@@ -67,7 +69,7 @@ Codebase ready for Android optimization:
 - 31,126 LOC (Kotlin + Python bridge for testing)
 - TCP/UDP interfaces working
 - 120+ interop tests can verify Android changes don't break protocol
-- ReticulumService partially implemented (needs Doze observer, scope injection)
+- ReticulumService fully implemented with observer lifecycle management
 
 ### Pending Todos
 
@@ -75,10 +77,10 @@ None yet.
 
 ### Blockers/Concerns
 
-- **[FLAGGED in v1]** Android battery/Doze issues — now being addressed in v2
+- **[RESOLVED]** Android battery/Doze issues - Phase 10 foundation complete, reactions in Phase 12
 
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Created 10-04-PLAN.md gap closure plan - observers need lifecycle integration
+Stopped at: Completed Phase 10 (Android Lifecycle Foundation)
 Resume file: None
