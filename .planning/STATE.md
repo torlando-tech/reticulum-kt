@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 11 of 17 (Lifecycle-Aware Scope Injection)
-Plan: 1 of 4 in current phase - COMPLETE
+Plan: 2 of 4 in current phase - COMPLETE
 Status: In progress
-Last activity: 2026-01-25 - Completed 11-01-PLAN.md (TCPClientInterface scope injection)
+Last activity: 2026-01-25 - Completed 11-02-PLAN.md (UDPInterface scope injection)
 
-Progress: v2 [████░░░░░░] 42%
+Progress: v2 [████░░░░░░] 45%
 
 ## Milestone Goals
 
@@ -30,16 +30,16 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5 (v2)
-- Average duration: 2.4min
-- Total execution time: 12min
+- Total plans completed: 6 (v2)
+- Average duration: 2.5min
+- Total execution time: 15min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
-| 11 | 1/4 | 4min | 4min |
+| 11 | 2/4 | 7min | 3.5min |
 
 *Updated after each plan completion*
 
@@ -66,6 +66,8 @@ Recent decisions affecting current work:
 - [11-01]: SupervisorJob(parentJob) for child scope - independent failure isolation
 - [11-01]: invokeOnCompletion listener for automatic cleanup on parent cancellation
 - [11-01]: Default null parentScope preserves backward compatibility for JVM tests
+- [11-02]: parentScope as last parameter preserves all existing call sites
+- [11-02]: stop() delegates to detach() - single cleanup path
 
 ### From v1
 
@@ -86,5 +88,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 11-01-PLAN.md (TCPClientInterface scope injection)
+Stopped at: Completed 11-02-PLAN.md (UDPInterface scope injection)
 Resume file: None
