@@ -50,12 +50,13 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
   4. NetworkStateObserver detects WiFi/cellular/VPN transitions
   5. BatteryOptimizationChecker detects if app is battery-optimized
 
-**Plans:** 3 plans in 1 wave (all parallel)
+**Plans:** 4 plans (3 parallel + 1 gap closure)
 
 Plans:
-- [ ] 10-01-PLAN.md - Foreground service type + notification channels
-- [ ] 10-02-PLAN.md - DozeStateObserver with StateFlow API
-- [ ] 10-03-PLAN.md - NetworkStateObserver + BatteryOptimizationChecker
+- [x] 10-01-PLAN.md - Foreground service type + notification channels
+- [x] 10-02-PLAN.md - DozeStateObserver with StateFlow API
+- [x] 10-03-PLAN.md - NetworkStateObserver + BatteryOptimizationChecker
+- [ ] 10-04-PLAN.md - Gap closure: Wire observers into ReticulumService lifecycle
 
 ### Phase 11: Lifecycle-Aware Scope Injection
 
@@ -161,7 +162,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. Android Lifecycle Foundation | 0/3 | Planned | - |
+| 10. Android Lifecycle Foundation | 3/4 | Gap closure | - |
 | 11. Lifecycle-Aware Scope Injection | 0/TBD | Not started | - |
 | 12. Doze-Aware Connection Management | 0/TBD | Not started | - |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
