@@ -354,6 +354,24 @@ class ReticulumService : LifecycleService() {
      */
     fun isRunning(): Boolean = reticulum != null
 
+    /**
+     * Get the Doze state observer.
+     * Downstream phases use this to react to Doze mode changes.
+     */
+    fun getDozeObserver(): DozeStateObserver = dozeObserver
+
+    /**
+     * Get the network state observer.
+     * Downstream phases use this to react to network transitions.
+     */
+    fun getNetworkObserver(): NetworkStateObserver = networkObserver
+
+    /**
+     * Get the battery optimization checker.
+     * Downstream phases use this for exemption flow and status display.
+     */
+    fun getBatteryChecker(): BatteryOptimizationChecker = batteryChecker
+
     companion object {
         private const val TAG = "ReticulumService"
         private const val NOTIFICATION_ID = 1001
