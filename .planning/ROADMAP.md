@@ -26,7 +26,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 
 **Phase Numbering:** Continues from v1 (phases 10-17)
 
-- [ ] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
+- [x] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
 - [ ] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
 - [ ] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
 - [ ] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
@@ -56,7 +56,7 @@ Plans:
 - [x] 10-01-PLAN.md - Foreground service type + notification channels
 - [x] 10-02-PLAN.md - DozeStateObserver with StateFlow API
 - [x] 10-03-PLAN.md - NetworkStateObserver + BatteryOptimizationChecker
-- [ ] 10-04-PLAN.md - Gap closure: Wire observers into ReticulumService lifecycle
+- [x] 10-04-PLAN.md - Gap closure: Wire observers into ReticulumService lifecycle
 
 ### Phase 11: Lifecycle-Aware Scope Injection
 
@@ -162,7 +162,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. Android Lifecycle Foundation | 3/4 | Gap closure | - |
+| 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
 | 11. Lifecycle-Aware Scope Injection | 0/TBD | Not started | - |
 | 12. Doze-Aware Connection Management | 0/TBD | Not started | - |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
