@@ -87,9 +87,21 @@ class UDPInterface(
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope: CoroutineScope = createScope(parentScope).also { _ ->
         // Listen for parent cancellation AFTER scope is created
-        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { cause ->
-            if (cause != null) {
-                // Parent was cancelled - trigger graceful shutdown
+        // When parent scope completes (cancelled or otherwise), trigger graceful shutdown
+        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { _ ->
+            // Parent completed - trigger graceful shutdown
+            // Note: This fires after parent starts cancelling AND its children complete,
+            // so also monitor the child scope's cancellation state
+            detach()
+        }
+        // Additionally, launch a coroutine that watches for scope cancellation
+        // This provides faster response to parent cancellation
+        parentScope?.launch {
+            try {
+                // This coroutine will be cancelled when parent is cancelled
+                kotlinx.coroutines.awaitCancellation()
+            } finally {
+                // Parent scope was cancelled - trigger shutdown
                 detach()
             }
         }
