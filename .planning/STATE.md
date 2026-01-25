@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 12 of 17 (Doze-Aware Connection Management)
-Plan: 2 of 5 in current phase
+Plan: 3 of 5 in current phase
 Status: In progress
-Last activity: 2026-01-25 - Completed 12-01-PLAN.md (ConnectionPolicy)
+Last activity: 2026-01-25 - Completed 12-03-PLAN.md (Wire ConnectionPolicyProvider)
 
-Progress: v2 [█████░░░░░] 53%
+Progress: v2 [██████░░░░] 60%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8 (v2)
-- Average duration: 2.4min
-- Total execution time: 19min
+- Total plans completed: 9 (v2)
+- Average duration: 2.3min
+- Total execution time: 21min
 
 **By Phase:**
 
@@ -40,7 +40,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
-| 12 | 2/5 | 4min | 2min |
+| 12 | 3/5 | 6min | 2min |
 
 *Updated after each plan completion*
 
@@ -78,6 +78,8 @@ Recent decisions affecting current work:
 - [12-01]: Charging overrides battery throttling but not Doze
 - [12-02]: Pure Kotlin ExponentialBackoff in rns-interfaces module (not Android-specific)
 - [12-02]: Default backoff: 1s initial, 60s max, 2.0 multiplier, 10 attempts
+- [12-03]: Log.d for state changes (policy collector handles throttling reactions)
+- [12-03]: Reverse lifecycle order: policyProvider.stop() before batteryMonitor.stop()
 
 ### From v1
 
@@ -98,5 +100,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 12-01-PLAN.md (ConnectionPolicy)
+Stopped at: Completed 12-03-PLAN.md (Wire ConnectionPolicyProvider)
 Resume file: None
