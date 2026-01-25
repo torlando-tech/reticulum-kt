@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 11 of 17 (Lifecycle-Aware Scope Injection) - COMPLETE
-Plan: 4 of 4 in current phase - COMPLETE
-Status: Phase complete, ready for Phase 12
-Last activity: 2026-01-25 - Completed Phase 11 (Lifecycle-Aware Scope Injection)
+Phase: 12 of 17 (Doze-Aware Connection Management)
+Plan: 2 of 5 in current phase
+Status: In progress
+Last activity: 2026-01-25 - Completed 12-02-PLAN.md (ExponentialBackoff)
 
-Progress: v2 [████░░░░░░] 50%
+Progress: v2 [█████░░░░░] 53%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6 (v2)
-- Average duration: 2.5min
-- Total execution time: 15min
+- Total plans completed: 8 (v2)
+- Average duration: 2.4min
+- Total execution time: 19min
 
 **By Phase:**
 
@@ -40,6 +40,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
+| 12 | 2/5 | 4min | 2min |
 
 *Updated after each plan completion*
 
@@ -72,6 +73,8 @@ Recent decisions affecting current work:
 - [11-04]: stopInterface uses stop() for TCPClientInterface, detach() fallback for others
 - [11-03]: awaitCancellation() watcher for immediate cancellation response
 - [11-03]: Test both positive path (stays alive) and negative path (cancels correctly)
+- [12-02]: Pure Kotlin ExponentialBackoff in rns-interfaces module (not Android-specific)
+- [12-02]: Default backoff: 1s initial, 60s max, 2.0 multiplier, 10 attempts
 
 ### From v1
 
@@ -92,5 +95,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed Phase 11 (Lifecycle-Aware Scope Injection)
+Stopped at: Completed 12-02-PLAN.md (ExponentialBackoff)
 Resume file: None
