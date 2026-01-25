@@ -1,7 +1,6 @@
 package network.reticulum.android
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -30,17 +29,7 @@ class NotificationHelper(private val context: Context) {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            ReticulumService.CHANNEL_ID,
-            "Reticulum Service",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Reticulum mesh network service"
-            setShowBadge(false)
-            enableLights(false)
-            enableVibration(false)
-        }
-        notificationManager.createNotificationChannel(channel)
+        NotificationChannels.createChannels(context)
     }
 
     /**
@@ -58,7 +47,7 @@ class NotificationHelper(private val context: Context) {
     ): Notification {
         val modeText = if (enableTransport) "Transport" else "Client"
 
-        val builder = NotificationCompat.Builder(context, ReticulumService.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, NotificationChannels.SERVICE_CHANNEL_ID)
             .setContentTitle("Reticulum $modeText")
             .setContentText(status)
             .setSmallIcon(R.drawable.ic_reticulum)

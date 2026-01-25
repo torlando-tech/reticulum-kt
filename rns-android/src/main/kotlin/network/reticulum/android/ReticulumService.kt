@@ -1,9 +1,7 @@
 package network.reticulum.android
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -20,8 +18,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
-import network.reticulum.interfaces.InterfaceAdapter
-import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
 import java.io.File
 
@@ -74,7 +70,7 @@ class ReticulumService : LifecycleService() {
             startForeground(
                 NOTIFICATION_ID,
                 createNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
         } else {
             startForeground(NOTIFICATION_ID, createNotification())
@@ -270,23 +266,13 @@ class ReticulumService : LifecycleService() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Reticulum Service",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Reticulum mesh network service"
-            setShowBadge(false)
-        }
-
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.createNotificationChannel(channel)
+        NotificationChannels.createChannels(this)
     }
 
     private fun createNotification(status: String = "Starting..."): Notification {
         val modeText = if (config.enableTransport) "Transport" else "Client"
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, NotificationChannels.SERVICE_CHANNEL_ID)
             .setContentTitle("Reticulum $modeText")
             .setContentText(status)
             .setSmallIcon(R.drawable.ic_reticulum)
@@ -321,7 +307,6 @@ class ReticulumService : LifecycleService() {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
-        const val CHANNEL_ID = "reticulum_service"
         private const val EXTRA_CONFIG = "config"
 
         /**
