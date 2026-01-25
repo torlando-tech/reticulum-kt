@@ -49,7 +49,13 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
   3. DozeStateObserver exposes current Doze state via StateFlow
   4. NetworkStateObserver detects WiFi/cellular/VPN transitions
   5. BatteryOptimizationChecker detects if app is battery-optimized
-**Plans**: TBD
+
+**Plans:** 3 plans in 1 wave (all parallel)
+
+Plans:
+- [ ] 10-01-PLAN.md - Foreground service type + notification channels
+- [ ] 10-02-PLAN.md - DozeStateObserver with StateFlow API
+- [ ] 10-03-PLAN.md - NetworkStateObserver + BatteryOptimizationChecker
 
 ### Phase 11: Lifecycle-Aware Scope Injection
 
@@ -155,7 +161,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. Android Lifecycle Foundation | 0/TBD | Not started | - |
+| 10. Android Lifecycle Foundation | 0/3 | Planned | - |
 | 11. Lifecycle-Aware Scope Injection | 0/TBD | Not started | - |
 | 12. Doze-Aware Connection Management | 0/TBD | Not started | - |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
