@@ -70,12 +70,13 @@ Plans:
   3. Service stop cancels all interface I/O coroutines within 1 second
   4. TCP/UDP connections remain alive when app is backgrounded (service running)
   5. JVM tests continue working without Android dependencies
-**Plans:** 3 plans (2 parallel + 1 verification)
+**Plans:** 4 plans (2 parallel in wave 1, 2 parallel in wave 2)
 
 Plans:
 - [ ] 11-01-PLAN.md - TCPClientInterface parentScope injection
 - [ ] 11-02-PLAN.md - UDPInterface parentScope injection
 - [ ] 11-03-PLAN.md - Scope injection tests and verification
+- [ ] 11-04-PLAN.md - Wire InterfaceManager to pass parentScope to interfaces
 
 ### Phase 12: Doze-Aware Connection Management
 
