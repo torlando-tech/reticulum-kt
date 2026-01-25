@@ -8,18 +8,30 @@ A Kotlin implementation of the Reticulum network stack and LXMF messaging protoc
 
 **Perfect byte-level interoperability with Python LXMF** — Kotlin clients can send and receive LXMF messages (including files and images) with any Python LXMF client, and use Python-hosted propagation nodes for message relay.
 
-## Current State (v1 Shipped)
+## Current Milestone: v2 Android Production Readiness
 
-**Shipped:** 2026-01-24
+**Goal:** Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android — always-connected background operation that survives Doze and battery optimization without excessive drain.
 
-v1 delivers complete LXMF interoperability:
+**Target features:**
+- Foreground service for persistent connection
+- Doze mode handling (wake locks, maintenance windows)
+- Battery optimization exemption flow
+- WorkManager integration for periodic tasks
+- Memory footprint optimization
+- Android-specific crypto acceleration (if available)
+
+**API Level:** 26+ (Android 8.0+)
+
+## Previous Milestone: v1 LXMF Interoperability (Shipped 2026-01-24)
+
+v1 delivered complete LXMF interoperability:
 - 120+ interop tests verify byte-level compatibility with Python LXMF
 - All 3 delivery methods: DIRECT, OPPORTUNISTIC, PROPAGATED
 - Large message support via Resource transfer with BZ2 compression
 - Stamp generation for propagation node submission
 - 31,126 LOC (Kotlin + Python bridge)
 
-Ready for Columba integration.
+See `.planning/MILESTONES.md` for full details.
 
 ## Requirements
 
@@ -59,9 +71,14 @@ Ready for Columba integration.
 
 ### Active
 
-<!-- Next milestone scope. To be defined in /gsd:new-milestone. -->
+<!-- Current scope. Building toward these for v2. -->
 
-(No active requirements — start next milestone with `/gsd:new-milestone`)
+- [ ] Foreground service for persistent network connection
+- [ ] Doze mode handling with proper wake lock management
+- [ ] Battery optimization exemption request flow
+- [ ] WorkManager integration for background scheduling
+- [ ] Memory footprint optimization (<50MB peak)
+- [ ] Hardware-accelerated crypto on Android (if available)
 
 ### Out of Scope
 
@@ -73,11 +90,11 @@ Ready for Columba integration.
 - BLE interface — Not needed for Columba use case
 - I2P interface — Not needed for Columba use case
 
-**Potential v2 scope (deferred, not blocked):**
-- Android battery optimization (Doze mode, WorkManager)
+**Potential v3+ scope (deferred, not blocked):**
+- RNode/LoRa interface
+- BLE interface
 - Auto Interface (mDNS peer discovery)
 - IFAC (Interface Authentication)
-- Hardware-accelerated crypto
 
 ## Context
 
@@ -125,4 +142,4 @@ Ready for Columba integration.
 | RESOURCE_PRF routing to activeLinks | Not reverse_table (per Python reference) | ✓ Good — fixed proof delivery |
 
 ---
-*Last updated: 2026-01-24 after v1 milestone*
+*Last updated: 2026-01-24 after starting v2 milestone*

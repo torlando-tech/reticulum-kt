@@ -5,59 +5,49 @@
 See: .planning/PROJECT.md (updated 2026-01-24)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** v1 shipped — ready for next milestone
+**Current focus:** v2 Android Production Readiness
 
 ## Current Position
 
-Phase: v1 complete (10 phases, 25 plans)
-Plan: N/A — milestone shipped
-Status: Ready to start next milestone
-Last activity: 2026-01-24 — v1 milestone complete
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-01-24 — Milestone v2 started
 
-Progress: v1 [██████████] 100% SHIPPED
+Progress: v2 [░░░░░░░░░░] 0%
 
-## v1 Shipped
+## Milestone Goals
 
-**LXMF Interoperability complete:**
-- 120+ interop tests verify byte-level compatibility
-- All 3 delivery methods working (DIRECT, OPPORTUNISTIC, PROPAGATED)
-- Large message Resource transfer with BZ2 compression
-- Stamp generation for propagation nodes
+**v2: Android Production Readiness**
 
-**Stats:**
-- 10 phases, 25 plans
-- 122 commits
-- 116 files, +23,758 lines
-- 2 days (2026-01-23 → 2026-01-24)
+Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
+- Always-connected background operation
+- Survives Doze and battery optimization
+- Reasonable power consumption
+- API 26+ (Android 8.0+)
 
 ## Accumulated Context
 
 ### Decisions
 
-Key decisions logged in PROJECT.md. Highlights from v1:
-- forRetrieval parameter in establishPropagationLink differentiates delivery vs retrieval callbacks
-- RESOURCE_PRF proofs routed through activeLinks (not reverse_table)
-- Resource proof format is 64 bytes: [hash (32)][proof (32)]
+Key decisions logged in PROJECT.md. Relevant for v2:
+- API 26+ target floor (from v1 constraints)
+- TCP/UDP interfaces already working (from v1)
+- No Python at runtime (final Android app)
 
-### Archives
+### From v1
 
-v1 artifacts archived to `.planning/milestones/`:
-- v1-ROADMAP.md (full phase details)
-- v1-REQUIREMENTS.md (all requirements with outcomes)
-- v1-MILESTONE-AUDIT.md (verification report)
+Codebase ready for Android optimization:
+- 31,126 LOC (Kotlin + Python bridge for testing)
+- TCP/UDP interfaces working
+- 120+ interop tests can verify Android changes don't break protocol
 
-### Next Steps
+### Blockers/Concerns
 
-Start next milestone with `/gsd:new-milestone`
-
-Potential v2 directions:
-- Android battery optimization (Doze mode, WorkManager)
-- Columba integration
-- Auto Interface (mDNS peer discovery)
-- IFAC support
+- **[FLAGGED in v1]** Android battery/Doze issues — now being addressed in v2
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: v1 milestone shipped
-Next step: `/gsd:new-milestone` (when ready)
+Stopped at: Starting v2 milestone, defining requirements
+Next step: Research → Requirements → Roadmap
