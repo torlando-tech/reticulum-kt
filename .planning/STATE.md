@@ -5,24 +5,40 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Perfect byte-level interoperability with Python LXMF
-**Current focus:** Phase 9 - Resource Transfer
+**Current focus:** Phase 9 - Resource Transfer COMPLETE
 
 ## Current Position
 
-Phase: 9 of 10 (Resource Transfer) - IN PROGRESS
-Plan: 2 of 2
-Status: Phase 9 complete
-Last activity: 2026-01-24 - Completed 09-02-PLAN.md (BZ2 compression + progress tests)
-Next action: Phase 10 planning or project completion
+Phase: 9 of 10 (Resource Transfer) - COMPLETE
+Plan: 3 of 3 (all plans complete including gap closure)
+Status: Phase 9 verification complete
+Last activity: 2026-01-24 - Completed 09-03-PLAN.md (Resource protocol fix)
+Next action: Phase 10 planning
 
-Progress: [██████████] ~95%
+Progress: [█████████-] ~90% (Phase 9 complete)
+
+## Phase 9 Completion
+
+**VERIFICATION.md Status:** verified
+**Score:** 4/4 truths verified
+
+**All objectives met:**
+- Threshold detection: Working (319/320 bytes boundary)
+- BZ2 compression: Working bidirectionally
+- Progress tracking: Working
+- Large message delivery: Working K<->P with DELIVERED state
+
+**Gap closure (09-03) findings:**
+- Bug 1: RESOURCE_PRF proof not delivered to activeLinks - FIXED
+- Bug 2: Proof format 48 bytes expected, 64 bytes received - FIXED
+- All tests now have strict assertions requiring DELIVERED state
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 24
-- Average duration: 6.3 min
-- Total execution time: 152 min
+- Total plans completed: 25
+- Average duration: 6.2 min
+- Total execution time: ~162 min
 
 **By Phase:**
 
@@ -37,11 +53,10 @@ Progress: [██████████] ~95%
 | 07-opportunistic-delivery | 3 | 16 min | 5.3 min |
 | 08-propagated-delivery | 2 | 10 min | 5 min |
 | 08.1-tcp-interface-interop | 4 | 28 min | 7 min |
-
-| 09-resource-transfer | 2 | 14 min | 7 min |
+| 09-resource-transfer | 3 | 24 min | 8 min |
 
 **Recent Trend:**
-- Last 5 plans: 5, 6, 12, 6, 8 min
+- Last 5 plans: 6, 12, 6, 8, 10 min
 - Trend: Consistent execution
 
 *Updated after each plan completion*
@@ -101,7 +116,9 @@ Recent decisions affecting current work:
 - Accept SENDING/SENT/DELIVERED as valid progress states for propagated delivery (resource transfer timeout is separate issue)
 - Add commons-compress as testImplementation for BZ2 compression tests in lxmf-core
 - Use InteropTestBase for compression tests (simpler, no full delivery infrastructure)
-- Test PACKET-sized messages for content integrity verification (Resource has known interop issues with Python LXMF)
+- Test PACKET-sized messages for content integrity verification
+- **RESOURCE_PRF proofs routed through activeLinks (not reverse_table)**
+- **Resource proof format is 64 bytes: [hash (32)][proof (32)]**
 
 ### Roadmap Evolution
 
@@ -124,15 +141,6 @@ Recent decisions affecting current work:
 - Resource transfer may timeout waiting for Python propagation node acknowledgment
 - This remaining issue is beyond TCP layer scope, needs separate investigation
 
-### Pending Todos
-
-None yet.
-
-### Blockers/Concerns
-
-- **[RESOLVED at TCP layer]** TCP interface compatibility issue between Kotlin and Python RNS. Plan 01 discovered basic TCP/HDLC layer works correctly. Plan 02 added socket option alignment. Plan 03 confirmed direct delivery works with strict assertions.
-- **[PARTIALLY RESOLVED]** LXMF propagation protocol link callback issue. Plan 04 fixed forRetrieval parameter and nextDeliveryAttempt timing. Messages now progress from OUTBOUND to SENDING. Resource transfer acknowledgment from Python propagation node may still timeout (separate protocol issue).
-
 ### Phase 9 Findings
 
 **BZ2 Compression Interop:** Working correctly
@@ -146,13 +154,25 @@ None yet.
 - Callback infrastructure properly hooked up in LXMRouter
 - PACKET-sized messages deliver with content intact
 
-**Resource Transfer:** Known limitation
-- Large messages (>319 bytes) trigger Resource representation
-- Resource protocol times out with Python LXMF acknowledgment
-- This is a protocol-level issue, not compression or progress tracking
+**Resource Transfer:** FIXED (Plan 03)
+- Bug 1: RESOURCE_PRF proof not routed to activeLinks - Fixed in Transport.processProof()
+- Bug 2: Proof format mismatch (48 vs 64 bytes) - Fixed in Link.kt and Resource.kt
+- Large messages (>319 bytes) now reach DELIVERED state bidirectionally
+- All ResourceDeliveryTest tests pass with strict assertions
+
+### Pending Todos
+
+None yet.
+
+### Blockers/Concerns
+
+- **[RESOLVED at TCP layer]** TCP interface compatibility issue between Kotlin and Python RNS. Plan 01 discovered basic TCP/HDLC layer works correctly. Plan 02 added socket option alignment. Plan 03 confirmed direct delivery works with strict assertions.
+- **[PARTIALLY RESOLVED]** LXMF propagation protocol link callback issue. Plan 04 fixed forRetrieval parameter and nextDeliveryAttempt timing. Messages now progress from OUTBOUND to SENDING. Resource transfer acknowledgment from Python propagation node may still timeout (separate protocol issue).
+- **[RESOLVED]** Resource protocol proof routing and format issues. Plan 09-03 fixed RESOURCE_PRF routing to activeLinks and corrected proof format from 48 to 64 bytes.
 
 ## Session Continuity
 
 Last session: 2026-01-24
-Stopped at: Completed 09-02-PLAN.md
-Resume file: None
+Stopped at: Completed 09-03-PLAN.md (Phase 9 complete)
+Resume file: None (awaiting Phase 10 planning)
+Next step: Plan Phase 10 or proceed to final verification
