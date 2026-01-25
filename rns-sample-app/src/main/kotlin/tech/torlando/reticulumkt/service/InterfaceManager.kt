@@ -230,14 +230,22 @@ class InterfaceManager(
 
     /**
      * Stop and deregister an interface.
+     *
+     * Note: With parentScope wiring (11-04), explicit stop calls become a backup path -
+     * the primary cleanup happens automatically when the service scope is cancelled.
      */
     private fun stopInterface(id: String, iface: Interface) {
         try {
             // Deregister from Transport first
             Transport.deregisterInterface(InterfaceAdapter.getOrCreate(iface))
 
-            // Then detach (closes connections, cancels coroutines)
-            iface.detach()
+            // Use stop() if available (TCPClientInterface) for explicit lifecycle API,
+            // or fall back to detach() for other interface types
+            when (iface) {
+                is TCPClientInterface -> iface.stop()
+                // Add UDPInterface case when used in production
+                else -> iface.detach()
+            }
 
             Log.i(TAG, "Stopped interface: ${iface.name}")
         } catch (e: Exception) {
