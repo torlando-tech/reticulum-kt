@@ -422,6 +422,28 @@ class TCPClientInterface(
         detach()
     }
 
+    /**
+     * Notify the interface that the network has changed.
+     *
+     * This resets the reconnection backoff counter, allowing quick
+     * reconnection attempts on the new network. Call this when:
+     * - WiFi <-> cellular handoff occurs
+     * - Network becomes available after being offline
+     *
+     * Per CONTEXT.md: "Network changes reset the backoff counter"
+     */
+    fun onNetworkChanged() {
+        log("Network changed - resetting reconnection backoff")
+        backoff.reset()
+
+        // If currently offline and not detached, trigger reconnection
+        if (!online.get() && !detached.get() && !reconnecting.get()) {
+            ioScope.launch {
+                reconnect()
+            }
+        }
+    }
+
     override fun detach() {
         super.detach()
         // Cancel all coroutines first
