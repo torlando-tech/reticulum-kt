@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 12 of 17 (Doze-Aware Connection Management)
-Plan: 3 of 5 in current phase
+Plan: 4 of 5 in current phase
 Status: In progress
-Last activity: 2026-01-25 - Completed 12-03-PLAN.md (Wire ConnectionPolicyProvider)
+Last activity: 2026-01-25 - Completed 12-04-PLAN.md (TCPClientInterface Backoff Integration)
 
-Progress: v2 [██████░░░░] 60%
+Progress: v2 [██████░░░░] 67%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9 (v2)
-- Average duration: 2.3min
-- Total execution time: 21min
+- Total plans completed: 10 (v2)
+- Average duration: 2.5min
+- Total execution time: 25min
 
 **By Phase:**
 
@@ -40,7 +40,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
-| 12 | 3/5 | 6min | 2min |
+| 12 | 4/5 | 10min | 2.5min |
 
 *Updated after each plan completion*
 
@@ -80,6 +80,8 @@ Recent decisions affecting current work:
 - [12-02]: Default backoff: 1s initial, 60s max, 2.0 multiplier, 10 attempts
 - [12-03]: Log.d for state changes (policy collector handles throttling reactions)
 - [12-03]: Reverse lifecycle order: policyProvider.stop() before batteryMonitor.stop()
+- [12-04]: Backoff resets on success or network change, not on reconnect cycle start
+- [12-04]: Max attempts causes detach() with log message for debugging
 
 ### From v1
 
@@ -100,5 +102,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 12-03-PLAN.md (Wire ConnectionPolicyProvider)
+Stopped at: Completed 12-04-PLAN.md (TCPClientInterface Backoff Integration)
 Resume file: None
