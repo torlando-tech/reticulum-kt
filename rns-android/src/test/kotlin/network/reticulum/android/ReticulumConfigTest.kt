@@ -48,35 +48,30 @@ class ReticulumConfigTest {
     }
 
     @Test
-    fun `getEffectiveJobInterval for MAXIMUM_BATTERY returns at least 2 minutes`() {
+    fun `getEffectiveTablesCullInterval for MAXIMUM_BATTERY returns 30 seconds`() {
         val config = ReticulumConfig(
-            jobIntervalMs = 60_000,
             batteryOptimization = ReticulumConfig.BatteryMode.MAXIMUM_BATTERY
         )
 
-        val interval = config.getEffectiveJobInterval()
-        assertTrue("Should be at least 120000ms", interval >= 120_000)
+        assertEquals(30_000L, config.getEffectiveTablesCullInterval())
     }
 
     @Test
-    fun `getEffectiveJobInterval for BALANCED returns configured value`() {
+    fun `getEffectiveTablesCullInterval for BALANCED returns 10 seconds`() {
         val config = ReticulumConfig(
-            jobIntervalMs = 45_000,
             batteryOptimization = ReticulumConfig.BatteryMode.BALANCED
         )
 
-        assertEquals(45_000L, config.getEffectiveJobInterval())
+        assertEquals(10_000L, config.getEffectiveTablesCullInterval())
     }
 
     @Test
-    fun `getEffectiveJobInterval for PERFORMANCE caps at 30 seconds`() {
+    fun `getEffectiveTablesCullInterval for PERFORMANCE returns 5 seconds`() {
         val config = ReticulumConfig(
-            jobIntervalMs = 60_000,
             batteryOptimization = ReticulumConfig.BatteryMode.PERFORMANCE
         )
 
-        val interval = config.getEffectiveJobInterval()
-        assertTrue("Should be at most 30000ms", interval <= 30_000)
+        assertEquals(5_000L, config.getEffectiveTablesCullInterval())
     }
 
     @Test
