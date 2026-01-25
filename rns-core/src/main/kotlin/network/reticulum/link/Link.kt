@@ -2103,14 +2103,16 @@ class Link private constructor(
                 return
             }
 
-            // Proof format: [resource_hash (16 bytes)][proof (32 bytes)]
-            if (data.size != RnsConstants.TRUNCATED_HASH_BYTES + RnsConstants.FULL_HASH_BYTES) {
+            // Proof format: [resource_hash (32 bytes)][proof (32 bytes)]
+            // Python sends full hash (32 bytes), not truncated (16 bytes)
+            if (data.size != RnsConstants.FULL_HASH_BYTES * 2) {
                 log("Invalid proof packet size: ${data.size}")
                 return
             }
 
-            // Extract resource hash
-            val resourceHash = data.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+            // Extract resource hash (full 32 bytes, but we compare truncated for lookup)
+            val resourceHashFull = data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
+            val resourceHash = resourceHashFull.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
             // Find matching outgoing resource - compare truncated hash (first 16 bytes)
             val resource = synchronized(outgoingResources) {

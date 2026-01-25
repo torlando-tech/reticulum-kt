@@ -963,14 +963,15 @@ class Resource private constructor(
         if (status == ResourceConstants.FAILED) return false
 
         try {
-            // Proof format: [resource_hash (16 bytes)][proof (32 bytes)]
-            if (proofData.size != RnsConstants.TRUNCATED_HASH_BYTES + RnsConstants.FULL_HASH_BYTES) {
+            // Proof format: [resource_hash (32 bytes)][proof (32 bytes)]
+            // Python sends full hash (32 bytes), not truncated (16 bytes)
+            if (proofData.size != RnsConstants.FULL_HASH_BYTES * 2) {
                 log("Invalid proof length: ${proofData.size}")
                 return false
             }
 
-            val receivedHash = proofData.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
-            val receivedProof = proofData.copyOfRange(RnsConstants.TRUNCATED_HASH_BYTES, proofData.size)
+            val receivedHash = proofData.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
+            val receivedProof = proofData.copyOfRange(RnsConstants.FULL_HASH_BYTES, proofData.size)
 
             // Verify the proof matches expected
             val expected = expectedProof

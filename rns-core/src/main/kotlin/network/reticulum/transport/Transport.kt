@@ -2638,6 +2638,23 @@ object Transport {
             }
         }
 
+        // Handle RESOURCE_PRF (Resource Proof) - deliver to active link
+        // Resource proofs are sent with the link ID as destination
+        if (packet.context == PacketContext.RESOURCE_PRF) {
+            val activeLink = activeLinks[packet.destinationHash.toKey()]
+            if (activeLink != null) {
+                log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
+                try {
+                    // Call receive() on the Link to process the proof
+                    val receiveMethod = activeLink::class.java.getMethod("receive", Packet::class.java)
+                    receiveMethod.invoke(activeLink, packet)
+                } catch (e: Exception) {
+                    log("Error delivering resource proof to link: ${e.message}")
+                }
+                return
+            }
+        }
+
         // For other proof types, try reverse table
         var reverseEntry = reverseTable[packet.destinationHash.toKey()]
         if (reverseEntry == null) {
