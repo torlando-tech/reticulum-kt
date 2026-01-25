@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 10 of 17 (Android Lifecycle Foundation) - COMPLETE
-Plan: 4 of 4 in current phase - COMPLETE
-Status: Phase complete, ready for Phase 11
-Last activity: 2026-01-25 - Completed 10-04-PLAN.md (Observer lifecycle integration)
+Phase: 11 of 17 (Lifecycle-Aware Scope Injection)
+Plan: 1 of 4 in current phase - COMPLETE
+Status: In progress
+Last activity: 2026-01-25 - Completed 11-01-PLAN.md (TCPClientInterface scope injection)
 
-Progress: v2 [████░░░░░░] 40%
+Progress: v2 [████░░░░░░] 42%
 
 ## Milestone Goals
 
@@ -30,15 +30,16 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4 (v2)
-- Average duration: 2min
-- Total execution time: 8min
+- Total plans completed: 5 (v2)
+- Average duration: 2.4min
+- Total execution time: 12min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
+| 11 | 1/4 | 4min | 4min |
 
 *Updated after each plan completion*
 
@@ -62,6 +63,9 @@ Recent decisions affecting current work:
 - [10-03]: No history buffer for battery status (rare, user-initiated changes)
 - [10-04]: Observers stopped before serviceScope.cancel() for clean shutdown
 - [10-04]: StateFlow collectors use placeholder logging - reactions deferred to Phase 12/15
+- [11-01]: SupervisorJob(parentJob) for child scope - independent failure isolation
+- [11-01]: invokeOnCompletion listener for automatic cleanup on parent cancellation
+- [11-01]: Default null parentScope preserves backward compatibility for JVM tests
 
 ### From v1
 
@@ -82,5 +86,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed Phase 10 (Android Lifecycle Foundation)
+Stopped at: Completed 11-01-PLAN.md (TCPClientInterface scope injection)
 Resume file: None
