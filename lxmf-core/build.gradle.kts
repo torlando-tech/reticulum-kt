@@ -33,4 +33,7 @@ dependencies {
     // Interop testing - reuse Python bridge infrastructure from rns-test
     testImplementation(project(":rns-test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
+
+    // Compression - Apache Commons Compress for BZ2 interop tests
+    testImplementation("org.apache.commons:commons-compress:1.26.0")
 }
