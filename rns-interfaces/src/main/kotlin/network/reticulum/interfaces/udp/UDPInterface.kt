@@ -85,7 +85,15 @@ class UDPInterface(
     private val running = AtomicBoolean(false)
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope: CoroutineScope = createScope(parentScope)
+    private val ioScope: CoroutineScope = createScope(parentScope).also { _ ->
+        // Listen for parent cancellation AFTER scope is created
+        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion { cause ->
+            if (cause != null) {
+                // Parent was cancelled - trigger graceful shutdown
+                detach()
+            }
+        }
+    }
     private var readJob: Job? = null
 
     private fun createScope(parent: CoroutineScope?): CoroutineScope {
@@ -329,6 +337,16 @@ class UDPInterface(
         ioScope.cancel()
 
         cleanup()
+    }
+
+    /**
+     * Stop the interface gracefully.
+     * Cancels all coroutines and closes sockets.
+     * This is the explicit cleanup path - called directly in JVM usage
+     * or triggered automatically when parent scope is cancelled.
+     */
+    fun stop() {
+        detach()
     }
 
     private fun cleanup() {
