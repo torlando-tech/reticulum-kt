@@ -32,9 +32,9 @@ Requirements for LXMF interoperability certification. Each maps to roadmap phase
 
 ### Resource Transfer (Large Messages)
 
-- [ ] **RES-01**: Large LXMF message (>500 bytes) transfers as Resource correctly
-- [ ] **RES-02**: Resource transfer with compression matches Python output
-- [ ] **RES-03**: Resource chunking and reassembly interoperates
+- [x] **RES-01**: Large LXMF message (>500 bytes) transfers as Resource correctly
+- [x] **RES-02**: Resource transfer with compression matches Python output
+- [x] **RES-03**: Resource chunking and reassembly interoperates
 
 ## v2 Requirements
 
@@ -85,9 +85,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | E2E-02 | Phase 6 | Complete |
 | E2E-03 | Phase 7 | Complete |
 | E2E-04 | Phase 8 | Complete |
-| RES-01 | Phase 9 | Pending |
-| RES-02 | Phase 9 | Pending |
-| RES-03 | Phase 9 | Pending |
+| RES-01 | Phase 9 | Complete |
+| RES-02 | Phase 9 | Complete |
+| RES-03 | Phase 9 | Complete |
 
 **Coverage:**
 - v1 requirements: 17 total

@@ -19,7 +19,7 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
 - [x] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
 - [x] **Phase 8.1: TCP Interface Interop** - Fix TCP transport between Kotlin and Python RNS (INSERTED)
-- [ ] **Phase 9: Resource Transfer** - Large LXMF messages as Resources
+- [x] **Phase 9: Resource Transfer** - Large LXMF messages as Resources
 
 ## Phase Details
 
@@ -173,11 +173,12 @@ Plans:
   2. BZ2 compression interoperates bidirectionally (K->P and P->K decompression works)
   3. Large messages transfer with content intact via Resource
   4. Transfer progress callbacks fire appropriately
-**Plans**: 2 plans
+**Plans**: 3 plans
 
 Plans:
-- [ ] 09-01-PLAN.md - Large message Resource transfer tests (threshold boundary + bidirectional delivery)
-- [ ] 09-02-PLAN.md - Resource compression interop tests (BZ2 interop + progress callbacks)
+- [x] 09-01-PLAN.md - Large message Resource transfer tests (threshold boundary + bidirectional delivery)
+- [x] 09-02-PLAN.md - Resource compression interop tests (BZ2 interop + progress callbacks)
+- [x] 09-03-PLAN.md - Gap closure: Fix Resource protocol transfer (proof routing + format)
 
 ## Progress
 
@@ -195,7 +196,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 8.1 -> 
 | 7. Opportunistic Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 8. Propagated Delivery | 2/2 | ✓ Complete | 2026-01-24 |
 | 8.1 TCP Interface Interop | 4/4 | ✓ Complete | 2026-01-24 |
-| 9. Resource Transfer | 0/2 | Not started | - |
+| 9. Resource Transfer | 3/3 | ✓ Complete | 2026-01-24 |
 
 ---
 *Roadmap created: 2026-01-23*
