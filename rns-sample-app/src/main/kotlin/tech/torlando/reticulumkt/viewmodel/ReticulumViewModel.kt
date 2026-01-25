@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.android.NetworkStateObserver
 import network.reticulum.android.ReticulumConfig
 import network.reticulum.android.ReticulumService
 import tech.torlando.reticulumkt.data.PreferencesManager
@@ -74,6 +75,9 @@ sealed class SharedInstanceStatus {
 class ReticulumViewModel(application: Application) : AndroidViewModel(application) {
 
     private val preferencesManager = PreferencesManager(application)
+
+    // Network state observer for InterfaceManager (observes WiFi/cellular transitions)
+    private val networkObserver = NetworkStateObserver(application)
 
     // Interface manager for hot-reload support
     private var interfaceManager: InterfaceManager? = null
@@ -165,12 +169,19 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Wait for Reticulum to initialize
             kotlinx.coroutines.delay(2000)
 
+            // Start network observer for interface manager (WiFi/cellular transitions)
+            networkObserver.start()
+
             // Start interface manager for hot-reload support
             // This observes interface config changes and dynamically starts/stops interfaces
             interfaceManager = InterfaceManager(
                 scope = viewModelScope,
                 interfacesFlow = preferencesManager.interfaces,
-            ).also { it.startObserving() }
+                networkObserver = networkObserver,  // Wire for network change notifications
+            ).also {
+                it.startObserving()
+                it.startNetworkObservation()  // Start observing network changes for backoff reset
+            }
 
             // Start periodic status refresh (every 2 seconds)
             statusRefreshJob = viewModelScope.launch {
@@ -196,6 +207,9 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Stop interface manager first (gracefully shuts down all interfaces)
             interfaceManager?.stopAll()
             interfaceManager = null
+
+            // Stop network observer (no longer needed when interfaces stopped)
+            networkObserver.stop()
 
             // Clear interface statuses
             _interfaceStatuses.value = emptyMap()
