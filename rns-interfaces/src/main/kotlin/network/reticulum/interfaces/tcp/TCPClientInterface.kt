@@ -14,6 +14,7 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.backoff.ExponentialBackoff
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
 import java.io.IOException
@@ -57,6 +58,8 @@ class TCPClientInterface(
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
+
+        @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
         const val RECONNECT_WAIT_MS = 5000L // 5 seconds
 
         /** Enable verbose debug logging via -Dreticulum.tcp.debug=true */
@@ -88,6 +91,11 @@ class TCPClientInterface(
     // Debug counters
     private val framesSent = AtomicLong(0)
     private val framesReceived = AtomicLong(0)
+
+    // Exponential backoff for reconnection: 1s, 2s, 4s... up to 60s, give up after maxReconnectAttempts
+    private val backoff = ExponentialBackoff(
+        maxAttempts = maxReconnectAttempts ?: 10
+    )
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope: CoroutineScope = createScope(parentScope).also {
@@ -220,7 +228,7 @@ class TCPClientInterface(
         } catch (e: Exception) {
             if (initial) {
                 log("Initial connection failed: ${e.message}")
-                log("Will retry in ${RECONNECT_WAIT_MS / 1000} seconds")
+                log("Will retry with exponential backoff (1s, 2s, 4s... up to 60s)")
             }
             false
         }
@@ -229,29 +237,36 @@ class TCPClientInterface(
     private suspend fun reconnect() {
         if (reconnecting.getAndSet(true)) return
 
-        var attempts = 0
-        while (!online.get() && !detached.get()) {
-            delay(RECONNECT_WAIT_MS)
-            attempts++
+        // Note: Do NOT reset backoff here - network change handler will reset when appropriate
+        // This allows progressive backoff across reconnect cycles
 
-            if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
-                log("Max reconnection attempts ($maxReconnectAttempts) reached")
+        while (!online.get() && !detached.get()) {
+            val delayMs = backoff.nextDelay()
+
+            if (delayMs == null) {
+                log("Max reconnection attempts (${backoff.attemptCount}) reached, giving up")
                 detach()
                 break
             }
 
+            delay(delayMs)
+
+            // Check if scope still active after delay
+            if (!ioScope.isActive) break
+
             try {
                 if (connect()) {
                     if (!neverConnected.get()) {
-                        log("Reconnected successfully")
+                        log("Reconnected successfully after ${backoff.attemptCount} attempts")
                     }
+                    backoff.reset() // Success - reset for next time
                     break
                 }
             } catch (e: CancellationException) {
                 // Scope was cancelled, stop reconnecting
                 break
             } catch (e: Exception) {
-                log("Reconnection attempt $attempts failed: ${e.message}")
+                log("Reconnection attempt ${backoff.attemptCount} failed: ${e.message}")
             }
         }
 
