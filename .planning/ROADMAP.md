@@ -27,7 +27,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 **Phase Numbering:** Continues from v1 (phases 10-17)
 
 - [x] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
-- [ ] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
+- [x] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
 - [ ] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
 - [ ] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
 - [ ] **Phase 14: Service Notification UX** - Status display and quick actions
@@ -73,10 +73,10 @@ Plans:
 **Plans:** 4 plans (2 parallel in wave 1, 2 parallel in wave 2)
 
 Plans:
-- [ ] 11-01-PLAN.md - TCPClientInterface parentScope injection
-- [ ] 11-02-PLAN.md - UDPInterface parentScope injection
-- [ ] 11-03-PLAN.md - Scope injection tests and verification
-- [ ] 11-04-PLAN.md - Wire InterfaceManager to pass parentScope to interfaces
+- [x] 11-01-PLAN.md - TCPClientInterface parentScope injection
+- [x] 11-02-PLAN.md - UDPInterface parentScope injection
+- [x] 11-03-PLAN.md - Scope injection tests and verification
+- [x] 11-04-PLAN.md - Wire InterfaceManager to pass parentScope to interfaces
 
 ### Phase 12: Doze-Aware Connection Management
 
@@ -169,7 +169,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
-| 11. Lifecycle-Aware Scope Injection | 0/3 | Planned | - |
+| 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
 | 12. Doze-Aware Connection Management | 0/TBD | Not started | - |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
 | 14. Service Notification UX | 0/TBD | Not started | - |

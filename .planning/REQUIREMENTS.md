@@ -9,7 +9,7 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 
 ### Background Connectivity
 
-- [ ] **CONN-01**: Foreground service keeps TCP/UDP connections alive when app backgrounded
+- [x] **CONN-01**: Foreground service keeps TCP/UDP connections alive when app backgrounded
 - [ ] **CONN-02**: Connection survives Doze mode via maintenance window scheduling
 - [ ] **CONN-03**: Automatic reconnection after network changes (WiFi ↔ cellular, offline → online)
 - [ ] **CONN-04**: Works on API 26+ (Android 8.0 Oreo and later)
@@ -36,7 +36,7 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 
 - [ ] **SERV-01**: Foreground service with correct type (`connectedDevice` for P2P mesh)
 - [ ] **SERV-02**: Notification channel with user controls (importance, sound, vibration)
-- [ ] **SERV-03**: Lifecycle-aware coroutine management (proper cancellation on service stop)
+- [x] **SERV-03**: Lifecycle-aware coroutine management (proper cancellation on service stop)
 - [ ] **SERV-04**: Connection status displayed in persistent notification
 - [ ] **SERV-05**: Quick actions in notification (reconnect, pause connection)
 
@@ -79,7 +79,7 @@ Which phases cover which requirements.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CONN-01 | Phase 11 | Pending |
+| CONN-01 | Phase 11 | Complete |
 | CONN-02 | Phase 12 | Pending |
 | CONN-03 | Phase 12 | Pending |
 | CONN-04 | Phase 10 | Pending |
@@ -97,7 +97,7 @@ Which phases cover which requirements.
 | OEM-05 | Phase 16 | Pending |
 | SERV-01 | Phase 10 | Pending |
 | SERV-02 | Phase 10 | Pending |
-| SERV-03 | Phase 11 | Pending |
+| SERV-03 | Phase 11 | Complete |
 | SERV-04 | Phase 14 | Pending |
 | SERV-05 | Phase 14 | Pending |
 | MEM-01 | Phase 17 | Pending |
