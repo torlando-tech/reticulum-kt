@@ -75,40 +75,40 @@ Explicitly excluded. Documented to prevent scope creep.
 
 ## Traceability
 
-Which phases cover which requirements. Populated during roadmap creation.
+Which phases cover which requirements.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CONN-01 | TBD | Pending |
-| CONN-02 | TBD | Pending |
-| CONN-03 | TBD | Pending |
-| CONN-04 | TBD | Pending |
-| CONN-05 | TBD | Pending |
-| CONN-06 | TBD | Pending |
-| BATT-01 | TBD | Pending |
-| BATT-02 | TBD | Pending |
-| BATT-03 | TBD | Pending |
-| BATT-04 | TBD | Pending |
-| BATT-05 | TBD | Pending |
-| OEM-01 | TBD | Pending |
-| OEM-02 | TBD | Pending |
-| OEM-03 | TBD | Pending |
-| OEM-04 | TBD | Pending |
-| OEM-05 | TBD | Pending |
-| SERV-01 | TBD | Pending |
-| SERV-02 | TBD | Pending |
-| SERV-03 | TBD | Pending |
-| SERV-04 | TBD | Pending |
-| SERV-05 | TBD | Pending |
-| MEM-01 | TBD | Pending |
-| MEM-02 | TBD | Pending |
-| MEM-03 | TBD | Pending |
+| CONN-01 | Phase 11 | Pending |
+| CONN-02 | Phase 12 | Pending |
+| CONN-03 | Phase 12 | Pending |
+| CONN-04 | Phase 10 | Pending |
+| CONN-05 | Phase 12 | Pending |
+| CONN-06 | Phase 13 | Pending |
+| BATT-01 | Phase 15 | Pending |
+| BATT-02 | Phase 15 | Pending |
+| BATT-03 | Phase 13 | Pending |
+| BATT-04 | Phase 12 | Pending |
+| BATT-05 | Phase 15 | Pending |
+| OEM-01 | Phase 16 | Pending |
+| OEM-02 | Phase 16 | Pending |
+| OEM-03 | Phase 16 | Pending |
+| OEM-04 | Phase 16 | Pending |
+| OEM-05 | Phase 16 | Pending |
+| SERV-01 | Phase 10 | Pending |
+| SERV-02 | Phase 10 | Pending |
+| SERV-03 | Phase 11 | Pending |
+| SERV-04 | Phase 14 | Pending |
+| SERV-05 | Phase 14 | Pending |
+| MEM-01 | Phase 17 | Pending |
+| MEM-02 | Phase 17 | Pending |
+| MEM-03 | Phase 17 | Pending |
 
 **Coverage:**
 - v2 requirements: 24 total
-- Mapped to phases: 0 (pending roadmap creation)
-- Unmapped: 24
+- Mapped to phases: 24
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-01-24*
-*Traceability updated: pending roadmap creation*
+*Traceability updated: 2026-01-24*
