@@ -5,6 +5,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import network.reticulum.android.NetworkStateObserver
+import network.reticulum.android.NetworkType
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.InterfaceAdapter
 import network.reticulum.interfaces.auto.AutoInterface
@@ -24,6 +26,7 @@ import java.util.concurrent.ConcurrentHashMap
 class InterfaceManager(
     private val scope: CoroutineScope,
     private val interfacesFlow: Flow<List<StoredInterfaceConfig>>,
+    private val networkObserver: NetworkStateObserver? = null,  // Optional for backward compat
 ) {
     companion object {
         private const val TAG = "InterfaceManager"
@@ -31,6 +34,12 @@ class InterfaceManager(
 
     /** Running interfaces keyed by config ID. */
     private val runningInterfaces = ConcurrentHashMap<String, Interface>()
+
+    /** Previous network type for detecting actual changes (not repeated events). */
+    private var previousNetworkType: NetworkType? = null
+
+    /** Job for observing network state changes. */
+    private var networkObserveJob: Job? = null
 
     /** Job for observing interface configuration changes. */
     private var observeJob: Job? = null
@@ -51,9 +60,55 @@ class InterfaceManager(
     }
 
     /**
+     * Start observing network state changes.
+     * Must be called after interfaces are registered.
+     *
+     * When network type changes (WiFi <-> Cellular, None <-> Connected),
+     * notifies all TCP interfaces to reset their reconnection backoff.
+     */
+    fun startNetworkObservation() {
+        val observer = networkObserver ?: return
+
+        networkObserveJob?.cancel()
+        networkObserveJob = scope.launch {
+            observer.state.collect { state ->
+                val currentType = state.type
+                val previousType = previousNetworkType
+
+                // Detect actual network type changes (not just repeated events)
+                if (previousType != null && currentType != previousType) {
+                    Log.i(TAG, "Network type changed: $previousType -> $currentType")
+                    notifyNetworkChange()
+                }
+
+                previousNetworkType = currentType
+            }
+        }
+    }
+
+    /**
+     * Notify all TCP client interfaces that the network has changed.
+     * This resets their reconnection backoff for quick reconnection.
+     */
+    private fun notifyNetworkChange() {
+        runningInterfaces.values.forEach { iface ->
+            when (iface) {
+                is TCPClientInterface -> {
+                    Log.d(TAG, "Notifying ${iface.name} of network change")
+                    iface.onNetworkChanged()
+                }
+                // UDP interfaces are connectionless, no notification needed
+                // Other interface types can be added as needed
+            }
+        }
+    }
+
+    /**
      * Stop observing and shut down all managed interfaces.
      */
     fun stopAll() {
+        networkObserveJob?.cancel()
+        networkObserveJob = null
         observeJob?.cancel()
         observeJob = null
 
