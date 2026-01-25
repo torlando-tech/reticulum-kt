@@ -290,7 +290,9 @@ class ScopeInjectionTest {
             targetHost = "127.0.0.1",
             targetPort = 15311,
             connectTimeoutMs = 100,
-            maxReconnectAttempts = 0,
+            // Use high maxReconnectAttempts so interface keeps retrying during test window
+            // (with exponential backoff starting at 1s, 10 attempts gives >2 minutes of retries)
+            maxReconnectAttempts = 10,
             parentScope = parentScope
         )
         interfaces.add(tcp)
@@ -301,11 +303,11 @@ class ScopeInjectionTest {
         delay(300)
 
         // The key test: interface should NOT be detached while parent is active
-        // (only detached when parent is cancelled or explicit stop)
+        // (only detached when parent is cancelled or explicit stop, or max attempts exhausted)
         assertTrue(parentScope.isActive, "Parent scope should still be active")
         assertFalse(tcp.detached.get(), "Interface should NOT be detached while parent is active")
 
-        // Wait longer - still should not auto-detach
+        // Wait longer - still should not auto-detach (within backoff window)
         delay(500)
         assertFalse(tcp.detached.get(), "Interface should STILL not be detached after 800ms")
     }
