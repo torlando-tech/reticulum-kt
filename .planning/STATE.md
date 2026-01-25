@@ -12,7 +12,7 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 Phase: 12 of 17 (Doze-Aware Connection Management)
 Plan: 2 of 5 in current phase
 Status: In progress
-Last activity: 2026-01-25 - Completed 12-02-PLAN.md (ExponentialBackoff)
+Last activity: 2026-01-25 - Completed 12-01-PLAN.md (ConnectionPolicy)
 
 Progress: v2 [█████░░░░░] 53%
 
@@ -73,6 +73,9 @@ Recent decisions affecting current work:
 - [11-04]: stopInterface uses stop() for TCPClientInterface, detach() fallback for others
 - [11-03]: awaitCancellation() watcher for immediate cancellation response
 - [11-03]: Test both positive path (stays alive) and negative path (cancels correctly)
+- [12-01]: 3% hysteresis for battery throttling (15% start, 18% resume)
+- [12-01]: 30-second polling for battery state (simpler than callbackFlow)
+- [12-01]: Charging overrides battery throttling but not Doze
 - [12-02]: Pure Kotlin ExponentialBackoff in rns-interfaces module (not Android-specific)
 - [12-02]: Default backoff: 1s initial, 60s max, 2.0 multiplier, 10 attempts
 
@@ -95,5 +98,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 12-02-PLAN.md (ExponentialBackoff)
+Stopped at: Completed 12-01-PLAN.md (ConnectionPolicy)
 Resume file: None
