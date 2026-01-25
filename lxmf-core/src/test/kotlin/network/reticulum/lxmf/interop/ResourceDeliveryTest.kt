@@ -29,6 +29,8 @@ import kotlin.time.Duration.Companion.seconds
  * Threshold boundary:
  * - Content <= 319 bytes: PACKET representation
  * - Content > 319 bytes: RESOURCE representation
+ *
+ * Resource protocol verified working bidirectionally (Phase 9.3).
  */
 class ResourceDeliveryTest : DirectDeliveryTestBase() {
 
@@ -132,13 +134,11 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
 
     // ===== Bidirectional Large Message Delivery Tests =====
     //
-    // Note: Resource transfer over TCP has known timing issues (Phase 8.1 findings).
+    // Resource protocol verified working bidirectionally (Phase 9.3).
     // These tests verify:
     // 1. RESOURCE representation is correctly selected
-    // 2. Message progresses beyond OUTBOUND state (Resource transfer initiated)
-    // 3. If completed, content is preserved
-    //
-    // Accept SENDING/SENT/DELIVERED as valid progress states, similar to PropagatedDeliveryTest.
+    // 2. Message reaches DELIVERED state
+    // 3. Content integrity is preserved
 
     @Test
     @Timeout(90, unit = TimeUnit.SECONDS)
@@ -190,16 +190,11 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
         val currentState = if (callbackFired.get()) finalState.get() else message.state
         println("[KT] Message state: $currentState")
 
-        // Verify message progressed (OUTBOUND -> SENDING/SENT/DELIVERED)
-        val validProgressStates = listOf(
-            MessageState.OUTBOUND,  // May still be establishing link
-            MessageState.SENDING,   // Resource transfer in progress
-            MessageState.SENT,      // Transfer completed
-            MessageState.DELIVERED  // Full round-trip
-        )
-        validProgressStates shouldContain currentState
+        // Verify message reached DELIVERED state (Resource proof received)
+        currentState shouldBe MessageState.DELIVERED
+        println("[KT] Message reached DELIVERED state")
 
-        // Check if Python received the message (may succeed even if Kotlin state didn't update)
+        // Verify Python received the message with content intact
         val received = withTimeoutOrNull(20.seconds) {
             var messages = getPythonMessages()
             while (messages.isEmpty()) {
@@ -209,21 +204,17 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
             messages
         }
 
-        if (received != null && received.isNotEmpty()) {
-            received[0].title shouldBe "Large K->P"
-            received[0].content shouldBe largeContent
-            println("[KT] Python received message with content intact!")
-            println("     Content: ${received[0].content.length} bytes")
-        } else {
-            println("[KT] Message did not reach Python within timeout")
-            println("[KT] This may indicate TCP/Resource timing issues (known limitation)")
-        }
+        received shouldNotBe null
+        received!!.isNotEmpty() shouldBe true
+        received[0].title shouldBe "Large K->P"
+        received[0].content shouldBe largeContent
+        println("[KT] Python received message with content intact!")
+        println("     Content: ${received[0].content.length} bytes")
 
-        // Final state check - accept progress as success
         println("\n[OK] Kotlin -> Python RESOURCE delivery test complete")
         println("     Representation: RESOURCE (verified)")
         println("     State: $currentState")
-        println("     Python received: ${received != null && received.isNotEmpty()}")
+        println("     Python received: true")
     }
 
     @Test
@@ -259,19 +250,14 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
             receivedMessages.toList()
         }
 
-        if (received != null && received.isNotEmpty()) {
-            received[0].title shouldBe "Large P->K"
-            received[0].content shouldBe largeContent
-            println("\n[OK] Python -> Kotlin RESOURCE delivery successful!")
-            println("     Title: ${received[0].title}")
-            println("     Content: ${received[0].content.length} bytes")
-        } else {
-            println("\n[Info] Python -> Kotlin RESOURCE delivery did not complete")
-            println("       This may indicate TCP/Resource timing issues (known limitation)")
-            println("       Python initiated send: ${result.getString("status")}")
-        }
-
-        // The test verifies the attempt was made; actual delivery depends on TCP stability
+        // Verify Kotlin received the message
+        received shouldNotBe null
+        received!!.isNotEmpty() shouldBe true
+        received[0].title shouldBe "Large P->K"
+        received[0].content shouldBe largeContent
+        println("\n[OK] Python -> Kotlin RESOURCE delivery successful!")
+        println("     Title: ${received[0].title}")
+        println("     Content: ${received[0].content.length} bytes")
         println("[OK] Python -> Kotlin RESOURCE delivery test complete")
     }
 
@@ -319,13 +305,11 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
             messages
         }
 
-        val k2pSuccess = pythonReceived != null && pythonReceived.isNotEmpty()
-        if (k2pSuccess) {
-            pythonReceived!![0].content shouldBe k2pContent
-            println("     [OK] Kotlin -> Python: received ${pythonReceived[0].content.length} bytes")
-        } else {
-            println("     [Info] Kotlin -> Python: delivery pending/timeout")
-        }
+        // Verify K->P delivery
+        pythonReceived shouldNotBe null
+        pythonReceived!!.isNotEmpty() shouldBe true
+        pythonReceived[0].content shouldBe k2pContent
+        println("     [OK] Kotlin -> Python: received ${pythonReceived[0].content.length} bytes")
 
         // 2. Python -> Kotlin
         println("[Test] Step 2: Python -> Kotlin (500 bytes)")
@@ -345,18 +329,14 @@ class ResourceDeliveryTest : DirectDeliveryTestBase() {
             receivedMessages.toList()
         }
 
-        val p2kSuccess = kotlinReceived != null && kotlinReceived.isNotEmpty()
-        if (p2kSuccess) {
-            kotlinReceived!![0].content shouldBe p2kContent
-            println("     [OK] Python -> Kotlin: received ${kotlinReceived[0].content.length} bytes")
-        } else {
-            println("     [Info] Python -> Kotlin: delivery pending/timeout")
-        }
+        // Verify P->K delivery
+        kotlinReceived shouldNotBe null
+        kotlinReceived!!.isNotEmpty() shouldBe true
+        kotlinReceived[0].content shouldBe p2kContent
+        println("     [OK] Python -> Kotlin: received ${kotlinReceived[0].content.length} bytes")
 
         println("\n[OK] Bidirectional RESOURCE delivery test complete")
-        println("     K->P: ${if (k2pSuccess) "delivered" else "pending"}")
-        println("     P->K: ${if (p2kSuccess) "delivered" else "pending"}")
-
-        // At least verify RESOURCE was used (which it was, checked above)
+        println("     K->P: delivered")
+        println("     P->K: delivered")
     }
 }
