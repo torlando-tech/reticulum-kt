@@ -10,10 +10,10 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 ### Background Connectivity
 
 - [x] **CONN-01**: Foreground service keeps TCP/UDP connections alive when app backgrounded
-- [ ] **CONN-02**: Connection survives Doze mode via maintenance window scheduling
-- [ ] **CONN-03**: Automatic reconnection after network changes (WiFi ↔ cellular, offline → online)
+- [x] **CONN-02**: Connection survives Doze mode via maintenance window scheduling
+- [x] **CONN-03**: Automatic reconnection after network changes (WiFi ↔ cellular, offline → online)
 - [ ] **CONN-04**: Works on API 26+ (Android 8.0 Oreo and later)
-- [ ] **CONN-05**: Connection persists across full device sleep/wake cycles
+- [x] **CONN-05**: Connection persists across full device sleep/wake cycles
 - [ ] **CONN-06**: Sub-second message delivery even when app is backgrounded
 
 ### Battery Management
@@ -21,7 +21,7 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 - [ ] **BATT-01**: Battery drain <2% per hour while maintaining connection
 - [ ] **BATT-02**: Battery optimization exemption request flow (guides user through settings)
 - [ ] **BATT-03**: WorkManager integration for Doze-surviving periodic tasks (15-minute windows)
-- [ ] **BATT-04**: Intelligent connection throttling during low battery (<15%)
+- [x] **BATT-04**: Intelligent connection throttling during low battery (<15%)
 - [ ] **BATT-05**: Battery usage statistics visible to user in app
 
 ### OEM Compatibility
@@ -80,15 +80,15 @@ Which phases cover which requirements.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | CONN-01 | Phase 11 | Complete |
-| CONN-02 | Phase 12 | Pending |
-| CONN-03 | Phase 12 | Pending |
+| CONN-02 | Phase 12 | Complete |
+| CONN-03 | Phase 12 | Complete |
 | CONN-04 | Phase 10 | Pending |
-| CONN-05 | Phase 12 | Pending |
+| CONN-05 | Phase 12 | Complete |
 | CONN-06 | Phase 13 | Pending |
 | BATT-01 | Phase 15 | Pending |
 | BATT-02 | Phase 15 | Pending |
 | BATT-03 | Phase 13 | Pending |
-| BATT-04 | Phase 12 | Pending |
+| BATT-04 | Phase 12 | Complete |
 | BATT-05 | Phase 15 | Pending |
 | OEM-01 | Phase 16 | Pending |
 | OEM-02 | Phase 16 | Pending |

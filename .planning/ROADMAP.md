@@ -28,7 +28,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 
 - [x] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
 - [x] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
-- [ ] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
+- [x] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
 - [ ] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
 - [ ] **Phase 14: Service Notification UX** - Status display and quick actions
 - [ ] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
@@ -93,11 +93,11 @@ Plans:
 **Plans:** 5 plans (2 parallel in wave 1, 2 parallel in wave 2, 1 in wave 3)
 
 Plans:
-- [ ] 12-01-PLAN.md - ConnectionPolicy and ConnectionPolicyProvider (combines state flows)
-- [ ] 12-02-PLAN.md - ExponentialBackoff utility for reconnection strategy
-- [ ] 12-03-PLAN.md - Wire policy into ReticulumService for Transport throttling
-- [ ] 12-04-PLAN.md - TCPClientInterface exponential backoff integration
-- [ ] 12-05-PLAN.md - InterfaceManager network change notifications
+- [x] 12-01-PLAN.md - ConnectionPolicy and ConnectionPolicyProvider (combines state flows)
+- [x] 12-02-PLAN.md - ExponentialBackoff utility for reconnection strategy
+- [x] 12-03-PLAN.md - Wire policy into ReticulumService for Transport throttling
+- [x] 12-04-PLAN.md - TCPClientInterface exponential backoff integration
+- [x] 12-05-PLAN.md - InterfaceManager network change notifications
 
 ### Phase 13: WorkManager Integration
 
@@ -177,7 +177,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
 | 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
-| 12. Doze-Aware Connection Management | 0/5 | Planned | - |
+| 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
 | 14. Service Notification UX | 0/TBD | Not started | - |
 | 15. Battery Optimization UX | 0/TBD | Not started | - |
