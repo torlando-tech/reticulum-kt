@@ -8,12 +8,38 @@ A Kotlin implementation of the Reticulum network stack and LXMF messaging protoc
 
 **Perfect byte-level interoperability with Python LXMF** — Kotlin clients can send and receive LXMF messages (including files and images) with any Python LXMF client, and use Python-hosted propagation nodes for message relay.
 
+## Current State (v1 Shipped)
+
+**Shipped:** 2026-01-24
+
+v1 delivers complete LXMF interoperability:
+- 120+ interop tests verify byte-level compatibility with Python LXMF
+- All 3 delivery methods: DIRECT, OPPORTUNISTIC, PROPAGATED
+- Large message support via Resource transfer with BZ2 compression
+- Stamp generation for propagation node submission
+- 31,126 LOC (Kotlin + Python bridge)
+
+Ready for Columba integration.
+
 ## Requirements
 
 ### Validated
 
-<!-- Shipped and confirmed valuable. Inferred from existing codebase. -->
+<!-- Shipped and confirmed valuable. -->
 
+**v1 LXMF Interoperability (2026-01-24):**
+- ✓ LXMF message round-trip (Kotlin↔Python) — v1
+- ✓ LXMF file attachment interop — v1
+- ✓ LXMF image attachment interop — v1
+- ✓ LXMF stamp generation and validation — v1
+- ✓ End-to-end DIRECT delivery — v1
+- ✓ End-to-end OPPORTUNISTIC delivery — v1
+- ✓ End-to-end PROPAGATED delivery — v1
+- ✓ Large message Resource transfer — v1
+- ✓ Message hash computed identically — v1
+- ✓ Message signature validates across implementations — v1
+
+**Pre-v1 (RNS Foundation):**
 - ✓ X25519/Ed25519 cryptography — verified via Python bridge (70+ commands)
 - ✓ HKDF key derivation — verified via Python bridge
 - ✓ AES-256-CBC encryption — verified via Python bridge
@@ -29,34 +55,29 @@ A Kotlin implementation of the Reticulum network stack and LXMF messaging protoc
 - ✓ TCP client/server interfaces — working
 - ✓ UDP interface (unicast, broadcast, multicast) — working
 - ✓ Local/shared instance interface — working
-- ✓ Transport routing and path management — working (basic)
-- ✓ LXMessage encoding/decoding — Python→Kotlin verified via test vectors
+- ✓ Transport routing and path management — working
 
 ### Active
 
-<!-- Current scope. Building toward these for this milestone. -->
+<!-- Next milestone scope. To be defined in /gsd:new-milestone. -->
 
-- [ ] LXMF message round-trip (Kotlin→Python→Kotlin) — prove Kotlin-packed messages unpack in Python
-- [ ] LXMF file attachment interop — FIELD_FILE_ATTACHMENTS survives round-trip
-- [ ] LXMF image attachment interop — FIELD_IMAGE survives round-trip
-- [ ] LXMF stamp generation and validation — stamps accepted by Python propagation nodes
-- [ ] End-to-end DIRECT delivery — Kotlin client ↔ Python client via Link
-- [ ] End-to-end OPPORTUNISTIC delivery — Kotlin sends when path available
-- [ ] End-to-end PROPAGATED delivery — Kotlin → Python propagation node → Python recipient
-- [ ] Large message Resource transfer — messages >500 bytes transfer correctly
+(No active requirements — start next milestone with `/gsd:new-milestone`)
 
 ### Out of Scope
 
 <!-- Explicit boundaries. Includes reasoning to prevent re-adding. -->
 
 - Hosting LXMF propagation nodes — User only needs client functionality for Columba
-- Android battery optimization — Deferred until interop verified; no point optimizing broken code
 - Serial interface — Not needed for Columba use case
 - RNode/LoRa interface — Not needed for Columba use case
 - BLE interface — Not needed for Columba use case
 - I2P interface — Not needed for Columba use case
-- Auto Interface (mDNS) — Not needed for Columba use case (connects to known nodes)
-- IFAC (Interface Authentication) — Nice-to-have, not blocking
+
+**Potential v2 scope (deferred, not blocked):**
+- Android battery optimization (Doze mode, WorkManager)
+- Auto Interface (mDNS peer discovery)
+- IFAC (Interface Authentication)
+- Hardware-accelerated crypto
 
 ## Context
 
@@ -66,16 +87,20 @@ A Kotlin implementation of the Reticulum network stack and LXMF messaging protoc
 
 **Testing Infrastructure:**
 - Python bridge server: `python-bridge/bridge_server.py` (70+ commands for cross-implementation verification)
-- Interop test suite: `rns-test/src/test/kotlin/network/reticulum/interop/`
+- Interop test suite: `lxmf-core/src/test/kotlin/network/reticulum/lxmf/interop/` (120+ tests)
 - LXMF test vectors: `lxmf-core/src/test/resources/lxmf_test_vectors.json`
 
 **Codebase Analysis:**
 - See `.planning/codebase/` for detailed architecture, stack, and concerns documentation
-- Key concern: Android battery/Doze issues flagged but deferred
+- Key concern: Android battery/Doze issues flagged but deferred to v2
 
 **Target Integration:**
 - Columba: Existing LXMF messaging app using Python Reticulum
 - Goal: Replace Python backend with Kotlin implementation
+
+**Milestone History:**
+- See `.planning/MILESTONES.md` for shipped versions
+- See `.planning/milestones/` for archived roadmaps and requirements
 
 ## Constraints
 
@@ -90,10 +115,14 @@ A Kotlin implementation of the Reticulum network stack and LXMF messaging protoc
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Interop before Android optimization | Prove correctness first, then optimize | — Pending |
-| Skip propagation node hosting | Client-only scope for Columba | — Pending |
-| Skip Serial/RNode/BLE interfaces | Not needed for TCP/UDP mesh connectivity | — Pending |
-| Use existing Python bridge pattern | Proven effective for RNS interop (70+ commands) | ✓ Good |
+| Interop before Android optimization | Prove correctness first, then optimize | ✓ Good — v1 shipped with full interop |
+| Skip propagation node hosting | Client-only scope for Columba | ✓ Good — client-only verified |
+| Skip Serial/RNode/BLE interfaces | Not needed for TCP/UDP mesh connectivity | ✓ Good — TCP/UDP sufficient |
+| Use existing Python bridge pattern | Proven effective for RNS interop | ✓ Excellent — 120+ tests verify interop |
+| Raw hashes in LXMF bridge | Avoids RNS initialization complexity | ✓ Good — simplified testing |
+| forRetrieval parameter in establishPropagationLink | Differentiate delivery vs retrieval callbacks | ✓ Good — fixed propagation delivery |
+| 64-byte Resource proof format | Match Python protocol exactly | ✓ Good — fixed Resource transfer |
+| RESOURCE_PRF routing to activeLinks | Not reverse_table (per Python reference) | ✓ Good — fixed proof delivery |
 
 ---
-*Last updated: 2026-01-23 after initialization*
+*Last updated: 2026-01-24 after v1 milestone*
