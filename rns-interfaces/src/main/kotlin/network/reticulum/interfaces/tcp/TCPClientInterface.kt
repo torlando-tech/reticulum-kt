@@ -45,6 +45,12 @@ class TCPClientInterface(
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
+    /**
+     * Parent coroutine scope for lifecycle-aware cancellation.
+     * When null (default), creates standalone scope - for JVM/standalone usage.
+     * When provided, creates child scope that cancels when parent cancels - for Android service usage.
+     */
+    private val parentScope: CoroutineScope? = null,
 ) : Interface(name) {
 
     companion object {
@@ -84,9 +90,25 @@ class TCPClientInterface(
     private val framesReceived = AtomicLong(0)
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ioScope: CoroutineScope = createScope(parentScope)
     private var readJob: Job? = null
     private var connectJob: Job? = null
+
+    /**
+     * Create the appropriate coroutine scope based on parent.
+     * - With parent: child scope that cancels when parent cancels (Android service lifecycle)
+     * - Without parent: standalone scope for JVM/test usage
+     */
+    private fun createScope(parent: CoroutineScope?): CoroutineScope {
+        return if (parent != null) {
+            // Child scope: cancels when parent cancels, but can cancel independently
+            // SupervisorJob(parentJob) creates a child that doesn't propagate failures upward
+            CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
+        } else {
+            // Standalone scope: lives until explicitly cancelled
+            CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+    }
 
     private val hdlcDeframer = HDLC.createDeframer { data ->
         val frameNum = framesReceived.incrementAndGet()
