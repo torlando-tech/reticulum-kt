@@ -17,8 +17,8 @@ This roadmap delivers byte-level LXMF interoperability between Kotlin and Python
 - [x] **Phase 5: Stamp Interop** - Proof-of-work stamp generation and validation
 - [x] **Phase 6: Direct Delivery** - LXMF messages over established Links
 - [x] **Phase 7: Opportunistic Delivery** - LXMF messages when path available
-- [ ] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
-- [ ] **Phase 8.1: TCP Interface Interop** - Fix TCP transport between Kotlin and Python RNS (INSERTED)
+- [x] **Phase 8: Propagated Delivery** - LXMF messages via propagation node
+- [x] **Phase 8.1: TCP Interface Interop** - Fix TCP transport between Kotlin and Python RNS (INSERTED)
 - [ ] **Phase 9: Resource Transfer** - Large LXMF messages as Resources
 
 ## Phase Details
@@ -162,7 +162,7 @@ Plans:
 - [x] 08.1-01-PLAN.md - Diagnostic logging + minimal Python TCP interop test
 - [x] 08.1-02-PLAN.md - Socket options alignment and write safeguards
 - [x] 08.1-03-PLAN.md - Tighten E2E test assertions (strict DELIVERED state)
-- [ ] 08.1-04-PLAN.md - Gap closure: LXMF propagation link callback fix
+- [x] 08.1-04-PLAN.md - Gap closure: LXMF propagation link callback fix
 
 ### Phase 9: Resource Transfer
 **Goal**: Large LXMF messages (>500 bytes) transfer correctly as Resources
@@ -193,8 +193,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 8.1 -> 
 | 5. Stamp Interop | 2/2 | ✓ Complete | 2026-01-24 |
 | 6. Direct Delivery | 3/3 | ✓ Complete | 2026-01-24 |
 | 7. Opportunistic Delivery | 3/3 | ✓ Complete | 2026-01-24 |
-| 8. Propagated Delivery | 2/2 | ⚠ Gaps found | - |
-| 8.1 TCP Interface Interop | 3/4 | Gap closure | - |
+| 8. Propagated Delivery | 2/2 | ✓ Complete | 2026-01-24 |
+| 8.1 TCP Interface Interop | 4/4 | ✓ Complete | 2026-01-24 |
 | 9. Resource Transfer | 0/2 | Not started | - |
 
 ---
