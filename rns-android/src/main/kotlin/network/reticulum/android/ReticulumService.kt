@@ -8,6 +8,7 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
@@ -46,6 +47,11 @@ class ReticulumService : LifecycleService() {
     private var config: ReticulumConfig = ReticulumConfig.DEFAULT
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    // Lifecycle-aware observers for Android system state
+    private lateinit var dozeObserver: DozeStateObserver
+    private lateinit var networkObserver: NetworkStateObserver
+    private lateinit var batteryChecker: BatteryOptimizationChecker
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -55,6 +61,44 @@ class ReticulumService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+
+        // Initialize lifecycle-aware observers
+        dozeObserver = DozeStateObserver(this)
+        networkObserver = NetworkStateObserver(this)
+        batteryChecker = BatteryOptimizationChecker(this)
+
+        // Start observers
+        dozeObserver.start()
+        networkObserver.start()
+        batteryChecker.start()
+
+        // Log initial states
+        Log.i(TAG, "Doze state: ${dozeObserver.state.value}")
+        Log.i(TAG, "Network state: ${networkObserver.state.value}")
+        Log.i(TAG, "Battery optimization: ${batteryChecker.status.value}")
+
+        // Collect state changes with placeholder logging
+        // Phase 12 will implement actual reactions to these state changes
+        lifecycleScope.launch {
+            dozeObserver.state.collect { state ->
+                Log.i(TAG, "Doze state changed: $state")
+                // Phase 12 will implement actual reactions
+            }
+        }
+
+        lifecycleScope.launch {
+            networkObserver.state.collect { state ->
+                Log.i(TAG, "Network state changed: $state")
+                // Phase 12 will implement actual reactions
+            }
+        }
+
+        lifecycleScope.launch {
+            batteryChecker.status.collect { status ->
+                Log.i(TAG, "Battery optimization status: $status")
+                // Phase 15 will implement guidance flow
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -90,6 +134,11 @@ class ReticulumService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        // Stop observers before other cleanup
+        dozeObserver.stop()
+        networkObserver.stop()
+        batteryChecker.stop()
+
         serviceScope.cancel()
         shutdownReticulum()
         super.onDestroy()
@@ -306,6 +355,7 @@ class ReticulumService : LifecycleService() {
     fun isRunning(): Boolean = reticulum != null
 
     companion object {
+        private const val TAG = "ReticulumService"
         private const val NOTIFICATION_ID = 1001
         private const val EXTRA_CONFIG = "config"
 
