@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 11 of 17 (Lifecycle-Aware Scope Injection)
-Plan: 2 of 4 in current phase - COMPLETE
-Status: In progress
-Last activity: 2026-01-25 - Completed 11-02-PLAN.md (UDPInterface scope injection)
+Plan: 4 of 4 in current phase - COMPLETE
+Status: Phase complete (11-03 skipped - tests deferred)
+Last activity: 2026-01-25 - Completed 11-04-PLAN.md (InterfaceManager scope wiring)
 
-Progress: v2 [████░░░░░░] 45%
+Progress: v2 [████░░░░░░] 50%
 
 ## Milestone Goals
 
@@ -39,7 +39,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
-| 11 | 2/4 | 7min | 3.5min |
+| 11 | 3/4 | 8min | 2.7min |
 
 *Updated after each plan completion*
 
@@ -68,6 +68,8 @@ Recent decisions affecting current work:
 - [11-01]: Default null parentScope preserves backward compatibility for JVM tests
 - [11-02]: parentScope as last parameter preserves all existing call sites
 - [11-02]: stop() delegates to detach() - single cleanup path
+- [11-04]: parentScope = scope wired in InterfaceManager TCP_CLIENT case
+- [11-04]: stopInterface uses stop() for TCPClientInterface, detach() fallback for others
 
 ### From v1
 
@@ -88,5 +90,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 11-02-PLAN.md (UDPInterface scope injection)
+Stopped at: Completed 11-04-PLAN.md (InterfaceManager scope wiring)
 Resume file: None
