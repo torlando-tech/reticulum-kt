@@ -52,6 +52,8 @@ Recent decisions affecting current work:
 - [v1]: API 26+ target floor (enables modern Android APIs)
 - [v1]: TCP/UDP interfaces already working (v2 adds lifecycle management)
 - [v1]: No Python at runtime (pure Kotlin for production)
+- [10-01]: connectedDevice service type for P2P mesh networking (not dataSync)
+- [10-01]: Dual notification channels (service low-priority, alerts default-priority)
 - [10-02]: StateFlow over callback-based listener for reactive Doze API
 - [10-02]: Injectable class design over singleton for testability
 - [10-02]: ConcurrentLinkedDeque for thread-safe history buffer
