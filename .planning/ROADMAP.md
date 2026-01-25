@@ -165,19 +165,19 @@ Plans:
 - [x] 08.1-04-PLAN.md - Gap closure: LXMF propagation link callback fix
 
 ### Phase 9: Resource Transfer
-**Goal**: Large LXMF messages (>500 bytes) transfer correctly as Resources
+**Goal**: Large LXMF messages (>319 bytes content) transfer correctly as Resources between Kotlin and Python
 **Depends on**: Phase 6
 **Requirements**: RES-01, RES-02, RES-03
 **Success Criteria** (what must be TRUE):
-  1. LXMF message over 500 bytes automatically transfers as Resource
-  2. Resource compression output matches Python for same input
-  3. Chunked transfer reassembles correctly with content intact
+  1. LXMF message over 319 bytes content automatically uses RESOURCE representation
+  2. BZ2 compression interoperates bidirectionally (K->P and P->K decompression works)
+  3. Large messages transfer with content intact via Resource
   4. Transfer progress callbacks fire appropriately
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 09-01: Large message Resource transfer tests
-- [ ] 09-02: Resource compression interop tests
+- [ ] 09-01-PLAN.md - Large message Resource transfer tests (threshold boundary + bidirectional delivery)
+- [ ] 09-02-PLAN.md - Resource compression interop tests (BZ2 interop + progress callbacks)
 
 ## Progress
 
