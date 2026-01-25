@@ -151,6 +151,7 @@ class InterfaceManager(
                         targetPort = port,
                         ifacNetname = config.networkName,
                         ifacNetkey = config.passphrase,
+                        parentScope = scope,  // Wire service scope for lifecycle-aware cancellation
                     )
 
                     // Set up packet callback to forward to Transport
