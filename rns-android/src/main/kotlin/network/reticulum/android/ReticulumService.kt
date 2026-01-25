@@ -52,6 +52,10 @@ class ReticulumService : LifecycleService() {
     private lateinit var networkObserver: NetworkStateObserver
     private lateinit var batteryChecker: BatteryOptimizationChecker
 
+    // Connection policy provider for throttling based on Doze, network, and battery state
+    private lateinit var batteryMonitor: BatteryMonitor
+    private lateinit var policyProvider: ConnectionPolicyProvider
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -72,24 +76,52 @@ class ReticulumService : LifecycleService() {
         networkObserver.start()
         batteryChecker.start()
 
+        // Create BatteryMonitor for policy provider
+        batteryMonitor = BatteryMonitor(this)
+        batteryMonitor.start()
+
+        // Create connection policy provider
+        policyProvider = ConnectionPolicyProvider(
+            dozeObserver = dozeObserver,
+            networkObserver = networkObserver,
+            batteryMonitor = batteryMonitor,
+            scope = lifecycleScope
+        )
+        policyProvider.start()
+
         // Log initial states
         Log.i(TAG, "Doze state: ${dozeObserver.state.value}")
         Log.i(TAG, "Network state: ${networkObserver.state.value}")
         Log.i(TAG, "Battery optimization: ${batteryChecker.status.value}")
+        Log.i(TAG, "Connection policy: ${policyProvider.currentPolicy}")
 
-        // Collect state changes with placeholder logging
-        // Phase 12 will implement actual reactions to these state changes
+        // Collect policy changes to throttle Transport job interval
+        lifecycleScope.launch {
+            policyProvider.policy.collect { policy ->
+                // Base interval from Python: 250ms (Transport.JOB_INTERVAL)
+                val baseIntervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL
+                val throttledIntervalMs = (baseIntervalMs * policy.throttleMultiplier).toLong()
+
+                network.reticulum.transport.Transport.customJobIntervalMs = throttledIntervalMs
+
+                Log.i(TAG, "Transport job interval: ${throttledIntervalMs}ms (${policy.reason})")
+
+                if (!policy.networkAvailable) {
+                    Log.w(TAG, "Network unavailable - connections may pause")
+                }
+            }
+        }
+
+        // Log state changes for debugging (policy provider handles throttling)
         lifecycleScope.launch {
             dozeObserver.state.collect { state ->
-                Log.i(TAG, "Doze state changed: $state")
-                // Phase 12 will implement actual reactions
+                Log.d(TAG, "Doze state changed: $state")
             }
         }
 
         lifecycleScope.launch {
             networkObserver.state.collect { state ->
-                Log.i(TAG, "Network state changed: $state")
-                // Phase 12 will implement actual reactions
+                Log.d(TAG, "Network state changed: $state")
             }
         }
 
@@ -134,6 +166,10 @@ class ReticulumService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        // Stop policy provider first (depends on observers)
+        policyProvider.stop()
+        batteryMonitor.stop()
+
         // Stop observers before other cleanup
         dozeObserver.stop()
         networkObserver.stop()
@@ -371,6 +407,12 @@ class ReticulumService : LifecycleService() {
      * Downstream phases use this for exemption flow and status display.
      */
     fun getBatteryChecker(): BatteryOptimizationChecker = batteryChecker
+
+    /**
+     * Get the connection policy provider.
+     * Downstream phases use this to apply throttling to reconnection logic.
+     */
+    fun getPolicyProvider(): ConnectionPolicyProvider = policyProvider
 
     companion object {
         private const val TAG = "ReticulumService"
