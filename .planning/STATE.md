@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 12 of 17 (Doze-Aware Connection Management)
-Plan: 4 of 5 in current phase
-Status: In progress
-Last activity: 2026-01-25 - Completed 12-04-PLAN.md (TCPClientInterface Backoff Integration)
+Phase: 12 of 17 (Doze-Aware Connection Management) - COMPLETE
+Plan: 5 of 5 in current phase
+Status: Phase complete
+Last activity: 2026-01-25 - Completed 12-05-PLAN.md (Network Change Notifications)
 
-Progress: v2 [██████░░░░] 67%
+Progress: v2 [███████░░░] 70%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 10 (v2)
-- Average duration: 2.5min
-- Total execution time: 25min
+- Total plans completed: 13 (v2)
+- Average duration: 2.8min
+- Total execution time: 36min
 
 **By Phase:**
 
@@ -40,7 +40,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 |-------|-------|-------|----------|
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
-| 12 | 4/5 | 10min | 2.5min |
+| 12 | 5/5 | 14min | 2.8min |
 
 *Updated after each plan completion*
 
@@ -82,6 +82,9 @@ Recent decisions affecting current work:
 - [12-03]: Reverse lifecycle order: policyProvider.stop() before batteryMonitor.stop()
 - [12-04]: Backoff resets on success or network change, not on reconnect cycle start
 - [12-04]: Max attempts causes detach() with log message for debugging
+- [12-05]: ViewModel-owned NetworkStateObserver for InterfaceManager (separate from ReticulumService)
+- [12-05]: Only notify on actual type changes (previousType != currentType) - avoids redundant notifications
+- [12-05]: Optional networkObserver parameter with null default - backward compatible
 
 ### From v1
 
@@ -102,5 +105,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-25
-Stopped at: Completed 12-04-PLAN.md (TCPClientInterface Backoff Integration)
+Stopped at: Completed 12-05-PLAN.md (Network Change Notifications) - Phase 12 COMPLETE
 Resume file: None
