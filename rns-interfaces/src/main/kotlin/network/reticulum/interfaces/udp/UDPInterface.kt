@@ -44,7 +44,8 @@ class UDPInterface(
     private val forwardPort: Int,
     private val broadcast: Boolean = false,
     private val multicast: Boolean = false,
-    private val multicastTtl: Int = 1
+    private val multicastTtl: Int = 1,
+    parentScope: CoroutineScope? = null
 ) : Interface(name) {
 
     companion object {
@@ -84,8 +85,18 @@ class UDPInterface(
     private val running = AtomicBoolean(false)
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
-    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ioScope: CoroutineScope = createScope(parentScope)
     private var readJob: Job? = null
+
+    private fun createScope(parent: CoroutineScope?): CoroutineScope {
+        return if (parent != null) {
+            // Child scope: cancels when parent cancels, but can cancel independently
+            CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
+        } else {
+            // Standalone scope: lives until explicitly cancelled
+            CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+    }
 
     override fun start() {
         if (running.getAndSet(true)) {
