@@ -70,7 +70,12 @@ Plans:
   3. Service stop cancels all interface I/O coroutines within 1 second
   4. TCP/UDP connections remain alive when app is backgrounded (service running)
   5. JVM tests continue working without Android dependencies
-**Plans**: TBD
+**Plans:** 3 plans (2 parallel + 1 verification)
+
+Plans:
+- [ ] 11-01-PLAN.md - TCPClientInterface parentScope injection
+- [ ] 11-02-PLAN.md - UDPInterface parentScope injection
+- [ ] 11-03-PLAN.md - Scope injection tests and verification
 
 ### Phase 12: Doze-Aware Connection Management
 
@@ -163,7 +168,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
-| 11. Lifecycle-Aware Scope Injection | 0/TBD | Not started | - |
+| 11. Lifecycle-Aware Scope Injection | 0/3 | Planned | - |
 | 12. Doze-Aware Connection Management | 0/TBD | Not started | - |
 | 13. WorkManager Integration | 0/TBD | Not started | - |
 | 14. Service Notification UX | 0/TBD | Not started | - |
