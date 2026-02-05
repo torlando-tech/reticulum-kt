@@ -72,6 +72,17 @@ sealed class SharedInstanceStatus {
     data class Error(val message: String) : SharedInstanceStatus()
 }
 
+/**
+ * Snapshot of a Transport-registered interface for display in the UI.
+ */
+data class TransportInterfaceInfo(
+    val name: String,
+    val isOnline: Boolean,
+    val isLocalSharedInstance: Boolean,
+    val isSpawnedClient: Boolean,
+    val parentName: String?,
+)
+
 class ReticulumViewModel(application: Application) : AndroidViewModel(application) {
 
     private val preferencesManager = PreferencesManager(application)
@@ -138,6 +149,10 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     // Shared instance status
     private val _sharedInstanceStatus = MutableStateFlow<SharedInstanceStatus>(SharedInstanceStatus.Stopped)
     val sharedInstanceStatus: StateFlow<SharedInstanceStatus> = _sharedInstanceStatus.asStateFlow()
+
+    // Transport-registered interfaces (includes system interfaces like LocalServerInterface)
+    private val _transportInterfaces = MutableStateFlow<List<TransportInterfaceInfo>>(emptyList())
+    val transportInterfaces: StateFlow<List<TransportInterfaceInfo>> = _transportInterfaces.asStateFlow()
 
     // Service control
     fun startService() {
@@ -213,6 +228,7 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
             // Clear interface statuses
             _interfaceStatuses.value = emptyMap()
+            _transportInterfaces.value = emptyList()
 
             // Stop the actual service
             ReticulumService.stop(context)
@@ -245,6 +261,17 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 val pathCount = network.reticulum.transport.Transport.pathTable.size
                 val linkCount = network.reticulum.transport.Transport.linkTable.size
                 val transportInterfaces = network.reticulum.transport.Transport.getInterfaces()
+
+                // Build transport interface info list for UI
+                _transportInterfaces.value = transportInterfaces.map { iface ->
+                    TransportInterfaceInfo(
+                        name = iface.name,
+                        isOnline = iface.online,
+                        isLocalSharedInstance = iface.isLocalSharedInstance,
+                        isSpawnedClient = iface.parentInterface?.isLocalSharedInstance == true,
+                        parentName = iface.parentInterface?.name,
+                    )
+                }
 
                 // Get actual interface statuses from InterfaceManager
                 val manager = interfaceManager

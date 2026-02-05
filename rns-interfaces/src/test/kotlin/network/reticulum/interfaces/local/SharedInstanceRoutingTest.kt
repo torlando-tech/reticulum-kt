@@ -125,22 +125,23 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `client processOutgoing sends data correctly`() {
-        // Verify that individual client interfaces can still send data
-        // (Transport calls these directly, not the server)
+        // Verify that spawned client interfaces can send data to external clients.
+        // In production, Transport calls each spawned client's processOutgoing() directly.
 
         val tcpPort = 37437
-        val testData = "Test data".toByteArray()
+        // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
+        val testData = "Test data from server!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
         server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
-        server!!.onPacketReceived = { data, _ ->
-            receivedData = data
-            receivedLatch.countDown()
-        }
         server!!.start()
 
         val client = LocalClientInterface(name = "Client", tcpPort = tcpPort)
+        client.onPacketReceived = { data, _ ->
+            receivedData = data
+            receivedLatch.countDown()
+        }
         clients.add(client)
         client.start()
 
@@ -153,7 +154,7 @@ class SharedInstanceRoutingTest {
         // Transport would call spawned client's processOutgoing() directly
         spawnedClient!!.processOutgoing(testData)
 
-        // Server should receive the data
+        // External client should receive the data
         assertTrue(receivedLatch.await(1, TimeUnit.SECONDS))
         assertArrayEquals(testData, receivedData)
     }
@@ -205,9 +206,10 @@ class SharedInstanceRoutingTest {
         val spawnedClient = server!!.spawnedInterfaces?.firstOrNull()
         assertNotNull(spawnedClient)
 
-        // Spawned client should identify as connected to shared instance
+        // Spawned client is server-side, NOT a client connecting to shared instance.
+        // Python: spawned.is_connected_to_shared_instance = False
         if (spawnedClient is LocalClientInterface) {
-            assertTrue(spawnedClient.isConnectedToSharedInstance())
+            assertFalse(spawnedClient.isConnectedToSharedInstance())
         }
     }
 

@@ -65,7 +65,8 @@ class LocalInterfaceTest {
     @Test
     fun `test packet transmission from client to server via TCP`() {
         val tcpPort = 37429
-        val testData = "Hello from client!".toByteArray()
+        // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
+        val testData = "Hello from client!!!!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
@@ -97,7 +98,8 @@ class LocalInterfaceTest {
     @Test
     fun `test packet transmission from server to client via TCP`() {
         val tcpPort = 37430
-        val testData = "Hello from server!".toByteArray()
+        // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
+        val testData = "Hello from server!!!!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
@@ -117,8 +119,10 @@ class LocalInterfaceTest {
         // Give connection time to establish
         Thread.sleep(200)
 
-        // Send data from server (broadcasts to all clients)
-        server!!.processOutgoing(testData)
+        // In production, Transport calls each spawned interface's processOutgoing() directly.
+        // server.processOutgoing() is intentionally a no-op to prevent double-send.
+        val spawnedClient = server!!.getClients().first()
+        spawnedClient.processOutgoing(testData)
 
         // Wait for client to receive
         assertTrue(receivedLatch.await(2, TimeUnit.SECONDS))
@@ -129,7 +133,8 @@ class LocalInterfaceTest {
     @Test
     fun `test broadcast to multiple clients via TCP`() {
         val tcpPort = 37431
-        val testData = "Broadcast message!".toByteArray()
+        // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
+        val testData = "Broadcast message!!!!!".toByteArray()
         val numClients = 3
         val receivedLatch = CountDownLatch(numClients)
         val receivedDataList = mutableListOf<ByteArray>()
@@ -157,8 +162,11 @@ class LocalInterfaceTest {
 
         assertEquals(numClients, server!!.clientCount())
 
-        // Broadcast from server
-        server!!.processOutgoing(testData)
+        // In production, Transport calls each spawned interface's processOutgoing() directly.
+        // Simulate that broadcast pattern here.
+        for (spawnedClient in server!!.getClients()) {
+            spawnedClient.processOutgoing(testData)
+        }
 
         // Wait for all clients to receive
         assertTrue(receivedLatch.await(2, TimeUnit.SECONDS))
@@ -238,8 +246,9 @@ class LocalInterfaceTest {
     @Test
     fun `test bidirectional communication via TCP`() {
         val tcpPort = 37433
-        val clientToServerData = "Client to server".toByteArray()
-        val serverToClientData = "Server to client".toByteArray()
+        // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
+        val clientToServerData = "Client to server!!!!!".toByteArray()
+        val serverToClientData = "Server to client!!!!!".toByteArray()
 
         val serverReceivedLatch = CountDownLatch(1)
         val clientReceivedLatch = CountDownLatch(1)
@@ -270,8 +279,9 @@ class LocalInterfaceTest {
         // Client sends to server
         client.processOutgoing(clientToServerData)
 
-        // Server sends to client
-        server!!.processOutgoing(serverToClientData)
+        // Server sends to client (via spawned interface, as Transport would)
+        val spawnedClient = server!!.getClients().first()
+        spawnedClient.processOutgoing(serverToClientData)
 
         // Wait for both to receive
         assertTrue(serverReceivedLatch.await(2, TimeUnit.SECONDS))

@@ -20,6 +20,8 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Radio
+import androidx.compose.material.icons.filled.Lan
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
@@ -49,6 +51,7 @@ import tech.torlando.reticulumkt.ui.components.InterfaceTypeCard
 import tech.torlando.reticulumkt.ui.theme.StatusConnected
 import tech.torlando.reticulumkt.ui.theme.StatusOffline
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
+import tech.torlando.reticulumkt.viewmodel.TransportInterfaceInfo
 
 enum class InterfaceType(
     val displayName: String,
@@ -81,7 +84,12 @@ fun InterfacesScreen(
     val interfaces by viewModel.interfaces.collectAsState()
     val serviceState by viewModel.serviceState.collectAsState()
     val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
+    val transportInterfaces by viewModel.transportInterfaces.collectAsState()
     var navigation by remember { mutableStateOf<InterfaceNavigation>(InterfaceNavigation.None) }
+
+    // Filter transport interfaces to find shared instance server and its spawned clients
+    val sharedInstanceServer = transportInterfaces.find { it.isLocalSharedInstance }
+    val spawnedClients = transportInterfaces.filter { it.isSpawnedClient }
 
     Scaffold(
         topBar = {
@@ -98,7 +106,9 @@ fun InterfacesScreen(
             }
         }
     ) { padding ->
-        if (interfaces.isEmpty()) {
+        val hasContent = interfaces.isNotEmpty() || sharedInstanceServer != null
+
+        if (!hasContent) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -127,29 +137,64 @@ fun InterfacesScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 item { Spacer(modifier = Modifier.height(8.dp)) }
-                items(interfaces, key = { it.id }) { iface ->
-                    // Get actual online status from running interface, not just service state
-                    val actualStatus = interfaceStatuses[iface.id]
-                    val isActuallyOnline = actualStatus?.isOnline ?: false
 
-                    InterfaceCard(
-                        config = iface,
-                        isOnline = isActuallyOnline,
-                        onDelete = { viewModel.removeInterface(iface.id) },
-                        onEdit = {
-                            val type = try {
-                                InterfaceType.valueOf(iface.type)
-                            } catch (e: Exception) {
-                                InterfaceType.TCP_CLIENT
-                            }
-                            when (type) {
-                                InterfaceType.TCP_CLIENT -> onNavigateToTcpWizard()
-                                InterfaceType.RNODE -> onNavigateToRNodeWizard()
-                                else -> navigation = InterfaceNavigation.Edit(iface)
-                            }
+                // Shared Instance section
+                if (sharedInstanceServer != null) {
+                    item {
+                        Text(
+                            text = "Shared Instance",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
+                    }
+                    item {
+                        SharedInstanceCard(
+                            server = sharedInstanceServer,
+                            clientCount = spawnedClients.size,
+                        )
+                    }
+                    if (spawnedClients.isNotEmpty()) {
+                        items(spawnedClients, key = { it.name }) { client ->
+                            SpawnedClientCard(client = client)
                         }
-                    )
+                    }
                 }
+
+                // User-configured interfaces section
+                if (interfaces.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "Configured Interfaces",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = if (sharedInstanceServer != null) 8.dp else 0.dp, bottom = 4.dp)
+                        )
+                    }
+                    items(interfaces, key = { it.id }) { iface ->
+                        val actualStatus = interfaceStatuses[iface.id]
+                        val isActuallyOnline = actualStatus?.isOnline ?: false
+
+                        InterfaceCard(
+                            config = iface,
+                            isOnline = isActuallyOnline,
+                            onDelete = { viewModel.removeInterface(iface.id) },
+                            onEdit = {
+                                val type = try {
+                                    InterfaceType.valueOf(iface.type)
+                                } catch (e: Exception) {
+                                    InterfaceType.TCP_CLIENT
+                                }
+                                when (type) {
+                                    InterfaceType.TCP_CLIENT -> onNavigateToTcpWizard()
+                                    InterfaceType.RNODE -> onNavigateToRNodeWizard()
+                                    else -> navigation = InterfaceNavigation.Edit(iface)
+                                }
+                            }
+                        )
+                    }
+                }
+
                 item { Spacer(modifier = Modifier.height(80.dp)) }
             }
         }
@@ -343,6 +388,117 @@ private fun SimpleAddInterfaceDialog(
             }
         }
     )
+}
+
+@Composable
+private fun SharedInstanceCard(
+    server: TransportInterfaceInfo,
+    clientCount: Int,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Lan,
+                contentDescription = null,
+                tint = if (server.isOnline) StatusConnected else StatusOffline,
+                modifier = Modifier.size(32.dp)
+            )
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = server.name,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    text = "Local Server",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = if (server.isOnline) "Online" else "Offline",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (server.isOnline) StatusConnected else StatusOffline
+                )
+                if (clientCount > 0) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Filled.People,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "$clientCount",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SpawnedClientCard(client: TransportInterfaceInfo) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 24.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Filled.People,
+                contentDescription = null,
+                tint = if (client.isOnline) StatusConnected else StatusOffline,
+                modifier = Modifier.size(24.dp)
+            )
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = client.name,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    text = "Connected Client",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Text(
+                text = if (client.isOnline) "Online" else "Offline",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (client.isOnline) StatusConnected else StatusOffline
+            )
+        }
+    }
 }
 
 @Composable

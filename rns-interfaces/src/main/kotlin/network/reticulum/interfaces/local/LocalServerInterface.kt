@@ -11,6 +11,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
+import network.reticulum.interfaces.toRef
+import network.reticulum.transport.Transport
 import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -336,6 +338,12 @@ class LocalServerInterface : Interface {
 
         clientInterface.start()
 
+        try {
+            Transport.registerInterface(clientInterface.toRef())
+        } catch (e: Exception) {
+            log("Could not register spawned interface with Transport: ${e.message}")
+        }
+
         log("Client connected: $clientName (total: ${clients.size})")
     }
 
@@ -345,6 +353,11 @@ class LocalServerInterface : Interface {
     internal fun clientDisconnected(client: LocalClientInterface) {
         clients.remove(client)
         spawnedInterfaces?.remove(client)
+        try {
+            Transport.deregisterInterface(client.toRef())
+        } catch (e: Exception) {
+            log("Could not deregister spawned interface from Transport: ${e.message}")
+        }
 
         log("Client disconnected: ${client.name} (remaining: ${clients.size})")
     }
@@ -384,6 +397,11 @@ class LocalServerInterface : Interface {
 
         // Disconnect all clients
         for (client in clients.toList()) {
+            try {
+                Transport.deregisterInterface(client.toRef())
+            } catch (e: Exception) {
+                // Ignore during shutdown
+            }
             client.detach()
         }
         clients.clear()
