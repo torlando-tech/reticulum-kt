@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 
 ## Current Position
 
-Phase: 18 of 22 (Fragmentation and Driver Contract)
-Plan: 02 of 02 in phase
-Status: Phase complete
-Last activity: 2026-02-06 - Completed 18-02-PLAN.md (BLE Fragmentation and Reassembly)
+Phase: 19 of 22 (GATT Server and Advertising)
+Plan: 01 of 02 in phase
+Status: In progress
+Last activity: 2026-02-06 - Completed 19-01-PLAN.md (GATT Server Implementation)
 
-Progress: v3 [████░░░░░░░░] 20%
+Progress: v3 [█████░░░░░░░] 30%
 
 ## Milestone Goals
 
@@ -22,7 +22,7 @@ Progress: v3 [████░░░░░░░░] 20%
 
 5 phases (18-22) delivering BLE mesh networking:
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
-- Phase 19: GATT Server and Advertising (peripheral role)
+- Phase 19: GATT Server and Advertising (peripheral role) -- IN PROGRESS (1/2 plans)
 - Phase 20: GATT Client and Scanner (central role)
 - Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
@@ -30,9 +30,10 @@ Progress: v3 [████░░░░░░░░] 20%
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2 (v3)
+- Total plans completed: 3 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
+- 19-01: 3min (GATT server implementation)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -47,6 +48,11 @@ Progress: v3 [████░░░░░░░░] 20%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [19-01]: SharedFlow events over nullable callbacks for multi-collector support
+- [19-01]: Single stateMutex for all per-device maps (connect/disconnect modify all maps together)
+- [19-01]: Global notification Mutex (Android BLE stack serializes globally, not per-device)
+- [19-01]: No keepalive/identity parsing in GATT server (delegates to Phase 21 BLEInterface)
+- [19-01]: Per-device CCCD tracking in map (not descriptor.value like Columba)
 - [18-02]: Constants delegated to BLEConstants; BLEFragmenter.TYPE_START etc. are public API aliases
 - [18-02]: Throw on MTU < 6 instead of Python's clamping to 20 -- Kotlin convention for invalid construction
 - [18-02]: @Synchronized over coroutine locks for GATT callback thread safety
@@ -86,6 +92,18 @@ Fragment protocol fully implemented and tested:
 - Thread-safe via @Synchronized; no Android dependencies
 - Constants delegate to BLEConstants for single source of truth
 
+### From 19-01 (GATT Server Implementation)
+
+GATT server fully implemented in rns-android module:
+- `BleGattServer` -- hosts Reticulum GATT service with RX/TX/Identity characteristics
+- All 8 GATT callbacks dispatch to coroutine scope (avoids blocking binder thread)
+- Notification serialization via global Mutex + CompletableDeferred
+- Per-device MTU (mtu-3), CCCD subscription, and device tracking in Mutex-protected maps
+- API 33 compat for notifyCharacteristicChanged (4-param vs deprecated 3-param)
+- SharedFlow events: centralConnected, centralDisconnected, dataReceived, mtuChanged
+- AndroidManifest.xml has all 6 BLE permissions + hardware feature declaration
+- Package: `network.reticulum.android.ble` in rns-android module
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -105,6 +123,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T18:31:00Z
-Stopped at: Completed 18-02-PLAN.md (BLE Fragmentation and Reassembly) -- Phase 18 complete
+Last session: 2026-02-06T21:22:00Z
+Stopped at: Completed 19-01-PLAN.md (GATT Server Implementation)
 Resume file: None
