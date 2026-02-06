@@ -105,6 +105,9 @@ object Transport {
     /** Whether jobs are currently running. */
     private val jobsRunning = AtomicBoolean(false)
 
+    /** Whether Transport is paused (drops inbound/outbound, skips job work). */
+    val paused = AtomicBoolean(false)
+
     // ===== Coroutine Support (for Android) =====
 
     /** Coroutine scope for job loop (null when using thread-based loop). */
@@ -1881,6 +1884,7 @@ object Transport {
             log("Transport not started, dropping packet")
             return
         }
+        if (paused.get()) return
         if (raw.size < RnsConstants.HEADER_MIN_SIZE) {
             log("Packet too small (${raw.size} < ${RnsConstants.HEADER_MIN_SIZE}), dropping")
             return
@@ -2086,6 +2090,7 @@ object Transport {
      */
     fun outbound(packet: Packet): Boolean {
         if (!started.get()) return false
+        if (paused.get()) return false
 
         return jobsLock.withLock {
             try {
@@ -2955,11 +2960,12 @@ object Transport {
      * Thread-based job loop (legacy, for JVM).
      */
     private fun jobLoop() {
-        val interval = getJobInterval()
         while (started.get()) {
             try {
-                Thread.sleep(interval)
-                runJobs()
+                Thread.sleep(getJobInterval())
+                if (!paused.get()) {
+                    runJobs()
+                }
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
@@ -2974,13 +2980,14 @@ object Transport {
      */
     private fun startCoroutineJobLoop() {
         val scope = jobLoopScope ?: return
-        val interval = getJobInterval()
 
         jobLoopJob = scope.launch {
             while (isActive && started.get()) {
                 try {
-                    delay(interval)
-                    runJobs()
+                    delay(getJobInterval())
+                    if (!paused.get()) {
+                        runJobs()
+                    }
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     log("Coroutine job error: ${e.message}")

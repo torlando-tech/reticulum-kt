@@ -615,8 +615,8 @@ class ReticulumService : LifecycleService() {
      */
     fun pause() {
         _isPaused = true
-        // Freeze Transport job loop by setting interval to effectively infinite
-        network.reticulum.transport.Transport.customJobIntervalMs = Long.MAX_VALUE
+        // Pause Transport: drops inbound/outbound packets, skips job work
+        network.reticulum.transport.Transport.paused.set(true)
         // Cancel WorkManager periodic recovery
         ReticulumWorker.cancel(this)
         Log.i(TAG, "Service paused by user")
@@ -631,11 +631,8 @@ class ReticulumService : LifecycleService() {
      */
     fun resume() {
         _isPaused = false
-        // Restore Transport job interval based on current connection policy
-        val baseIntervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL
-        val policy = policyProvider.currentPolicy
-        network.reticulum.transport.Transport.customJobIntervalMs =
-            (baseIntervalMs * policy.throttleMultiplier).toLong()
+        // Unpause Transport: resumes inbound/outbound processing and job work
+        network.reticulum.transport.Transport.paused.set(false)
         // Re-schedule WorkManager periodic recovery
         ReticulumWorker.schedule(this, intervalMinutes = 15)
         // Trigger immediate reconnection on all interfaces
