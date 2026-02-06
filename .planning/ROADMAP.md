@@ -106,12 +106,17 @@ Plans:
 **Requirements**: BATT-03, CONN-06
 **Research flags**: Standard WorkManager patterns, skip phase research. Official documentation sufficient.
 **Success Criteria** (what must be TRUE):
-  1. ReticulumWorker executes every 15 minutes with network constraint
+  1. ReticulumWorker executes every 15 minutes without network constraint (mesh routing)
   2. Path table cleanup and announce processing run during maintenance windows
-  3. Messages queue locally and deliver when maintenance window opens
+  3. Worker performs interface health checks and conditional service restart
   4. Sub-second delivery when app is in foreground or service active
   5. Worker survives app restart (re-enqueues on boot if service was running)
-**Plans**: TBD
+**Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
+
+Plans:
+- [ ] 13-01-PLAN.md -- Enhanced ReticulumWorker with recovery-focused health checks
+- [ ] 13-02-PLAN.md -- BootReceiver + service lifecycle WorkManager wiring
+- [ ] 13-03-PLAN.md -- Sample app ViewModel integration and autoStart wiring
 
 ### Phase 14: Service Notification UX
 
