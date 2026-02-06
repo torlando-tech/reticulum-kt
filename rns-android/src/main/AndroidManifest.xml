@@ -25,13 +25,14 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
-        <!-- Boot receiver for auto-start (optional, disabled by default) -->
+        <!-- Boot receiver for auto-start and app update recovery (optional, disabled by default) -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="false"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>
