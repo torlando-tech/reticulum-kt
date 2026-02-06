@@ -84,7 +84,12 @@ Plans:
   8. BLE advertising with service UUID, restarts after connection, 60s refresh
   9. BleOperationQueue ensures serial GATT operations
 
-**Deliverables:** `BleGattServer.kt`, `BleAdvertiser.kt`, `BleOperationQueue.kt` in `rns-sample-app/service/ble/`
+**Deliverables:** `BleGattServer.kt`, `BleAdvertiser.kt` in `rns-android/ble/`; `BleOperationQueue.kt` in `rns-interfaces/ble/`
+**Plans:** 2 plans
+
+Plans:
+- [ ] 19-01-PLAN.md -- BleGattServer and BLE permissions
+- [ ] 19-02-PLAN.md -- BleAdvertiser, BleOperationQueue, and tests
 
 ### Phase 20: GATT Client and Scanner
 
@@ -146,7 +151,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 18. Fragmentation and Driver Contract | 2/2 | Complete | 2026-02-06 |
-| 19. GATT Server and Advertising | 0/TBD | Not started | - |
+| 19. GATT Server and Advertising | 0/2 | Planned | - |
 | 20. GATT Client and Scanner | 0/TBD | Not started | - |
 | 21. BLEInterface Orchestration | 0/TBD | Not started | - |
 | 22. Hardening and Edge Cases | 0/TBD | Not started | - |
