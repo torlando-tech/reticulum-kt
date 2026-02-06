@@ -31,7 +31,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 - [x] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
 - [x] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
 - [x] **Phase 14: Service Notification UX** - Status display and quick actions
-- [ ] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
+- [x] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
 - [ ] **Phase 16: OEM Compatibility** - Samsung, Xiaomi, Huawei manufacturer handling
 - [ ] **Phase 17: Memory Optimization** - Long-term stability and leak prevention
 
@@ -152,9 +152,9 @@ Plans:
 **Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
 
 Plans:
-- [ ] 15-01-PLAN.md -- Battery stats tracking infrastructure and exemption helper
-- [ ] 15-02-PLAN.md -- Service event tracking and kill detection wiring
-- [ ] 15-03-PLAN.md -- Monitor screen battery UX (chart, warning, exemption sheet)
+- [x] 15-01-PLAN.md -- Battery stats tracking infrastructure and exemption helper
+- [x] 15-02-PLAN.md -- Service event tracking and kill detection wiring
+- [x] 15-03-PLAN.md -- Monitor screen battery UX (chart, warning, exemption sheet)
 
 ### Phase 16: OEM Compatibility
 
@@ -195,7 +195,7 @@ Plans:
 | 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
 | 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
 | 14. Service Notification UX | 3/3 | ✓ Complete | 2026-02-05 |
-| 15. Battery Optimization UX | 0/3 | Not started | - |
+| 15. Battery Optimization UX | 3/3 | ✓ Complete | 2026-02-05 |
 | 16. OEM Compatibility | 0/TBD | Not started | - |
 | 17. Memory Optimization | 0/TBD | Not started | - |
 

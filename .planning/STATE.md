@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 15 of 17 (Battery Optimization UX)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-05 - Completed 15-02-PLAN.md (Service Event Tracking)
+Phase: 16 of 17 (OEM Compatibility)
+Plan: 0 of TBD in current phase
+Status: Not started
+Last activity: 2026-02-05 - Completed Phase 15 (Battery Optimization UX)
 
-Progress: v2 [███████████░] 92%
+Progress: v2 [████████████░] 95%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 21 (v2)
-- Average duration: 2.5min
-- Total execution time: 51.75min
+- Total plans completed: 24 (v2)
+- Average duration: 2.4min
+- Total execution time: 57.75min
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
 | 14 | 3/3 | 6.75min | 2.25min |
-| 15 | 2/3 | 4min | 2min |
+| 15 | 3/3 | 6min | 2min |
 
 *Updated after each plan completion*
 
@@ -115,6 +115,9 @@ Recent decisions affecting current work:
 - [15-02]: Flag-pair kill detection (service_was_running + user_initiated_stop)
 - [15-02]: Daily reset via date string comparison (YYYY-MM-DD)
 - [15-02]: Warning dismissed at count, not boolean (progressive urgency on new kills)
+- [15-03]: Compose Canvas for chart (no charting library dependency)
+- [15-03]: ModalBottomSheet for exemption flow (standard Android pattern)
+- [15-03]: ViewModel-driven sheet visibility via StateFlow
 
 ### From v1
 
@@ -135,5 +138,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 15-02-PLAN.md (Service Event Tracking)
+Stopped at: Completed Phase 15 (Battery Optimization UX)
 Resume file: None
