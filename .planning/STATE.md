@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 12 of 17 (Doze-Aware Connection Management) - COMPLETE
-Plan: 5 of 5 in current phase
-Status: Phase complete
-Last activity: 2026-01-25 - Completed 12-05-PLAN.md (Network Change Notifications)
+Phase: 13 of 17 (WorkManager Integration)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-02-05 - Completed 13-01-PLAN.md (ReticulumWorker Enhancement)
 
-Progress: v2 [███████░░░] 70%
+Progress: v2 [████████░░] 74%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 13 (v2)
-- Average duration: 2.8min
-- Total execution time: 36min
+- Total plans completed: 14 (v2)
+- Average duration: 2.7min
+- Total execution time: 38min
 
 **By Phase:**
 
@@ -41,6 +41,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
+| 13 | 1/3 | 2min | 2min |
 
 *Updated after each plan completion*
 
@@ -85,6 +86,9 @@ Recent decisions affecting current work:
 - [12-05]: ViewModel-owned NetworkStateObserver for InterfaceManager (separate from ReticulumService)
 - [12-05]: Only notify on actual type changes (previousType != currentType) - avoids redundant notifications
 - [12-05]: Optional networkObserver parameter with null default - backward compatible
+- [13-01]: inputData for auto-restart flag keeps library module independent of app DataStore
+- [13-01]: BatteryManager direct read in worker (short-lived, no BatteryMonitor needed)
+- [13-01]: Interface health check is logging-only; reconnection handled by TCPClientInterface
 
 ### From v1
 
@@ -104,6 +108,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-01-25
-Stopped at: Completed 12-05-PLAN.md (Network Change Notifications) - Phase 12 COMPLETE
+Last session: 2026-02-05
+Stopped at: Completed 13-01-PLAN.md (ReticulumWorker Enhancement)
 Resume file: None
