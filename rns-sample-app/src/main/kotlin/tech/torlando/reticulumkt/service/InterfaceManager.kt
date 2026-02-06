@@ -313,6 +313,7 @@ class InterfaceManager(
                             txPower = txp,
                             spreadingFactor = sf,
                             codingRate = cr,
+                            flowControl = false, // BLE has its own flow control; RNode doesn't send CMD_READY over BLE
                             parentScope = scope,
                         )
 

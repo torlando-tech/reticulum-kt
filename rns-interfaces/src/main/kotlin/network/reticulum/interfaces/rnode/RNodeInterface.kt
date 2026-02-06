@@ -91,6 +91,7 @@ class RNodeInterface(
     // Flow control
     @Volatile private var interfaceReady: Boolean = false
     private val packetQueue = CopyOnWriteArrayList<ByteArray>()
+    private val txLock = Any()
 
     // Coroutine management
     private val ioScope: CoroutineScope = if (parentScope != null) {
@@ -504,7 +505,6 @@ class RNodeInterface(
                             }
                         }
                     } else if (command == KISS.CMD_READY) {
-                        log("CMD_READY received, draining queue")
                         processQueue()
                     } else if (command == KISS.CMD_DETECT) {
                         detected = (byte.toByte() == KISS.DETECT_RESP)
@@ -522,10 +522,7 @@ class RNodeInterface(
                         }
                     }
                     else {
-                        // Unknown command — log it so we can detect missing handlers
-                        if (commandBuffer.size() == 0 && dataBuffer.size() == 0) {
-                            log("Unknown KISS cmd=0x${"%02x".format(command.toInt() and 0xFF)} byte=0x${"%02x".format(byte)}")
-                        }
+                        // Unknown command — silently consume
                     }
                 }
             }
@@ -563,20 +560,19 @@ class RNodeInterface(
     // -- TX path --
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
-            log("processOutgoing: dropped ${data.size}b (online=${online.get()}, detached=${detached.get()})")
-            return
-        }
+        if (!online.get() || detached.get()) return
 
-        if (interfaceReady) {
-            if (flowControl) {
-                interfaceReady = false
+        synchronized(txLock) {
+            if (!online.get()) return // re-check after acquiring lock
+
+            if (interfaceReady) {
+                if (flowControl) {
+                    interfaceReady = false
+                }
+                transmit(data)
+            } else {
+                packetQueue.add(data)
             }
-            log("TX: ${data.size} bytes (queue=${packetQueue.size})")
-            transmit(data)
-        } else {
-            packetQueue.add(data)
-            log("TX queued: ${data.size} bytes (queue=${packetQueue.size}, waiting for CMD_READY)")
         }
     }
 
@@ -602,7 +598,6 @@ class RNodeInterface(
         if (packetQueue.isNotEmpty()) {
             val data = packetQueue.removeFirstOrNull() ?: return
             interfaceReady = true
-            log("CMD_READY: draining queue (remaining=${packetQueue.size})")
             processOutgoing(data)
         } else {
             interfaceReady = true
