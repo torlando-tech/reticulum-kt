@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 13 of 17 (WorkManager Integration)
-Plan: 3 of 3 in current phase
-Status: Phase complete
-Last activity: 2026-02-05 - Completed 13-03-PLAN.md (ViewModel WorkManager Integration)
+Phase: 14 of 17 (Service Notification UX)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-02-05 - Completed 14-01-PLAN.md (Connection State Model and Notification Builder)
 
-Progress: v2 [████████░░] 78%
+Progress: v2 [████████░░] 81%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 16 (v2)
-- Average duration: 2.6min
-- Total execution time: 41min
+- Total plans completed: 17 (v2)
+- Average duration: 2.5min
+- Total execution time: 42.5min
 
 **By Phase:**
 
@@ -42,6 +42,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
+| 14 | 1/3 | 1.5min | 1.5min |
 
 *Updated after each plan completion*
 
@@ -95,6 +96,9 @@ Recent decisions affecting current work:
 - [13-03]: Belt-and-suspenders WorkManager: ViewModel schedules/cancels alongside Service's own management
 - [13-03]: DONT_KILL_APP flag when toggling BootReceiver to avoid disrupting running app
 - [13-03]: Preference-to-component binding: DataStore preference drives PackageManager component state
+- [14-01]: Em dash separator in notification content text for clean visual
+- [14-01]: Interface detail in parentheses in expanded view for readability
+- [14-01]: Sort interface breakdown by count descending (most common type first)
 
 ### From v1
 
@@ -115,5 +119,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 13-03-PLAN.md (ViewModel WorkManager Integration) - Phase 13 complete
+Stopped at: Completed 14-01-PLAN.md (Connection State Model and Notification Builder)
 Resume file: None
