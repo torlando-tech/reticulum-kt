@@ -1,6 +1,7 @@
 package tech.torlando.reticulumkt.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
@@ -16,6 +17,7 @@ import network.reticulum.Reticulum
 import network.reticulum.android.NetworkStateObserver
 import network.reticulum.android.ReticulumConfig
 import network.reticulum.android.ReticulumService
+import network.reticulum.android.ReticulumWorker
 import tech.torlando.reticulumkt.data.PreferencesManager
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.service.InterfaceManager
@@ -178,6 +180,13 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Start the actual service
             ReticulumService.start(context, config)
 
+            // Enqueue WorkManager periodic maintenance as a safety net
+            // The service also schedules this internally, but doing it here ensures
+            // WorkManager is running even if service initialization is slow.
+            // Uses KEEP policy so this is a no-op if already enqueued.
+            ReticulumWorker.schedule(context)
+            Log.i(TAG, "WorkManager maintenance scheduled")
+
             _serviceState.value = _serviceState.value.copy(isRunning = true, enableTransport = transport)
             _sharedInstanceStatus.value = SharedInstanceStatus.Starting
 
@@ -229,6 +238,13 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Clear interface statuses
             _interfaceStatuses.value = emptyMap()
             _transportInterfaces.value = emptyList()
+
+            // Cancel WorkManager before stopping service to ensure "stop means stop"
+            // The service's shutdownReticulum() also cancels, but doing it here is
+            // belt-and-suspenders — ensures no background activity after user-initiated stop.
+            // cancel() is idempotent.
+            ReticulumWorker.cancel(context)
+            Log.i(TAG, "WorkManager maintenance cancelled")
 
             // Stop the actual service
             ReticulumService.stop(context)
@@ -568,5 +584,9 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             appendLine()
             appendLine("Generated: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(java.util.Date())}")
         }
+    }
+
+    companion object {
+        private const val TAG = "ReticulumViewModel"
     }
 }
