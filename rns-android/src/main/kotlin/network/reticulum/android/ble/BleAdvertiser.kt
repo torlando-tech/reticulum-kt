@@ -36,7 +36,7 @@ import network.reticulum.interfaces.ble.BLEConstants
  *
  * Advertising payload is minimal: service UUID only, no device name or TX power level.
  */
-class BleAdvertiser(
+internal class BleAdvertiser(
     private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
@@ -52,7 +52,7 @@ class BleAdvertiser(
     /**
      * User-configurable advertising mode controlling power/latency trade-off.
      */
-    enum class AdvertiseMode(val value: Int) {
+    internal enum class AdvertiseMode(val value: Int) {
         /** ~1000ms interval. Best battery life, slowest discovery. */
         LOW_POWER(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER),
 

@@ -50,7 +50,7 @@ import java.util.UUID
  * @property operationQueue Shared operation queue for GATT serialization
  * @property scope Coroutine scope for async operations
  */
-class BleGattClient(
+internal class BleGattClient(
     private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter,
     private val operationQueue: BleOperationQueue,

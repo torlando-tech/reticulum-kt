@@ -44,7 +44,7 @@ import network.reticulum.interfaces.ble.DiscoveredPeer
  * @property bluetoothAdapter Bluetooth adapter
  * @property scope Coroutine scope for async operations
  */
-class BleScanner(
+internal class BleScanner(
     private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
@@ -56,7 +56,7 @@ class BleScanner(
     /**
      * User-configurable scan mode controlling power/latency trade-off.
      */
-    enum class ScanMode(val value: Int) {
+    internal enum class ScanMode(val value: Int) {
         /** ~5120ms scan window. Best battery life, slowest discovery. */
         LOW_POWER(ScanSettings.SCAN_MODE_LOW_POWER),
 

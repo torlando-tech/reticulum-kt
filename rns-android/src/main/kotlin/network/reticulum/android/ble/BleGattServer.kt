@@ -58,7 +58,7 @@ import network.reticulum.interfaces.ble.BLEConstants
  * @property bluetoothManager Bluetooth manager
  * @property scope Coroutine scope for async operations
  */
-class BleGattServer(
+internal class BleGattServer(
     private val context: Context,
     private val bluetoothManager: BluetoothManager,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
