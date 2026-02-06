@@ -115,6 +115,47 @@ class NotificationHelper(private val context: Context) {
         notificationManager.notify(notificationId, notification)
     }
 
+    /**
+     * Create a rich foreground service notification from a connection snapshot.
+     *
+     * Produces a notification with color-coded status, interface breakdown,
+     * uptime, and BigTextStyle expanded view with per-interface details.
+     *
+     * @param snapshot Current connection state and interface data
+     * @param contentIntent Optional intent for tapping the notification
+     * @param actions Quick action buttons (e.g., Reconnect, Pause/Resume)
+     * @return The notification to display
+     */
+    fun createServiceNotification(
+        snapshot: ConnectionSnapshot,
+        contentIntent: PendingIntent? = null,
+        actions: List<NotificationCompat.Action> = emptyList()
+    ): Notification {
+        return NotificationContentBuilder(context).buildNotification(
+            snapshot = snapshot,
+            contentIntent = contentIntent,
+            actions = actions
+        )
+    }
+
+    /**
+     * Update the existing notification with a connection snapshot.
+     *
+     * @param notificationId The notification ID to update
+     * @param snapshot Current connection state and interface data
+     * @param contentIntent Optional intent for tapping the notification
+     * @param actions Quick action buttons (e.g., Reconnect, Pause/Resume)
+     */
+    fun updateNotification(
+        notificationId: Int,
+        snapshot: ConnectionSnapshot,
+        contentIntent: PendingIntent? = null,
+        actions: List<NotificationCompat.Action> = emptyList()
+    ) {
+        val notification = createServiceNotification(snapshot, contentIntent, actions)
+        notificationManager.notify(notificationId, notification)
+    }
+
     private fun formatStats(stats: NetworkStats): String {
         return when {
             stats.activeLinks > 0 -> "${stats.activeLinks} links, ${stats.knownPeers} peers"
