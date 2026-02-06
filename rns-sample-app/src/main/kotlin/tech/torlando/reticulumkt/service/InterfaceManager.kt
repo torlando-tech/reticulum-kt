@@ -281,9 +281,54 @@ class InterfaceManager(
             }
 
             InterfaceType.BLE -> {
-                // BLE interface would require Android Bluetooth APIs
-                // Not implemented yet
-                Log.w(TAG, "BLE interface not yet implemented")
+                // BLE connection and setup requires Android BLE APIs and is async,
+                // so launch on IO dispatcher (same pattern as RNODE)
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        // Require Transport identity before starting BLE
+                        val identityHash = Transport.identity?.hash
+                            ?: throw IllegalStateException("Transport identity not available for BLE interface")
+
+                        // Construct the Android BLE driver
+                        val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE)
+                            as android.bluetooth.BluetoothManager
+                        val driver = network.reticulum.android.ble.AndroidBLEDriver(
+                            context = context,
+                            bluetoothManager = bluetoothManager,
+                            scope = scope,
+                        )
+
+                        // Set transport identity on the GATT server Identity characteristic
+                        // This MUST be done before BLEInterface.start() so the identity is
+                        // available when peers read it during the handshake
+                        driver.setTransportIdentity(identityHash)
+
+                        // Create the BLEInterface (pure JVM, lives in rns-interfaces)
+                        val iface = network.reticulum.interfaces.ble.BLEInterface(
+                            name = config.name,
+                            driver = driver,
+                            transportIdentity = identityHash,
+                        )
+
+                        // Set up packet callback (same pattern as TCP/Auto)
+                        iface.onPacketReceived = { data, fromInterface ->
+                            Transport.inbound(data, InterfaceAdapter.getOrCreate(fromInterface))
+                        }
+
+                        // Start BLE operations (advertise, scan, event collection)
+                        iface.start()
+
+                        // Register parent interface with Transport for lifecycle tracking
+                        Transport.registerInterface(InterfaceAdapter.getOrCreate(iface))
+                        runningInterfaces[config.id] = iface
+
+                        Log.i(TAG, "Started BLE interface: ${config.name}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start BLE interface ${config.name}: ${e.message}", e)
+                    }
+                }
+                // Return null -- the interface will be registered asynchronously
+                // when the BLE setup completes (same pattern as RNODE)
                 null
             }
 
