@@ -87,6 +87,15 @@ class InterfaceManager(
     }
 
     /**
+     * Trigger reconnection on all managed interfaces.
+     * Resets reconnection backoff for quick reconnection after pause/resume or user action.
+     */
+    fun reconnectAll() {
+        Log.i(TAG, "Reconnect requested on all interfaces")
+        notifyNetworkChange()
+    }
+
+    /**
      * Notify all TCP client interfaces that the network has changed.
      * This resets their reconnection backoff for quick reconnection.
      */

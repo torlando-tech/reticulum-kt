@@ -156,6 +156,10 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     private val _transportInterfaces = MutableStateFlow<List<TransportInterfaceInfo>>(emptyList())
     val transportInterfaces: StateFlow<List<TransportInterfaceInfo>> = _transportInterfaces.asStateFlow()
 
+    // Service pause state (driven by notification quick actions)
+    private val _isPaused = MutableStateFlow(false)
+    val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
+
     // Service control
     fun startService() {
         viewModelScope.launch {
@@ -207,6 +211,16 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 it.startNetworkObservation()  // Start observing network changes for backoff reset
             }
 
+            // Wire service callbacks for notification quick actions
+            ReticulumService.getInstance()?.let { service ->
+                service.onReconnectRequested = {
+                    interfaceManager?.reconnectAll()
+                }
+                service.onPauseStateChanged = {
+                    _isPaused.value = service.isPaused
+                }
+            }
+
             // Start periodic status refresh (every 2 seconds)
             statusRefreshJob = viewModelScope.launch {
                 while (isActive) {
@@ -235,9 +249,16 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Stop network observer (no longer needed when interfaces stopped)
             networkObserver.stop()
 
-            // Clear interface statuses
+            // Clear interface statuses and pause state
             _interfaceStatuses.value = emptyMap()
             _transportInterfaces.value = emptyList()
+            _isPaused.value = false
+
+            // Clear service callbacks
+            ReticulumService.getInstance()?.let { service ->
+                service.onReconnectRequested = null
+                service.onPauseStateChanged = null
+            }
 
             // Cancel WorkManager before stopping service to ensure "stop means stop"
             // The service's shutdownReticulum() also cancels, but doing it here is
@@ -263,6 +284,11 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun updateServiceStatus() {
         try {
+            // Sync pause state from service
+            ReticulumService.getInstance()?.let { service ->
+                _isPaused.value = service.isPaused
+            }
+
             if (Reticulum.isStarted()) {
                 val rns = Reticulum.getInstance()
                 val clientCount = rns.getSharedInstanceClientCount()
@@ -314,6 +340,17 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
         } catch (e: Exception) {
             _sharedInstanceStatus.value = SharedInstanceStatus.Error(e.message ?: "Unknown error")
         }
+    }
+
+    // Service pause/resume for UI controls
+    fun pauseService() {
+        ReticulumService.getInstance()?.pause()
+        _isPaused.value = true
+    }
+
+    fun resumeService() {
+        ReticulumService.getInstance()?.resume()
+        _isPaused.value = false
     }
 
     // Settings updates
