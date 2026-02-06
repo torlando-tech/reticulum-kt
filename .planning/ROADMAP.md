@@ -39,7 +39,7 @@ See `.planning/milestones/v2-ROADMAP.md` for archived roadmap.
 - [x] **Phase 18: Fragmentation and Driver Contract** - Wire format, reassembly, BLEDriver interface
 - [x] **Phase 19: GATT Server and Advertising** - Peripheral role, characteristic hosting, notifications
 - [x] **Phase 20: GATT Client and Scanner** - Central role, service discovery, MTU negotiation
-- [ ] **Phase 21: BLEInterface Orchestration** - MAC sorting, identity handshake, dual-role, Transport integration
+- [x] **Phase 21: BLEInterface Orchestration** - MAC sorting, identity handshake, dual-role, Transport integration
 - [ ] **Phase 22: Hardening and Edge Cases** - Zombie detection, blacklisting, deduplication, peer scoring
 
 ## Phase Details
@@ -134,8 +134,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 21-01-PLAN.md -- BLEInterface and BLEPeerInterface core orchestration classes
-- [ ] 21-02-PLAN.md -- InterfaceManager BLE integration and manifest permissions
+- [x] 21-01-PLAN.md -- BLEInterface and BLEPeerInterface core orchestration classes
+- [x] 21-02-PLAN.md -- InterfaceManager BLE integration and manifest permissions
 
 ### Phase 22: Hardening and Edge Cases
 
@@ -163,7 +163,7 @@ Plans:
 | 18. Fragmentation and Driver Contract | 2/2 | Complete | 2026-02-06 |
 | 19. GATT Server and Advertising | 2/2 | Complete | 2026-02-06 |
 | 20. GATT Client and Scanner | 2/2 | Complete | 2026-02-06 |
-| 21. BLEInterface Orchestration | 0/2 | Not started | - |
+| 21. BLEInterface Orchestration | 2/2 | Complete | 2026-02-06 |
 | 22. Hardening and Edge Cases | 0/TBD | Not started | - |
 
 ---

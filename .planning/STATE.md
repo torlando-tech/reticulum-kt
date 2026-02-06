@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 ## Current Position
 
 Phase: 21 of 22 (BLEInterface Orchestration)
-Plan: 01 of 01 in phase
+Plan: 02 of 02 in phase
 Status: Phase complete
-Last activity: 2026-02-06 - Completed 21-01-PLAN.md (BLEInterface and BLEPeerInterface)
+Last activity: 2026-02-06 - Completed 21-02-PLAN.md (InterfaceManager BLE integration)
 
-Progress: v3 [█████████░░░] 70%
+Progress: v3 [██████████░░] 80%
 
 ## Milestone Goals
 
@@ -24,13 +24,13 @@ Progress: v3 [█████████░░░] 70%
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
 - Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
 - Phase 20: GATT Client and Scanner (central role) -- COMPLETE (2/2 plans)
-- Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport) -- COMPLETE (1/1 plan)
+- Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport) -- COMPLETE (2/2 plans)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7 (v3)
+- Total plans completed: 8 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
@@ -38,6 +38,7 @@ Progress: v3 [█████████░░░] 70%
 - 20-01: 3min (BLE scanner and GATT client)
 - 20-02: 2min (AndroidBLEDriver and internal visibility)
 - 21-01: 3min (BLEInterface and BLEPeerInterface orchestration)
+- 21-02: 2min (InterfaceManager BLE integration and manifest permissions)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -52,6 +53,9 @@ Progress: v3 [█████████░░░] 70%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [21-02]: Fully-qualified type names for AndroidBLEDriver/BLEInterface in BLE case (single-use types, no imports)
+- [21-02]: Explicit BLUETOOTH_ADVERTISE in sample app manifest despite rns-android merger
+- [21-02]: No stopInterface() change needed -- else -> detach() fallback covers BLEInterface
 - [21-01]: No downcast to AndroidBLEDriver -- caller sets identity on driver before construction
 - [21-01]: No restartAdvertisingIfNeeded() call -- BleAdvertiser 60s refresh is sufficient
 - [21-01]: Optimistic connect then sort -- deduplicate by identity after handshake
@@ -166,6 +170,16 @@ BLE mesh orchestration layer complete:
 - Pure JVM: no Android imports, depends only on BLEDriver/BLEPeerConnection interfaces
 - Package: `network.reticulum.interfaces.ble` in rns-interfaces module
 
+### From 21-02 (InterfaceManager BLE Integration)
+
+App-level BLE wiring complete:
+- InterfaceManager BLE case: creates AndroidBLEDriver + BLEInterface on Dispatchers.IO
+- Transport identity set on driver BEFORE BLEInterface.start() (identity handshake prerequisite)
+- Async launch + null return pattern (same as RNODE case)
+- BLUETOOTH_ADVERTISE permission added to sample app manifest
+- All 3 BLE runtime permissions declared: SCAN, CONNECT, ADVERTISE
+- stopInterface() covered by existing else -> detach() fallback
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -185,6 +199,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T23:25:00Z
-Stopped at: Phase 21 complete — BLEInterface and BLEPeerInterface orchestration done
+Last session: 2026-02-06T23:29:00Z
+Stopped at: Phase 21 complete — all 2 plans done (BLEInterface + InterfaceManager integration)
 Resume file: None
