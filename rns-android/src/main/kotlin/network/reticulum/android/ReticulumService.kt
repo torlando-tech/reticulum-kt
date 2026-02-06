@@ -56,6 +56,28 @@ class ReticulumService : LifecycleService() {
     private lateinit var batteryMonitor: BatteryMonitor
     private lateinit var policyProvider: ConnectionPolicyProvider
 
+    // Pause/resume state tracking
+    private var _isPaused = false
+
+    /** Whether the service is currently paused by the user. */
+    val isPaused: Boolean get() = _isPaused
+
+    // Session start time for uptime tracking in notifications
+    private var sessionStartTime: Long = 0L
+
+    /** System.currentTimeMillis() when the service session started. */
+    val sessionStartTimeMs: Long get() = sessionStartTime
+
+    /**
+     * Called when pause state changes. Plan 03 sets this to trigger notification update.
+     */
+    var onPauseStateChanged: (() -> Unit)? = null
+
+    /**
+     * Called when reconnect is requested. Sample app ViewModel sets this.
+     */
+    var onReconnectRequested: (() -> Unit)? = null
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -64,6 +86,7 @@ class ReticulumService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createNotificationChannel()
 
         // Initialize lifecycle-aware observers
@@ -141,6 +164,9 @@ class ReticulumService : LifecycleService() {
             config = it
         }
 
+        // Track session start time for uptime display
+        sessionStartTime = System.currentTimeMillis()
+
         // Start as foreground service
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -166,6 +192,8 @@ class ReticulumService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        instance = null
+
         // Stop policy provider first (depends on observers)
         policyProvider.stop()
         batteryMonitor.stop()
@@ -417,10 +445,73 @@ class ReticulumService : LifecycleService() {
      */
     fun getPolicyProvider(): ConnectionPolicyProvider = policyProvider
 
+    /**
+     * Pause the service: freeze Transport job loop and cancel WorkManager.
+     *
+     * The service stays alive as a foreground service but stops all network activity.
+     * The notification updates to show "Paused" state via [onPauseStateChanged] callback.
+     */
+    fun pause() {
+        _isPaused = true
+        // Freeze Transport job loop by setting interval to effectively infinite
+        network.reticulum.transport.Transport.customJobIntervalMs = Long.MAX_VALUE
+        // Cancel WorkManager periodic recovery
+        ReticulumWorker.cancel(this)
+        Log.i(TAG, "Service paused by user")
+        onPauseStateChanged?.invoke()
+    }
+
+    /**
+     * Resume the service: restore Transport job interval and re-schedule WorkManager.
+     *
+     * Restores the policy-based throttle interval, re-schedules WorkManager,
+     * and triggers immediate reconnection on all interfaces.
+     */
+    fun resume() {
+        _isPaused = false
+        // Restore Transport job interval based on current connection policy
+        val baseIntervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL
+        val policy = policyProvider.currentPolicy
+        network.reticulum.transport.Transport.customJobIntervalMs =
+            (baseIntervalMs * policy.throttleMultiplier).toLong()
+        // Re-schedule WorkManager periodic recovery
+        ReticulumWorker.schedule(this, intervalMinutes = 15)
+        // Trigger immediate reconnection on all interfaces
+        reconnectInterfaces()
+        Log.i(TAG, "Service resumed by user")
+        onPauseStateChanged?.invoke()
+    }
+
+    /**
+     * Trigger reconnection attempt on all Transport-registered interfaces.
+     *
+     * Invokes the [onReconnectRequested] callback which the ViewModel can use
+     * to call onNetworkChanged() on the InterfaceManager for immediate reconnection.
+     */
+    fun reconnectInterfaces() {
+        val interfaces = network.reticulum.transport.Transport.getInterfaces()
+        Log.i(TAG, "Triggering reconnection on ${interfaces.size} interfaces")
+        onReconnectRequested?.invoke()
+    }
+
     companion object {
         private const val TAG = "ReticulumService"
         private const val NOTIFICATION_ID = 1001
         private const val EXTRA_CONFIG = "config"
+
+        // Notification quick action intent actions
+        const val ACTION_PAUSE = "network.reticulum.android.ACTION_PAUSE"
+        const val ACTION_RESUME = "network.reticulum.android.ACTION_RESUME"
+        const val ACTION_RECONNECT = "network.reticulum.android.ACTION_RECONNECT"
+
+        // Static instance for BroadcastReceiver access
+        private var instance: ReticulumService? = null
+
+        /**
+         * Get the currently running service instance, or null if not running.
+         * Used by [NotificationActionReceiver] to dispatch quick actions.
+         */
+        fun getInstance(): ReticulumService? = instance
 
         /**
          * Start the Reticulum service with default client-only configuration.
