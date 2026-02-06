@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 
 ## Current Position
 
-Phase: 20 of 22 (GATT Client and Scanner)
-Plan: 02 of 02 in phase
+Phase: 21 of 22 (BLEInterface Orchestration)
+Plan: 01 of 01 in phase
 Status: Phase complete
-Last activity: 2026-02-06 - Completed 20-02-PLAN.md (AndroidBLEDriver and internal visibility)
+Last activity: 2026-02-06 - Completed 21-01-PLAN.md (BLEInterface and BLEPeerInterface)
 
-Progress: v3 [████████░░░░] 60%
+Progress: v3 [█████████░░░] 70%
 
 ## Milestone Goals
 
@@ -24,19 +24,20 @@ Progress: v3 [████████░░░░] 60%
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
 - Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
 - Phase 20: GATT Client and Scanner (central role) -- COMPLETE (2/2 plans)
-- Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport)
+- Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport) -- COMPLETE (1/1 plan)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6 (v3)
+- Total plans completed: 7 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
 - 19-02: 3min (BLE advertising and operation queue)
 - 20-01: 3min (BLE scanner and GATT client)
 - 20-02: 2min (AndroidBLEDriver and internal visibility)
+- 21-01: 3min (BLEInterface and BLEPeerInterface orchestration)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -51,6 +52,11 @@ Progress: v3 [████████░░░░] 60%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [21-01]: No downcast to AndroidBLEDriver -- caller sets identity on driver before construction
+- [21-01]: No restartAdvertisingIfNeeded() call -- BleAdvertiser 60s refresh is sufficient
+- [21-01]: Optimistic connect then sort -- deduplicate by identity after handshake
+- [21-01]: runBlocking(Dispatchers.IO) bridge for processOutgoing sync-to-async
+- [21-01]: shouldInitiateConnection reserved for Phase 22 dedup enhancements
 - [20-02]: runBlocking for MTU property getter (quick Mutex-protected map lookup, acceptable)
 - [20-02]: Private inner class for AndroidBLEPeerConnection (access to enclosing driver components)
 - [20-02]: Shared CoroutineScope passed to all BLE components for coordinated lifecycle
@@ -148,6 +154,18 @@ AndroidBLEDriver facade completing the BLE transport layer:
 - Only AndroidBLEDriver is public API from `network.reticulum.android.ble` package
 - Phase 21 API: setTransportIdentity(), getPeerConnection(), restartAdvertisingIfNeeded()
 
+### From 21-01 (BLEInterface Orchestration)
+
+BLE mesh orchestration layer complete:
+- `BLEInterface` -- server-style parent: dual-role startup, discovery, identity handshake, peer spawning
+- `BLEPeerInterface` -- per-peer child: fragmentation, reassembly, keepalive, Transport integration
+- Identity handshake: central reads Identity char, writes own identity to RX (30s timeout)
+- Duplicate identity detection: keeps newest connection, tears down oldest
+- Blacklist (60s) on handshake timeout, reconnection backoff (7s) on connection failure
+- processOutgoing no-op on parent; runBlocking bridge on child for sync-to-async
+- Pure JVM: no Android imports, depends only on BLEDriver/BLEPeerConnection interfaces
+- Package: `network.reticulum.interfaces.ble` in rns-interfaces module
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -167,6 +185,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T22:20:00Z
-Stopped at: Phase 20 complete — all plans executed, ROADMAP updated
+Last session: 2026-02-06T23:25:00Z
+Stopped at: Phase 21 complete — BLEInterface and BLEPeerInterface orchestration done
 Resume file: None
