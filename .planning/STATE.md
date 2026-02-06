@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 14 of 17 (Service Notification UX)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-05 - Completed 14-02-PLAN.md (Notification Quick Actions)
+Plan: 3 of 3 in current phase
+Status: Phase complete
+Last activity: 2026-02-05 - Completed 14-03-PLAN.md (Service Notification Wiring)
 
-Progress: v2 [█████████░] 84%
+Progress: v2 [██████████░] 88%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 18 (v2)
+- Total plans completed: 19 (v2)
 - Average duration: 2.5min
-- Total execution time: 44.5min
+- Total execution time: 47.75min
 
 **By Phase:**
 
@@ -42,7 +42,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
-| 14 | 2/3 | 3.5min | 1.75min |
+| 14 | 3/3 | 6.75min | 2.25min |
 
 *Updated after each plan completion*
 
@@ -103,6 +103,10 @@ Recent decisions affecting current work:
 - [14-02]: Long.MAX_VALUE interval for pause (Transport.stopCoroutineJobLoop is private)
 - [14-02]: Reconnect hidden when paused (contradictory to frozen state)
 - [14-02]: Callback-based onReconnectRequested (service doesn't own InterfaceManager)
+- [14-03]: Handler-based debounce for notification updates (500ms minimum interval)
+- [14-03]: Name-based heuristic for interface categorization with optional provider override
+- [14-03]: 5-second periodic update loop with 3-second initial delay for initialization
+- [14-03]: promote lifecycle-service to api() scope for transitive dependency access
 
 ### From v1
 
@@ -123,5 +127,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 14-02-PLAN.md (Notification Quick Actions)
+Stopped at: Completed 14-03-PLAN.md (Service Notification Wiring) - Phase 14 complete
 Resume file: None
