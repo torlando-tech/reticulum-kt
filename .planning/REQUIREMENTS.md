@@ -37,8 +37,8 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 - [ ] **SERV-01**: Foreground service with correct type (`connectedDevice` for P2P mesh)
 - [ ] **SERV-02**: Notification channel with user controls (importance, sound, vibration)
 - [x] **SERV-03**: Lifecycle-aware coroutine management (proper cancellation on service stop)
-- [ ] **SERV-04**: Connection status displayed in persistent notification
-- [ ] **SERV-05**: Quick actions in notification (reconnect, pause connection)
+- [x] **SERV-04**: Connection status displayed in persistent notification
+- [x] **SERV-05**: Quick actions in notification (reconnect, pause connection)
 
 ### Memory & Stability
 
@@ -98,8 +98,8 @@ Which phases cover which requirements.
 | SERV-01 | Phase 10 | Pending |
 | SERV-02 | Phase 10 | Pending |
 | SERV-03 | Phase 11 | Complete |
-| SERV-04 | Phase 14 | Pending |
-| SERV-05 | Phase 14 | Pending |
+| SERV-04 | Phase 14 | Complete |
+| SERV-05 | Phase 14 | Complete |
 | MEM-01 | Phase 17 | Pending |
 | MEM-02 | Phase 17 | Pending |
 | MEM-03 | Phase 17 | Pending |

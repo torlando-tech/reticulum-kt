@@ -30,7 +30,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 - [x] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
 - [x] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
 - [x] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
-- [ ] **Phase 14: Service Notification UX** - Status display and quick actions
+- [x] **Phase 14: Service Notification UX** - Status display and quick actions
 - [ ] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
 - [ ] **Phase 16: OEM Compatibility** - Samsung, Xiaomi, Huawei manufacturer handling
 - [ ] **Phase 17: Memory Optimization** - Long-term stability and leak prevention
@@ -133,9 +133,9 @@ Plans:
 **Plans:** 3 plans (1 in wave 1, 1 in wave 2, 1 in wave 3)
 
 Plans:
-- [ ] 14-01-PLAN.md -- Connection state model and notification content builder
-- [ ] 14-02-PLAN.md -- Notification quick actions (Reconnect + Pause/Resume)
-- [ ] 14-03-PLAN.md -- Wire notification updates into service lifecycle
+- [x] 14-01-PLAN.md -- Connection state model and notification content builder
+- [x] 14-02-PLAN.md -- Notification quick actions (Reconnect + Pause/Resume)
+- [x] 14-03-PLAN.md -- Wire notification updates into service lifecycle
 
 ### Phase 15: Battery Optimization UX
 
@@ -189,7 +189,7 @@ Plans:
 | 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
 | 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
 | 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
-| 14. Service Notification UX | 0/3 | Planned | - |
+| 14. Service Notification UX | 3/3 | ✓ Complete | 2026-02-05 |
 | 15. Battery Optimization UX | 0/TBD | Not started | - |
 | 16. OEM Compatibility | 0/TBD | Not started | - |
 | 17. Memory Optimization | 0/TBD | Not started | - |
