@@ -130,7 +130,12 @@ Plans:
   3. Quick action: Reconnect button triggers immediate reconnection attempt
   4. Quick action: Pause button temporarily disables connection (user-controlled)
   5. Tapping notification opens app to connection status screen
-**Plans**: TBD
+**Plans:** 3 plans (1 in wave 1, 1 in wave 2, 1 in wave 3)
+
+Plans:
+- [ ] 14-01-PLAN.md -- Connection state model and notification content builder
+- [ ] 14-02-PLAN.md -- Notification quick actions (Reconnect + Pause/Resume)
+- [ ] 14-03-PLAN.md -- Wire notification updates into service lifecycle
 
 ### Phase 15: Battery Optimization UX
 
@@ -184,7 +189,7 @@ Plans:
 | 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
 | 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
 | 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
-| 14. Service Notification UX | 0/TBD | Not started | - |
+| 14. Service Notification UX | 0/3 | Planned | - |
 | 15. Battery Optimization UX | 0/TBD | Not started | - |
 | 16. OEM Compatibility | 0/TBD | Not started | - |
 | 17. Memory Optimization | 0/TBD | Not started | - |
