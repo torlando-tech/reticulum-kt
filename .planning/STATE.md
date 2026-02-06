@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 ## Current Position
 
 Phase: 20 of 22 (GATT Client and Scanner)
-Plan: 01 of 02 in phase
-Status: In progress
-Last activity: 2026-02-06 - Completed 20-01-PLAN.md (BleScanner and BleGattClient)
+Plan: 02 of 02 in phase
+Status: Phase complete
+Last activity: 2026-02-06 - Completed 20-02-PLAN.md (AndroidBLEDriver and internal visibility)
 
-Progress: v3 [███████░░░░░] 50%
+Progress: v3 [████████░░░░] 60%
 
 ## Milestone Goals
 
@@ -23,19 +23,20 @@ Progress: v3 [███████░░░░░] 50%
 5 phases (18-22) delivering BLE mesh networking:
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
 - Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
-- Phase 20: GATT Client and Scanner (central role) -- IN PROGRESS (1/2 plans)
+- Phase 20: GATT Client and Scanner (central role) -- COMPLETE (2/2 plans)
 - Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5 (v3)
+- Total plans completed: 6 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
 - 19-02: 3min (BLE advertising and operation queue)
 - 20-01: 3min (BLE scanner and GATT client)
+- 20-02: 2min (AndroidBLEDriver and internal visibility)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -50,6 +51,9 @@ Progress: v3 [███████░░░░░] 50%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [20-02]: runBlocking for MTU property getter (quick Mutex-protected map lookup, acceptable)
+- [20-02]: Private inner class for AndroidBLEPeerConnection (access to enclosing driver components)
+- [20-02]: Shared CoroutineScope passed to all BLE components for coordinated lifecycle
 - [20-01]: Single long-running scan (no cycling) -- BLE chip handles power management via ScanMode
 - [20-01]: Per-device 3s throttle for scan callbacks
 - [20-01]: Error 133: gatt.close() only (no disconnect first) + exponential backoff retry
@@ -134,6 +138,16 @@ BLE central-role components implemented in rns-android module:
 - SharedFlow events: discoveredPeers, connected, disconnected, connectionFailed, dataReceived, mtuChanged
 - Package: `network.reticulum.android.ble` in rns-android module
 
+### From 20-02 (AndroidBLEDriver and Internal Visibility)
+
+AndroidBLEDriver facade completing the BLE transport layer:
+- `AndroidBLEDriver` -- concrete BLEDriver implementation aggregating all BLE components
+- `AndroidBLEPeerConnection` -- private inner class wrapping outgoing/incoming connections
+- Event aggregation: 6 coroutine collectors route component events to BLEDriver flows
+- All BLE components (BleGattServer, BleAdvertiser, BleScanner, BleGattClient) marked `internal`
+- Only AndroidBLEDriver is public API from `network.reticulum.android.ble` package
+- Phase 21 API: setTransportIdentity(), getPeerConnection(), restartAdvertisingIfNeeded()
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -153,6 +167,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T22:07:00Z
-Stopped at: Completed 20-01-PLAN.md (BleScanner and BleGattClient)
+Last session: 2026-02-06T22:12:00Z
+Stopped at: Completed 20-02-PLAN.md (AndroidBLEDriver and internal visibility)
 Resume file: None
