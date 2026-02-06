@@ -14,13 +14,13 @@ Requirements for Android production readiness. Each maps to roadmap phases.
 - [x] **CONN-03**: Automatic reconnection after network changes (WiFi ↔ cellular, offline → online)
 - [ ] **CONN-04**: Works on API 26+ (Android 8.0 Oreo and later)
 - [x] **CONN-05**: Connection persists across full device sleep/wake cycles
-- [ ] **CONN-06**: Sub-second message delivery even when app is backgrounded
+- [x] **CONN-06**: Sub-second message delivery even when app is backgrounded
 
 ### Battery Management
 
 - [ ] **BATT-01**: Battery drain <2% per hour while maintaining connection
 - [ ] **BATT-02**: Battery optimization exemption request flow (guides user through settings)
-- [ ] **BATT-03**: WorkManager integration for Doze-surviving periodic tasks (15-minute windows)
+- [x] **BATT-03**: WorkManager integration for Doze-surviving periodic tasks (15-minute windows)
 - [x] **BATT-04**: Intelligent connection throttling during low battery (<15%)
 - [ ] **BATT-05**: Battery usage statistics visible to user in app
 
@@ -84,10 +84,10 @@ Which phases cover which requirements.
 | CONN-03 | Phase 12 | Complete |
 | CONN-04 | Phase 10 | Pending |
 | CONN-05 | Phase 12 | Complete |
-| CONN-06 | Phase 13 | Pending |
+| CONN-06 | Phase 13 | Complete |
 | BATT-01 | Phase 15 | Pending |
 | BATT-02 | Phase 15 | Pending |
-| BATT-03 | Phase 13 | Pending |
+| BATT-03 | Phase 13 | Complete |
 | BATT-04 | Phase 12 | Complete |
 | BATT-05 | Phase 15 | Pending |
 | OEM-01 | Phase 16 | Pending |

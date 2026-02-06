@@ -29,7 +29,7 @@ See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 - [x] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
 - [x] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
 - [x] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
-- [ ] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
+- [x] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
 - [ ] **Phase 14: Service Notification UX** - Status display and quick actions
 - [ ] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
 - [ ] **Phase 16: OEM Compatibility** - Samsung, Xiaomi, Huawei manufacturer handling
@@ -114,9 +114,9 @@ Plans:
 **Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
 
 Plans:
-- [ ] 13-01-PLAN.md -- Enhanced ReticulumWorker with recovery-focused health checks
-- [ ] 13-02-PLAN.md -- BootReceiver + service lifecycle WorkManager wiring
-- [ ] 13-03-PLAN.md -- Sample app ViewModel integration and autoStart wiring
+- [x] 13-01-PLAN.md -- Enhanced ReticulumWorker with recovery-focused health checks
+- [x] 13-02-PLAN.md -- BootReceiver + service lifecycle WorkManager wiring
+- [x] 13-03-PLAN.md -- Sample app ViewModel integration and autoStart wiring
 
 ### Phase 14: Service Notification UX
 
@@ -183,7 +183,7 @@ Plans:
 | 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
 | 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
 | 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
-| 13. WorkManager Integration | 0/TBD | Not started | - |
+| 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
 | 14. Service Notification UX | 0/TBD | Not started | - |
 | 15. Battery Optimization UX | 0/TBD | Not started | - |
 | 16. OEM Compatibility | 0/TBD | Not started | - |
