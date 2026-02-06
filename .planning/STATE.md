@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 
 ## Current Position
 
-Phase: 14 of 17 (Service Notification UX)
-Plan: 3 of 3 in current phase
-Status: Phase complete
-Last activity: 2026-02-05 - Completed 14-03-PLAN.md (Service Notification Wiring)
+Phase: 15 of 17 (Battery Optimization UX)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-02-05 - Completed 15-01-PLAN.md (Battery Stats Infrastructure)
 
-Progress: v2 [██████████░] 88%
+Progress: v2 [███████████░] 91%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 19 (v2)
+- Total plans completed: 20 (v2)
 - Average duration: 2.5min
-- Total execution time: 47.75min
+- Total execution time: 49.75min
 
 **By Phase:**
 
@@ -43,6 +43,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
 | 14 | 3/3 | 6.75min | 2.25min |
+| 15 | 1/3 | 2min | 2min |
 
 *Updated after each plan completion*
 
@@ -107,6 +108,10 @@ Recent decisions affecting current work:
 - [14-03]: Name-based heuristic for interface categorization with optional provider override
 - [14-03]: 5-second periodic update loop with 3-second initial delay for initialization
 - [14-03]: promote lifecycle-service to api() scope for transitive dependency access
+- [15-01]: org.json (Android SDK built-in) for sample persistence instead of external JSON library
+- [15-01]: Shared SharedPreferences file (reticulum_battery) between tracker and exemption helper
+- [15-01]: Short JSON keys (t, l, c) for compact persistence of 1440 samples
+- [15-01]: Synchronized sampleList access for thread safety between coroutine and stop()
 
 ### From v1
 
@@ -127,5 +132,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 14-03-PLAN.md (Service Notification Wiring) - Phase 14 complete
+Stopped at: Completed 15-01-PLAN.md (Battery Stats Infrastructure)
 Resume file: None
