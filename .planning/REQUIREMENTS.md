@@ -22,7 +22,7 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 
 - [x] **DRV-01**: BLEDriver interface defined in rns-interfaces (pure JVM, no Android imports)
 - [x] **DRV-02**: BLEDriver exposes message-based API (send/receive fragments, not streams)
-- [ ] **DRV-03**: AndroidBLEDriver implements BLEDriver using Android BLE APIs
+- [x] **DRV-03**: AndroidBLEDriver implements BLEDriver using Android BLE APIs
 - [x] **DRV-04**: Protocol logic unit-testable on JVM with mock BLEDriver (no Android required)
 
 ### GATT Server (Peripheral Role)
@@ -43,29 +43,29 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 
 ### GATT Client (Central Role)
 
-- [ ] **CLI-01**: Scanner discovers peers by service UUID filter (single long-running scan)
-- [ ] **CLI-02**: GATT client connects, discovers services, enables TX notifications
-- [ ] **CLI-03**: MTU negotiation requests 517 bytes, accepts any negotiated value
-- [ ] **CLI-04**: All GATT operations serialized via operation queue (prevents pipelining)
-- [ ] **CLI-05**: GATT error 133 triggers retry with exponential backoff
+- [x] **CLI-01**: Scanner discovers peers by service UUID filter (single long-running scan)
+- [x] **CLI-02**: GATT client connects, discovers services, enables TX notifications
+- [x] **CLI-03**: MTU negotiation requests 517 bytes, accepts any negotiated value
+- [x] **CLI-04**: All GATT operations serialized via operation queue (prevents pipelining)
+- [x] **CLI-05**: GATT error 133 triggers retry with exponential backoff
 
 ### Identity Handshake
 
-- [ ] **ID-01**: Central reads peripheral's Identity characteristic (16 bytes)
-- [ ] **ID-02**: Central writes own 16-byte identity to RX as first packet (WRITE_WITH_RESPONSE)
-- [ ] **ID-03**: Identity exchange completes before any data transfer
-- [ ] **ID-04**: Peer keyed by identity hash (survives MAC rotation)
-- [ ] **ID-05**: Identity handshake times out after 30 seconds
+- [x] **ID-01**: Central reads peripheral's Identity characteristic (16 bytes)
+- [x] **ID-02**: Central writes own 16-byte identity to RX as first packet (WRITE_WITH_RESPONSE)
+- [x] **ID-03**: Identity exchange completes before any data transfer
+- [x] **ID-04**: Peer keyed by identity hash (survives MAC rotation)
+- [x] **ID-05**: Identity handshake times out after 30 seconds
 
 ### Connection Management
 
-- [ ] **CONN-01**: MAC sorting determines role — lower MAC acts as central, higher as peripheral
-- [ ] **CONN-02**: Dual-role operation — simultaneous scanning, advertising, and connections
-- [ ] **CONN-03**: BLEInterface spawns BLEPeerInterface per connected peer
-- [ ] **CONN-04**: Spawned BLEPeerInterface registered with Transport for routing
-- [ ] **CONN-05**: Keepalive byte (0x00) sent every 15 seconds per connection
-- [ ] **CONN-06**: Disconnected peers cleaned up (Transport deregistered, state freed)
-- [ ] **CONN-07**: Connection limit respected (max 4-5 simultaneous peers)
+- [x] **CONN-01**: Identity-based sorting determines connection dedup (replaces MAC sorting — Android can't provide local MAC)
+- [x] **CONN-02**: Dual-role operation — simultaneous scanning, advertising, and connections
+- [x] **CONN-03**: BLEInterface spawns BLEPeerInterface per connected peer
+- [x] **CONN-04**: Spawned BLEPeerInterface registered with Transport for routing
+- [x] **CONN-05**: Keepalive byte (0x00) sent every 15 seconds per connection
+- [x] **CONN-06**: Disconnected peers cleaned up (Transport deregistered, state freed)
+- [x] **CONN-07**: Connection limit respected (max 5 simultaneous peers, configurable)
 
 ### Deduplication
 
@@ -81,9 +81,9 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 
 ### App Integration
 
-- [ ] **APP-01**: InterfaceManager creates BLEInterface with AndroidBLEDriver injection
+- [x] **APP-01**: InterfaceManager creates BLEInterface with AndroidBLEDriver injection
 - [ ] **APP-02**: BLE interface toggle in UI (start/stop discovery and connections)
-- [ ] **APP-03**: BLE permissions requested at runtime (SCAN, CONNECT, ADVERTISE)
+- [x] **APP-03**: BLE permissions declared in manifest (SCAN, CONNECT, ADVERTISE)
 
 ## Out of Scope
 
@@ -101,15 +101,16 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 |-------------|-------|--------|
 | FRAG-01..08 | Phase 18 | Complete |
 | DRV-01..02,04 | Phase 18 | Complete |
-| DRV-03 | Phase 20 | Pending |
+| DRV-03 | Phase 20 | Complete |
 | GATT-01..07 | Phase 19 | Complete |
 | ADV-01..03 | Phase 19 | Complete |
-| CLI-01..05 | Phase 20 | Pending |
-| ID-01..05 | Phase 21 | Pending |
-| CONN-01..07 | Phase 21 | Pending |
+| CLI-01..05 | Phase 20 | Complete |
+| ID-01..05 | Phase 21 | Complete |
+| CONN-01..07 | Phase 21 | Complete |
 | DEDUP-01..02 | Phase 22 | Pending |
 | HARD-01..04 | Phase 22 | Pending |
-| APP-01..03 | Phase 21 | Pending |
+| APP-01,03 | Phase 21 | Complete |
+| APP-02 | Phase 22+ | Pending |
 
 **Coverage:**
 - v3 requirements: 42 total
