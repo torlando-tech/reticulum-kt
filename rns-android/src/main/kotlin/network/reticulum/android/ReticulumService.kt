@@ -2,20 +2,23 @@ package network.reticulum.android
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
@@ -68,8 +71,17 @@ class ReticulumService : LifecycleService() {
     /** System.currentTimeMillis() when the service session started. */
     val sessionStartTimeMs: Long get() = sessionStartTime
 
+    // Rich notification builder and debounce state
+    private lateinit var notificationBuilder: NotificationContentBuilder
+    private var lastNotificationUpdate = 0L
+    private var pendingNotificationUpdate = false
+    private val notificationHandler = Handler(Looper.getMainLooper())
+
+    /** Minimum interval between notification updates to avoid flickering during handoffs. */
+    private val NOTIFICATION_DEBOUNCE_MS = 500L
+
     /**
-     * Called when pause state changes. Plan 03 sets this to trigger notification update.
+     * Called when pause state changes. Triggers notification update.
      */
     var onPauseStateChanged: (() -> Unit)? = null
 
@@ -88,6 +100,21 @@ class ReticulumService : LifecycleService() {
         super.onCreate()
         instance = this
         createNotificationChannel()
+
+        // Initialize rich notification builder
+        notificationBuilder = NotificationContentBuilder(this)
+
+        // Wire pause state change to trigger notification update
+        onPauseStateChanged = { updateNotificationDebounced() }
+
+        // Start periodic notification update loop
+        lifecycleScope.launch {
+            delay(3000) // Wait for initialization
+            while (isActive) {
+                updateNotificationDebounced()
+                delay(5000) // Update every 5 seconds
+            }
+        }
 
         // Initialize lifecycle-aware observers
         dozeObserver = DozeStateObserver(this)
@@ -194,6 +221,9 @@ class ReticulumService : LifecycleService() {
     override fun onDestroy() {
         instance = null
 
+        // Remove any pending notification updates
+        notificationHandler.removeCallbacksAndMessages(null)
+
         // Stop policy provider first (depends on observers)
         policyProvider.stop()
         batteryMonitor.stop()
@@ -272,14 +302,12 @@ class ReticulumService : LifecycleService() {
             ReticulumWorker.schedule(this@ReticulumService, intervalMinutes = 15)
             Log.i(TAG, "WorkManager recovery worker scheduled (15-minute interval)")
 
-            val statusText = when {
-                reticulum?.isSharedInstance == true -> "Shared Instance (port ${config.sharedInstancePort})"
-                reticulum?.isConnectedToSharedInstance == true -> "Connected to shared instance"
-                else -> "Connected"
-            }
-            updateNotification(statusText)
+            // Trigger immediate rich notification update with real interface state
+            updateNotificationDebounced()
         } catch (e: Exception) {
-            updateNotification("Error: ${e.message}")
+            Log.e(TAG, "Failed to initialize Reticulum: ${e.message}")
+            // Update notification to show error state (disconnected with no interfaces)
+            updateNotificationDebounced()
         }
     }
 
@@ -385,24 +413,133 @@ class ReticulumService : LifecycleService() {
         NotificationChannels.createChannels(this)
     }
 
-    private fun createNotification(status: String = "Starting..."): Notification {
-        val modeText = if (config.enableTransport) "Transport" else "Client"
-
-        return NotificationCompat.Builder(this, NotificationChannels.SERVICE_CHANNEL_ID)
-            .setContentTitle("Reticulum $modeText")
-            .setContentText(status)
-            .setSmallIcon(R.drawable.ic_reticulum)
-            .setOngoing(true)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .build()
+    /**
+     * Create the initial foreground notification in CONNECTING state.
+     * Used only for the initial startForeground() call before Reticulum is ready.
+     */
+    private fun createNotification(): Notification {
+        val snapshot = ConnectionSnapshot(
+            state = ServiceConnectionState.CONNECTING,
+            interfaces = emptyList(),
+            sessionStartTime = System.currentTimeMillis(),
+            enableTransport = config.enableTransport,
+            isPaused = false
+        )
+        return notificationBuilder.buildNotification(snapshot, buildContentIntent(), emptyList())
     }
 
-    private fun updateNotification(status: String) {
-        val notification = createNotification(status)
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, notification)
+    /**
+     * Build a snapshot of current connection state from Transport-registered interfaces.
+     */
+    private fun buildConnectionSnapshot(): ConnectionSnapshot {
+        val transportInterfaces = try {
+            network.reticulum.transport.Transport.getInterfaces()
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        val snapshots = transportInterfaces.map { ref ->
+            InterfaceSnapshot(
+                name = ref.name,
+                typeName = categorizeInterface(ref),
+                isOnline = ref.online,
+                detail = ""
+            )
+        }
+
+        return ConnectionSnapshot(
+            state = computeConnectionState(snapshots, _isPaused),
+            interfaces = snapshots,
+            sessionStartTime = sessionStartTime,
+            enableTransport = config.enableTransport,
+            isPaused = _isPaused
+        )
+    }
+
+    /**
+     * Categorize an interface by examining its name.
+     *
+     * Since [InterfaceRef] wraps the real interface type and doesn't expose the class,
+     * we use a name-based heuristic. A [interfaceTypeProvider] callback can override this.
+     */
+    private fun categorizeInterface(ref: network.reticulum.transport.InterfaceRef): String {
+        interfaceTypeProvider?.let { provider ->
+            return provider(ref.name)
+        }
+
+        // Name-based heuristic fallback
+        if (ref.isLocalSharedInstance || ref.parentInterface?.isLocalSharedInstance == true) {
+            return "Local"
+        }
+
+        val nameLower = ref.name.lowercase()
+        return when {
+            nameLower.contains("tcp") -> "TCP"
+            nameLower.contains("udp") -> "UDP"
+            nameLower.contains("auto") -> "Auto"
+            nameLower.contains("ble") || nameLower.contains("bluetooth") -> "BLE"
+            nameLower.contains("rnode") -> "RNode"
+            else -> "Interface"
+        }
+    }
+
+    /**
+     * Optional callback to provide interface type names from the ViewModel/InterfaceManager.
+     * If set, overrides the name-based heuristic in [categorizeInterface].
+     */
+    var interfaceTypeProvider: ((String) -> String)? = null
+
+    /**
+     * Update the notification, debounced to avoid flickering during rapid state changes.
+     *
+     * If less than [NOTIFICATION_DEBOUNCE_MS] has elapsed since the last update,
+     * the update is deferred and coalesced with subsequent requests.
+     */
+    private fun updateNotificationDebounced() {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastNotificationUpdate
+
+        if (elapsed >= NOTIFICATION_DEBOUNCE_MS) {
+            postNotificationUpdate()
+        } else if (!pendingNotificationUpdate) {
+            pendingNotificationUpdate = true
+            notificationHandler.postDelayed(
+                { postNotificationUpdate() },
+                NOTIFICATION_DEBOUNCE_MS - elapsed
+            )
+        }
+    }
+
+    /**
+     * Perform the actual notification update: build snapshot, build notification, post it.
+     */
+    private fun postNotificationUpdate() {
+        try {
+            val snapshot = buildConnectionSnapshot()
+            val contentIntent = buildContentIntent()
+            val actions = NotificationActionReceiver.buildActions(this, _isPaused)
+            val notification = notificationBuilder.buildNotification(snapshot, contentIntent, actions)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIFICATION_ID, notification)
+            lastNotificationUpdate = System.currentTimeMillis()
+            pendingNotificationUpdate = false
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update notification: ${e.message}")
+        }
+    }
+
+    /**
+     * Build a PendingIntent that opens the app when the notification is tapped.
+     * Uses the package manager's launch intent to find the main activity.
+     */
+    private fun buildContentIntent(): PendingIntent? {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        return launchIntent?.let {
+            PendingIntent.getActivity(
+                this, 0, it,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
     }
 
     /**
