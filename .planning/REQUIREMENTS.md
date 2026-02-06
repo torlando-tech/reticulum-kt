@@ -27,19 +27,19 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 
 ### GATT Server (Peripheral Role)
 
-- [ ] **GATT-01**: GATT server hosts custom service (UUID: 37145b00-442d-4a94-917f-8f42c5da28e3)
-- [ ] **GATT-02**: RX characteristic accepts writes and write-without-response
-- [ ] **GATT-03**: TX characteristic supports notifications (CCCD descriptor)
-- [ ] **GATT-04**: Identity characteristic serves 16-byte Transport identity hash (read-only)
-- [ ] **GATT-05**: Server always calls sendResponse() when responseNeeded=true
-- [ ] **GATT-06**: Notifications serialized (wait for onNotificationSent before next)
-- [ ] **GATT-07**: Per-device MTU tracked from onMtuChanged callbacks
+- [x] **GATT-01**: GATT server hosts custom service (UUID: 37145b00-442d-4a94-917f-8f42c5da28e3)
+- [x] **GATT-02**: RX characteristic accepts writes and write-without-response
+- [x] **GATT-03**: TX characteristic supports notifications (CCCD descriptor)
+- [x] **GATT-04**: Identity characteristic serves 16-byte Transport identity hash (read-only)
+- [x] **GATT-05**: Server always calls sendResponse() when responseNeeded=true
+- [x] **GATT-06**: Notifications serialized (wait for onNotificationSent before next)
+- [x] **GATT-07**: Per-device MTU tracked from onMtuChanged callbacks
 
 ### BLE Advertising
 
-- [ ] **ADV-01**: Advertises custom service UUID for peer discovery
-- [ ] **ADV-02**: Advertising restarts after connection (handles Android auto-stop)
-- [ ] **ADV-03**: Advertising refresh every 60 seconds (background persistence)
+- [x] **ADV-01**: Advertises custom service UUID for peer discovery
+- [x] **ADV-02**: Advertising restarts after connection (handles Android auto-stop)
+- [x] **ADV-03**: Advertising refresh every 60 seconds (background persistence)
 
 ### GATT Client (Central Role)
 
@@ -102,8 +102,8 @@ Requirements for BLE mesh interface. Each maps to roadmap phases.
 | FRAG-01..08 | Phase 18 | Complete |
 | DRV-01..02,04 | Phase 18 | Complete |
 | DRV-03 | Phase 20 | Pending |
-| GATT-01..07 | Phase 19 | Pending |
-| ADV-01..03 | Phase 19 | Pending |
+| GATT-01..07 | Phase 19 | Complete |
+| ADV-01..03 | Phase 19 | Complete |
 | CLI-01..05 | Phase 20 | Pending |
 | ID-01..05 | Phase 21 | Pending |
 | CONN-01..07 | Phase 21 | Pending |
