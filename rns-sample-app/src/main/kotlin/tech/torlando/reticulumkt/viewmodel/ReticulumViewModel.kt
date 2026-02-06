@@ -1,6 +1,7 @@
 package tech.torlando.reticulumkt.viewmodel
 
 import android.app.Application
+import android.content.Intent
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,10 +15,13 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.android.BatteryExemptionHelper
+import network.reticulum.android.BatteryStatsTracker
 import network.reticulum.android.NetworkStateObserver
 import network.reticulum.android.ReticulumConfig
 import network.reticulum.android.ReticulumService
 import network.reticulum.android.ReticulumWorker
+import network.reticulum.android.ServiceEventTracker
 import tech.torlando.reticulumkt.data.PreferencesManager
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.service.InterfaceManager
@@ -160,6 +164,18 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     private val _isPaused = MutableStateFlow(false)
     val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
 
+    // Battery statistics from BatteryStatsTracker (drain rate, chart samples)
+    private val _batteryStats = MutableStateFlow(BatteryStatsTracker.BatteryStats.EMPTY)
+    val batteryStats: StateFlow<BatteryStatsTracker.BatteryStats> = _batteryStats.asStateFlow()
+
+    // Service event tracking (kill counts, warning state)
+    private val _serviceEvents = MutableStateFlow(ServiceEventTracker.ServiceEvents.EMPTY)
+    val serviceEvents: StateFlow<ServiceEventTracker.ServiceEvents> = _serviceEvents.asStateFlow()
+
+    // Battery exemption bottom sheet visibility
+    private val _showExemptionSheet = MutableStateFlow(false)
+    val showExemptionSheet: StateFlow<Boolean> = _showExemptionSheet.asStateFlow()
+
     // Service control
     fun startService() {
         viewModelScope.launch {
@@ -219,6 +235,26 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 service.onPauseStateChanged = {
                     _isPaused.value = service.isPaused
                 }
+
+                // Collect battery stats from service tracker
+                viewModelScope.launch {
+                    service.getBatteryStatsTracker().stats.collect { stats ->
+                        _batteryStats.value = stats
+                    }
+                }
+
+                // Collect service events from event tracker
+                viewModelScope.launch {
+                    service.getEventTracker().events.collect { events ->
+                        _serviceEvents.value = events
+                    }
+                }
+            }
+
+            // Show exemption prompt on first service start if not already exempt
+            val exemptionHelper = BatteryExemptionHelper(context)
+            if (exemptionHelper.shouldPrompt()) {
+                _showExemptionSheet.value = true
             }
 
             // Start periodic status refresh (every 2 seconds)
@@ -351,6 +387,31 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     fun resumeService() {
         ReticulumService.getInstance()?.resume()
         _isPaused.value = false
+    }
+
+    // Battery exemption and optimization warning actions
+
+    /** Dismiss the exemption bottom sheet and mark prompt as dismissed. */
+    fun dismissExemptionSheet() {
+        _showExemptionSheet.value = false
+        val context = getApplication<Application>()
+        BatteryExemptionHelper(context).markPromptDismissed()
+    }
+
+    /** Show the exemption bottom sheet (triggered by "Fix" button in warning). */
+    fun showExemptionSheet() {
+        _showExemptionSheet.value = true
+    }
+
+    /** Dismiss the optimization kill warning (remembers dismissal at current count). */
+    fun dismissOptimizationWarning() {
+        ReticulumService.getInstance()?.getEventTracker()?.dismissWarning()
+    }
+
+    /** Build the system intent for requesting battery optimization exemption. */
+    fun requestBatteryExemption(): Intent {
+        val context = getApplication<Application>()
+        return BatteryExemptionHelper(context).buildExemptionIntent()
     }
 
     // Settings updates
