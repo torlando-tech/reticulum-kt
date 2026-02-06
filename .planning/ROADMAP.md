@@ -105,7 +105,12 @@ Plans:
   5. GATT error 133 triggers disconnect + exponential backoff retry
   6. AndroidBLEDriver complete: connects Phase 19 server + Phase 20 client to Phase 18 protocol
 
-**Deliverables:** `BleGattClient.kt`, `BleScanner.kt`, `AndroidBLEDriver.kt` in `rns-sample-app/service/ble/`
+**Deliverables:** `BleGattClient.kt`, `BleScanner.kt`, `AndroidBLEDriver.kt` in `rns-android/ble/`
+**Plans:** 2 plans
+
+Plans:
+- [ ] 20-01-PLAN.md -- BleScanner and BleGattClient (central role components)
+- [ ] 20-02-PLAN.md -- AndroidBLEDriver implementation and internal visibility
 
 ### Phase 21: BLEInterface Orchestration
 
@@ -152,7 +157,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 18. Fragmentation and Driver Contract | 2/2 | Complete | 2026-02-06 |
 | 19. GATT Server and Advertising | 2/2 | Complete | 2026-02-06 |
-| 20. GATT Client and Scanner | 0/TBD | Not started | - |
+| 20. GATT Client and Scanner | 0/2 | Planned | - |
 | 21. BLEInterface Orchestration | 0/TBD | Not started | - |
 | 22. Hardening and Edge Cases | 0/TBD | Not started | - |
 
