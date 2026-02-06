@@ -66,8 +66,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
 
             if (!isPaused) {
                 // Reconnect action (only when running - reconnect during pause makes no sense)
-                val reconnectIntent = Intent(ReticulumService.ACTION_RECONNECT)
-                    .setPackage(context.packageName)
+                val reconnectIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+                    action = ReticulumService.ACTION_RECONNECT
+                }
                 val reconnectPending = PendingIntent.getBroadcast(
                     context,
                     REQUEST_RECONNECT,
@@ -83,8 +84,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
                 )
 
                 // Pause action
-                val pauseIntent = Intent(ReticulumService.ACTION_PAUSE)
-                    .setPackage(context.packageName)
+                val pauseIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+                    action = ReticulumService.ACTION_PAUSE
+                }
                 val pausePending = PendingIntent.getBroadcast(
                     context,
                     REQUEST_PAUSE_RESUME,
@@ -100,8 +102,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
                 )
             } else {
                 // Resume action (only when paused)
-                val resumeIntent = Intent(ReticulumService.ACTION_RESUME)
-                    .setPackage(context.packageName)
+                val resumeIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+                    action = ReticulumService.ACTION_RESUME
+                }
                 val resumePending = PendingIntent.getBroadcast(
                     context,
                     REQUEST_PAUSE_RESUME,
