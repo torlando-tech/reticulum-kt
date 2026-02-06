@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 13 of 17 (WorkManager Integration)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-05 - Completed 13-02-PLAN.md (WorkManager Lifecycle Wiring)
+Plan: 3 of 3 in current phase
+Status: Phase complete
+Last activity: 2026-02-05 - Completed 13-03-PLAN.md (ViewModel WorkManager Integration)
 
-Progress: v2 [████████░░] 76%
+Progress: v2 [████████░░] 78%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 15 (v2)
-- Average duration: 2.7min
-- Total execution time: 40min
+- Total plans completed: 16 (v2)
+- Average duration: 2.6min
+- Total execution time: 41min
 
 **By Phase:**
 
@@ -41,7 +41,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
-| 13 | 2/3 | 4min | 2min |
+| 13 | 3/3 | 5min | 1.7min |
 
 *Updated after each plan completion*
 
@@ -92,6 +92,9 @@ Recent decisions affecting current work:
 - [13-02]: WorkManager scheduled in all modes, not just transport (recovery is universal)
 - [13-02]: Cancel WorkManager before Reticulum.stop() to avoid restart race
 - [13-02]: MY_PACKAGE_REPLACED as safety net for KEEP policy across app updates
+- [13-03]: Belt-and-suspenders WorkManager: ViewModel schedules/cancels alongside Service's own management
+- [13-03]: DONT_KILL_APP flag when toggling BootReceiver to avoid disrupting running app
+- [13-03]: Preference-to-component binding: DataStore preference drives PackageManager component state
 
 ### From v1
 
@@ -112,5 +115,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 13-02-PLAN.md (WorkManager Lifecycle Wiring)
+Stopped at: Completed 13-03-PLAN.md (ViewModel WorkManager Integration) - Phase 13 complete
 Resume file: None
