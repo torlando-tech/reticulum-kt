@@ -153,6 +153,11 @@ Plans:
   7. On-device testing confirms 2+ peers mesh correctly for >1 hour
 
 **Deliverables:** Hardening logic in `BLEInterface.kt` and `BLEPeerInterface.kt`; on-device test scripts
+**Plans:** 2 plans
+
+Plans:
+- [ ] 22-01-PLAN.md -- Zombie detection and exponential blacklist backoff
+- [ ] 22-02-PLAN.md -- Connection limit eviction and on-device verification
 
 ## Progress
 
@@ -164,7 +169,7 @@ Plans:
 | 19. GATT Server and Advertising | 2/2 | Complete | 2026-02-06 |
 | 20. GATT Client and Scanner | 2/2 | Complete | 2026-02-06 |
 | 21. BLEInterface Orchestration | 2/2 | Complete | 2026-02-06 |
-| 22. Hardening and Edge Cases | 0/TBD | Not started | - |
+| 22. Hardening and Edge Cases | 0/2 | Not started | - |
 
 ---
 
