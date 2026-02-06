@@ -326,7 +326,29 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setAutoStart(enabled: Boolean) {
-        viewModelScope.launch { preferencesManager.setAutoStart(enabled) }
+        viewModelScope.launch {
+            preferencesManager.setAutoStart(enabled)
+
+            // Enable/disable BootReceiver component based on preference.
+            // When enabled: device boot starts service + enqueues WorkManager.
+            // When disabled: no boot-time activity, user must start manually.
+            val context = getApplication<Application>()
+            val componentName = android.content.ComponentName(
+                context,
+                network.reticulum.android.BootReceiver::class.java
+            )
+            val newState = if (enabled) {
+                android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            }
+            context.packageManager.setComponentEnabledSetting(
+                componentName,
+                newState,
+                android.content.pm.PackageManager.DONT_KILL_APP
+            )
+            Log.i(TAG, "BootReceiver ${if (enabled) "enabled" else "disabled"}")
+        }
     }
 
     fun setShowNotification(enabled: Boolean) {
