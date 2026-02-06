@@ -1,15 +1,19 @@
 package tech.torlando.reticulumkt.service
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import network.reticulum.android.NetworkStateObserver
 import network.reticulum.android.NetworkType
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.InterfaceAdapter
 import network.reticulum.interfaces.auto.AutoInterface
+import network.reticulum.interfaces.rnode.RNodeInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.transport.Transport
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
@@ -24,6 +28,7 @@ import java.util.concurrent.ConcurrentHashMap
  * interfaces as needed.
  */
 class InterfaceManager(
+    private val context: Context,
     private val scope: CoroutineScope,
     private val interfacesFlow: Flow<List<StoredInterfaceConfig>>,
     private val networkObserver: NetworkStateObserver? = null,  // Optional for backward compat
@@ -34,6 +39,9 @@ class InterfaceManager(
 
     /** Running interfaces keyed by config ID. */
     private val runningInterfaces = ConcurrentHashMap<String, Interface>()
+
+    /** Active BLE connections keyed by config ID (for cleanup). */
+    private val bleConnections = ConcurrentHashMap<String, BluetoothLeConnection>()
 
     /** Previous network type for detecting actual changes (not repeated events). */
     private var previousNetworkType: NetworkType? = null
@@ -125,6 +133,8 @@ class InterfaceManager(
             stopInterface(id, iface)
         }
         runningInterfaces.clear()
+        bleConnections.values.forEach { it.disconnect() }
+        bleConnections.clear()
     }
 
     /**
@@ -278,9 +288,50 @@ class InterfaceManager(
             }
 
             InterfaceType.RNODE -> {
-                // RNode interface would require serial/BLE communication
-                // Not implemented yet
-                Log.w(TAG, "RNode interface not yet implemented")
+                val address = config.host ?: return null
+                val freqHz = ((config.frequency ?: 868.0) * 1_000_000).toLong()
+                val bwHz = (config.bandwidth ?: 125).toLong() * 1000
+                val sf = config.spreadingFactor ?: 8
+                val txp = config.txPower ?: 17
+                val cr = config.codingRate ?: 5
+
+                // BLE connection is blocking (scan + GATT + MTU negotiation),
+                // so launch it on IO dispatcher to avoid blocking the config observer
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        Log.i(TAG, "Connecting RNode: ${config.name} -> $address...")
+                        val bleConn = BluetoothLeConnection(context, address)
+                        val (input, output) = bleConn.connect()
+                        bleConnections[config.id] = bleConn
+
+                        val iface = RNodeInterface(
+                            name = config.name,
+                            inputStream = input,
+                            outputStream = output,
+                            frequency = freqHz,
+                            bandwidth = bwHz,
+                            txPower = txp,
+                            spreadingFactor = sf,
+                            codingRate = cr,
+                            parentScope = scope,
+                        )
+
+                        iface.onPacketReceived = { data, fromInterface ->
+                            Transport.inbound(data, InterfaceAdapter.getOrCreate(fromInterface))
+                        }
+
+                        iface.start()
+                        Transport.registerInterface(InterfaceAdapter.getOrCreate(iface))
+                        runningInterfaces[config.id] = iface
+
+                        Log.i(TAG, "Started RNode interface: ${config.name} -> $address (${config.frequency}MHz, BW=${config.bandwidth}kHz, SF=$sf, CR=$cr, TX=$txp)")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start RNode interface ${config.name}: ${e.message}", e)
+                        bleConnections.remove(config.id)?.disconnect()
+                    }
+                }
+                // Return null — the interface will be registered asynchronously
+                // when the BLE connection completes
                 null
             }
 
@@ -307,7 +358,11 @@ class InterfaceManager(
             // or fall back to detach() for other interface types
             when (iface) {
                 is TCPClientInterface -> iface.stop()
-                // Add UDPInterface case when used in production
+                is RNodeInterface -> {
+                    iface.detach()
+                    // Also disconnect the BLE connection
+                    bleConnections.remove(id)?.disconnect()
+                }
                 else -> iface.detach()
             }
 

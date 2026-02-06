@@ -39,6 +39,13 @@ data class StoredInterfaceConfig(
     // IFAC (Interface Access Code) - network isolation (all interface types)
     val networkName: String? = null,
     val passphrase: String? = null,
+    // RNode radio parameters
+    val frequency: Double? = null,          // MHz (user enters 915.0, stored as MHz)
+    val bandwidth: Int? = null,             // kHz (user enters 125, stored as kHz)
+    val spreadingFactor: Int? = null,       // 7-12
+    val txPower: Int? = null,               // dBm
+    val codingRate: Int? = null,            // 5-8
+    val connectionType: String? = null,     // "BLUETOOTH_CLASSIC", "BLUETOOTH_LE", "TCP_WIFI"
 )
 
 class PreferencesManager(private val context: Context) {

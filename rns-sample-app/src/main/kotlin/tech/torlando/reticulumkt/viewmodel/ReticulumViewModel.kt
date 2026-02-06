@@ -219,6 +219,7 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Start interface manager for hot-reload support
             // This observes interface config changes and dynamically starts/stops interfaces
             interfaceManager = InterfaceManager(
+                context = getApplication<android.app.Application>(),
                 scope = viewModelScope,
                 interfacesFlow = preferencesManager.interfaces,
                 networkObserver = networkObserver,  // Wire for network change notifications

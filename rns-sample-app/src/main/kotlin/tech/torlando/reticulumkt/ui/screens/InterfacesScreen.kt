@@ -1,6 +1,7 @@
 package tech.torlando.reticulumkt.ui.screens
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +20,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.People
@@ -27,12 +29,14 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -45,6 +49,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.ui.components.InterfaceTypeCard
@@ -178,6 +184,9 @@ fun InterfacesScreen(
                         InterfaceCard(
                             config = iface,
                             isOnline = isActuallyOnline,
+                            onToggle = { enabled ->
+                                viewModel.updateInterface(iface.copy(enabled = enabled))
+                            },
                             onDelete = { viewModel.removeInterface(iface.id) },
                             onEdit = {
                                 val type = try {
@@ -501,10 +510,12 @@ private fun SpawnedClientCard(client: TransportInterfaceInfo) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun InterfaceCard(
     config: StoredInterfaceConfig,
     isOnline: Boolean,
+    onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
     onEdit: () -> Unit = {},
 ) {
@@ -522,64 +533,128 @@ private fun InterfaceCard(
         InterfaceType.RNODE -> config.host ?: "RNode"
     }
 
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .let { modifier ->
-                if (type != InterfaceType.AUTO && type != InterfaceType.BLE) {
-                    modifier.clickable { onEdit() }
-                } else modifier
-            },
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        )
-    ) {
-        Row(
+    var showContextMenu by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
+
+    Box {
+        Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = type.icon,
-                contentDescription = null,
-                tint = if (isOnline && config.enabled) StatusConnected else StatusOffline,
-                modifier = Modifier.size(32.dp)
+                .combinedClickable(
+                    onClick = { onEdit() },
+                    onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        showContextMenu = true
+                    },
+                ),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
             )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = type.icon,
+                    contentDescription = null,
+                    tint = if (isOnline && config.enabled) StatusConnected else StatusOffline,
+                    modifier = Modifier.size(32.dp)
+                )
 
-            Spacer(modifier = Modifier.width(16.dp))
+                Spacer(modifier = Modifier.width(16.dp))
 
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = config.name,
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    text = type.displayName,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Text(
-                    text = target,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = config.name,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = type.displayName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = target,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = if (isOnline && config.enabled) "Online" else "Offline",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (isOnline && config.enabled) StatusConnected else StatusOffline
-                )
-                IconButton(onClick = onDelete) {
-                    Icon(
-                        imageVector = Icons.Filled.Delete,
-                        contentDescription = "Delete",
-                        tint = MaterialTheme.colorScheme.error
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        text = when {
+                            !config.enabled -> "Disabled"
+                            isOnline -> "Online"
+                            else -> "Offline"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = when {
+                            !config.enabled -> MaterialTheme.colorScheme.onSurfaceVariant
+                            isOnline -> StatusConnected
+                            else -> StatusOffline
+                        }
+                    )
+                    Switch(
+                        checked = config.enabled,
+                        onCheckedChange = onToggle,
                     )
                 }
             }
         }
+
+        DropdownMenu(
+            expanded = showContextMenu,
+            onDismissRequest = { showContextMenu = false },
+        ) {
+            DropdownMenuItem(
+                text = { Text("Edit") },
+                onClick = {
+                    showContextMenu = false
+                    onEdit()
+                },
+                leadingIcon = {
+                    Icon(Icons.Filled.Edit, contentDescription = null)
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                onClick = {
+                    showContextMenu = false
+                    showDeleteConfirm = true
+                },
+                leadingIcon = {
+                    Icon(
+                        Icons.Filled.Delete,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                },
+            )
+        }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete Interface") },
+            text = { Text("Delete \"${config.name}\"? This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteConfirm = false
+                    onDelete()
+                }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }

@@ -75,12 +75,14 @@ fun RNodeWizardScreen(
     var deviceName by remember { mutableStateOf(editingInterface?.name ?: "") }
     var deviceAddress by remember { mutableStateOf(editingInterface?.host ?: "") }
     var tcpPort by remember { mutableStateOf(editingInterface?.port?.toString() ?: "4242") }
+    var showManualEntry by remember { mutableStateOf(editingInterface != null) }
 
-    // Radio config (simplified)
-    var frequency by remember { mutableStateOf("868.0") }
-    var bandwidth by remember { mutableStateOf("125") }
-    var spreadingFactor by remember { mutableStateOf("8") }
-    var txPower by remember { mutableStateOf("17") }
+    // Radio config
+    var frequency by remember { mutableStateOf(editingInterface?.frequency?.toString() ?: "868.0") }
+    var bandwidth by remember { mutableStateOf(editingInterface?.bandwidth?.toString() ?: "125") }
+    var spreadingFactor by remember { mutableStateOf(editingInterface?.spreadingFactor?.toString() ?: "8") }
+    var txPower by remember { mutableStateOf(editingInterface?.txPower?.toString() ?: "17") }
+    var codingRate by remember { mutableStateOf(editingInterface?.codingRate?.toString() ?: "5") }
 
     val steps = RNodeWizardStep.entries
     val canProceed = when (steps[currentStep]) {
@@ -92,7 +94,8 @@ fun RNodeWizardScreen(
         RNodeWizardStep.RADIO_CONFIG -> frequency.toDoubleOrNull() != null &&
             bandwidth.toIntOrNull() != null &&
             spreadingFactor.toIntOrNull() != null &&
-            txPower.toIntOrNull() != null
+            txPower.toIntOrNull() != null &&
+            codingRate.toIntOrNull() != null
     }
 
     fun goBack() {
@@ -117,6 +120,12 @@ fun RNodeWizardScreen(
                 type = InterfaceType.RNODE.name,
                 host = deviceAddress,
                 port = if (connectionType == RNodeConnectionType.TCP_WIFI) tcpPort.toIntOrNull() else null,
+                frequency = frequency.toDoubleOrNull(),
+                bandwidth = bandwidth.toIntOrNull(),
+                spreadingFactor = spreadingFactor.toIntOrNull(),
+                txPower = txPower.toIntOrNull(),
+                codingRate = codingRate.toIntOrNull(),
+                connectionType = connectionType.name,
             )
             onSave(config)
         }
@@ -151,7 +160,10 @@ fun RNodeWizardScreen(
         when (steps[currentStep]) {
             RNodeWizardStep.CONNECTION_TYPE -> ConnectionTypeStep(
                 selectedType = connectionType,
-                onTypeSelected = { connectionType = it },
+                onTypeSelected = {
+                    connectionType = it
+                    showManualEntry = it != RNodeConnectionType.BLUETOOTH_LE
+                },
                 modifier = Modifier.padding(padding)
             )
             RNodeWizardStep.DEVICE_CONFIG -> DeviceConfigStep(
@@ -159,9 +171,15 @@ fun RNodeWizardScreen(
                 deviceName = deviceName,
                 deviceAddress = deviceAddress,
                 tcpPort = tcpPort,
+                showManualEntry = showManualEntry,
                 onNameChange = { deviceName = it },
                 onAddressChange = { deviceAddress = it },
                 onPortChange = { tcpPort = it },
+                onDeviceSelected = { name, address ->
+                    deviceAddress = address
+                    if (deviceName.isBlank()) deviceName = name
+                },
+                onManualEntry = { showManualEntry = true },
                 modifier = Modifier.padding(padding)
             )
             RNodeWizardStep.RADIO_CONFIG -> RadioConfigStep(
@@ -169,10 +187,12 @@ fun RNodeWizardScreen(
                 bandwidth = bandwidth,
                 spreadingFactor = spreadingFactor,
                 txPower = txPower,
+                codingRate = codingRate,
                 onFrequencyChange = { frequency = it },
                 onBandwidthChange = { bandwidth = it },
                 onSpreadingFactorChange = { spreadingFactor = it },
                 onTxPowerChange = { txPower = it },
+                onCodingRateChange = { codingRate = it },
                 modifier = Modifier.padding(padding)
             )
         }
@@ -236,11 +256,16 @@ private fun DeviceConfigStep(
     deviceName: String,
     deviceAddress: String,
     tcpPort: String,
+    showManualEntry: Boolean,
     onNameChange: (String) -> Unit,
     onAddressChange: (String) -> Unit,
     onPortChange: (String) -> Unit,
+    onDeviceSelected: (name: String, address: String) -> Unit,
+    onManualEntry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val showPicker = connectionType == RNodeConnectionType.BLUETOOTH_LE && !showManualEntry
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -253,10 +278,11 @@ private fun DeviceConfigStep(
             style = MaterialTheme.typography.headlineSmall,
         )
         Text(
-            text = when (connectionType) {
-                RNodeConnectionType.BLUETOOTH_LE -> "Enter your RNode's Bluetooth LE details."
-                RNodeConnectionType.BLUETOOTH_CLASSIC -> "Enter your RNode's Bluetooth address."
-                RNodeConnectionType.TCP_WIFI -> "Enter your RNode's network address."
+            text = when {
+                showPicker -> "Select your RNode device from the list below."
+                connectionType == RNodeConnectionType.BLUETOOTH_LE -> "Enter your RNode's Bluetooth LE details."
+                connectionType == RNodeConnectionType.BLUETOOTH_CLASSIC -> "Enter your RNode's Bluetooth address."
+                else -> "Enter your RNode's network address."
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -308,44 +334,63 @@ private fun DeviceConfigStep(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        OutlinedTextField(
-            value = deviceName,
-            onValueChange = onNameChange,
-            label = { Text("Interface Name") },
-            placeholder = { Text("e.g., My RNode") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        OutlinedTextField(
-            value = deviceAddress,
-            onValueChange = onAddressChange,
-            label = { Text(
-                when (connectionType) {
-                    RNodeConnectionType.TCP_WIFI -> "IP Address or Hostname"
-                    else -> "Bluetooth Address"
-                }
-            ) },
-            placeholder = { Text(
-                when (connectionType) {
-                    RNodeConnectionType.TCP_WIFI -> "192.168.1.100"
-                    else -> "AA:BB:CC:DD:EE:FF"
-                }
-            ) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        if (connectionType == RNodeConnectionType.TCP_WIFI) {
+        if (showPicker) {
+            // BLE device picker mode
             OutlinedTextField(
-                value = tcpPort,
-                onValueChange = { if (it.all { c -> c.isDigit() }) onPortChange(it) },
-                label = { Text("Port") },
-                placeholder = { Text("4242") },
+                value = deviceName,
+                onValueChange = onNameChange,
+                label = { Text("Interface Name") },
+                placeholder = { Text("e.g., My RNode") },
                 singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
+
+            BleDevicePicker(
+                selectedAddress = deviceAddress,
+                onDeviceSelected = onDeviceSelected,
+                onManualEntry = onManualEntry,
+            )
+        } else {
+            // Manual entry mode (all connection types)
+            OutlinedTextField(
+                value = deviceName,
+                onValueChange = onNameChange,
+                label = { Text("Interface Name") },
+                placeholder = { Text("e.g., My RNode") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            OutlinedTextField(
+                value = deviceAddress,
+                onValueChange = onAddressChange,
+                label = { Text(
+                    when (connectionType) {
+                        RNodeConnectionType.TCP_WIFI -> "IP Address or Hostname"
+                        else -> "Bluetooth Address"
+                    }
+                ) },
+                placeholder = { Text(
+                    when (connectionType) {
+                        RNodeConnectionType.TCP_WIFI -> "192.168.1.100"
+                        else -> "AA:BB:CC:DD:EE:FF"
+                    }
+                ) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            if (connectionType == RNodeConnectionType.TCP_WIFI) {
+                OutlinedTextField(
+                    value = tcpPort,
+                    onValueChange = { if (it.all { c -> c.isDigit() }) onPortChange(it) },
+                    label = { Text("Port") },
+                    placeholder = { Text("4242") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
         }
     }
 }
@@ -357,10 +402,12 @@ private fun RadioConfigStep(
     bandwidth: String,
     spreadingFactor: String,
     txPower: String,
+    codingRate: String,
     onFrequencyChange: (String) -> Unit,
     onBandwidthChange: (String) -> Unit,
     onSpreadingFactorChange: (String) -> Unit,
     onTxPowerChange: (String) -> Unit,
+    onCodingRateChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -441,6 +488,23 @@ private fun RadioConfigStep(
                     selected = spreadingFactor == sf,
                     onClick = { onSpreadingFactorChange(sf) },
                     label = { Text("SF$sf") }
+                )
+            }
+        }
+
+        // Coding Rate presets
+        Text(
+            text = "Coding Rate",
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            listOf("5", "6", "7", "8").forEach { cr ->
+                FilterChip(
+                    selected = codingRate == cr,
+                    onClick = { onCodingRateChange(cr) },
+                    label = { Text("4/$cr") }
                 )
             }
         }
