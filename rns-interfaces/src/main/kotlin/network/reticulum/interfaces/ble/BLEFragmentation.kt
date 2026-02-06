@@ -38,16 +38,16 @@ class BLEFragmenter(mtu: Int = 185) {
 
     companion object {
         /** Fragment header size: 1 byte type + 2 bytes sequence + 2 bytes total */
-        const val HEADER_SIZE = 5
+        const val HEADER_SIZE = BLEConstants.FRAGMENT_HEADER_SIZE
 
         /** First fragment */
-        const val TYPE_START: Byte = 0x01
+        const val TYPE_START: Byte = BLEConstants.FRAGMENT_TYPE_START
 
         /** Middle fragment(s) */
-        const val TYPE_CONTINUE: Byte = 0x02
+        const val TYPE_CONTINUE: Byte = BLEConstants.FRAGMENT_TYPE_CONTINUE
 
         /** Last fragment */
-        const val TYPE_END: Byte = 0x03
+        const val TYPE_END: Byte = BLEConstants.FRAGMENT_TYPE_END
 
         /** Maximum number of fragments (16-bit unsigned) */
         const val MAX_FRAGMENTS = 65535
