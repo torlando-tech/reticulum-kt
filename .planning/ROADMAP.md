@@ -1,13 +1,14 @@
-# Roadmap: Reticulum-KT v2
+# Roadmap: Reticulum-KT v3
 
 ## Milestones
 
 - v1.0 LXMF Interoperability - Phases 1-9 (shipped 2026-01-24)
-- v2.0 Android Production Readiness - Phases 10-17 (in progress)
+- v2.0 Android Production Readiness - Phases 10-15 (shipped 2026-02-06, Phases 16-17 deferred)
+- v3.0 BLE Interface - Phases 18-22 (in progress)
 
 ## Overview
 
-This milestone delivers production-ready Android background connectivity for TCP/UDP interfaces. Starting with lifecycle observation infrastructure, we progressively add scope injection for proper coroutine cancellation, Doze-aware connection management, WorkManager for maintenance windows, service notification UX, battery optimization guidance, OEM-specific compatibility, and memory optimization. Each phase builds on the previous to create an always-connected service that survives Doze mode, respects battery constraints, and runs reliably across Android 8.0+ devices from major manufacturers.
+This milestone delivers a complete BLE mesh interface for peer-to-peer Reticulum communication between Android devices. Starting with the fragment protocol and driver abstraction, we progressively build the GATT server (peripheral), GATT client (central), orchestration layer (MAC sorting, identity handshake, dual-role), and production hardening (zombie detection, blacklisting, deduplication). Each phase builds on the previous to create a reliable BLE mesh that interoperates with the Python ble-reticulum reference implementation.
 
 ## Phases
 
@@ -16,190 +17,141 @@ This milestone delivers production-ready Android background connectivity for TCP
 
 See `.planning/milestones/v1-ROADMAP.md` for archived roadmap.
 
-**Summary:** 25 plans across 10 phases (including 8.1 inserted) delivered complete LXMF interoperability with 120+ tests verifying byte-level compatibility with Python LXMF.
+**Summary:** 25 plans across 10 phases delivered complete LXMF interoperability with 120+ tests verifying byte-level compatibility with Python LXMF.
 
 </details>
 
-### v2.0 Android Production Readiness (In Progress)
+<details>
+<summary>v2.0 Android Production Readiness (Phases 10-15) - SHIPPED 2026-02-06</summary>
 
-**Milestone Goal:** Always-connected background operation that survives Doze and battery optimization without excessive drain
+See `.planning/milestones/v2-ROADMAP.md` for archived roadmap.
 
-**Phase Numbering:** Continues from v1 (phases 10-17)
+**Summary:** 22 plans across 6 phases delivered production-ready Android background connectivity: foreground service, Doze-aware connections, WorkManager, notification UX, battery optimization. Phases 16-17 deferred.
 
-- [x] **Phase 10: Android Lifecycle Foundation** - Doze/network/battery state observers
-- [x] **Phase 11: Lifecycle-Aware Scope Injection** - Coroutine scope propagation from service to interfaces
-- [x] **Phase 12: Doze-Aware Connection Management** - Connection survival through Doze and network transitions
-- [x] **Phase 13: WorkManager Integration** - Doze-surviving periodic maintenance
-- [x] **Phase 14: Service Notification UX** - Status display and quick actions
-- [x] **Phase 15: Battery Optimization UX** - Exemption flow and usage statistics
-- [ ] **Phase 16: OEM Compatibility** - Samsung, Xiaomi, Huawei manufacturer handling
-- [ ] **Phase 17: Memory Optimization** - Long-term stability and leak prevention
+</details>
+
+### v3.0 BLE Interface (In Progress)
+
+**Milestone Goal:** BLE mesh networking — peer-to-peer Reticulum over Bluetooth Low Energy, wire-compatible with Python ble-reticulum
+
+**Phase Numbering:** Continues from v2 (phases 18-22)
+
+- [ ] **Phase 18: Fragmentation and Driver Contract** - Wire format, reassembly, BLEDriver interface
+- [ ] **Phase 19: GATT Server and Advertising** - Peripheral role, characteristic hosting, notifications
+- [ ] **Phase 20: GATT Client and Scanner** - Central role, service discovery, MTU negotiation
+- [ ] **Phase 21: BLEInterface Orchestration** - MAC sorting, identity handshake, dual-role, Transport integration
+- [ ] **Phase 22: Hardening and Edge Cases** - Zombie detection, blacklisting, deduplication, peer scoring
 
 ## Phase Details
 
-### Phase 10: Android Lifecycle Foundation
+### Phase 18: Fragmentation and Driver Contract
 
-**Goal**: Establish infrastructure for observing Android power states and network conditions
-**Depends on**: Nothing (first v2 phase, builds on v1 ReticulumService)
-**Requirements**: SERV-01, SERV-02, CONN-04
-**Research flags**: Standard patterns, skip phase research. Official Android documentation covers all APIs.
+**Goal**: Establish the wire format and module boundary that all subsequent phases build against
+**Depends on**: Nothing (first v3 phase)
+**Requirements**: FRAG-01..08, DRV-01..04
+**Research flags**: Standard patterns, skip phase research. Protocol completely specified in BLE_PROTOCOL_v2.2.md and BLEFragmentation.py.
 **Success Criteria** (what must be TRUE):
-  1. Service runs with connectedDevice foreground service type on API 26+
-  2. Notification channel exists with configurable importance/sound/vibration
-  3. DozeStateObserver exposes current Doze state via StateFlow
-  4. NetworkStateObserver detects WiFi/cellular/VPN transitions
-  5. BatteryOptimizationChecker detects if app is battery-optimized
+  1. BLEFragmenter splits packets into fragments with 5-byte header [type:1][seq:2][total:2] big-endian
+  2. Fragment types: START(0x01), CONTINUE(0x02), END(0x03) — single-fragment packets use START
+  3. BLEReassembler reconstructs packets from fragments, including out-of-order
+  4. Reassembler times out incomplete packets after 30 seconds
+  5. BLEDriver interface in rns-interfaces defines message-based contract (no Android imports)
+  6. DiscoveredPeer data class with identity, address, RSSI, scoring
+  7. Wire format byte-identical to Python BLEFragmentation.py (verified by unit tests)
+  8. All tests run on JVM without Android dependencies
 
-**Plans:** 4 plans (3 parallel + 1 gap closure)
+**Deliverables:** `BLEFragmentation.kt`, `BLEDriver.kt`, `BLEConstants.kt`, `DiscoveredPeer.kt` in `rns-interfaces/ble/`
+**Plans:** 2 plans
 
 Plans:
-- [x] 10-01-PLAN.md - Foreground service type + notification channels
-- [x] 10-02-PLAN.md - DozeStateObserver with StateFlow API
-- [x] 10-03-PLAN.md - NetworkStateObserver + BatteryOptimizationChecker
-- [x] 10-04-PLAN.md - Gap closure: Wire observers into ReticulumService lifecycle
+- [ ] 18-01-PLAN.md -- Constants, BLEDriver interface, and DiscoveredPeer data class
+- [ ] 18-02-PLAN.md -- BLE fragmentation and reassembly (TDD)
 
-### Phase 11: Lifecycle-Aware Scope Injection
+### Phase 19: GATT Server and Advertising
 
-**Goal**: Enable proper coroutine cancellation when service stops, preventing leaks
-**Depends on**: Phase 10
-**Requirements**: SERV-03, CONN-01
-**Research flags**: Standard coroutine patterns, skip phase research. Well-documented in Kotlin docs.
+**Goal**: Be discoverable and accept incoming BLE connections as peripheral
+**Depends on**: Phase 18 (uses BLEDriver contract, BLEConstants)
+**Requirements**: GATT-01..07, ADV-01..03
+**Research flags**: Needs phase research for advertising persistence across OEMs and CCCD tracking patterns.
 **Success Criteria** (what must be TRUE):
-  1. TCPClientInterface accepts optional parentScope parameter (defaults to standalone)
-  2. UDPInterface accepts optional parentScope parameter (defaults to standalone)
-  3. Service stop cancels all interface I/O coroutines within 1 second
-  4. TCP/UDP connections remain alive when app is backgrounded (service running)
-  5. JVM tests continue working without Android dependencies
-**Plans:** 4 plans (2 parallel in wave 1, 2 parallel in wave 2)
+  1. GATT server hosts service UUID 37145b00-442d-4a94-917f-8f42c5da28e3
+  2. RX characteristic accepts WRITE and WRITE_WITHOUT_RESPONSE
+  3. TX characteristic supports NOTIFY with CCCD descriptor
+  4. Identity characteristic serves 16-byte Transport.identity.hash (read-only)
+  5. sendResponse() always called when responseNeeded=true
+  6. Notifications serialized via onNotificationSent callback
+  7. Per-device MTU tracked from onMtuChanged
+  8. BLE advertising with service UUID, restarts after connection, 60s refresh
+  9. BleOperationQueue ensures serial GATT operations
 
-Plans:
-- [x] 11-01-PLAN.md - TCPClientInterface parentScope injection
-- [x] 11-02-PLAN.md - UDPInterface parentScope injection
-- [x] 11-03-PLAN.md - Scope injection tests and verification
-- [x] 11-04-PLAN.md - Wire InterfaceManager to pass parentScope to interfaces
+**Deliverables:** `BleGattServer.kt`, `BleAdvertiser.kt`, `BleOperationQueue.kt` in `rns-sample-app/service/ble/`
 
-### Phase 12: Doze-Aware Connection Management
+### Phase 20: GATT Client and Scanner
 
-**Goal**: Connections survive Doze mode and network transitions with intelligent backoff
-**Depends on**: Phase 10, Phase 11
-**Requirements**: CONN-02, CONN-03, CONN-05, BATT-04
-**Research flags**: Needs testing-focused phase research. Doze behavior varies by OEM.
+**Goal**: Discover nearby peers and connect as central
+**Depends on**: Phase 18 (uses BLEDriver contract), Phase 19 (loopback testing against server)
+**Requirements**: CLI-01..05
+**Research flags**: Standard patterns, skip phase research. Well-trodden GATT client path, existing BluetoothLeConnection.kt to adapt.
 **Success Criteria** (what must be TRUE):
-  1. Transport job loop uses longer intervals during Doze (reduces wake-ups)
-  2. Interfaces reconnect automatically after WiFi/cellular transitions
-  3. Connections persist across full device sleep/wake cycles
-  4. Connection polling throttles when battery <15%
-  5. Reconnection uses exponential backoff (avoids battery drain on flaky networks)
-**Plans:** 5 plans (2 parallel in wave 1, 2 parallel in wave 2, 1 in wave 3)
+  1. Scanner discovers peers by service UUID filter (single long-running scan, no cycling)
+  2. GATT client connects, discovers services, enables TX notifications via CCCD
+  3. MTU negotiation requests 517, accepts negotiated value, reports to BLEDriver
+  4. All GATT operations serialized via BleOperationQueue (shared with server)
+  5. GATT error 133 triggers disconnect + exponential backoff retry
+  6. AndroidBLEDriver complete: connects Phase 19 server + Phase 20 client to Phase 18 protocol
 
-Plans:
-- [x] 12-01-PLAN.md - ConnectionPolicy and ConnectionPolicyProvider (combines state flows)
-- [x] 12-02-PLAN.md - ExponentialBackoff utility for reconnection strategy
-- [x] 12-03-PLAN.md - Wire policy into ReticulumService for Transport throttling
-- [x] 12-04-PLAN.md - TCPClientInterface exponential backoff integration
-- [x] 12-05-PLAN.md - InterfaceManager network change notifications
+**Deliverables:** `BleGattClient.kt`, `BleScanner.kt`, `AndroidBLEDriver.kt` in `rns-sample-app/service/ble/`
 
-### Phase 13: WorkManager Integration
+### Phase 21: BLEInterface Orchestration
 
-**Goal**: Periodic maintenance survives deep Doze via system-scheduled windows
-**Depends on**: Phase 10, Phase 11
-**Requirements**: BATT-03, CONN-06
-**Research flags**: Standard WorkManager patterns, skip phase research. Official documentation sufficient.
+**Goal**: Wire discovery, connection direction, identity exchange, and peer lifecycle into a working mesh
+**Depends on**: Phase 18, Phase 19, Phase 20 (requires all BLE components)
+**Requirements**: ID-01..05, CONN-01..07, APP-01..03
+**Research flags**: Needs research on practical connection limits under dual-role operation.
 **Success Criteria** (what must be TRUE):
-  1. ReticulumWorker executes every 15 minutes without network constraint (mesh routing)
-  2. Path table cleanup and announce processing run during maintenance windows
-  3. Worker performs interface health checks and conditional service restart
-  4. Sub-second delivery when app is in foreground or service active
-  5. Worker survives app restart (re-enqueues on boot if service was running)
-**Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
+  1. MAC sorting: lower MAC initiates as central, higher waits as peripheral
+  2. Identity handshake: central reads peripheral Identity char, writes own identity to RX
+  3. Identity exchange completes before data transfer, times out at 30 seconds
+  4. BLEInterface spawns BLEPeerInterface per connected peer
+  5. Spawned BLEPeerInterface registered with Transport, deregistered on disconnect
+  6. Keepalive byte (0x00) sent every 15 seconds per connection
+  7. Dual-role: simultaneous scanning + advertising + server + client connections
+  8. InterfaceManager creates BLEInterface with AndroidBLEDriver injection
+  9. BLE permissions gate (SCAN, CONNECT, ADVERTISE) before starting
+  10. Two devices can exchange Reticulum packets over BLE (end-to-end verified)
 
-Plans:
-- [x] 13-01-PLAN.md -- Enhanced ReticulumWorker with recovery-focused health checks
-- [x] 13-02-PLAN.md -- BootReceiver + service lifecycle WorkManager wiring
-- [x] 13-03-PLAN.md -- Sample app ViewModel integration and autoStart wiring
+**Deliverables:** `BLEInterface.kt`, `BLEPeerInterface.kt` in `rns-interfaces/ble/`; InterfaceManager integration in `rns-sample-app`
 
-### Phase 14: Service Notification UX
+### Phase 22: Hardening and Edge Cases
 
-**Goal**: Persistent notification provides status and control without opening app
-**Depends on**: Phase 10, Phase 11
-**Requirements**: SERV-04, SERV-05
-**Research flags**: Skip phase research. Standard notification patterns.
+**Goal**: Production-quality resilience under adverse conditions
+**Depends on**: Phase 21 (requires working mesh to harden)
+**Requirements**: DEDUP-01..02, HARD-01..04
+**Research flags**: Needs research on Android 14 GATT 133 persistent state and MAC rotation timing across OEMs.
 **Success Criteria** (what must be TRUE):
-  1. Notification shows current connection status (connected/connecting/disconnected)
-  2. Notification shows connected interface count and type (e.g., "2 TCP, 1 UDP")
-  3. Quick action: Reconnect button triggers immediate reconnection attempt
-  4. Quick action: Pause button temporarily disables connection (user-controlled)
-  5. Tapping notification opens app to connection status screen
-**Plans:** 3 plans (1 in wave 1, 1 in wave 2, 1 in wave 3)
+  1. Zombie detection: peer unresponsive despite connected state triggers disconnect
+  2. Failed peer blacklisting with exponential backoff (prevents reconnect storms)
+  3. Duplicate identity connections detected and resolved (keep newest)
+  4. MAC rotation does not create duplicate connections for same identity
+  5. Graceful degradation at connection limit (drop lowest-scored peer)
+  6. Peer scoring: RSSI (60%) + connection history (30%) + recency (10%)
+  7. On-device testing confirms 2+ peers mesh correctly for >1 hour
 
-Plans:
-- [x] 14-01-PLAN.md -- Connection state model and notification content builder
-- [x] 14-02-PLAN.md -- Notification quick actions (Reconnect + Pause/Resume)
-- [x] 14-03-PLAN.md -- Wire notification updates into service lifecycle
-
-### Phase 15: Battery Optimization UX
-
-**Goal**: User understands battery impact and can optimize for their usage pattern
-**Depends on**: Phase 12, Phase 13
-**Requirements**: BATT-01, BATT-02, BATT-05
-**Research flags**: Skip phase research. Exemption flow well-documented.
-**Success Criteria** (what must be TRUE):
-  1. Battery drain <2% per hour measured during 8-hour idle test
-  2. App detects battery optimization status and shows guidance
-  3. Exemption request flow explains why (mesh networking requires persistent connection)
-  4. Battery usage statistics visible in app (current session, last 24h, weekly average)
-  5. User can see if battery optimization is affecting connectivity
-**Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
-
-Plans:
-- [x] 15-01-PLAN.md -- Battery stats tracking infrastructure and exemption helper
-- [x] 15-02-PLAN.md -- Service event tracking and kill detection wiring
-- [x] 15-03-PLAN.md -- Monitor screen battery UX (chart, warning, exemption sheet)
-
-### Phase 16: OEM Compatibility
-
-**Goal**: Service runs reliably on Samsung, Xiaomi, and Huawei devices despite manufacturer restrictions
-**Depends on**: Phase 15
-**Requirements**: OEM-01, OEM-02, OEM-03, OEM-04, OEM-05
-**Research flags**: Needs phase research for OEM-specific deep-link intents. Manufacturer settings paths change frequently.
-**Success Criteria** (what must be TRUE):
-  1. Samsung: App excluded from "sleeping apps" via user guidance
-  2. Xiaomi: Autostart permission requested with explanation
-  3. Huawei: Protected apps inclusion requested with explanation
-  4. OEM detected at runtime with manufacturer-specific guidance shown
-  5. Deep-links open correct battery settings screen per manufacturer
-**Plans**: TBD
-
-### Phase 17: Memory Optimization
-
-**Goal**: Service runs for days without memory leaks or OOM crashes
-**Depends on**: Phase 16
-**Requirements**: MEM-01, MEM-02, MEM-03
-**Research flags**: Standard profiling techniques, skip phase research. Android Studio Memory Profiler + LeakCanary cover all needs.
-**Success Criteria** (what must be TRUE):
-  1. Peak memory usage <50MB during normal operation (verified via profiler)
-  2. No memory growth over 24-hour soak test (heap dumps at 1h, 8h, 24h)
-  3. onTrimMemory triggers ByteArrayPool release and Transport cache trim
-  4. Service survives TRIM_MEMORY_RUNNING_CRITICAL without crash
-  5. LeakCanary reports zero leaks in test builds
-**Plans**: TBD
+**Deliverables:** Hardening logic in `BLEInterface.kt` and `BLEPeerInterface.kt`; on-device test scripts
 
 ## Progress
 
-**Execution Order:** Phases 10 through 17 in sequence, with 12 and 13 parallelizable after 10+11.
+**Execution Order:** Phases 18 through 22 in sequence. Phase 19 and 20 are potentially parallelizable but server-first de-risks the harder component.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 10. Android Lifecycle Foundation | 4/4 | ✓ Complete | 2026-01-25 |
-| 11. Lifecycle-Aware Scope Injection | 4/4 | ✓ Complete | 2026-01-25 |
-| 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
-| 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
-| 14. Service Notification UX | 3/3 | ✓ Complete | 2026-02-05 |
-| 15. Battery Optimization UX | 3/3 | ✓ Complete | 2026-02-05 |
-| 16. OEM Compatibility | 0/TBD | Not started | - |
-| 17. Memory Optimization | 0/TBD | Not started | - |
+| 18. Fragmentation and Driver Contract | 0/2 | Planned | - |
+| 19. GATT Server and Advertising | 0/TBD | Not started | - |
+| 20. GATT Client and Scanner | 0/TBD | Not started | - |
+| 21. BLEInterface Orchestration | 0/TBD | Not started | - |
+| 22. Hardening and Edge Cases | 0/TBD | Not started | - |
 
 ---
 
-*Created: 2026-01-24*
-*Milestone: v2 Android Production Readiness*
+*Created: 2026-02-06*
+*Milestone: v3 BLE Interface*
