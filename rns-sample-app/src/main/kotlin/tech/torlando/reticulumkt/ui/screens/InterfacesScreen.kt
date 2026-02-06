@@ -89,7 +89,7 @@ fun InterfacesScreen(
 
     // Filter transport interfaces to find shared instance server and its spawned clients
     val sharedInstanceServer = transportInterfaces.find { it.isLocalSharedInstance }
-    val spawnedClients = transportInterfaces.filter { it.isSpawnedClient }
+    val spawnedClients = transportInterfaces.filter { it.isSpawnedClient }.distinctBy { it.name }
 
     Scaffold(
         topBar = {
@@ -155,7 +155,7 @@ fun InterfacesScreen(
                         )
                     }
                     if (spawnedClients.isNotEmpty()) {
-                        items(spawnedClients, key = { it.name }) { client ->
+                        items(spawnedClients, key = { "spawned_${it.name}" }) { client ->
                             SpawnedClientCard(client = client)
                         }
                     }
