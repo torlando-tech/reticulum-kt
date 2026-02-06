@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 
 ## Current Position
 
-Phase: 19 of 22 (GATT Server and Advertising)
-Plan: 02 of 02 in phase
-Status: Phase complete
-Last activity: 2026-02-06 - Completed 19-02-PLAN.md (BLE Advertising and Operation Queue)
+Phase: 20 of 22 (GATT Client and Scanner)
+Plan: 01 of 02 in phase
+Status: In progress
+Last activity: 2026-02-06 - Completed 20-01-PLAN.md (BleScanner and BleGattClient)
 
-Progress: v3 [██████░░░░░░] 40%
+Progress: v3 [███████░░░░░] 50%
 
 ## Milestone Goals
 
@@ -23,18 +23,19 @@ Progress: v3 [██████░░░░░░] 40%
 5 phases (18-22) delivering BLE mesh networking:
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
 - Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
-- Phase 20: GATT Client and Scanner (central role)
+- Phase 20: GATT Client and Scanner (central role) -- IN PROGRESS (1/2 plans)
 - Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4 (v3)
+- Total plans completed: 5 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
 - 19-02: 3min (BLE advertising and operation queue)
+- 20-01: 3min (BLE scanner and GATT client)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -49,6 +50,10 @@ Progress: v3 [██████░░░░░░] 40%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [20-01]: Single long-running scan (no cycling) -- BLE chip handles power management via ScanMode
+- [20-01]: Per-device 3s throttle for scan callbacks
+- [20-01]: Error 133: gatt.close() only (no disconnect first) + exponential backoff retry
+- [20-01]: Connection timeout via coroutine Job (not operationQueue)
 - [19-02]: Channel-based BleOperationQueue (single consumer) over Mutex-based serialization
 - [19-02]: No scan response data in advertising (CONTEXT.md: service UUID only)
 - [19-02]: Linear backoff (2s, 4s, 6s) for advertising retry
@@ -117,6 +122,18 @@ BLE advertising and operation serialization:
 - AdvertiseMode enum: LOW_POWER, BALANCED, LOW_LATENCY (user-configurable)
 - 8 unit tests for queue serialization, timeout, exception propagation, concurrent access
 
+### From 20-01 (BleScanner and BleGattClient)
+
+BLE central-role components implemented in rns-android module:
+- `BleScanner` -- hardware UUID ScanFilter, single long-running scan, per-device 3s throttle
+- `BleGattClient` -- connect/disconnect, service discovery, MTU 517, CCCD, data send/receive
+- All GATT operations serialized via `BleOperationQueue` with `CompletableDeferred` bridge
+- GATT error 133: full close + fresh `connectGatt` with exponential backoff (1s-16s), 5 retries
+- Temporary 60-second blacklist after max retries
+- API 33 compat for writeCharacteristic/writeDescriptor and pre-API 33 callback overloads
+- SharedFlow events: discoveredPeers, connected, disconnected, connectionFailed, dataReceived, mtuChanged
+- Package: `network.reticulum.android.ble` in rns-android module
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -136,6 +153,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T21:23:00Z
-Stopped at: Completed 19-02-PLAN.md (BLE Advertising and Operation Queue) -- Phase 19 complete
+Last session: 2026-02-06T22:07:00Z
+Stopped at: Completed 20-01-PLAN.md (BleScanner and BleGattClient)
 Resume file: None
