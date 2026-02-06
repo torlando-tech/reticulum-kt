@@ -149,7 +149,12 @@ Plans:
   3. Exemption request flow explains why (mesh networking requires persistent connection)
   4. Battery usage statistics visible in app (current session, last 24h, weekly average)
   5. User can see if battery optimization is affecting connectivity
-**Plans**: TBD
+**Plans:** 3 plans (2 parallel in wave 1, 1 in wave 2)
+
+Plans:
+- [ ] 15-01-PLAN.md -- Battery stats tracking infrastructure and exemption helper
+- [ ] 15-02-PLAN.md -- Service event tracking and kill detection wiring
+- [ ] 15-03-PLAN.md -- Monitor screen battery UX (chart, warning, exemption sheet)
 
 ### Phase 16: OEM Compatibility
 
@@ -190,7 +195,7 @@ Plans:
 | 12. Doze-Aware Connection Management | 5/5 | ✓ Complete | 2026-01-25 |
 | 13. WorkManager Integration | 3/3 | ✓ Complete | 2026-02-05 |
 | 14. Service Notification UX | 3/3 | ✓ Complete | 2026-02-05 |
-| 15. Battery Optimization UX | 0/TBD | Not started | - |
+| 15. Battery Optimization UX | 0/3 | Not started | - |
 | 16. OEM Compatibility | 0/TBD | Not started | - |
 | 17. Memory Optimization | 0/TBD | Not started | - |
 
