@@ -36,7 +36,7 @@ See `.planning/milestones/v2-ROADMAP.md` for archived roadmap.
 
 **Phase Numbering:** Continues from v2 (phases 18-22)
 
-- [ ] **Phase 18: Fragmentation and Driver Contract** - Wire format, reassembly, BLEDriver interface
+- [x] **Phase 18: Fragmentation and Driver Contract** - Wire format, reassembly, BLEDriver interface
 - [ ] **Phase 19: GATT Server and Advertising** - Peripheral role, characteristic hosting, notifications
 - [ ] **Phase 20: GATT Client and Scanner** - Central role, service discovery, MTU negotiation
 - [ ] **Phase 21: BLEInterface Orchestration** - MAC sorting, identity handshake, dual-role, Transport integration
@@ -64,8 +64,8 @@ See `.planning/milestones/v2-ROADMAP.md` for archived roadmap.
 **Plans:** 2 plans
 
 Plans:
-- [ ] 18-01-PLAN.md -- Constants, BLEDriver interface, and DiscoveredPeer data class
-- [ ] 18-02-PLAN.md -- BLE fragmentation and reassembly (TDD)
+- [x] 18-01-PLAN.md -- Constants, BLEDriver interface, and DiscoveredPeer data class
+- [x] 18-02-PLAN.md -- BLE fragmentation and reassembly (TDD)
 
 ### Phase 19: GATT Server and Advertising
 
@@ -145,7 +145,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 18. Fragmentation and Driver Contract | 0/2 | Planned | - |
+| 18. Fragmentation and Driver Contract | 2/2 | Complete | 2026-02-06 |
 | 19. GATT Server and Advertising | 0/TBD | Not started | - |
 | 20. GATT Client and Scanner | 0/TBD | Not started | - |
 | 21. BLEInterface Orchestration | 0/TBD | Not started | - |
