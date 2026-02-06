@@ -131,6 +131,11 @@ Plans:
   10. Two devices can exchange Reticulum packets over BLE (end-to-end verified)
 
 **Deliverables:** `BLEInterface.kt`, `BLEPeerInterface.kt` in `rns-interfaces/ble/`; InterfaceManager integration in `rns-sample-app`
+**Plans:** 2 plans
+
+Plans:
+- [ ] 21-01-PLAN.md -- BLEInterface and BLEPeerInterface core orchestration classes
+- [ ] 21-02-PLAN.md -- InterfaceManager BLE integration and manifest permissions
 
 ### Phase 22: Hardening and Edge Cases
 
@@ -158,7 +163,7 @@ Plans:
 | 18. Fragmentation and Driver Contract | 2/2 | Complete | 2026-02-06 |
 | 19. GATT Server and Advertising | 2/2 | Complete | 2026-02-06 |
 | 20. GATT Client and Scanner | 2/2 | Complete | 2026-02-06 |
-| 21. BLEInterface Orchestration | 0/TBD | Not started | - |
+| 21. BLEInterface Orchestration | 0/2 | Not started | - |
 | 22. Hardening and Edge Cases | 0/TBD | Not started | - |
 
 ---
