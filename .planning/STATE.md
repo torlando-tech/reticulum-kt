@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 15 of 17 (Battery Optimization UX)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-05 - Completed 15-01-PLAN.md (Battery Stats Infrastructure)
+Last activity: 2026-02-05 - Completed 15-02-PLAN.md (Service Event Tracking)
 
-Progress: v2 [███████████░] 91%
+Progress: v2 [███████████░] 92%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 20 (v2)
+- Total plans completed: 21 (v2)
 - Average duration: 2.5min
-- Total execution time: 49.75min
+- Total execution time: 51.75min
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
 | 14 | 3/3 | 6.75min | 2.25min |
-| 15 | 1/3 | 2min | 2min |
+| 15 | 2/3 | 4min | 2min |
 
 *Updated after each plan completion*
 
@@ -112,6 +112,9 @@ Recent decisions affecting current work:
 - [15-01]: Shared SharedPreferences file (reticulum_battery) between tracker and exemption helper
 - [15-01]: Short JSON keys (t, l, c) for compact persistence of 1440 samples
 - [15-01]: Synchronized sampleList access for thread safety between coroutine and stop()
+- [15-02]: Flag-pair kill detection (service_was_running + user_initiated_stop)
+- [15-02]: Daily reset via date string comparison (YYYY-MM-DD)
+- [15-02]: Warning dismissed at count, not boolean (progressive urgency on new kills)
 
 ### From v1
 
@@ -132,5 +135,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 15-01-PLAN.md (Battery Stats Infrastructure)
+Stopped at: Completed 15-02-PLAN.md (Service Event Tracking)
 Resume file: None
