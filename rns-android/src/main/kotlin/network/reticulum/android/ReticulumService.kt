@@ -59,6 +59,10 @@ class ReticulumService : LifecycleService() {
     private lateinit var batteryMonitor: BatteryMonitor
     private lateinit var policyProvider: ConnectionPolicyProvider
 
+    // Battery statistics and service event tracking
+    private lateinit var batteryStatsTracker: BatteryStatsTracker
+    private lateinit var eventTracker: ServiceEventTracker
+
     // Pause/resume state tracking
     private var _isPaused = false
 
@@ -101,6 +105,10 @@ class ReticulumService : LifecycleService() {
         instance = this
         createNotificationChannel()
 
+        // Initialize service event tracker and record start (detects system kills)
+        eventTracker = ServiceEventTracker(this)
+        eventTracker.recordServiceStart()
+
         // Initialize rich notification builder
         notificationBuilder = NotificationContentBuilder(this)
 
@@ -129,6 +137,10 @@ class ReticulumService : LifecycleService() {
         // Create BatteryMonitor for policy provider
         batteryMonitor = BatteryMonitor(this)
         batteryMonitor.start()
+
+        // Start battery statistics tracker for drain rate and chart data
+        batteryStatsTracker = BatteryStatsTracker(this)
+        batteryStatsTracker.start(lifecycleScope)
 
         // Create connection policy provider
         policyProvider = ConnectionPolicyProvider(
@@ -226,6 +238,7 @@ class ReticulumService : LifecycleService() {
 
         // Stop policy provider first (depends on observers)
         policyProvider.stop()
+        batteryStatsTracker.stop()
         batteryMonitor.stop()
 
         // Stop observers before other cleanup
@@ -583,6 +596,18 @@ class ReticulumService : LifecycleService() {
     fun getPolicyProvider(): ConnectionPolicyProvider = policyProvider
 
     /**
+     * Get the service event tracker.
+     * Tracks system kills, provides kill count for battery optimization warnings.
+     */
+    fun getEventTracker(): ServiceEventTracker = eventTracker
+
+    /**
+     * Get the battery statistics tracker.
+     * Provides drain rate and sample history for battery impact display.
+     */
+    fun getBatteryStatsTracker(): BatteryStatsTracker = batteryStatsTracker
+
+    /**
      * Pause the service: freeze Transport job loop and cancel WorkManager.
      *
      * The service stays alive as a foreground service but stops all network activity.
@@ -669,8 +694,12 @@ class ReticulumService : LifecycleService() {
 
         /**
          * Stop the Reticulum service.
+         *
+         * Records a user-initiated stop so the event tracker does NOT count
+         * the next service start as a system kill.
          */
         fun stop(context: Context) {
+            instance?.getEventTracker()?.recordUserStop()
             context.stopService(Intent(context, ReticulumService::class.java))
         }
     }
