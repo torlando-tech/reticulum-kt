@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 14 of 17 (Service Notification UX)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-05 - Completed 14-01-PLAN.md (Connection State Model and Notification Builder)
+Last activity: 2026-02-05 - Completed 14-02-PLAN.md (Notification Quick Actions)
 
-Progress: v2 [████████░░] 81%
+Progress: v2 [█████████░] 84%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 17 (v2)
+- Total plans completed: 18 (v2)
 - Average duration: 2.5min
-- Total execution time: 42.5min
+- Total execution time: 44.5min
 
 **By Phase:**
 
@@ -42,7 +42,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
 | 13 | 3/3 | 5min | 1.7min |
-| 14 | 1/3 | 1.5min | 1.5min |
+| 14 | 2/3 | 3.5min | 1.75min |
 
 *Updated after each plan completion*
 
@@ -99,6 +99,10 @@ Recent decisions affecting current work:
 - [14-01]: Em dash separator in notification content text for clean visual
 - [14-01]: Interface detail in parentheses in expanded view for readability
 - [14-01]: Sort interface breakdown by count descending (most common type first)
+- [14-02]: Static instance pattern for BroadcastReceiver-to-Service communication
+- [14-02]: Long.MAX_VALUE interval for pause (Transport.stopCoroutineJobLoop is private)
+- [14-02]: Reconnect hidden when paused (contradictory to frozen state)
+- [14-02]: Callback-based onReconnectRequested (service doesn't own InterfaceManager)
 
 ### From v1
 
@@ -119,5 +123,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 14-01-PLAN.md (Connection State Model and Notification Builder)
+Stopped at: Completed 14-02-PLAN.md (Notification Quick Actions)
 Resume file: None
