@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 ## Current Position
 
 Phase: 19 of 22 (GATT Server and Advertising)
-Plan: 01 of 02 in phase
-Status: In progress
-Last activity: 2026-02-06 - Completed 19-01-PLAN.md (GATT Server Implementation)
+Plan: 02 of 02 in phase
+Status: Phase complete
+Last activity: 2026-02-06 - Completed 19-02-PLAN.md (BLE Advertising and Operation Queue)
 
-Progress: v3 [█████░░░░░░░] 30%
+Progress: v3 [██████░░░░░░] 40%
 
 ## Milestone Goals
 
@@ -22,7 +22,7 @@ Progress: v3 [█████░░░░░░░] 30%
 
 5 phases (18-22) delivering BLE mesh networking:
 - Phase 18: Fragmentation and Driver Contract (wire format, module boundary) -- COMPLETE (2/2 plans)
-- Phase 19: GATT Server and Advertising (peripheral role) -- IN PROGRESS (1/2 plans)
+- Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
 - Phase 20: GATT Client and Scanner (central role)
 - Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport)
 - Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
@@ -30,10 +30,11 @@ Progress: v3 [█████░░░░░░░] 30%
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3 (v3)
+- Total plans completed: 4 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
+- 19-02: 3min (BLE advertising and operation queue)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -48,6 +49,9 @@ Progress: v3 [█████░░░░░░░] 30%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [19-02]: Channel-based BleOperationQueue (single consumer) over Mutex-based serialization
+- [19-02]: No scan response data in advertising (CONTEXT.md: service UUID only)
+- [19-02]: Linear backoff (2s, 4s, 6s) for advertising retry
 - [19-01]: SharedFlow events over nullable callbacks for multi-collector support
 - [19-01]: Single stateMutex for all per-device maps (connect/disconnect modify all maps together)
 - [19-01]: Global notification Mutex (Android BLE stack serializes globally, not per-device)
@@ -104,6 +108,15 @@ GATT server fully implemented in rns-android module:
 - AndroidManifest.xml has all 6 BLE permissions + hardware feature declaration
 - Package: `network.reticulum.android.ble` in rns-android module
 
+### From 19-02 (BLE Advertising and Operation Queue)
+
+BLE advertising and operation serialization:
+- `BleAdvertiser` -- advertising lifecycle with service UUID, 60s refresh, OEM restart
+- `BleOperationQueue` -- pure JVM generic suspend-based operation queue (Channel + single consumer)
+- `BleOperationTimeoutException` -- timeout exception for queue operations
+- AdvertiseMode enum: LOW_POWER, BALANCED, LOW_LATENCY (user-configurable)
+- 8 unit tests for queue serialization, timeout, exception propagation, concurrent access
+
 ### Research Completed
 
 4 research documents produced (`.planning/research/v3/`):
@@ -123,6 +136,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T21:22:00Z
-Stopped at: Completed 19-01-PLAN.md (GATT Server Implementation)
+Last session: 2026-02-06T21:23:00Z
+Stopped at: Completed 19-02-PLAN.md (BLE Advertising and Operation Queue) -- Phase 19 complete
 Resume file: None
