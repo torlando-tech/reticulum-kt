@@ -204,6 +204,9 @@ fun SettingsScreen(
                     Text("Debug", style = MaterialTheme.typography.bodyMedium)
                 }
             }
+
+            // Bottom padding for navigation bar
+            Spacer(modifier = Modifier.height(80.dp))
         }
     }
 }

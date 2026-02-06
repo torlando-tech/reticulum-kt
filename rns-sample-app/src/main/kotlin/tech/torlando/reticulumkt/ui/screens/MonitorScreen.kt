@@ -165,6 +165,9 @@ fun MonitorScreen(
                 StatusRow("Heap Max", "${monitorState.heapMaxMb} MB", null)
                 StatusRow("ByteArray Pool", "${String.format("%.1f", monitorState.byteArrayPoolMb)} MB", null)
             }
+
+            // Bottom padding for navigation bar
+            Spacer(modifier = Modifier.height(80.dp))
         }
     }
 }
