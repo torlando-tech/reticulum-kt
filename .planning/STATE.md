@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-01-24)
 ## Current Position
 
 Phase: 13 of 17 (WorkManager Integration)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-05 - Completed 13-01-PLAN.md (ReticulumWorker Enhancement)
+Last activity: 2026-02-05 - Completed 13-02-PLAN.md (WorkManager Lifecycle Wiring)
 
-Progress: v2 [████████░░] 74%
+Progress: v2 [████████░░] 76%
 
 ## Milestone Goals
 
@@ -30,9 +30,9 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 14 (v2)
+- Total plans completed: 15 (v2)
 - Average duration: 2.7min
-- Total execution time: 38min
+- Total execution time: 40min
 
 **By Phase:**
 
@@ -41,7 +41,7 @@ Make existing Reticulum-KT interfaces (TCP/UDP) production-ready for Android:
 | 10 | 4/4 | 8min | 2min |
 | 11 | 4/4 | 14min | 3.5min |
 | 12 | 5/5 | 14min | 2.8min |
-| 13 | 1/3 | 2min | 2min |
+| 13 | 2/3 | 4min | 2min |
 
 *Updated after each plan completion*
 
@@ -89,6 +89,9 @@ Recent decisions affecting current work:
 - [13-01]: inputData for auto-restart flag keeps library module independent of app DataStore
 - [13-01]: BatteryManager direct read in worker (short-lived, no BatteryMonitor needed)
 - [13-01]: Interface health check is logging-only; reconnection handled by TCPClientInterface
+- [13-02]: WorkManager scheduled in all modes, not just transport (recovery is universal)
+- [13-02]: Cancel WorkManager before Reticulum.stop() to avoid restart race
+- [13-02]: MY_PACKAGE_REPLACED as safety net for KEEP policy across app updates
 
 ### From v1
 
@@ -109,5 +112,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-05
-Stopped at: Completed 13-01-PLAN.md (ReticulumWorker Enhancement)
+Stopped at: Completed 13-02-PLAN.md (WorkManager Lifecycle Wiring)
 Resume file: None
