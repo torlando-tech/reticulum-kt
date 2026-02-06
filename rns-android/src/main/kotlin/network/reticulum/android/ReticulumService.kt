@@ -238,11 +238,11 @@ class ReticulumService : LifecycleService() {
                 }
             }
 
-            // When transport is enabled, schedule WorkManager for periodic maintenance
-            // This survives Doze mode and app backgrounding
-            if (config.enableTransport) {
-                ReticulumWorker.schedule(this@ReticulumService, intervalMinutes = 15)
-            }
+            // Schedule WorkManager for periodic recovery (interface health, service restart)
+            // Runs in all modes — recovery applies to client mode too, not just transport
+            // This survives Doze mode and app backgrounding via KEEP policy
+            ReticulumWorker.schedule(this@ReticulumService, intervalMinutes = 15)
+            Log.i(TAG, "WorkManager recovery worker scheduled (15-minute interval)")
 
             val statusText = when {
                 reticulum?.isSharedInstance == true -> "Shared Instance (port ${config.sharedInstancePort})"
@@ -314,13 +314,16 @@ class ReticulumService : LifecycleService() {
 
     private fun shutdownReticulum() {
         try {
-            // Cancel WorkManager maintenance if scheduled
+            // Cancel WorkManager recovery worker before stopping Reticulum
+            // This ensures "stop means stop" — no background activity after user-initiated stop
             ReticulumWorker.cancel(this)
+            Log.i(TAG, "WorkManager recovery worker cancelled")
 
             Reticulum.stop()
             reticulum = null
+            Log.i(TAG, "Reticulum stopped")
         } catch (e: Exception) {
-            // Log error but don't crash
+            Log.e(TAG, "Error during Reticulum shutdown: ${e.message}")
         }
     }
 
