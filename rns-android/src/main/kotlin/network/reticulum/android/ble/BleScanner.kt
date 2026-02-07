@@ -122,6 +122,7 @@ internal class BleScanner(
     suspend fun startScanning(mode: ScanMode = ScanMode.BALANCED): Result<Unit> =
         withContext(Dispatchers.Main) {
             try {
+                Log.d(TAG, "startScanning: entering (mode=$mode, btEnabled=${bluetoothAdapter.isEnabled})")
                 if (!bluetoothAdapter.isEnabled) {
                     return@withContext Result.failure(
                         IllegalStateException("Bluetooth is disabled"),
@@ -156,9 +157,11 @@ internal class BleScanner(
                     .setReportDelay(0)
                     .build()
 
+                Log.d(TAG, "startScanning: calling startScan with service UUID filter...")
                 scanner.startScan(listOf(scanFilter), scanSettings, scanCallback)
                 _isScanning.value = true
 
+                Log.d(TAG, "startScanning: scan started successfully")
                 Result.success(Unit)
             } catch (e: SecurityException) {
                 Log.e(TAG, "Permission denied when starting scan", e)
@@ -237,6 +240,7 @@ internal class BleScanner(
             rssi = rssi,
             lastSeen = now,
         )
+        Log.d(TAG, "Discovered peer: ${address.takeLast(8)} rssi=$rssi")
         _discoveredPeers.tryEmit(peer)
     }
 

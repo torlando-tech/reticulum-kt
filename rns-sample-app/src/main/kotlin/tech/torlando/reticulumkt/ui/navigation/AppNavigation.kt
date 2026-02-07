@@ -2,6 +2,7 @@ package tech.torlando.reticulumkt.ui.navigation
 
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Monitor
@@ -27,6 +28,7 @@ import tech.torlando.reticulumkt.ui.screens.ModeScreen
 import tech.torlando.reticulumkt.ui.screens.MonitorScreen
 import tech.torlando.reticulumkt.ui.screens.PerformanceScreen
 import tech.torlando.reticulumkt.ui.screens.SettingsScreen
+import tech.torlando.reticulumkt.ui.screens.BleConnectionsScreen
 import tech.torlando.reticulumkt.ui.screens.wizard.RNodeWizardScreen
 import tech.torlando.reticulumkt.ui.screens.wizard.TcpClientWizardScreen
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
@@ -46,6 +48,7 @@ sealed class Screen(
     // Wizard screens (not shown in bottom nav)
     data object TcpWizard : Screen("tcp_wizard", "TCP Wizard", Icons.Filled.Router)
     data object RNodeWizard : Screen("rnode_wizard", "RNode Wizard", Icons.Filled.Router)
+    data object BleConnections : Screen("ble_connections/{configId}", "BLE Connections", Icons.Filled.Bluetooth)
 }
 
 // Main navigation items (bottom nav)
@@ -70,6 +73,7 @@ fun AppNavigation(
         Screen.Performance.route,
         Screen.TcpWizard.route,
         Screen.RNodeWizard.route,
+        Screen.BleConnections.route,
     )
     val shouldShowBottomNav = currentDestination?.route !in hideBottomNavScreens
 
@@ -147,6 +151,9 @@ fun AppNavigation(
                     viewModel = viewModel,
                     onNavigateToTcpWizard = { navController.navigate(Screen.TcpWizard.route) },
                     onNavigateToRNodeWizard = { navController.navigate(Screen.RNodeWizard.route) },
+                    onNavigateToBleConnections = { configId ->
+                        navController.navigate("ble_connections/$configId")
+                    },
                 )
             }
             composable(Screen.TcpWizard.route) {
@@ -165,6 +172,21 @@ fun AppNavigation(
                         viewModel.addInterface(config)
                         navController.popBackStack()
                     },
+                )
+            }
+            composable(
+                route = Screen.BleConnections.route,
+                arguments = listOf(
+                    androidx.navigation.navArgument("configId") {
+                        type = androidx.navigation.NavType.StringType
+                    }
+                )
+            ) { backStackEntry ->
+                val configId = backStackEntry.arguments?.getString("configId") ?: ""
+                BleConnectionsScreen(
+                    viewModel = viewModel,
+                    configId = configId,
+                    onNavigateBack = { navController.popBackStack() },
                 )
             }
             composable(Screen.Performance.route) {

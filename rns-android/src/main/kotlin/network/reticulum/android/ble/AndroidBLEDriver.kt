@@ -144,8 +144,11 @@ class AndroidBLEDriver(
     // ========== BLEDriver Interface Implementation ==========
 
     override suspend fun startAdvertising() {
+        Log.d(TAG, "startAdvertising: opening GATT server...")
         gattServer.open().getOrThrow()
+        Log.d(TAG, "startAdvertising: GATT server opened, starting advertiser...")
         advertiser.startAdvertising().getOrThrow()
+        Log.d(TAG, "startAdvertising: advertiser started successfully")
         _isRunning = true
     }
 
@@ -155,7 +158,9 @@ class AndroidBLEDriver(
     }
 
     override suspend fun startScanning() {
+        Log.d(TAG, "startScanning: starting BLE scanner...")
         scanner.startScanning().getOrThrow()
+        Log.d(TAG, "startScanning: BLE scanner started successfully")
         _isRunning = true
     }
 

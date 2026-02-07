@@ -202,6 +202,7 @@ internal class BleGattServer(
         }
 
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            Log.d(TAG, "onServiceAdded: status=$status, uuid=${service.uuid}")
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 serviceAddedDeferred?.complete(Result.success(Unit))
             } else {
@@ -223,26 +224,32 @@ internal class BleGattServer(
      */
     suspend fun open(): Result<Unit> = withContext(Dispatchers.Main) {
         try {
+            Log.d(TAG, "open(): entering on thread ${Thread.currentThread().name}")
             if (gattServer != null) {
+                Log.d(TAG, "open(): GATT server already open, returning success")
                 return@withContext Result.success(Unit)
             }
 
             if (!hasConnectPermission()) {
+                Log.e(TAG, "open(): missing BLUETOOTH_CONNECT permission")
                 return@withContext Result.failure(
                     SecurityException("Missing BLUETOOTH_CONNECT permission"),
                 )
             }
 
+            Log.d(TAG, "open(): calling openGattServer...")
             val server = bluetoothManager.openGattServer(context, gattServerCallback)
                 ?: return@withContext Result.failure(
                     IllegalStateException("Failed to open GATT server"),
                 )
             gattServer = server
+            Log.d(TAG, "open(): GATT server opened, creating service...")
 
             val service = createReticulumService()
 
             serviceAddedDeferred = CompletableDeferred()
 
+            Log.d(TAG, "open(): adding service to GATT server...")
             val added = server.addService(service)
             if (!added) {
                 serviceAddedDeferred = null
@@ -254,12 +261,14 @@ internal class BleGattServer(
             }
 
             // Wait for onServiceAdded callback
+            Log.d(TAG, "open(): waiting for onServiceAdded callback (timeout=${BLEConstants.OPERATION_TIMEOUT_MS}ms)...")
             val serviceResult = withTimeoutOrNull(BLEConstants.OPERATION_TIMEOUT_MS) {
                 serviceAddedDeferred?.await()
             }
             serviceAddedDeferred = null
 
             if (serviceResult == null) {
+                Log.e(TAG, "open(): TIMEOUT waiting for onServiceAdded callback")
                 server.close()
                 gattServer = null
                 return@withContext Result.failure(
@@ -276,6 +285,7 @@ internal class BleGattServer(
             // Store TX characteristic reference for notifications
             txCharacteristic = service.getCharacteristic(BLEConstants.TX_CHAR_UUID)
 
+            Log.d(TAG, "open(): GATT server fully initialized with Reticulum service")
             Result.success(Unit)
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied when opening GATT server", e)
@@ -464,6 +474,7 @@ internal class BleGattServer(
 
         when (newState) {
             BluetoothProfile.STATE_CONNECTED -> {
+                Log.d(TAG, "Central connected: $address (status: $status)")
                 stateMutex.withLock {
                     connectedCentrals[address] = device
                     centralMtus[address] = BLEConstants.MIN_MTU

@@ -79,6 +79,24 @@ sealed class SharedInstanceStatus {
 }
 
 /**
+ * Snapshot of a spawned peer interface for display in the UI.
+ * Maps to a single child interface (AutoInterfacePeer or BLEPeerInterface).
+ */
+data class SpawnedPeerInfo(
+    val name: String,
+    val isOnline: Boolean,
+    val rxBytes: Long,
+    val txBytes: Long,
+    // BLE-specific (null for AutoInterface peers)
+    val peerIdentityHex: String? = null,
+    val peerAddress: String? = null,
+    val peerMtu: Int? = null,
+    val discoveryRssi: Int? = null,
+    val lastTrafficReceived: Long? = null,
+    val connectedSince: Long? = null,
+)
+
+/**
  * Snapshot of a Transport-registered interface for display in the UI.
  */
 data class TransportInterfaceInfo(
@@ -105,6 +123,10 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     // Actual interface statuses (from running interfaces, not config)
     private val _interfaceStatuses = MutableStateFlow<Map<String, InterfaceStatus>>(emptyMap())
     val interfaceStatuses: StateFlow<Map<String, InterfaceStatus>> = _interfaceStatuses.asStateFlow()
+
+    // Spawned peer info keyed by parent config ID (for AutoInterface/BLEInterface peer display)
+    private val _spawnedPeersByConfig = MutableStateFlow<Map<String, List<SpawnedPeerInfo>>>(emptyMap())
+    val spawnedPeersByConfig: StateFlow<Map<String, List<SpawnedPeerInfo>>> = _spawnedPeersByConfig.asStateFlow()
 
     // Service state
     private val _serviceState = MutableStateFlow(ServiceState())
@@ -288,6 +310,7 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
 
             // Clear interface statuses and pause state
             _interfaceStatuses.value = emptyMap()
+            _spawnedPeersByConfig.value = emptyMap()
             _transportInterfaces.value = emptyList()
             _isPaused.value = false
 
@@ -365,6 +388,7 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 }
 
                 _interfaceStatuses.value = statuses
+                _spawnedPeersByConfig.value = manager?.getSpawnedPeerInfo() ?: emptyMap()
 
                 _serviceState.value = _serviceState.value.copy(
                     activeInterfaces = transportInterfaces.size,

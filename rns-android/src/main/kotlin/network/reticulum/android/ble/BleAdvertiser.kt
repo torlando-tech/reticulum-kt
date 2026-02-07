@@ -95,6 +95,7 @@ internal class BleAdvertiser(
      */
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            Log.d(TAG, "Advertising started successfully (mode=${settingsInEffect.mode})")
             _isAdvertising.value = true
             retryCount = 0
         }
@@ -129,6 +130,7 @@ internal class BleAdvertiser(
     suspend fun startAdvertising(mode: AdvertiseMode = AdvertiseMode.BALANCED): Result<Unit> =
         withContext(Dispatchers.Main) {
             try {
+                Log.d(TAG, "startAdvertising: entering (mode=$mode, btEnabled=${bluetoothAdapter.isEnabled})")
                 if (!bluetoothAdapter.isEnabled) {
                     return@withContext Result.failure(
                         IllegalStateException("Bluetooth is disabled"),
@@ -157,9 +159,11 @@ internal class BleAdvertiser(
                 shouldBeAdvertising = true
                 retryCount = 0
 
+                Log.d(TAG, "startAdvertising: calling startAdvertisingInternal...")
                 startAdvertisingInternal()
                 startRefreshTimer()
 
+                Log.d(TAG, "startAdvertising: returning success")
                 Result.success(Unit)
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting advertising", e)

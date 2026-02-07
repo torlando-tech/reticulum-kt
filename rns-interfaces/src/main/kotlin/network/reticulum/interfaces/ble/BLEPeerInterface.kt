@@ -41,6 +41,12 @@ class BLEPeerInterface(
     override val canReceive: Boolean = true
     override val canSend: Boolean = true
 
+    /** BLE MAC address of the connected peer (for UI display). */
+    val peerAddress: String get() = connection.address
+
+    /** Negotiated BLE MTU for this connection (for UI display). */
+    val peerMtu: Int get() = connection.mtu
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var receiveJob: Job? = null
     private var keepaliveJob: Job? = null

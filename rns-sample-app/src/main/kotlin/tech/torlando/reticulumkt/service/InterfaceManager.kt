@@ -13,11 +13,13 @@ import network.reticulum.android.NetworkType
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.InterfaceAdapter
 import network.reticulum.interfaces.auto.AutoInterface
+import network.reticulum.interfaces.ble.BLEPeerInterface
 import network.reticulum.interfaces.rnode.RNodeInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.transport.Transport
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.ui.screens.InterfaceType
+import tech.torlando.reticulumkt.viewmodel.SpawnedPeerInfo
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -416,6 +418,41 @@ class InterfaceManager(
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping interface ${iface.name}: ${e.message}")
         }
+    }
+
+    /**
+     * Get spawned peer info from all running interfaces that have spawned children.
+     * Returns a map of config ID -> list of peer info snapshots.
+     */
+    fun getSpawnedPeerInfo(): Map<String, List<SpawnedPeerInfo>> {
+        return runningInterfaces.mapNotNull { (configId, iface) ->
+            val spawned = iface.spawnedInterfaces ?: return@mapNotNull null
+            if (spawned.isEmpty()) return@mapNotNull null
+
+            configId to spawned.map { child ->
+                when (child) {
+                    is BLEPeerInterface -> SpawnedPeerInfo(
+                        name = child.name,
+                        isOnline = child.online.get(),
+                        rxBytes = child.rxBytes.get(),
+                        txBytes = child.txBytes.get(),
+                        peerIdentityHex = child.peerIdentity.joinToString("") { "%02x".format(it) },
+                        peerAddress = child.peerAddress,
+                        peerMtu = child.peerMtu,
+                        discoveryRssi = child.discoveryRssi,
+                        lastTrafficReceived = child.lastTrafficReceived,
+                        connectedSince = child.createdAt,
+                    )
+                    else -> SpawnedPeerInfo(
+                        name = child.name,
+                        isOnline = child.online.get(),
+                        rxBytes = child.rxBytes.get(),
+                        txBytes = child.txBytes.get(),
+                        connectedSince = child.createdAt,
+                    )
+                }
+            }
+        }.toMap()
     }
 
     /**

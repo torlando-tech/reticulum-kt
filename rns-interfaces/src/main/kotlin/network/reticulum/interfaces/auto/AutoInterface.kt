@@ -74,6 +74,10 @@ class AutoInterface(
     // Multicast echo tracking for carrier detection
     private val multicastEchoes = ConcurrentHashMap<String, Long>()
 
+    init {
+        spawnedInterfaces = mutableListOf()
+    }
+
     override val bitrate: Int
         get() = configuredBitrate ?: AutoInterfaceConstants.BITRATE_GUESS
 
@@ -635,8 +639,10 @@ class AutoInterface(
         val oldPeer = spawnedPeers.put(cleanAddr, peer)
         oldPeer?.let {
             log("Cleaning up stale peer interface for $cleanAddr")
+            spawnedInterfaces?.remove(it)
             it.detach()
         }
+        spawnedInterfaces?.add(peer)
 
         // Wire up to Transport
         val peerRef = peer.toRef()
@@ -658,6 +664,7 @@ class AutoInterface(
 
         val peer = spawnedPeers.remove(address)
         if (peer != null) {
+            spawnedInterfaces?.remove(peer)
             peer.detach()
             // Note: Transport.deregisterInterface would need to be implemented
         }
