@@ -207,7 +207,23 @@ App-level BLE wiring complete:
 
 ### Pending Todos
 
-None yet.
+**High Priority (network health):**
+- [ ] Announce bandwidth capping — Python caps announces at 2% of interface bandwidth; prevents flooding slow LoRa/BLE links (Transport.py:1091-1135)
+- [ ] Path table persistence — Save/restore path tables, tunnel tables, packet hashlist to disk across restarts (Transport.py persistence methods)
+- [ ] Packet cache & cache requests — Cache packets and respond to cache requests for path establishment (Transport.py:cache/should_cache/get_cached_packet)
+
+**Medium Priority (protocol completeness):**
+- [ ] Link MTU discovery — Auto-negotiate per-link MTU; `LINK_MTU_DISCOVERY` flag in Reticulum.py
+- [ ] PHY stats on packets — Expose RSSI/SNR/Q from RNode through Packet API (Packet.py:get_rssi/get_snr/get_q)
+- [ ] Interface discovery — `InterfaceAnnouncer`/`InterfaceMonitor` for mDNS-based interface discovery (Discovery.py)
+- [ ] Blackhole system — Identity blacklisting to block bad actors (Transport.py:blackhole_identity/unblackhole_identity)
+
+**Low Priority (server/tooling):**
+- [ ] Remote management — Control destinations for remote `/path` and `/status` queries
+- [ ] RPC server — Multi-process sharing of a single Reticulum instance
+- [ ] CLI utilities — `rnstatus`, `rnpath`, `rnprobe` equivalents
+- [ ] SerialInterface — Direct serial port (RNode covers most use cases)
+- [ ] I2PInterface — I2P anonymity network integration
 
 ### Blockers/Concerns
 
