@@ -13,7 +13,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Identity | Complete | X25519/Ed25519, ratchets, known destinations, persistent storage |
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs |
-| Transport | ~90% | Routing, path management, tunnels, announces, link management, IFAC, mode-based filtering |
+| Transport | ~95% | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
 | Link | ~95% | Establishment, encryption, channels, resources, request/response |
 | Channel | ~90% | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels |
@@ -51,7 +51,6 @@ Features that exist in the Python reference but are not yet implemented:
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Packet cache & cache requests | High | Cache packets and respond to cache requests for path establishment |
 | Link MTU discovery | Medium | Auto-negotiate per-link MTU (`LINK_MTU_DISCOVERY`) |
 | PHY stats on packets | Medium | Expose RSSI/SNR/Q from RNode through the Packet API |
 | Interface discovery | Medium | `InterfaceAnnouncer`/`InterfaceMonitor` for mDNS-based interface discovery |
