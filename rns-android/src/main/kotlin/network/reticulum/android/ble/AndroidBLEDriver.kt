@@ -276,6 +276,13 @@ class AndroidBLEDriver(
             }
         }
 
+        override suspend fun readRemoteRssi(): Int {
+            if (!isOutgoing) {
+                throw UnsupportedOperationException("RSSI reading not supported on peripheral connections")
+            }
+            return gattClient.readRemoteRssi(address)
+        }
+
         override suspend fun readIdentity(): ByteArray {
             check(isOutgoing) { "readIdentity only supported on outgoing (central) connections" }
             return gattClient.readCharacteristic(address, BLEConstants.IDENTITY_CHAR_UUID)

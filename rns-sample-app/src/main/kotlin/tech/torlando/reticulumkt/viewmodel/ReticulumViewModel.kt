@@ -94,6 +94,19 @@ data class SpawnedPeerInfo(
     val discoveryRssi: Int? = null,
     val lastTrafficReceived: Long? = null,
     val connectedSince: Long? = null,
+    val isOutgoing: Boolean? = null,       // true=central, false=peripheral
+    val currentRssi: Int? = null,          // live RSSI (polled every 10s, central only)
+)
+
+/**
+ * A single history data point for a BLE peer, captured every 2s.
+ * Used to derive speed charts and RSSI-over-time.
+ */
+data class PeerHistoryPoint(
+    val timestamp: Long,
+    val rxBytes: Long,
+    val txBytes: Long,
+    val rssi: Int?,
 )
 
 /**
@@ -127,6 +140,11 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
     // Spawned peer info keyed by parent config ID (for AutoInterface/BLEInterface peer display)
     private val _spawnedPeersByConfig = MutableStateFlow<Map<String, List<SpawnedPeerInfo>>>(emptyMap())
     val spawnedPeersByConfig: StateFlow<Map<String, List<SpawnedPeerInfo>>> = _spawnedPeersByConfig.asStateFlow()
+
+    // Peer history: peerIdentityHex -> ring buffer of history points (max 60 = 2min at 2s interval)
+    private val peerHistoryBuffers = mutableMapOf<String, ArrayDeque<PeerHistoryPoint>>()
+    private val _peerHistory = MutableStateFlow<Map<String, List<PeerHistoryPoint>>>(emptyMap())
+    val peerHistory: StateFlow<Map<String, List<PeerHistoryPoint>>> = _peerHistory.asStateFlow()
 
     // Service state
     private val _serviceState = MutableStateFlow(ServiceState())
@@ -280,12 +298,12 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 _showExemptionSheet.value = true
             }
 
-            // Start periodic status refresh (every 2 seconds)
+            // Start periodic status refresh (every 1 second for smooth chart animations)
             statusRefreshJob = viewModelScope.launch {
                 while (isActive) {
                     updateServiceStatus()
                     updateMonitorState()
-                    delay(2000)
+                    delay(1000)
                 }
             }
 
@@ -308,9 +326,11 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
             // Stop network observer (no longer needed when interfaces stopped)
             networkObserver.stop()
 
-            // Clear interface statuses and pause state
+            // Clear interface statuses, peer history, and pause state
             _interfaceStatuses.value = emptyMap()
             _spawnedPeersByConfig.value = emptyMap()
+            peerHistoryBuffers.clear()
+            _peerHistory.value = emptyMap()
             _transportInterfaces.value = emptyList()
             _isPaused.value = false
 
@@ -388,7 +408,29 @@ class ReticulumViewModel(application: Application) : AndroidViewModel(applicatio
                 }
 
                 _interfaceStatuses.value = statuses
-                _spawnedPeersByConfig.value = manager?.getSpawnedPeerInfo() ?: emptyMap()
+                val spawnedPeers = manager?.getSpawnedPeerInfo() ?: emptyMap()
+                _spawnedPeersByConfig.value = spawnedPeers
+
+                // Append history points for BLE peers
+                val now = System.currentTimeMillis()
+                val activeIdentities = mutableSetOf<String>()
+                for ((_, peerList) in spawnedPeers) {
+                    for (peer in peerList) {
+                        val id = peer.peerIdentityHex ?: continue
+                        activeIdentities.add(id)
+                        val buffer = peerHistoryBuffers.getOrPut(id) { ArrayDeque() }
+                        buffer.addLast(PeerHistoryPoint(
+                            timestamp = now,
+                            rxBytes = peer.rxBytes,
+                            txBytes = peer.txBytes,
+                            rssi = peer.currentRssi,
+                        ))
+                        while (buffer.size > 120) buffer.removeFirst()
+                    }
+                }
+                // Remove history for disconnected peers
+                peerHistoryBuffers.keys.removeAll { it !in activeIdentities }
+                _peerHistory.value = peerHistoryBuffers.mapValues { it.value.toList() }
 
                 _serviceState.value = _serviceState.value.copy(
                     activeInterfaces = transportInterfaces.size,

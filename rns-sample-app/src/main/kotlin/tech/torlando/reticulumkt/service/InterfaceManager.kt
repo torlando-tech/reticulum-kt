@@ -442,6 +442,8 @@ class InterfaceManager(
                         discoveryRssi = child.discoveryRssi,
                         lastTrafficReceived = child.lastTrafficReceived,
                         connectedSince = child.createdAt,
+                        isOutgoing = child.isOutgoing,
+                        currentRssi = child.currentRssi,
                     )
                     else -> SpawnedPeerInfo(
                         name = child.name,

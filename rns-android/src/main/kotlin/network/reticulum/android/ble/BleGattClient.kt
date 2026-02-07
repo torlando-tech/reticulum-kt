@@ -98,6 +98,9 @@ internal class BleGattClient(
     @Volatile
     private var pendingDescriptorWriteDeferred: CompletableDeferred<Int>? = null
 
+    @Volatile
+    private var pendingRssiDeferred: CompletableDeferred<Int>? = null
+
     // ---- Temporary blacklist ----
 
     private val blacklistedAddresses = mutableMapOf<String, Long>()
@@ -290,6 +293,18 @@ internal class BleGattClient(
                 pendingDescriptorWriteDeferred?.complete(status)
             }
         }
+
+        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+            scope.launch {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    pendingRssiDeferred?.complete(rssi)
+                } else {
+                    pendingRssiDeferred?.completeExceptionally(
+                        IllegalStateException("readRemoteRssi failed: status=$status"),
+                    )
+                }
+            }
+        }
     }
 
     // ========== Public API ==========
@@ -475,6 +490,35 @@ internal class BleGattClient(
                     throw SecurityException("Missing BLUETOOTH_CONNECT permission")
                 }
                 conn.gatt.readCharacteristic(characteristic)
+            }
+
+            deferred.await()
+        }
+    }
+
+    /**
+     * Read the RSSI (signal strength) for a connected peripheral.
+     *
+     * The read is serialized through [operationQueue] and uses a [CompletableDeferred]
+     * to bridge the GATT onReadRemoteRssi callback.
+     *
+     * @param address BLE MAC address of the peripheral
+     * @return RSSI value in dBm
+     * @throws IllegalStateException if not connected
+     */
+    suspend fun readRemoteRssi(address: String): Int {
+        val conn = connectionsMutex.withLock { connections[address] }
+            ?: throw IllegalStateException("Not connected to $address")
+
+        return operationQueue.enqueue(timeoutMs = BLEConstants.OPERATION_TIMEOUT_MS) {
+            val deferred = CompletableDeferred<Int>()
+            pendingRssiDeferred = deferred
+
+            withContext(Dispatchers.Main) {
+                if (!hasConnectPermission()) {
+                    throw SecurityException("Missing BLUETOOTH_CONNECT permission")
+                }
+                conn.gatt.readRemoteRssi()
             }
 
             deferred.await()

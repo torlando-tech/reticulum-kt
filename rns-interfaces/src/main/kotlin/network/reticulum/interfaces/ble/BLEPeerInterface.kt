@@ -66,6 +66,16 @@ class BLEPeerInterface(
     @Volatile
     var discoveryRssi: Int = -100
 
+    /** true = we are central (outgoing), false = we are peripheral (incoming) */
+    @Volatile
+    var isOutgoing: Boolean = true
+
+    /** Live RSSI from GATT readRemoteRssi, updated periodically (central only). */
+    @Volatile
+    var currentRssi: Int = -100
+
+    private var rssiJob: Job? = null
+
     init {
         this.parentInterface = parentBleInterface
     }
@@ -79,6 +89,26 @@ class BLEPeerInterface(
 
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
+        startRssiPolling()
+    }
+
+    /**
+     * Poll RSSI every 10 seconds on central (outgoing) connections.
+     * Peripheral connections don't have a GATT client handle, so RSSI reads are unsupported.
+     */
+    private fun startRssiPolling() {
+        if (!isOutgoing) return
+        rssiJob = scope.launch {
+            while (online.get() && !detached.get()) {
+                delay(10_000)
+                if (!online.get() || detached.get()) break
+                try {
+                    currentRssi = connection.readRemoteRssi()
+                } catch (_: Exception) {
+                    // Not all connections support RSSI reading — silently ignore
+                }
+            }
+        }
     }
 
     /**
@@ -192,9 +222,10 @@ class BLEPeerInterface(
      * Cancels old receive/keepalive, swaps connection, restarts loops.
      */
     fun updateConnection(newConnection: BLEPeerConnection, newAddress: String) {
-        // Cancel old receive/keepalive jobs
+        // Cancel old receive/keepalive/rssi jobs
         receiveJob?.cancel()
         keepaliveJob?.cancel()
+        rssiJob?.cancel()
 
         // Close old connection
         try { connection.close() } catch (_: Exception) {}
@@ -207,9 +238,10 @@ class BLEPeerInterface(
         // MAC rotation proves liveness -- reset zombie detection timer
         lastTrafficReceived = System.currentTimeMillis()
 
-        // Restart receive and keepalive
+        // Restart receive, keepalive, and RSSI polling
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
+        startRssiPolling()
 
         log("Connection updated to ${newAddress.takeLast(8)}")
     }
@@ -225,6 +257,7 @@ class BLEPeerInterface(
         // Cancel coroutines
         receiveJob?.cancel()
         keepaliveJob?.cancel()
+        rssiJob?.cancel()
         scope.cancel()
 
         // Close BLE connection

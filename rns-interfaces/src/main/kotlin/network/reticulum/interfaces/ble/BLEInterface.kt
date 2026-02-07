@@ -237,7 +237,7 @@ class BLEInterface(
             identityToAddress[identityHex] = address
 
             // Spawn peer interface
-            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = peer.rssi)
+            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = peer.rssi, isOutgoing = true)
 
             log("Connected to ${identityHex.take(8)} at ${address.takeLast(8)}")
 
@@ -342,7 +342,7 @@ class BLEInterface(
             // Handle capacity: accept incoming, then evaluate
             if (peers.size >= maxConnections) {
                 // Spawn the new peer first so we can score it
-                spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70)
+                spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70, isOutgoing = false)
 
                 // Now find the lowest scorer among ALL peers (including new one)
                 val (lowestIdentity, _) = findLowestScoredPeer() ?: return
@@ -362,7 +362,7 @@ class BLEInterface(
             }
 
             // Spawn peer interface (incoming connections don't have scan RSSI, use mid-range default)
-            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70)
+            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70, isOutgoing = false)
 
             log("Accepted peer ${identityHex.take(8)} from ${address.takeLast(8)}")
 
@@ -439,6 +439,7 @@ class BLEInterface(
         peerIdentity: ByteArray,
         connection: BLEPeerConnection,
         rssi: Int = -100,
+        isOutgoing: Boolean = true,
     ) {
         // Check if interface already exists for this identity (MAC rotation)
         val existing = peers[identityHex]
@@ -460,6 +461,7 @@ class BLEInterface(
         )
         peerInterface.parentInterface = this
         peerInterface.discoveryRssi = rssi
+        peerInterface.isOutgoing = isOutgoing
 
         // Set callback BEFORE toRef() -- InterfaceAdapter only sets if null
         peerInterface.onPacketReceived = { data, iface ->

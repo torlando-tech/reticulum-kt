@@ -187,6 +187,15 @@ interface BLEPeerConnection {
     suspend fun writeIdentity(identity: ByteArray)
 
     /**
+     * Read the current RSSI (signal strength) for this connection.
+     * Only supported on outgoing (central) connections that hold a GATT client handle.
+     *
+     * @return RSSI value in dBm
+     * @throws UnsupportedOperationException if not supported on this connection type
+     */
+    suspend fun readRemoteRssi(): Int
+
+    /**
      * Close this connection.
      * Disconnects the GATT client/server and releases resources.
      * After close, no further operations are valid.
