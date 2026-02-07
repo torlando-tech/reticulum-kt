@@ -56,6 +56,9 @@ abstract class Interface(
     /** Estimated bitrate in bits per second. */
     open val bitrate: Int = 62500
 
+    /** Announce bandwidth cap as fraction of interface bitrate (default 2%). */
+    open val announceCap: Double = 0.02
+
     /** Hardware MTU (if different from standard MTU). */
     open val hwMtu: Int? = null
 

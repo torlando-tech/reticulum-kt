@@ -1201,7 +1201,7 @@ object Transport {
 
                 // Calculate transmission time and wait time based on bitrate
                 val bitrate = interfaceRef.bitrate
-                val announceCap = TransportConstants.ANNOUNCE_CAP
+                val announceCap = interfaceRef.announceCap
 
                 val txTime = if (bitrate > 0) {
                     (selected.raw.size * 8.0) / bitrate
@@ -2163,10 +2163,17 @@ object Transport {
             log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
             for (iface in interfaces) {
-                if (iface.canSend && iface.online) {
-                    transmit(iface, packedData)
-                    sent = true
+                if (!iface.canSend || !iface.online) continue
+
+                // Mode-based announce filtering for locally-originated announces
+                // (Python Transport.py:1040-1084)
+                if (packet.packetType == PacketType.ANNOUNCE) {
+                    val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
+                    if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
                 }
+
+                transmit(iface, packedData)
+                sent = true
             }
         }
 
@@ -3965,6 +3972,10 @@ interface InterfaceRef {
     /** Bitrate in bits per second (0 if unknown). */
     val bitrate: Int
         get() = 0
+
+    /** Announce bandwidth cap as fraction of bitrate (default 2%). */
+    val announceCap: Double
+        get() = TransportConstants.ANNOUNCE_CAP
 
     /** Hardware MTU in bytes. */
     val hwMtu: Int

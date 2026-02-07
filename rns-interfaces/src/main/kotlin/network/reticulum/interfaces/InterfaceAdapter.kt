@@ -16,6 +16,7 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val canReceive: Boolean = iface.canReceive
     override val online: Boolean get() = iface.online.get()
     override val mode: InterfaceMode get() = iface.mode
+    override val announceCap: Double get() = iface.announceCap
 
     // Tunnel properties - delegate to underlying interface
     override var tunnelId: ByteArray?
