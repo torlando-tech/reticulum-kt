@@ -18,6 +18,10 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -31,7 +35,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import tech.torlando.reticulumkt.ui.screens.InterfaceType
 import tech.torlando.reticulumkt.ui.theme.StatusConnected
 import tech.torlando.reticulumkt.ui.theme.StatusOffline
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
@@ -46,6 +53,30 @@ fun HomeScreen(
     val serviceState by viewModel.serviceState.collectAsState()
     val interfaces by viewModel.interfaces.collectAsState()
     val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
+    val context = LocalContext.current
+
+    // BLE permission launcher: request all BLE permissions before starting service
+    val blePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        // Start service regardless of grant result — BLE will gracefully degrade if denied
+        viewModel.startService()
+    }
+
+    // Check if BLE permissions are needed (any enabled BLE interface configured)
+    val needsBlePermissions = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+        interfaces.any { it.enabled && it.type == InterfaceType.BLE.name }
+
+    fun hasBlePermissions(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return listOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+        ).all {
+            ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -104,6 +135,12 @@ fun HomeScreen(
                         onClick = {
                             if (serviceState.isRunning) {
                                 viewModel.stopService()
+                            } else if (needsBlePermissions && !hasBlePermissions()) {
+                                blePermissionLauncher.launch(arrayOf(
+                                    Manifest.permission.BLUETOOTH_SCAN,
+                                    Manifest.permission.BLUETOOTH_CONNECT,
+                                    Manifest.permission.BLUETOOTH_ADVERTISE,
+                                ))
                             } else {
                                 viewModel.startService()
                             }

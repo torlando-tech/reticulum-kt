@@ -52,11 +52,16 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import tech.torlando.reticulumkt.data.StoredInterfaceConfig
 import tech.torlando.reticulumkt.ui.components.InterfaceTypeCard
 import tech.torlando.reticulumkt.ui.theme.StatusConnected
 import tech.torlando.reticulumkt.ui.theme.StatusOffline
 import tech.torlando.reticulumkt.viewmodel.ReticulumViewModel
+import tech.torlando.reticulumkt.viewmodel.SpawnedPeerInfo
 import tech.torlando.reticulumkt.viewmodel.TransportInterfaceInfo
 
 enum class InterfaceType(
@@ -86,12 +91,31 @@ fun InterfacesScreen(
     viewModel: ReticulumViewModel,
     onNavigateToTcpWizard: () -> Unit = {},
     onNavigateToRNodeWizard: () -> Unit = {},
+    onNavigateToBleConnections: (String) -> Unit = {},
 ) {
     val interfaces by viewModel.interfaces.collectAsState()
     val serviceState by viewModel.serviceState.collectAsState()
     val interfaceStatuses by viewModel.interfaceStatuses.collectAsState()
     val transportInterfaces by viewModel.transportInterfaces.collectAsState()
+    val spawnedPeers by viewModel.spawnedPeersByConfig.collectAsState()
     var navigation by remember { mutableStateOf<InterfaceNavigation>(InterfaceNavigation.None) }
+
+    // Delete confirmation state (hoisted to screen level for dialog stability)
+    var pendingDeleteConfig by remember { mutableStateOf<StoredInterfaceConfig?>(null) }
+
+    // BLE permission launcher: request all needed BLE permissions before enabling
+    var pendingBleToggle by remember { mutableStateOf<StoredInterfaceConfig?>(null) }
+    val blePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val allGranted = results.values.all { it }
+        if (allGranted) {
+            pendingBleToggle?.let { iface ->
+                viewModel.updateInterface(iface.copy(enabled = true))
+            }
+        }
+        pendingBleToggle = null
+    }
 
     // Filter transport interfaces to find shared instance server and its spawned clients
     val sharedInstanceServer = transportInterfaces.find { it.isLocalSharedInstance }
@@ -177,34 +201,92 @@ fun InterfacesScreen(
                             modifier = Modifier.padding(top = if (sharedInstanceServer != null) 8.dp else 0.dp, bottom = 4.dp)
                         )
                     }
-                    items(interfaces, key = { it.id }) { iface ->
+                    interfaces.forEach { iface ->
                         val actualStatus = interfaceStatuses[iface.id]
                         val isActuallyOnline = actualStatus?.isOnline ?: false
+                        val peerList = spawnedPeers[iface.id] ?: emptyList()
 
-                        InterfaceCard(
-                            config = iface,
-                            isOnline = isActuallyOnline,
-                            onToggle = { enabled ->
-                                viewModel.updateInterface(iface.copy(enabled = enabled))
-                            },
-                            onDelete = { viewModel.removeInterface(iface.id) },
-                            onEdit = {
-                                val type = try {
-                                    InterfaceType.valueOf(iface.type)
-                                } catch (e: Exception) {
-                                    InterfaceType.TCP_CLIENT
+                        item(key = iface.id) {
+                            InterfaceCard(
+                                config = iface,
+                                isOnline = isActuallyOnline,
+                                peerCount = peerList.size,
+                                onToggle = { enabled ->
+                                    if (enabled && iface.type == InterfaceType.BLE.name && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                        // Request BLE permissions before enabling
+                                        pendingBleToggle = iface
+                                        blePermissionLauncher.launch(arrayOf(
+                                            Manifest.permission.BLUETOOTH_SCAN,
+                                            Manifest.permission.BLUETOOTH_CONNECT,
+                                            Manifest.permission.BLUETOOTH_ADVERTISE,
+                                        ))
+                                    } else {
+                                        viewModel.updateInterface(iface.copy(enabled = enabled))
+                                    }
+                                },
+                                onDelete = { pendingDeleteConfig = iface },
+                                onEdit = {
+                                    val type = try {
+                                        InterfaceType.valueOf(iface.type)
+                                    } catch (e: Exception) {
+                                        InterfaceType.TCP_CLIENT
+                                    }
+                                    when (type) {
+                                        InterfaceType.TCP_CLIENT -> onNavigateToTcpWizard()
+                                        InterfaceType.RNODE -> onNavigateToRNodeWizard()
+                                        else -> navigation = InterfaceNavigation.Edit(iface)
+                                    }
                                 }
-                                when (type) {
-                                    InterfaceType.TCP_CLIENT -> onNavigateToTcpWizard()
-                                    InterfaceType.RNODE -> onNavigateToRNodeWizard()
-                                    else -> navigation = InterfaceNavigation.Edit(iface)
+                            )
+                        }
+
+                        // Show spawned peers under parent
+                        if (peerList.isNotEmpty()) {
+                            items(peerList, key = { "peer_${iface.id}_${it.name}" }) { peer ->
+                                SpawnedPeerCard(peer = peer)
+                            }
+                        }
+
+                        // For BLE interfaces, always show "View Connections" link
+                        val ifaceType = try { InterfaceType.valueOf(iface.type) } catch (_: Exception) { null }
+                        if (ifaceType == InterfaceType.BLE && iface.enabled) {
+                            item(key = "ble_nav_${iface.id}") {
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 24.dp),
+                                    onClick = { onNavigateToBleConnections(iface.id) },
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Bluetooth,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "View BLE Connections",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
                                 }
                             }
-                        )
+                        }
                     }
                 }
 
-                item { Spacer(modifier = Modifier.height(80.dp)) }
+                item { Spacer(modifier = Modifier.height(160.dp)) }
             }
         }
     }
@@ -248,6 +330,28 @@ fun InterfacesScreen(
             )
         }
         else -> { /* No dialog */ }
+    }
+
+    // Hoisted delete confirmation dialog
+    pendingDeleteConfig?.let { config ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteConfig = null },
+            title = { Text("Delete Interface") },
+            text = { Text("Delete \"${config.name}\"? This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.removeInterface(config.id)
+                    pendingDeleteConfig = null
+                }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteConfig = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -510,11 +614,97 @@ private fun SpawnedClientCard(client: TransportInterfaceInfo) {
     }
 }
 
+@Composable
+private fun SpawnedPeerCard(peer: SpawnedPeerInfo) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 24.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = if (peer.peerAddress != null) Icons.Filled.Bluetooth else Icons.Filled.Sensors,
+                contentDescription = null,
+                tint = if (peer.isOnline) StatusConnected else StatusOffline,
+                modifier = Modifier.size(24.dp)
+            )
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = peer.name,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                // Show BLE-specific info (RSSI + connection duration)
+                if (peer.peerAddress != null) {
+                    val duration = peer.connectedSince?.let {
+                        formatDuration(System.currentTimeMillis() - it)
+                    } ?: ""
+                    val rssiText = peer.discoveryRssi?.let { "${it} dBm" } ?: ""
+                    val detail = listOfNotNull(
+                        rssiText.ifEmpty { null },
+                        duration.ifEmpty { null },
+                    ).joinToString(" | ")
+                    if (detail.isNotEmpty()) {
+                        Text(
+                            text = detail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = if (peer.isOnline) "Online" else "Offline",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (peer.isOnline) StatusConnected else StatusOffline
+                )
+                Text(
+                    text = "${formatBytes(peer.rxBytes)} / ${formatBytes(peer.txBytes)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+private fun formatDuration(millis: Long): String {
+    val seconds = millis / 1000
+    val minutes = seconds / 60
+    val hours = minutes / 60
+    return when {
+        hours > 0 -> "${hours}h ${minutes % 60}m"
+        minutes > 0 -> "${minutes}m ${seconds % 60}s"
+        else -> "${seconds}s"
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    return when {
+        bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
+        bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
+        else -> "$bytes B"
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun InterfaceCard(
     config: StoredInterfaceConfig,
     isOnline: Boolean,
+    peerCount: Int = 0,
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit,
     onEdit: () -> Unit = {},
@@ -534,7 +724,6 @@ private fun InterfaceCard(
     }
 
     var showContextMenu by remember { mutableStateOf(false) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
 
     Box {
@@ -598,6 +787,22 @@ private fun InterfaceCard(
                             else -> StatusOffline
                         }
                     )
+                    if (peerCount > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.People,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "$peerCount",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                     Switch(
                         checked = config.enabled,
                         onCheckedChange = onToggle,
@@ -624,7 +829,7 @@ private fun InterfaceCard(
                 text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
                 onClick = {
                     showContextMenu = false
-                    showDeleteConfirm = true
+                    onDelete()
                 },
                 leadingIcon = {
                     Icon(
@@ -637,24 +842,4 @@ private fun InterfaceCard(
         }
     }
 
-    if (showDeleteConfirm) {
-        AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
-            title = { Text("Delete Interface") },
-            text = { Text("Delete \"${config.name}\"? This cannot be undone.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    showDeleteConfirm = false
-                    onDelete()
-                }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) {
-                    Text("Cancel")
-                }
-            },
-        )
-    }
 }

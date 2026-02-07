@@ -95,6 +95,7 @@ private fun rememberBluetoothPermissions(): MultiplePermissionsState {
         listOf(
             android.Manifest.permission.BLUETOOTH_SCAN,
             android.Manifest.permission.BLUETOOTH_CONNECT,
+            android.Manifest.permission.BLUETOOTH_ADVERTISE,
         )
     } else {
         listOf(
