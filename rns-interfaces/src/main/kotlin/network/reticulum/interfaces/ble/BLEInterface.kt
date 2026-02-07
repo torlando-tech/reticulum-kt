@@ -58,9 +58,9 @@ class BLEInterface(
     // Identity hex -> BLE MAC address (for reverse lookup)
     private val identityToAddress = ConcurrentHashMap<String, String>()
 
-    // Temporary blacklist: address -> blacklist expiry timestamp
-    private val blacklist = ConcurrentHashMap<String, Long>()
-    private val blacklistDurationMs = 60_000L // 60 seconds
+    // Exponential blacklist: address -> expiry + failure count
+    private data class BlacklistEntry(val expiry: Long, val failureCount: Int)
+    private val blacklist = ConcurrentHashMap<String, BlacklistEntry>()
 
     // Reconnection backoff: address -> next-attempt-after timestamp
     private val reconnectBackoff = ConcurrentHashMap<String, Long>()
@@ -106,6 +106,7 @@ class BLEInterface(
         scope.launch { collectIncomingConnections() }
         scope.launch { collectDisconnections() }
         scope.launch { periodicCleanup() }
+        scope.launch { zombieDetectionLoop() }
     }
 
     /**
@@ -152,8 +153,11 @@ class BLEInterface(
             // Skip if already connected to this address
             if (addressToIdentity.containsKey(peer.address)) return@collect
 
-            // Skip if blacklisted
-            if (isBlacklisted(peer.address)) return@collect
+            // Blacklist forgiveness: re-discovery proves peer is alive
+            if (blacklist.containsKey(peer.address)) {
+                log("Cleared blacklist for re-discovered ${peer.address.takeLast(8)}")
+                blacklist.remove(peer.address)
+            }
 
             // Skip if in reconnection backoff
             if (isInBackoff(peer.address)) return@collect
@@ -203,7 +207,7 @@ class BLEInterface(
             identityToAddress[identityHex] = address
 
             // Spawn peer interface
-            spawnPeerInterface(address, identityHex, peerIdentity, connection)
+            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = peer.rssi)
 
             log("Connected to ${identityHex.take(8)} at ${address.takeLast(8)}")
 
@@ -211,7 +215,7 @@ class BLEInterface(
             throw e // Don't catch coroutine cancellation
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             log("Handshake timeout for ${address.takeLast(8)}, blacklisting")
-            blacklist[address] = System.currentTimeMillis() + blacklistDurationMs
+            addToBlacklist(address)
             try { driver.disconnect(address) } catch (_: Exception) {}
         } catch (e: Exception) {
             log("Connection failed for ${address.takeLast(8)}: ${e.message}")
@@ -281,8 +285,8 @@ class BLEInterface(
             addressToIdentity[address] = identityHex
             identityToAddress[identityHex] = address
 
-            // Spawn peer interface
-            spawnPeerInterface(address, identityHex, peerIdentity, connection)
+            // Spawn peer interface (incoming connections don't have scan RSSI, use mid-range default)
+            spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70)
 
             log("Accepted peer ${identityHex.take(8)} from ${address.takeLast(8)}")
 
@@ -290,7 +294,7 @@ class BLEInterface(
             throw e
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             log("Identity handshake timeout for incoming ${address.takeLast(8)}, disconnecting")
-            blacklist[address] = System.currentTimeMillis() + blacklistDurationMs
+            addToBlacklist(address)
             try { driver.disconnect(address) } catch (_: Exception) {}
         } catch (e: Exception) {
             log("Failed to process incoming connection from ${address.takeLast(8)}: ${e.message}")
@@ -352,11 +356,13 @@ class BLEInterface(
         identityHex: String,
         peerIdentity: ByteArray,
         connection: BLEPeerConnection,
+        rssi: Int = -100,
     ) {
         // Check if interface already exists for this identity (MAC rotation)
         val existing = peers[identityHex]
         if (existing != null) {
             existing.updateConnection(connection, address)
+            existing.discoveryRssi = rssi
             addressToIdentity[address] = identityHex
             identityToAddress[identityHex] = address
             log("Reused existing interface for ${identityHex.take(8)} at new address ${address.takeLast(8)}")
@@ -371,6 +377,7 @@ class BLEInterface(
             peerIdentity = peerIdentity,
         )
         peerInterface.parentInterface = this
+        peerInterface.discoveryRssi = rssi
 
         // Set callback BEFORE toRef() -- InterfaceAdapter only sets if null
         peerInterface.onPacketReceived = { data, iface ->
@@ -450,12 +457,27 @@ class BLEInterface(
     // ---- Blacklist and Backoff ----
 
     private fun isBlacklisted(address: String): Boolean {
-        val expiry = blacklist[address] ?: return false
-        if (System.currentTimeMillis() > expiry) {
+        val entry = blacklist[address] ?: return false
+        if (System.currentTimeMillis() > entry.expiry) {
             blacklist.remove(address)
             return false
         }
         return true
+    }
+
+    /**
+     * Add an address to the blacklist with exponential backoff.
+     * Duration grows: 60s, 120s, 180s, 240s, 300s, 360s, 420s, 480s (capped at 8x base).
+     */
+    private fun addToBlacklist(address: String) {
+        val existing = blacklist[address]
+        val count = (existing?.failureCount ?: 0) + 1
+        val duration = BLEConstants.BLACKLIST_BASE_DURATION_MS * minOf(count, BLEConstants.BLACKLIST_MAX_MULTIPLIER)
+        blacklist[address] = BlacklistEntry(
+            expiry = System.currentTimeMillis() + duration,
+            failureCount = count,
+        )
+        log("Blacklisted ${address.takeLast(8)} for ${duration / 1000}s (failure #$count)")
     }
 
     private fun isInBackoff(address: String): Boolean {
@@ -477,10 +499,50 @@ class BLEInterface(
             val now = System.currentTimeMillis()
 
             // Clean expired blacklist entries
-            blacklist.entries.removeIf { it.value < now }
+            blacklist.entries.removeIf { it.value.expiry < now }
 
             // Clean expired backoff entries
             reconnectBackoff.entries.removeIf { it.value < now }
+        }
+    }
+
+    // ---- Zombie Detection ----
+
+    /**
+     * Periodically check for zombie peers (connected but unresponsive).
+     *
+     * A peer is declared zombie if no traffic (data or keepalive) has been received
+     * for [BLEConstants.ZOMBIE_TIMEOUT_MS] (45 seconds = 3 missed keepalives).
+     *
+     * Flow: graceful disconnect -> grace period -> force teardown -> blacklist.
+     */
+    private suspend fun zombieDetectionLoop() {
+        while (online.get() && !detached.get()) {
+            delay(BLEConstants.ZOMBIE_CHECK_INTERVAL_MS)
+            val now = System.currentTimeMillis()
+
+            for ((identityHex, peerInterface) in peers.toMap()) {
+                val lastTraffic = peerInterface.lastTrafficReceived
+                if (now - lastTraffic > BLEConstants.ZOMBIE_TIMEOUT_MS) {
+                    log("Zombie detected: ${identityHex.take(8)} (no traffic for ${(now - lastTraffic) / 1000}s)")
+
+                    // Attempt graceful disconnect first
+                    val address = identityToAddress[identityHex]
+                    if (address != null) {
+                        try { driver.disconnect(address) } catch (_: Exception) {}
+                    }
+
+                    // Grace period for clean close
+                    delay(BLEConstants.ZOMBIE_GRACE_PERIOD_MS)
+
+                    // Force teardown if still present
+                    if (peers.containsKey(identityHex)) {
+                        tearDownPeer(identityHex)
+                        // Blacklist after zombie teardown
+                        if (address != null) addToBlacklist(address)
+                    }
+                }
+            }
         }
     }
 
