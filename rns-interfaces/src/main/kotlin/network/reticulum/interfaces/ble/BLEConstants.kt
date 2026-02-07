@@ -143,4 +143,24 @@ object BLEConstants {
      * Devices weaker than this are ignored during discovery.
      */
     const val MIN_RSSI_DBM = -85
+
+    // ---- Hardening ----
+
+    /** Zombie timeout: no traffic for this long declares a peer zombie. 3 missed keepalives = 45s. */
+    const val ZOMBIE_TIMEOUT_MS = 45_000L
+
+    /** How often to check for zombie peers. Same cadence as keepalive. */
+    const val ZOMBIE_CHECK_INTERVAL_MS = 15_000L
+
+    /** Grace period after attempting graceful disconnect before force-close. */
+    const val ZOMBIE_GRACE_PERIOD_MS = 5_000L
+
+    /** Base duration for blacklist backoff (60 seconds). */
+    const val BLACKLIST_BASE_DURATION_MS = 60_000L
+
+    /** Maximum multiplier for exponential blacklist backoff. 60s * 8 = 480s cap. */
+    const val BLACKLIST_MAX_MULTIPLIER = 8
+
+    /** Eviction margin: new peer must score this much higher than lowest peer to justify eviction. */
+    const val EVICTION_MARGIN = 0.15
 }

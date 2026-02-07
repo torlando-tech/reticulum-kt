@@ -52,6 +52,14 @@ class BLEPeerInterface(
     @Volatile
     private var lastKeepaliveReceived = System.currentTimeMillis()
 
+    // Traffic tracking for zombie detection (any traffic, including keepalives)
+    @Volatile
+    var lastTrafficReceived: Long = System.currentTimeMillis()
+
+    // RSSI at discovery time, used for scoring/eviction decisions
+    @Volatile
+    var discoveryRssi: Int = -100
+
     init {
         this.parentInterface = parentBleInterface
     }
@@ -75,6 +83,9 @@ class BLEPeerInterface(
         try {
             connection.receivedFragments.collect { fragment ->
                 if (!online.get() || detached.get()) return@collect
+
+                // Any traffic resets the zombie detection timer
+                lastTrafficReceived = System.currentTimeMillis()
 
                 // Filter keepalive bytes (single 0x00)
                 if (fragment.size == 1 && fragment[0] == BLEConstants.KEEPALIVE_BYTE) {
@@ -186,6 +197,9 @@ class BLEPeerInterface(
         connection = newConnection
         fragmenter = BLEFragmenter(newConnection.mtu)
         reassembler = BLEReassembler()
+
+        // MAC rotation proves liveness -- reset zombie detection timer
+        lastTrafficReceived = System.currentTimeMillis()
 
         // Restart receive and keepalive
         receiveJob = scope.launch { receiveLoop() }
