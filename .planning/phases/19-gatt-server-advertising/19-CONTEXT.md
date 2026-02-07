@@ -32,18 +32,17 @@ Implement the BLE peripheral role: host a GATT service with Reticulum characteri
 - Report and stop on GATT server init failure — emit error event, let InterfaceManager/BLEInterface decide retry policy
 
 ### Module Placement
-- **Android dependencies in rns-interfaces** — add Android BLE APIs to the rns-interfaces module. This is a purpose-built Android implementation; pure JVM compatibility for BLE code is not a goal
-- BleGattServer, BleAdvertiser, and BleOperationQueue all live in `rns-interfaces` under the existing `network.reticulum.interfaces.ble` package
+- **Android BLE code in rns-android** — BleGattServer, BleAdvertiser, AndroidBLEDriver go in `rns-android` (already an Android library module). rns-interfaces stays pure JVM to avoid breaking rns-test, rns-cli, lxmf-core, lxmf-examples
+- BLEDriver interface and BleOperationQueue stay in `rns-interfaces` (pure JVM, coroutines-only)
+- BLE implementation classes live in `rns-android` under the `ble/` package, implementing the BLEDriver contract from rns-interfaces
 - RNode BLE code (BluetoothLeConnection.kt, NUS-related code) stays in rns-sample-app — different BLE use case
 - BLEInterface appears in the sample app like any other Reticulum interface (TCP, Auto, RNode) — the peripheral role is an invisible implementation detail, no special UI
 - Fate of BLEDriver interface/BLEPeerConnection from Phase 18: Claude's discretion on whether to keep, simplify, or merge
-- Gradle dependency isolation strategy: Claude's discretion on source sets vs mixed deps
 
 ### Claude's Discretion
 - Per-device state caching on reconnect (fresh vs brief cache)
 - BLEDriver/BLEPeerConnection fate (keep abstraction or fold into concrete classes)
 - BleOperationQueue as standalone vs built-in (consider Phase 20 reuse)
-- Gradle source set isolation for Android BLE deps
 - Advertising resilience mechanism (periodic restart vs monitor+restart)
 - Testing strategy (mock Android APIs vs device-only tests)
 
