@@ -13,6 +13,7 @@ import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
 import network.reticulum.common.Platform
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.InterfaceMode
 import network.reticulum.common.TransportType
 import network.reticulum.common.concatBytes
 import network.reticulum.common.toHexString
@@ -2292,7 +2293,7 @@ object Transport {
             timestamp = System.currentTimeMillis(),
             nextHop = destHash.copyOf(), // For direct announces, next hop is the destination
             hops = packet.hops,
-            expires = System.currentTimeMillis() + TransportConstants.PATHFINDER_E,
+            expires = System.currentTimeMillis() + AnnounceFilter.pathExpiryForMode(interfaceRef.mode),
             randomBlobs = mutableListOf(announceData.randomHash),
             receivingInterfaceHash = interfaceRef.hash,
             announcePacketHash = packet.packetHash
@@ -2418,10 +2419,16 @@ object Transport {
         )
         announceTable[destKey] = announceEntry
 
-        // Queue on all interfaces except the receiving one
+        // Queue on all interfaces except the receiving one, applying mode-based filtering
+        // Matches Python Transport.py:1040-1084
+        val isLocal = destinations.any { it.hash.contentEquals(destinationHash) }
+        val sourceMode = nextHopInterface(destinationHash)?.mode
+
         for (iface in interfaces) {
-            if (iface.canSend && iface.online &&
-                !iface.hash.contentEquals(receivingInterface.hash)) {
+            if (!iface.canSend || !iface.online ||
+                iface.hash.contentEquals(receivingInterface.hash)) continue
+
+            if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
                 queueAnnounce(
                     destinationHash = destinationHash,
                     raw = announceEntry.raw,
@@ -3950,6 +3957,10 @@ interface InterfaceRef {
     val canSend: Boolean
     val canReceive: Boolean
     val online: Boolean
+
+    /** Interface operational mode. */
+    val mode: InterfaceMode
+        get() = InterfaceMode.FULL
 
     /** Bitrate in bits per second (0 if unknown). */
     val bitrate: Int

@@ -1,5 +1,6 @@
 package network.reticulum.interfaces
 
+import network.reticulum.common.InterfaceMode
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import java.util.concurrent.ConcurrentHashMap
@@ -14,6 +15,7 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val canSend: Boolean = iface.canSend
     override val canReceive: Boolean = iface.canReceive
     override val online: Boolean get() = iface.online.get()
+    override val mode: InterfaceMode get() = iface.mode
 
     // Tunnel properties - delegate to underlying interface
     override var tunnelId: ByteArray?
