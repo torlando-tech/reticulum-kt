@@ -294,6 +294,9 @@ object Transport {
             loadTunnelTable()
         }
 
+        // Load path table and packet hashlist from storage
+        loadPersistedDataFromStorage()
+
         // Start background job loop
         // On Android with coroutine scope provided, use coroutines
         // Otherwise, use traditional thread-based approach
@@ -372,6 +375,9 @@ object Transport {
         if (transportEnabled) {
             persistData()
         }
+
+        // Save path table and packet hashlist to storage
+        persistDataToStorage()
 
         tunnels.clear()
         tunnelInterfaces.clear()
@@ -3061,6 +3067,9 @@ object Transport {
         if (transportEnabled) {
             saveTunnelTable()
         }
+
+        // Save path table and packet hashlist periodically
+        persistDataToStorage()
     }
 
     private fun runJobs() {
@@ -3835,6 +3844,30 @@ object Transport {
      */
     fun persistData() {
         saveTunnelTable()
+    }
+
+    /**
+     * Save path table and packet hashlist to storage directory.
+     * Uses filenames matching Python reference: "destination_table" and "packet_hashlist".
+     */
+    private fun persistDataToStorage() {
+        if (storagePath.isBlank()) return
+        val dir = java.io.File(storagePath)
+        dir.mkdirs()
+        savePathTable(java.io.File(dir, "destination_table"))
+        savePacketHashlist(java.io.File(dir, "packet_hashlist"))
+    }
+
+    /**
+     * Load path table and packet hashlist from storage directory.
+     * Uses filenames matching Python reference: "destination_table" and "packet_hashlist".
+     */
+    private fun loadPersistedDataFromStorage() {
+        if (storagePath.isBlank()) return
+        val dir = java.io.File(storagePath)
+        if (!dir.exists()) return
+        loadPathTable(java.io.File(dir, "destination_table"))
+        loadPacketHashlist(java.io.File(dir, "packet_hashlist"))
     }
 
     /**

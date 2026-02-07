@@ -51,8 +51,6 @@ Features that exist in the Python reference but are not yet implemented:
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Announce bandwidth capping | High | Python caps announces at 2% of interface bandwidth to prevent flooding slow links (LoRa/BLE) |
-| Path table persistence | High | Save/restore path tables, tunnel tables, and packet hashlist across restarts |
 | Packet cache & cache requests | High | Cache packets and respond to cache requests for path establishment |
 | Link MTU discovery | Medium | Auto-negotiate per-link MTU (`LINK_MTU_DISCOVERY`) |
 | PHY stats on packets | Medium | Expose RSSI/SNR/Q from RNode through the Packet API |
