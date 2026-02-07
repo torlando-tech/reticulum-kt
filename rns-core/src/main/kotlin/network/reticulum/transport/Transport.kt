@@ -1849,8 +1849,8 @@ object Transport {
      */
     private fun processPathRequest(
         destinationHash: ByteArray,
-        @Suppress("UNUSED_PARAMETER") receivingInterface: InterfaceRef,
-        @Suppress("UNUSED_PARAMETER") requestingTransportId: ByteArray?,
+        receivingInterface: InterfaceRef,
+        requestingTransportId: ByteArray?,
         @Suppress("UNUSED_PARAMETER") tag: ByteArray
     ) {
         // Check if this is a local destination
@@ -1870,11 +1870,66 @@ object Transport {
         }
 
         // Check if we know a path (transport nodes can forward cached announces)
+        // Python Transport.py:2723-2781
         val pathEntry = pathTable[destinationHash.toKey()]
         if (pathEntry != null && !pathEntry.isExpired()) {
-            // Note: To forward cached announces, we would need to store the raw announce data
-            // in the path table or a separate announce cache. For now, just log that we know the path.
-            log("We know path to ${destinationHash.toHexString()} (${pathEntry.hops} hops), announce forwarding requires caching")
+            if (transportEnabled || localClientInterfaces.isNotEmpty()) {
+                log("Path to ${destinationHash.toHexString()} known (${pathEntry.hops} hops), retrieving cached announce")
+                val cachedData = getCachedAnnouncePacket(pathEntry.announcePacketHash)
+
+                if (cachedData == null) {
+                    log("Could not retrieve cached announce for ${destinationHash.toHexString()}")
+                    return
+                }
+
+                val (raw, interfaceName) = cachedData
+                val cachedPacket = Packet.unpack(raw)
+                if (cachedPacket == null) {
+                    log("Could not unpack cached announce for ${destinationHash.toHexString()}")
+                    return
+                }
+
+                // Find the original receiving interface
+                val originalInterface = interfaceName?.let { name ->
+                    interfaces.find { it.name == name }
+                }
+
+                // Set hop count from path table (Python line 2736)
+                cachedPacket.hops = pathEntry.hops
+
+                // Roaming mode check: don't answer if path is on the same roaming-mode interface
+                // Python line 2731-2732
+                if (receivingInterface.mode == InterfaceMode.ROAMING &&
+                    originalInterface != null &&
+                    receivingInterface.hash.contentEquals(originalInterface.hash)) {
+                    log("Not answering path request on roaming-mode interface (same interface)")
+                    return
+                }
+
+                // Loop prevention: don't answer if next hop is the requestor
+                // Python line 2738-2745
+                if (requestingTransportId != null &&
+                    pathEntry.nextHop.contentEquals(requestingTransportId)) {
+                    log("Not answering path request, next hop is the requestor")
+                    return
+                }
+
+                log("Answering path request for ${destinationHash.toHexString()}, forwarding cached announce")
+
+                // Hold any existing announce table entry to avoid losing an in-flight announce
+                // Python line 2777-2779
+                val existingEntry = announceTable[cachedPacket.destinationHash.toKey()]
+                if (existingEntry != null) {
+                    holdAnnounce(cachedPacket.destinationHash, existingEntry.raw)
+                }
+
+                // Queue for retransmission via the announce forwarding system
+                queueAnnounceRetransmit(
+                    destinationHash,
+                    cachedPacket,
+                    originalInterface ?: receivingInterface
+                )
+            }
         }
     }
 
@@ -2341,6 +2396,13 @@ object Transport {
             } catch (e: Exception) {
                 log("Announce handler error: ${e.message}")
             }
+        }
+
+        // Cache the announce packet for later path request responses
+        // Python Transport.py:1867 — cache pre-increment raw announce to disk
+        // Only cache if not connected to a shared instance (the server handles caching)
+        if (!interfaces.any { it.isConnectedToSharedInstance }) {
+            cacheAnnouncePacket(packet, interfaceRef)
         }
 
         // Python RNS: Immediately retransmit announces to local clients
