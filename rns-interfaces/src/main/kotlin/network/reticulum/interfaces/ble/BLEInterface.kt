@@ -66,6 +66,9 @@ class BLEInterface(
     private val reconnectBackoff = ConcurrentHashMap<String, Long>()
     private val reconnectDelayMs = 7_000L // 7s within the 5-10s range
 
+    // Addresses currently being connected to (prevents concurrent attempts to same address)
+    private val pendingConnections = ConcurrentHashMap.newKeySet<String>()
+
     init {
         spawnedInterfaces = mutableListOf()
     }
@@ -79,6 +82,7 @@ class BLEInterface(
      */
     override fun start() {
         online.set(true)
+        log("start() called — launching BLE coroutines")
 
         // Start advertising (peripheral role)
         scope.launch {
@@ -135,6 +139,7 @@ class BLEInterface(
         peers.clear()
         addressToIdentity.clear()
         identityToAddress.clear()
+        pendingConnections.clear()
 
         // Shut down the BLE driver
         driver.shutdown()
@@ -153,11 +158,11 @@ class BLEInterface(
             // Skip if already connected to this address
             if (addressToIdentity.containsKey(peer.address)) return@collect
 
-            // Blacklist forgiveness: re-discovery proves peer is alive
-            if (blacklist.containsKey(peer.address)) {
-                log("Cleared blacklist for re-discovered ${peer.address.takeLast(8)}")
-                blacklist.remove(peer.address)
-            }
+            // Skip if already attempting connection to this address
+            if (pendingConnections.contains(peer.address)) return@collect
+
+            // Skip if blacklisted (don't clear on re-discovery — let blacklist expire naturally)
+            if (isBlacklisted(peer.address)) return@collect
 
             // Skip if in reconnection backoff
             if (isInBackoff(peer.address)) return@collect
@@ -177,8 +182,13 @@ class BLEInterface(
             }
 
             // Attempt connection in a separate coroutine
+            pendingConnections.add(peer.address)
             scope.launch {
-                connectToPeer(peer)
+                try {
+                    connectToPeer(peer)
+                } finally {
+                    pendingConnections.remove(peer.address)
+                }
             }
         }
     }
@@ -206,10 +216,19 @@ class BLEInterface(
             val peerIdentity = performHandshakeAsCentral(connection)
             val identityHex = peerIdentity.toHex()
 
-            // Check for duplicate identity (same identity at different address)
+            // Check for duplicate identity (same peer at different address due to MAC rotation)
             val existingAddress = identityToAddress[identityHex]
             if (existingAddress != null && existingAddress != address) {
-                log("Duplicate identity ${identityHex.take(8)}: replacing ${existingAddress.takeLast(8)} with ${address.takeLast(8)}")
+                val existing = peers[identityHex]
+                if (existing != null && existing.online.get() && !existing.detached.get()) {
+                    // Existing connection is healthy — keep it, reject new
+                    log("Duplicate identity ${identityHex.take(8)}: keeping existing at ${existingAddress.takeLast(8)}, rejecting outgoing ${address.takeLast(8)}")
+                    reconnectBackoff[address] = System.currentTimeMillis() + 30_000
+                    try { driver.disconnect(address) } catch (_: Exception) {}
+                    return
+                }
+                // Existing connection is dead — replace it
+                log("Duplicate identity ${identityHex.take(8)}: replacing dead ${existingAddress.takeLast(8)} with ${address.takeLast(8)}")
                 tearDownPeer(identityHex)
             }
 
@@ -222,12 +241,18 @@ class BLEInterface(
 
             log("Connected to ${identityHex.take(8)} at ${address.takeLast(8)}")
 
-        } catch (e: CancellationException) {
-            throw e // Don't catch coroutine cancellation
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            // Re-check: an incoming connection may have completed handshake while we timed out.
+            // If so, don't disconnect — it would kill the healthy connection at this address.
+            if (addressToIdentity.containsKey(address)) {
+                log("Outgoing handshake timed out for ${address.takeLast(8)} but incoming connection already active, not disconnecting")
+                return
+            }
             log("Handshake timeout for ${address.takeLast(8)}, blacklisting")
             addToBlacklist(address)
             try { driver.disconnect(address) } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e // Don't catch coroutine cancellation
         } catch (e: Exception) {
             log("Connection failed for ${address.takeLast(8)}: ${e.message}")
             reconnectBackoff[address] = System.currentTimeMillis() + reconnectDelayMs
@@ -278,6 +303,15 @@ class BLEInterface(
      */
     private suspend fun handleIncomingConnection(connection: BLEPeerConnection) {
         val address = connection.address
+
+        // Skip if we already have a connection to this address (prevents dual central+peripheral
+        // connections to the same device, where the peripheral handshake would hang forever and
+        // then driver.disconnect() would kill the healthy central connection too)
+        if (addressToIdentity.containsKey(address)) {
+            log("Already connected to ${address.takeLast(8)}, skipping incoming handshake")
+            return  // Don't disconnect — would kill the healthy connection at this address
+        }
+
         log("Incoming connection from ${address.takeLast(8)}, waiting for identity handshake...")
 
         try {
@@ -285,10 +319,19 @@ class BLEInterface(
             val peerIdentity = performHandshakeAsPeripheral(connection)
             val identityHex = peerIdentity.toHex()
 
-            // Check for duplicate identity
+            // Check for duplicate identity (same peer at different address due to MAC rotation)
             val existingAddress = identityToAddress[identityHex]
             if (existingAddress != null && existingAddress != address) {
-                log("Duplicate identity ${identityHex.take(8)}: replacing ${existingAddress.takeLast(8)} with ${address.takeLast(8)}")
+                val existing = peers[identityHex]
+                if (existing != null && existing.online.get() && !existing.detached.get()) {
+                    // Existing connection is healthy — keep it, reject incoming
+                    log("Duplicate identity ${identityHex.take(8)}: keeping existing at ${existingAddress.takeLast(8)}, rejecting incoming ${address.takeLast(8)}")
+                    reconnectBackoff[address] = System.currentTimeMillis() + 30_000
+                    try { driver.disconnect(address) } catch (_: Exception) {}
+                    return
+                }
+                // Existing connection is dead — replace it
+                log("Duplicate identity ${identityHex.take(8)}: replacing dead ${existingAddress.takeLast(8)} with incoming ${address.takeLast(8)}")
                 tearDownPeer(identityHex)
             }
 
@@ -323,12 +366,18 @@ class BLEInterface(
 
             log("Accepted peer ${identityHex.take(8)} from ${address.takeLast(8)}")
 
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            // Re-check: a healthy outgoing connection may have completed while we were waiting.
+            // If so, don't disconnect — it would kill the healthy connection at this address.
+            if (addressToIdentity.containsKey(address)) {
+                log("Incoming handshake timed out for ${address.takeLast(8)} but outgoing connection already active, not disconnecting")
+                return
+            }
             log("Identity handshake timeout for incoming ${address.takeLast(8)}, disconnecting")
             addToBlacklist(address)
             try { driver.disconnect(address) } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             log("Failed to process incoming connection from ${address.takeLast(8)}: ${e.message}")
             try { driver.disconnect(address) } catch (_: Exception) {}
