@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-02-06)
 
 ## Current Position
 
-Phase: 21 of 22 (BLEInterface Orchestration)
-Plan: 02 of 02 in phase
-Status: Phase complete
-Last activity: 2026-02-06 - Completed 21-02-PLAN.md (InterfaceManager BLE integration)
+Phase: 22 of 22 (Hardening and Edge Cases)
+Plan: 01 of 02 in phase
+Status: In progress
+Last activity: 2026-02-07 - Completed 22-01-PLAN.md (Zombie detection and exponential blacklist)
 
-Progress: v3 [██████████░░] 80%
+Progress: v3 [███████████░] 90%
 
 ## Milestone Goals
 
@@ -25,12 +25,12 @@ Progress: v3 [██████████░░] 80%
 - Phase 19: GATT Server and Advertising (peripheral role) -- COMPLETE (2/2 plans)
 - Phase 20: GATT Client and Scanner (central role) -- COMPLETE (2/2 plans)
 - Phase 21: BLEInterface Orchestration (MAC sorting, identity, dual-role, Transport) -- COMPLETE (2/2 plans)
-- Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup)
+- Phase 22: Hardening and Edge Cases (zombie detection, blacklisting, dedup) -- IN PROGRESS (1/2 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8 (v3)
+- Total plans completed: 9 (v3)
 - 18-01: 3min (BLE driver contract)
 - 18-02: 4min (BLE fragmentation and reassembly)
 - 19-01: 3min (GATT server implementation)
@@ -39,6 +39,7 @@ Progress: v3 [██████████░░] 80%
 - 20-02: 2min (AndroidBLEDriver and internal visibility)
 - 21-01: 3min (BLEInterface and BLEPeerInterface orchestration)
 - 21-02: 2min (InterfaceManager BLE integration and manifest permissions)
+- 22-01: 3min (Zombie detection and exponential blacklist)
 
 **Historical (v2):**
 - 22 plans in ~58 minutes
@@ -53,6 +54,10 @@ Progress: v3 [██████████░░] 80%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [22-01]: Blacklist forgiveness replaces isBlacklisted check in collectDiscoveredPeers (re-discovery proves liveness)
+- [22-01]: Zombie timeout 45s = 3 missed keepalives (conservative to avoid false positives)
+- [22-01]: Linear multiplier (count * base) capped at 8x for exponential blacklist
+- [22-01]: Incoming connections get -70 RSSI default (no scan data available)
 - [21-02]: Fully-qualified type names for AndroidBLEDriver/BLEInterface in BLE case (single-use types, no imports)
 - [21-02]: Explicit BLUETOOTH_ADVERTISE in sample app manifest despite rns-android merger
 - [21-02]: No stopInterface() change needed -- else -> detach() fallback covers BLEInterface
@@ -170,6 +175,17 @@ BLE mesh orchestration layer complete:
 - Pure JVM: no Android imports, depends only on BLEDriver/BLEPeerConnection interfaces
 - Package: `network.reticulum.interfaces.ble` in rns-interfaces module
 
+### From 22-01 (Zombie Detection and Exponential Blacklist)
+
+BLE mesh hardening -- zombie detection and blacklist backoff:
+- `BLEConstants` hardening section: ZOMBIE_TIMEOUT_MS (45s), ZOMBIE_CHECK_INTERVAL_MS (15s), ZOMBIE_GRACE_PERIOD_MS (5s), BLACKLIST_BASE_DURATION_MS (60s), BLACKLIST_MAX_MULTIPLIER (8), EVICTION_MARGIN (0.15)
+- `BLEPeerInterface.lastTrafficReceived` -- updated on every incoming fragment (including keepalives)
+- `BLEPeerInterface.discoveryRssi` -- set by BLEInterface when spawning, available for eviction scoring
+- `BLEInterface.zombieDetectionLoop()` -- checks every 15s, graceful disconnect -> 5s grace -> force teardown -> blacklist
+- `BLEInterface.addToBlacklist()` -- single write path, exponential backoff: 60s * min(count, 8)
+- Blacklist forgiveness: `collectDiscoveredPeers()` clears blacklist on re-discovery via scan
+- `BlacklistEntry(expiry, failureCount)` data class replaces flat `Long` expiry
+
 ### From 21-02 (InterfaceManager BLE Integration)
 
 App-level BLE wiring complete:
@@ -199,6 +215,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-06T23:29:00Z
-Stopped at: Phase 21 complete — all 2 plans done (BLEInterface + InterfaceManager integration)
+Last session: 2026-02-07T00:05:00Z
+Stopped at: Completed 22-01-PLAN.md (Zombie detection and exponential blacklist)
 Resume file: None
