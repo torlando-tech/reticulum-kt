@@ -162,8 +162,19 @@ class BLEInterface(
             // Skip if in reconnection backoff
             if (isInBackoff(peer.address)) return@collect
 
-            // Skip if at capacity
-            if (peers.size >= maxConnections) return@collect
+            // At capacity: check if new peer is significantly better than worst existing
+            if (peers.size >= maxConnections) {
+                val (lowestIdentity, lowestScore) = findLowestScoredPeer() ?: return@collect
+                val newScore = peer.connectionScore()
+
+                if (newScore > lowestScore + BLEConstants.EVICTION_MARGIN) {
+                    log("Evicting ${lowestIdentity.take(8)} (score=${String.format("%.2f", lowestScore)}) for ${peer.address.takeLast(8)} (score=${String.format("%.2f", newScore)})")
+                    tearDownPeer(lowestIdentity)
+                    // Fall through to connection attempt
+                } else {
+                    return@collect  // New peer not significantly better
+                }
+            }
 
             // Attempt connection in a separate coroutine
             scope.launch {
@@ -284,6 +295,28 @@ class BLEInterface(
             // Store identity mapping
             addressToIdentity[address] = identityHex
             identityToAddress[identityHex] = address
+
+            // Handle capacity: accept incoming, then evaluate
+            if (peers.size >= maxConnections) {
+                // Spawn the new peer first so we can score it
+                spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70)
+
+                // Now find the lowest scorer among ALL peers (including new one)
+                val (lowestIdentity, _) = findLowestScoredPeer() ?: return
+
+                if (lowestIdentity == identityHex) {
+                    // New peer is the worst -- evict it
+                    log("Incoming peer ${identityHex.take(8)} scored lowest at capacity, removing")
+                    tearDownPeer(identityHex)
+                } else {
+                    // Evict existing worst peer to make room
+                    log("Evicting ${lowestIdentity.take(8)} to accept incoming ${identityHex.take(8)}")
+                    tearDownPeer(lowestIdentity)
+                }
+
+                log("Accepted peer ${identityHex.take(8)} from ${address.takeLast(8)}")
+                return  // Already spawned (or evicted) above
+            }
 
             // Spawn peer interface (incoming connections don't have scan RSSI, use mid-range default)
             spawnPeerInterface(address, identityHex, peerIdentity, connection, rssi = -70)
@@ -543,6 +576,36 @@ class BLEInterface(
                     }
                 }
             }
+        }
+    }
+
+    // ---- Eviction Scoring ----
+
+    /**
+     * Compute a connection score for an already-connected peer.
+     * Creates a synthetic [DiscoveredPeer] from the peer's current state and calls [DiscoveredPeer.connectionScore].
+     */
+    private fun computePeerScore(peerInterface: BLEPeerInterface): Double {
+        val identityHex = peerInterface.peerIdentity.toHex()
+        val address = identityToAddress[identityHex] ?: return 0.0
+        return DiscoveredPeer(
+            address = address,
+            rssi = peerInterface.discoveryRssi,
+            lastSeen = peerInterface.lastTrafficReceived,
+            connectionAttempts = 1,
+            connectionSuccesses = 1  // Connected peer = at least 1 success
+        ).connectionScore()
+    }
+
+    /**
+     * Find the lowest-scored connected peer for eviction decisions.
+     * @return Pair of (identityHex, score) or null if no peers connected
+     */
+    private fun findLowestScoredPeer(): Pair<String, Double>? {
+        return peers.entries.minByOrNull { (_, peerInterface) ->
+            computePeerScore(peerInterface)
+        }?.let { (identityHex, peerInterface) ->
+            identityHex to computePeerScore(peerInterface)
         }
     }
 
