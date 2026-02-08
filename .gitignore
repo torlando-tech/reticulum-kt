@@ -36,5 +36,11 @@ venv/
 # Local configuration
 local.properties
 
+# Claude Code / tooling
+.claude/
+.claude-flow/
+.mcp.json
+.planning/agent-history.json
+
 # Test identity files (binary keys)
 *_identity
