@@ -6,6 +6,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
+import java.util.Base64
 
 /**
  * LXMF Message class.
@@ -111,6 +112,31 @@ class LXMessage private constructor(
     /** Proof-of-work stamp (32 bytes, optional) */
     var stamp: ByteArray? = null
 
+    /** Whether the stamp has been validated */
+    var stampValid: Boolean = false
+
+    /** Whether the stamp has been checked */
+    var stampChecked: Boolean = false
+
+    /** Validated stamp value (leading zero bits), or null if not checked */
+    var stampValue: Int? = null
+
+    /** Required stamp cost for this message */
+    var stampCost: Int? = null
+
+    /** Outbound ticket for stamp bypass */
+    var outboundTicket: ByteArray? = null
+
+    /** Whether to include a ticket in this message */
+    var includeTicket: Boolean = false
+
+    /** Whether to defer stamp generation (compute later in background) */
+    var deferStamp: Boolean = false
+
+    /** Packed bytes for PAPER delivery (destHash + encrypted rest) */
+    var paperPacked: ByteArray? = null
+        private set
+
     // ===== Encryption State =====
 
     /** Whether message was transport-encrypted */
@@ -190,6 +216,22 @@ class LXMessage private constructor(
         determineDeliveryMethod()
 
         return packed!!
+    }
+
+    /**
+     * Re-pack the message with an updated stamp.
+     *
+     * Called after deferred stamp generation to update the packed bytes
+     * with the newly generated stamp. The hash and signature don't change
+     * because stamp is not included in the hashed/signed portion.
+     */
+    fun repackWithStamp() {
+        if (stamp == null || hash == null || signature == null) return
+
+        val payloadBytes = packPayload(timestamp!!, title, content, fields, stamp)
+        packed = destinationHash + sourceHash + signature!! + payloadBytes
+
+        determineDeliveryMethod()
     }
 
     /**
@@ -359,12 +401,144 @@ class LXMessage private constructor(
         content = bytes.toString(Charsets.UTF_8)
     }
 
+    /**
+     * Validate the stamp on this message.
+     *
+     * Matches Python LXMessage.validate_stamp() (lines 279-299):
+     * 1. Ticket path: check if stamp == truncatedHash(ticket + messageId)
+     * 2. Normal path: use LXStamper to validate proof-of-work
+     *
+     * @param targetCost Required stamp cost (leading zero bits)
+     * @param tickets List of valid inbound tickets, or null
+     * @return True if stamp is valid
+     */
+    fun validateStamp(targetCost: Int, tickets: List<ByteArray>? = null): Boolean {
+        val msgHash = hash ?: return false
+        val msgStamp = stamp
+
+        stampChecked = true
+
+        // Ticket path: check if stamp matches any ticket
+        if (msgStamp != null && tickets != null) {
+            for (ticket in tickets) {
+                val ticketStamp = Hashes.truncatedHash(ticket + msgHash)
+                if (msgStamp.contentEquals(ticketStamp)) {
+                    stampValid = true
+                    stampValue = LXMFConstants.COST_TICKET
+                    return true
+                }
+            }
+        }
+
+        // Normal path: validate proof-of-work stamp
+        if (msgStamp == null) {
+            stampValid = false
+            stampValue = null
+            return false
+        }
+
+        val valid = LXStamper.validateStamp(msgStamp, msgHash, targetCost)
+        stampValid = valid
+        if (valid) {
+            stampValue = LXStamper.getStampValue(msgStamp, msgHash)
+        } else {
+            stampValue = null
+        }
+        return valid
+    }
+
+    /**
+     * Get or generate the stamp for this message.
+     *
+     * Matches Python LXMessage.get_stamp() (lines 304-332):
+     * 1. Ticket path: if outboundTicket set, return truncatedHash(ticket + messageId)
+     * 2. No cost: if stampCost null, return null
+     * 3. Cached: if stamp already set, return it
+     * 4. Generate: use LXStamper.generateStamp()
+     *
+     * @return Stamp bytes, or null if no stamp needed
+     */
+    suspend fun getStamp(): ByteArray? {
+        val msgHash = hash ?: return null
+
+        // Ticket path
+        val ticket = outboundTicket
+        if (ticket != null) {
+            val ticketStamp = Hashes.truncatedHash(ticket + msgHash)
+            stamp = ticketStamp
+            stampCost = null
+            return ticketStamp
+        }
+
+        // No cost required
+        val cost = stampCost ?: return null
+
+        // Cached stamp
+        if (stamp != null) return stamp
+
+        // Generate stamp
+        val result = LXStamper.generateStampWithWorkblock(msgHash, cost)
+        stamp = result.stamp
+        return result.stamp
+    }
+
+    /**
+     * Encode this message as a paper delivery URI (lxm://...).
+     *
+     * Matches Python LXMessage.as_uri() (lines 685-703):
+     * 1. Pack message if not already packed
+     * 2. Encrypt everything after dest hash for the destination
+     * 3. Prepend dest hash to get paper_packed
+     * 4. Base64url-encode without padding
+     * 5. Prepend "lxm://"
+     *
+     * @return The lxm:// URI string
+     */
+    fun asUri(): String {
+        if (packed == null) {
+            pack()
+        }
+
+        val pp = paperPacked
+            ?: throw IllegalStateException("Paper packing not done — call packForPaper() first or use PAPER delivery method")
+
+        val encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(pp)
+        return "${URI_SCHEMA}://$encoded"
+    }
+
+    /**
+     * Pack message for PAPER delivery.
+     *
+     * Encrypts message content for the destination and prepends the destination hash.
+     * Must be called before asUri().
+     *
+     * @throws IllegalStateException if destination is null or has no identity
+     */
+    fun packForPaper() {
+        if (packed == null) {
+            pack()
+        }
+
+        val dest = destination
+            ?: throw IllegalStateException("Cannot pack for paper without destination")
+
+        val packedData = packed!!
+        val plainData = packedData.copyOfRange(LXMFConstants.DESTINATION_LENGTH, packedData.size)
+        val encryptedData = dest.encrypt(plainData)
+        paperPacked = packedData.copyOfRange(0, LXMFConstants.DESTINATION_LENGTH) + encryptedData
+
+        method = DeliveryMethod.PAPER
+        representation = MessageRepresentation.PACKET
+    }
+
     override fun toString(): String {
         val hashStr = hash?.toHexString()?.take(12) ?: "unpacked"
         return "<LXMessage $hashStr>"
     }
 
     companion object {
+        /** URI schema prefix */
+        const val URI_SCHEMA = "lxm"
         /**
          * Create a new outbound LXMF message.
          *

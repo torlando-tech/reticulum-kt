@@ -7,8 +7,10 @@ import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
+import network.reticulum.common.RnsConstants
 import network.reticulum.common.TransportType
 import network.reticulum.common.toHexString
+import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
@@ -17,6 +19,11 @@ import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
 import network.reticulum.transport.Transport
+import org.msgpack.core.MessagePack
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.security.SecureRandom
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -167,22 +174,72 @@ class LXMRouter(
 
     // ===== Delivery Tracking =====
 
-    /** Locally delivered message transient IDs for duplicate detection */
-    private val locallyDeliveredTransientIds = ConcurrentHashMap.newKeySet<String>()
+    /** Locally delivered message transient IDs: hexHash -> timestamp (seconds) */
+    private val locallyDeliveredTransientIds = ConcurrentHashMap<String, Long>()
 
-    /** Outbound stamp costs: destination_hash -> cost */
-    private val outboundStampCosts = ConcurrentHashMap<String, Int>()
+    /** Outbound stamp costs: destination_hash_hex -> [timestamp, cost] */
+    private val outboundStampCosts = ConcurrentHashMap<String, Pair<Long, Int>>()
+
+    // ===== Ticket System =====
+
+    /**
+     * Available tickets for stamp bypass.
+     * Structure mirrors Python's available_tickets dict:
+     * - outbound: destHashHex -> Pair(expiresTimestamp, ticketBytes)
+     * - inbound: destHashHex -> Map(ticketHex -> expiresTimestamp)
+     * - lastDeliveries: destHashHex -> timestamp
+     */
+    private val outboundTickets = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
+    private val inboundTickets = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
+    private val lastTicketDeliveries = ConcurrentHashMap<String, Long>()
+
+    // ===== Deferred Stamp Processing =====
+
+    /** Messages awaiting deferred stamp generation: messageIdHex -> LXMessage */
+    private val pendingDeferredStamps = ConcurrentHashMap<String, LXMessage>()
+
+    /** Mutex for stamp generation to prevent concurrent CPU-heavy work */
+    private val stampGenMutex = Mutex()
+
+    // ===== Access Control =====
+
+    /** Allowed identity hashes (for authentication) */
+    private val allowedList = mutableListOf<ByteArray>()
+
+    /** Ignored source destination hashes */
+    private val ignoredList = mutableListOf<ByteArray>()
+
+    /** Prioritised destination hashes */
+    private val prioritisedList = mutableListOf<ByteArray>()
+
+    /** Whether authentication is required for message delivery */
+    private var authRequired: Boolean = false
+
+    // ===== Cleanup Tracking =====
+
+    /** Processing loop counter for scheduling periodic cleanup */
+    private var processingCount: Long = 0
+
+    /** File locks for persistence */
+    private val costFileMutex = Mutex()
+    private val ticketFileMutex = Mutex()
+    private val transientIdFileMutex = Mutex()
 
     // ===== Initialization =====
 
     init {
         // Create storage directories if needed
         storagePath?.let { path ->
-            val dir = java.io.File(path, "lxmf")
+            val dir = File(path, "lxmf")
             if (!dir.exists()) {
                 dir.mkdirs()
             }
         }
+
+        // Load persisted state
+        loadOutboundStampCosts()
+        loadAvailableTickets()
+        loadTransientIds()
 
         // Register announce handler for propagation nodes
         // Note: Kotlin's AnnounceHandler doesn't have aspect filtering like Python,
@@ -203,7 +260,7 @@ class LXMRouter(
         val destination: Destination,
         val identity: Identity,
         val displayName: String? = null,
-        val stampCost: Int = 0
+        var stampCost: Int? = null
     )
 
     /**
@@ -277,7 +334,7 @@ class LXMRouter(
     fun registerDeliveryIdentity(
         identity: Identity,
         displayName: String? = null,
-        stampCost: Int = 0
+        stampCost: Int? = null
     ): Destination {
         // Create destination with LXMF delivery aspect
         val destination = Destination.create(
@@ -305,8 +362,8 @@ class LXMRouter(
         }
 
         // Set default app data for announcements
-        if (displayName != null || stampCost > 0) {
-            val appData = packAnnounceAppData(displayName, stampCost)
+        if (displayName != null || (stampCost != null && stampCost > 0)) {
+            val appData = packAnnounceAppData(displayName, stampCost ?: 0)
             destination.setDefaultAppData(appData)
         }
 
@@ -357,21 +414,65 @@ class LXMRouter(
      * @param message The message to send
      */
     suspend fun handleOutbound(message: LXMessage) {
+        val destHashHex = message.destinationHash.toHexString()
+
+        // Auto-configure stamp cost from outbound_stamp_costs if not set
+        if (message.stampCost == null) {
+            val costEntry = outboundStampCosts[destHashHex]
+            if (costEntry != null) {
+                message.stampCost = costEntry.second
+                println("[LXMRouter] Auto-configured stamp cost to ${costEntry.second} for $destHashHex")
+            }
+        }
+
         // Set message state to outbound
         message.state = MessageState.OUTBOUND
+
+        // Attach outbound ticket if available
+        message.outboundTicket = getOutboundTicket(destHashHex)
+        if (message.outboundTicket != null && message.deferStamp) {
+            // Ticket bypass means no PoW needed — don't defer
+            message.deferStamp = false
+        }
+
+        // Include ticket for reply if requested
+        if (message.includeTicket) {
+            val ticket = generateTicket(message.destinationHash)
+            if (ticket != null) {
+                message.fields[LXMFConstants.FIELD_TICKET] = ticket
+            }
+        }
 
         // Pack the message if not already packed
         if (message.packed == null) {
             message.pack()
         }
 
-        // Add to outbound queue
-        pendingOutboundMutex.withLock {
-            pendingOutbound.add(message)
+        // If stamp is deferred and no cost, don't defer
+        if (message.deferStamp && message.stampCost == null) {
+            message.deferStamp = false
         }
 
-        // Trigger processing
-        triggerProcessing()
+        if (!message.deferStamp) {
+            // Generate stamp now if needed (before queueing)
+            if (message.stampCost != null && message.stamp == null && message.outboundTicket == null) {
+                message.getStamp()
+                // Re-pack with stamp
+                message.repackWithStamp()
+            }
+
+            // Add to outbound queue
+            pendingOutboundMutex.withLock {
+                pendingOutbound.add(message)
+            }
+
+            // Trigger processing
+            triggerProcessing()
+        } else {
+            // Deferred: stamp will be generated in background
+            val messageIdHex = message.hash?.toHexString() ?: return
+            pendingDeferredStamps[messageIdHex] = message
+        }
     }
 
     /**
@@ -1100,7 +1201,7 @@ class LXMRouter(
 
             // Check for duplicates
             val transientId = message.transientId?.toHexString()
-            if (transientId != null && locallyDeliveredTransientIds.contains(transientId)) {
+            if (transientId != null && locallyDeliveredTransientIds.containsKey(transientId)) {
                 println("Duplicate message detected, ignoring")
                 return
             }
@@ -1122,7 +1223,32 @@ class LXMRouter(
                 }
             }
 
-            // TODO: Validate stamp if required
+            // Check ignored list (access control)
+            val sourceHashHexForCheck = message.sourceHash.toHexString()
+            if (ignoredList.any { it.toHexString() == sourceHashHexForCheck }) {
+                println("[LXMRouter] Ignored message from $sourceHashHexForCheck")
+                return
+            }
+
+            // Validate stamp if required (PAPER messages bypass stamp enforcement)
+            val destHashHex = message.destinationHash.toHexString()
+            val deliveryDest = deliveryDestinations[destHashHex]
+            val requiredCost = deliveryDest?.stampCost
+            val noStampEnforcement = method == DeliveryMethod.PAPER
+            if (requiredCost != null && requiredCost > 0) {
+                // Extract ticket from incoming message first
+                extractAndRememberTicket(message)
+
+                val tickets = getInboundTickets(sourceHashHexForCheck)
+                if (!message.validateStamp(requiredCost, tickets)) {
+                    if (noStampEnforcement) {
+                        println("[LXMRouter] Message from $sourceHashHexForCheck has invalid stamp, but allowing (PAPER delivery)")
+                    } else {
+                        println("[LXMRouter] Message from $sourceHashHexForCheck failed stamp validation (required cost: $requiredCost)")
+                        return
+                    }
+                }
+            }
 
             // Store backchannel link and identity for replies
             if (link != null) {
@@ -1149,7 +1275,11 @@ class LXMRouter(
             }
 
             // Mark as delivered
-            transientId?.let { locallyDeliveredTransientIds.add(it) }
+            val nowSeconds = System.currentTimeMillis() / 1000
+            transientId?.let {
+                locallyDeliveredTransientIds[it] = nowSeconds
+                saveTransientIdsAsync()
+            }
 
             // Invoke delivery callback
             deliveryCallback?.invoke(message)
@@ -1209,7 +1339,7 @@ class LXMRouter(
                 // Extract stamp cost
                 if (!unpacker.tryUnpackNil()) {
                     val stampCost = unpacker.unpackInt()
-                    outboundStampCosts[destHash.toHexString()] = stampCost
+                    updateStampCost(destHash.toHexString(), stampCost)
                 }
             }
         } catch (e: Exception) {
@@ -1245,6 +1375,15 @@ class LXMRouter(
             while (running) {
                 try {
                     processOutbound()
+                    processDeferredStamps()
+
+                    // Periodic cleanup every 60 iterations (~240 seconds at 4s interval)
+                    processingCount++
+                    if (processingCount % 60 == 0L) {
+                        cleanTransientIdCaches()
+                        cleanOutboundStampCosts()
+                        cleanAvailableTickets()
+                    }
                 } catch (e: Exception) {
                     println("Error in processing loop: ${e.message}")
                 }
@@ -1295,6 +1434,31 @@ class LXMRouter(
      */
     fun getDeliveryDestinations(): List<DeliveryDestination> {
         return deliveryDestinations.values.toList()
+    }
+
+    /**
+     * Set the inbound stamp cost for a registered delivery destination.
+     *
+     * Matches Python LXMRouter.set_inbound_stamp_cost() (lines 993-1001):
+     * Validates cost range (null or 1-254) and updates the delivery destination.
+     *
+     * @param destinationHexHash The hex hash of the delivery destination
+     * @param cost The stamp cost (null to disable, 1-254 for PoW requirement)
+     * @throws IllegalArgumentException if cost is out of range or destination not found
+     */
+    fun setInboundStampCost(destinationHexHash: String, cost: Int?) {
+        if (cost != null && (cost < 1 || cost > 254)) {
+            throw IllegalArgumentException("Stamp cost must be null or between 1 and 254, got $cost")
+        }
+
+        val deliveryDest = deliveryDestinations[destinationHexHash]
+            ?: throw IllegalArgumentException("No delivery destination registered with hash $destinationHexHash")
+
+        deliveryDest.stampCost = cost
+
+        // Update announce app data with new stamp cost
+        val appData = packAnnounceAppData(deliveryDest.displayName, cost ?: 0)
+        deliveryDest.destination.setDefaultAppData(appData)
     }
 
     /**
@@ -1645,7 +1809,7 @@ class LXMRouter(
 
                 // Check if we already have this message
                 val idHex = transientId.toHexString()
-                if (!locallyDeliveredTransientIds.contains(idHex)) {
+                if (!locallyDeliveredTransientIds.containsKey(idHex)) {
                     wantedIds.add(transientId)
                 }
             }
@@ -1754,5 +1918,683 @@ class LXMRouter(
             println("Error processing received messages: ${e.message}")
             propagationTransferState = PropagationTransferState.FAILED
         }
+    }
+
+    // ===== Stamp Cost Management =====
+
+    /**
+     * Update outbound stamp cost for a destination.
+     * Matches Python LXMRouter.update_stamp_cost() (lines 977-982).
+     */
+    private fun updateStampCost(destHashHex: String, stampCost: Int) {
+        val nowSeconds = System.currentTimeMillis() / 1000
+        outboundStampCosts[destHashHex] = Pair(nowSeconds, stampCost)
+        saveOutboundStampCostsAsync()
+    }
+
+    // ===== Deferred Stamp Processing (Phase 2) =====
+
+    /**
+     * Process deferred stamp generation.
+     *
+     * Picks one pending deferred message, generates its stamp in a coroutine,
+     * re-packs, and moves to pendingOutbound.
+     */
+    private suspend fun processDeferredStamps() {
+        if (pendingDeferredStamps.isEmpty()) return
+
+        stampGenMutex.withLock {
+            // Pick first entry
+            val entry = pendingDeferredStamps.entries.firstOrNull() ?: return
+            val messageIdHex = entry.key
+            val message = entry.value
+
+            try {
+                // Generate stamp
+                message.getStamp()
+                message.repackWithStamp()
+
+                // Move to outbound queue
+                pendingDeferredStamps.remove(messageIdHex)
+                pendingOutboundMutex.withLock {
+                    pendingOutbound.add(message)
+                }
+                triggerProcessing()
+            } catch (e: Exception) {
+                println("[LXMRouter] Error generating deferred stamp for $messageIdHex: ${e.message}")
+                // Leave in deferred queue for retry
+            }
+        }
+    }
+
+    // ===== Ticket System (Phase 3) =====
+
+    /**
+     * Generate a ticket for a destination.
+     *
+     * Matches Python LXMRouter.generate_ticket() (lines 1022-1049):
+     * - Check TICKET_INTERVAL between deliveries
+     * - Reuse existing ticket if > TICKET_RENEW validity left
+     * - Otherwise generate 32 random bytes
+     *
+     * @param destinationHash Raw destination hash bytes
+     * @return [expires, ticketBytes] list for FIELD_TICKET, or null
+     */
+    private fun generateTicket(destinationHash: ByteArray): List<Any>? {
+        val destHashHex = destinationHash.toHexString()
+        val nowSeconds = System.currentTimeMillis() / 1000
+
+        // Check if we delivered a ticket recently
+        val lastDelivery = lastTicketDeliveries[destHashHex]
+        if (lastDelivery != null) {
+            val elapsed = nowSeconds - lastDelivery
+            if (elapsed < LXMFConstants.TICKET_INTERVAL) {
+                return null
+            }
+        }
+
+        // Check for existing reusable ticket
+        val existingTickets = inboundTickets[destHashHex]
+        if (existingTickets != null) {
+            for ((ticketHex, expires) in existingTickets) {
+                val validityLeft = expires - nowSeconds
+                if (validityLeft > LXMFConstants.TICKET_RENEW) {
+                    // Reuse existing ticket
+                    return listOf(expires, hexToBytes(ticketHex))
+                }
+            }
+        }
+
+        // Generate new ticket
+        val expires = nowSeconds + LXMFConstants.TICKET_EXPIRY
+        val ticket = ByteArray(RnsConstants.TRUNCATED_HASH_BYTES)
+        SecureRandom().nextBytes(ticket)
+
+        // Store in inbound tickets
+        val tickets = inboundTickets.getOrPut(destHashHex) { ConcurrentHashMap() }
+        tickets[ticket.toHexString()] = expires
+        saveAvailableTicketsAsync()
+
+        return listOf(expires, ticket)
+    }
+
+    /**
+     * Remember a ticket received from a peer.
+     *
+     * Matches Python LXMRouter.remember_ticket() (lines 1051-1054).
+     */
+    private fun rememberTicket(sourceHashHex: String, ticketEntry: List<Any?>) {
+        if (ticketEntry.size < 2) return
+        val expires = (ticketEntry[0] as? Number)?.toLong() ?: return
+        val ticket = ticketEntry[1] as? ByteArray ?: return
+
+        outboundTickets[sourceHashHex] = Pair(expires, ticket)
+        saveAvailableTicketsAsync()
+    }
+
+    /**
+     * Get an outbound ticket for stamp bypass.
+     *
+     * Matches Python LXMRouter.get_outbound_ticket() (lines 1056-1062).
+     */
+    private fun getOutboundTicket(destHashHex: String): ByteArray? {
+        val entry = outboundTickets[destHashHex] ?: return null
+        val nowSeconds = System.currentTimeMillis() / 1000
+        return if (entry.first > nowSeconds) entry.second else null
+    }
+
+    /**
+     * Get valid inbound tickets for a source.
+     *
+     * Matches Python LXMRouter.get_inbound_tickets() (lines 1072-1083).
+     */
+    private fun getInboundTickets(sourceHashHex: String): List<ByteArray>? {
+        val tickets = inboundTickets[sourceHashHex] ?: return null
+        val nowSeconds = System.currentTimeMillis() / 1000
+        val valid = tickets.entries
+            .filter { nowSeconds < it.value }
+            .map { hexToBytes(it.key) }
+
+        return if (valid.isEmpty()) null else valid
+    }
+
+    /**
+     * Extract ticket from an incoming message and remember it.
+     *
+     * Matches Python LXMRouter.py lines 1730-1741.
+     */
+    private fun extractAndRememberTicket(message: LXMessage) {
+        if (!message.signatureValidated) return
+
+        val ticketField = message.fields[LXMFConstants.FIELD_TICKET] ?: return
+        val ticketEntry = ticketField as? List<*> ?: return
+        if (ticketEntry.size < 2) return
+
+        val expires = (ticketEntry[0] as? Number)?.toLong() ?: return
+        val ticket = ticketEntry[1] as? ByteArray ?: return
+        val nowSeconds = System.currentTimeMillis() / 1000
+
+        if (nowSeconds < expires && ticket.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            val sourceHashHex = message.sourceHash.toHexString()
+            @Suppress("UNCHECKED_CAST")
+            rememberTicket(sourceHashHex, ticketEntry as List<Any?>)
+        }
+    }
+
+    // ===== Persistence (Phase 4) =====
+
+    /**
+     * Save outbound stamp costs to disk.
+     * File: {storagePath}/lxmf/outbound_stamp_costs (msgpack)
+     */
+    private fun saveOutboundStampCosts() {
+        val path = storagePath ?: return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+
+            val buffer = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(buffer)
+
+            packer.packMapHeader(outboundStampCosts.size)
+            for ((hexHash, pair) in outboundStampCosts) {
+                val hashBytes = hexToBytes(hexHash)
+                packer.packBinaryHeader(hashBytes.size)
+                packer.writePayload(hashBytes)
+                packer.packArrayHeader(2)
+                packer.packLong(pair.first)
+                packer.packInt(pair.second)
+            }
+            packer.close()
+
+            File(dir, "outbound_stamp_costs").writeBytes(buffer.toByteArray())
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save outbound stamp costs: ${e.message}")
+        }
+    }
+
+    private fun saveOutboundStampCostsAsync() {
+        processingScope?.launch {
+            costFileMutex.withLock { saveOutboundStampCosts() }
+        }
+    }
+
+    /**
+     * Load outbound stamp costs from disk.
+     */
+    private fun loadOutboundStampCosts() {
+        val path = storagePath ?: return
+        val file = File(path, "lxmf/outbound_stamp_costs")
+        if (!file.exists()) return
+
+        try {
+            val data = file.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            val mapSize = unpacker.unpackMapHeader()
+
+            for (i in 0 until mapSize) {
+                val keyLen = unpacker.unpackBinaryHeader()
+                val keyBytes = ByteArray(keyLen)
+                unpacker.readPayload(keyBytes)
+                val hexHash = keyBytes.toHexString()
+
+                val arrSize = unpacker.unpackArrayHeader()
+                if (arrSize >= 2) {
+                    val timestamp = unpacker.unpackLong()
+                    val cost = unpacker.unpackInt()
+                    outboundStampCosts[hexHash] = Pair(timestamp, cost)
+                }
+            }
+            unpacker.close()
+
+            // Clean expired entries on load
+            cleanOutboundStampCosts()
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not load outbound stamp costs: ${e.message}")
+            outboundStampCosts.clear()
+        }
+    }
+
+    /**
+     * Save available tickets to disk.
+     * File: {storagePath}/lxmf/available_tickets (msgpack)
+     */
+    private fun saveAvailableTickets() {
+        val path = storagePath ?: return
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+
+            val buffer = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(buffer)
+
+            // Pack as map with 3 keys: "outbound", "inbound", "last_deliveries"
+            packer.packMapHeader(3)
+
+            // Outbound tickets
+            packer.packString("outbound")
+            packer.packMapHeader(outboundTickets.size)
+            for ((hexHash, pair) in outboundTickets) {
+                val hashBytes = hexToBytes(hexHash)
+                packer.packBinaryHeader(hashBytes.size)
+                packer.writePayload(hashBytes)
+                packer.packArrayHeader(2)
+                packer.packLong(pair.first)
+                packer.packBinaryHeader(pair.second.size)
+                packer.writePayload(pair.second)
+            }
+
+            // Inbound tickets
+            packer.packString("inbound")
+            packer.packMapHeader(inboundTickets.size)
+            for ((hexHash, ticketMap) in inboundTickets) {
+                val hashBytes = hexToBytes(hexHash)
+                packer.packBinaryHeader(hashBytes.size)
+                packer.writePayload(hashBytes)
+                packer.packMapHeader(ticketMap.size)
+                for ((ticketHex, expires) in ticketMap) {
+                    val ticketBytes = hexToBytes(ticketHex)
+                    packer.packBinaryHeader(ticketBytes.size)
+                    packer.writePayload(ticketBytes)
+                    packer.packArrayHeader(1)
+                    packer.packLong(expires)
+                }
+            }
+
+            // Last deliveries
+            packer.packString("last_deliveries")
+            packer.packMapHeader(lastTicketDeliveries.size)
+            for ((hexHash, timestamp) in lastTicketDeliveries) {
+                val hashBytes = hexToBytes(hexHash)
+                packer.packBinaryHeader(hashBytes.size)
+                packer.writePayload(hashBytes)
+                packer.packLong(timestamp)
+            }
+
+            packer.close()
+            File(dir, "available_tickets").writeBytes(buffer.toByteArray())
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save available tickets: ${e.message}")
+        }
+    }
+
+    private fun saveAvailableTicketsAsync() {
+        processingScope?.launch {
+            ticketFileMutex.withLock { saveAvailableTickets() }
+        }
+    }
+
+    /**
+     * Load available tickets from disk.
+     */
+    private fun loadAvailableTickets() {
+        val path = storagePath ?: return
+        val file = File(path, "lxmf/available_tickets")
+        if (!file.exists()) return
+
+        try {
+            val data = file.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            val mapSize = unpacker.unpackMapHeader()
+
+            for (i in 0 until mapSize) {
+                val key = unpacker.unpackString()
+                when (key) {
+                    "outbound" -> {
+                        val outSize = unpacker.unpackMapHeader()
+                        for (j in 0 until outSize) {
+                            val keyLen = unpacker.unpackBinaryHeader()
+                            val keyBytes = ByteArray(keyLen)
+                            unpacker.readPayload(keyBytes)
+                            val hexHash = keyBytes.toHexString()
+
+                            val arrSize = unpacker.unpackArrayHeader()
+                            if (arrSize >= 2) {
+                                val expires = unpacker.unpackLong()
+                                val ticketLen = unpacker.unpackBinaryHeader()
+                                val ticket = ByteArray(ticketLen)
+                                unpacker.readPayload(ticket)
+                                outboundTickets[hexHash] = Pair(expires, ticket)
+                            }
+                        }
+                    }
+                    "inbound" -> {
+                        val inSize = unpacker.unpackMapHeader()
+                        for (j in 0 until inSize) {
+                            val keyLen = unpacker.unpackBinaryHeader()
+                            val keyBytes = ByteArray(keyLen)
+                            unpacker.readPayload(keyBytes)
+                            val hexHash = keyBytes.toHexString()
+
+                            val ticketMapSize = unpacker.unpackMapHeader()
+                            val ticketMap = ConcurrentHashMap<String, Long>()
+                            for (k in 0 until ticketMapSize) {
+                                val tLen = unpacker.unpackBinaryHeader()
+                                val tBytes = ByteArray(tLen)
+                                unpacker.readPayload(tBytes)
+                                val arrSize = unpacker.unpackArrayHeader()
+                                if (arrSize >= 1) {
+                                    val expires = unpacker.unpackLong()
+                                    ticketMap[tBytes.toHexString()] = expires
+                                }
+                            }
+                            if (ticketMap.isNotEmpty()) {
+                                inboundTickets[hexHash] = ticketMap
+                            }
+                        }
+                    }
+                    "last_deliveries" -> {
+                        val ldSize = unpacker.unpackMapHeader()
+                        for (j in 0 until ldSize) {
+                            val keyLen = unpacker.unpackBinaryHeader()
+                            val keyBytes = ByteArray(keyLen)
+                            unpacker.readPayload(keyBytes)
+                            val hexHash = keyBytes.toHexString()
+                            val timestamp = unpacker.unpackLong()
+                            lastTicketDeliveries[hexHash] = timestamp
+                        }
+                    }
+                    else -> unpacker.skipValue()
+                }
+            }
+            unpacker.close()
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not load available tickets: ${e.message}")
+            outboundTickets.clear()
+            inboundTickets.clear()
+            lastTicketDeliveries.clear()
+        }
+    }
+
+    /**
+     * Save locally delivered transient IDs to disk.
+     * File: {storagePath}/lxmf/local_deliveries (msgpack)
+     */
+    private fun saveTransientIds() {
+        val path = storagePath ?: return
+        if (locallyDeliveredTransientIds.isEmpty()) return
+
+        try {
+            val dir = File(path, "lxmf")
+            if (!dir.exists()) dir.mkdirs()
+
+            val buffer = ByteArrayOutputStream()
+            val packer = MessagePack.newDefaultPacker(buffer)
+
+            packer.packMapHeader(locallyDeliveredTransientIds.size)
+            for ((hexHash, timestamp) in locallyDeliveredTransientIds) {
+                val hashBytes = hexToBytes(hexHash)
+                packer.packBinaryHeader(hashBytes.size)
+                packer.writePayload(hashBytes)
+                packer.packLong(timestamp)
+            }
+            packer.close()
+
+            File(dir, "local_deliveries").writeBytes(buffer.toByteArray())
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not save transient IDs: ${e.message}")
+        }
+    }
+
+    private fun saveTransientIdsAsync() {
+        processingScope?.launch {
+            transientIdFileMutex.withLock { saveTransientIds() }
+        }
+    }
+
+    /**
+     * Load locally delivered transient IDs from disk.
+     */
+    private fun loadTransientIds() {
+        val path = storagePath ?: return
+        val file = File(path, "lxmf/local_deliveries")
+        if (!file.exists()) return
+
+        try {
+            val data = file.readBytes()
+            val unpacker = MessagePack.newDefaultUnpacker(data)
+            val mapSize = unpacker.unpackMapHeader()
+
+            for (i in 0 until mapSize) {
+                val keyLen = unpacker.unpackBinaryHeader()
+                val keyBytes = ByteArray(keyLen)
+                unpacker.readPayload(keyBytes)
+                val hexHash = keyBytes.toHexString()
+                val timestamp = unpacker.unpackLong()
+                locallyDeliveredTransientIds[hexHash] = timestamp
+            }
+            unpacker.close()
+        } catch (e: Exception) {
+            println("[LXMRouter] Could not load transient IDs: ${e.message}")
+            locallyDeliveredTransientIds.clear()
+        }
+    }
+
+    // ===== Access Control (Phase 5) =====
+
+    /**
+     * Set whether authentication is required for message delivery.
+     */
+    fun setAuthentication(required: Boolean) {
+        authRequired = required
+    }
+
+    /**
+     * Check if authentication is required.
+     */
+    fun requiresAuthentication(): Boolean = authRequired
+
+    /**
+     * Add an identity hash to the allowed list.
+     *
+     * @param identityHash Truncated identity hash (16 bytes)
+     * @throws IllegalArgumentException if hash length is wrong
+     */
+    fun allow(identityHash: ByteArray) {
+        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Allowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        if (allowedList.none { it.contentEquals(identityHash) }) {
+            allowedList.add(identityHash)
+        }
+    }
+
+    /**
+     * Remove an identity hash from the allowed list.
+     */
+    fun disallow(identityHash: ByteArray) {
+        require(identityHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Disallowed identity hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        allowedList.removeAll { it.contentEquals(identityHash) }
+    }
+
+    /**
+     * Add a destination hash to the ignored list.
+     * Messages from ignored destinations are silently dropped.
+     */
+    fun ignoreDestination(destinationHash: ByteArray) {
+        if (ignoredList.none { it.contentEquals(destinationHash) }) {
+            ignoredList.add(destinationHash)
+        }
+    }
+
+    /**
+     * Remove a destination hash from the ignored list.
+     */
+    fun unignoreDestination(destinationHash: ByteArray) {
+        ignoredList.removeAll { it.contentEquals(destinationHash) }
+    }
+
+    /**
+     * Add a destination hash to the prioritised list.
+     *
+     * @param destinationHash Truncated destination hash (16 bytes)
+     * @throws IllegalArgumentException if hash length is wrong
+     */
+    fun prioritise(destinationHash: ByteArray) {
+        require(destinationHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Prioritised destination hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        if (prioritisedList.none { it.contentEquals(destinationHash) }) {
+            prioritisedList.add(destinationHash)
+        }
+    }
+
+    /**
+     * Remove a destination hash from the prioritised list.
+     */
+    fun unprioritise(destinationHash: ByteArray) {
+        require(destinationHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+            "Prioritised destination hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
+        }
+        prioritisedList.removeAll { it.contentEquals(destinationHash) }
+    }
+
+    /**
+     * Check if an identity is allowed to deliver messages.
+     */
+    fun identityAllowed(identity: Identity): Boolean {
+        return if (authRequired) {
+            allowedList.any { it.contentEquals(identity.hash) }
+        } else {
+            true
+        }
+    }
+
+    // ===== Cleanup Jobs (Phase 6) =====
+
+    /**
+     * Clean expired entries from transient ID caches.
+     *
+     * Matches Python LXMRouter.clean_transient_id_caches() (lines 955-975):
+     * Removes entries older than MESSAGE_EXPIRY * 6 (180 days).
+     */
+    private fun cleanTransientIdCaches() {
+        val nowSeconds = System.currentTimeMillis() / 1000
+        val expiryThreshold = LXMFConstants.MESSAGE_EXPIRY * 6
+
+        val removed = locallyDeliveredTransientIds.entries.removeIf { (_, timestamp) ->
+            nowSeconds > timestamp + expiryThreshold
+        }
+        if (removed) {
+            saveTransientIdsAsync()
+        }
+    }
+
+    /**
+     * Clean expired outbound stamp costs.
+     *
+     * Matches Python LXMRouter.clean_outbound_stamp_costs() (lines 1217-1230):
+     * Removes entries older than STAMP_COST_EXPIRY (45 days).
+     */
+    private fun cleanOutboundStampCosts() {
+        try {
+            val nowSeconds = System.currentTimeMillis() / 1000
+            val removed = outboundStampCosts.entries.removeIf { (_, pair) ->
+                nowSeconds > pair.first + LXMFConstants.STAMP_COST_EXPIRY
+            }
+            if (removed) {
+                saveOutboundStampCostsAsync()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Error cleaning outbound stamp costs: ${e.message}")
+        }
+    }
+
+    /**
+     * Clean expired available tickets.
+     *
+     * Matches Python LXMRouter.clean_available_tickets() (lines 1245-1271):
+     * - Outbound: remove expired tickets
+     * - Inbound: remove expired tickets + TICKET_GRACE
+     */
+    private fun cleanAvailableTickets() {
+        try {
+            val nowSeconds = System.currentTimeMillis() / 1000
+
+            // Clean outbound tickets
+            outboundTickets.entries.removeIf { (_, pair) ->
+                nowSeconds > pair.first
+            }
+
+            // Clean inbound tickets
+            for ((_, ticketMap) in inboundTickets) {
+                ticketMap.entries.removeIf { (_, expires) ->
+                    nowSeconds > expires + LXMFConstants.TICKET_GRACE
+                }
+            }
+
+            // Remove empty inbound ticket maps
+            inboundTickets.entries.removeIf { (_, ticketMap) ->
+                ticketMap.isEmpty()
+            }
+        } catch (e: Exception) {
+            println("[LXMRouter] Error cleaning available tickets: ${e.message}")
+        }
+    }
+
+    // ===== PAPER Delivery (Phase 6) =====
+
+    /**
+     * Ingest a paper message from an lxm:// URI.
+     *
+     * Matches Python LXMRouter.ingest_lxm_uri() (lines 2358-2378):
+     * 1. Validate URI prefix
+     * 2. Strip prefix and decode base64url
+     * 3. Process as paper message (no stamp enforcement)
+     *
+     * @param uri The lxm:// URI string
+     * @return True if the message was successfully ingested
+     */
+    fun ingestLxmUri(uri: String): Boolean {
+        try {
+            val schema = "${LXMFConstants.URI_SCHEMA}://"
+            if (!uri.lowercase().startsWith(schema)) {
+                println("[LXMRouter] Cannot ingest LXM, invalid URI provided")
+                return false
+            }
+
+            // Decode: remove protocol, remove slashes, add padding, base64url-decode
+            val encoded = uri.removePrefix(schema)
+                .replace(LXMFConstants.URI_SCHEMA + "://", "")
+                .replace("/", "") + "=="
+
+            val lxmfData = Base64.getUrlDecoder().decode(encoded)
+            val transientId = Hashes.fullHash(lxmfData)
+            val transientIdHex = transientId.toHexString()
+
+            // Check for duplicates
+            if (locallyDeliveredTransientIds.containsKey(transientIdHex)) {
+                println("[LXMRouter] Paper message already delivered, ignoring duplicate")
+                return false
+            }
+
+            // Process as inbound delivery (no stamp enforcement for paper messages)
+            processInboundDelivery(lxmfData, DeliveryMethod.PAPER)
+
+            println("[LXMRouter] Ingested paper message with transient ID ${transientIdHex.take(12)}")
+            return true
+
+        } catch (e: Exception) {
+            println("[LXMRouter] Error decoding URI-encoded LXMF message: ${e.message}")
+            return false
+        }
+    }
+
+    // ===== Utility =====
+
+    /**
+     * Convert hex string to byte array.
+     */
+    private fun hexToBytes(hex: String): ByteArray {
+        val len = hex.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
     }
 }

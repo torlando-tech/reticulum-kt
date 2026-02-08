@@ -253,6 +253,12 @@ object LXMFConstants {
     /** Message expiry time in seconds (30 days) */
     const val MESSAGE_EXPIRY = 30L * 24 * 60 * 60
 
+    /** Outbound stamp cost expiry time in seconds (45 days) */
+    const val STAMP_COST_EXPIRY = 45L * 24 * 60 * 60
+
+    /** URI schema for PAPER delivery */
+    const val URI_SCHEMA = "lxm"
+
     // ===== Encryption Descriptions =====
 
     const val ENCRYPTION_DESCRIPTION_AES = "AES-128"
