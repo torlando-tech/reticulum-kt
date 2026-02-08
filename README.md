@@ -4,7 +4,7 @@ A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.n
 
 ## Implementation Status
 
-Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference implementation. Interoperability is validated by 120+ automated tests against the Python reference.
+Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference implementation. Interoperability is validated by automated tests against the Python reference.
 
 ### Core Protocol
 
@@ -14,11 +14,11 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs |
 | Transport | ~95% | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
-| Link | ~95% | Establishment, encryption, channels, resources, request/response |
+| Link | Complete | Establishment, encryption, channels, resources, request/response, MTU discovery |
 | Channel | ~90% | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels |
 | Resource | ~90% | Chunked transfer, BZ2 compression, progress tracking, metadata |
-| LXMF | ~85% | Messages, routing, direct/opportunistic/propagated delivery, stamps |
+| LXMF | ~95% | Messages, routing, direct/opportunistic/propagated delivery, stamps, ticket system, access control, persistence, PAPER delivery |
 | Crypto | Complete | BouncyCastle: X25519, Ed25519, HKDF, AES-256-CBC, SHA-256/512 |
 
 ### Interfaces
@@ -51,7 +51,6 @@ Features that exist in the Python reference but are not yet implemented:
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| Link MTU discovery | Medium | Auto-negotiate per-link MTU (`LINK_MTU_DISCOVERY`) |
 | PHY stats on packets | Medium | Expose RSSI/SNR/Q from RNode through the Packet API |
 | Interface discovery | Medium | `InterfaceAnnouncer`/`InterfaceMonitor` for mDNS-based interface discovery |
 | Blackhole system | Medium | Identity blacklisting to block bad actors |
@@ -88,7 +87,8 @@ rns-cli/         # CLI utilities (rnsd-kt daemon)
 rns-test/        # Integration and interop tests
 rns-sample-app/  # Android sample app with Compose UI
 lxmf-core/       # LXMF messaging protocol implementation
-python-bridge/   # Python bridge server for interop testing (70+ commands)
+lxmf-examples/   # LXMF example programs (echo bot, sender, propagation node)
+python-bridge/   # Python bridge server for interop testing (120+ commands)
 ```
 
 ## Building
@@ -172,10 +172,10 @@ Reticulum.stop()
 
 ## Interop Testing
 
-The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 70+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
+The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 120+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
 
 Tests are started automatically - no manual setup required.
 
 ## License
 
-MIT
+[MPL-2.0](LICENSE)
