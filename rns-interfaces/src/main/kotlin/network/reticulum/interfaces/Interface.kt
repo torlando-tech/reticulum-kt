@@ -62,6 +62,9 @@ abstract class Interface(
     /** Hardware MTU (if different from standard MTU). */
     open val hwMtu: Int? = null
 
+    /** Whether this interface supports link MTU discovery (Python: AUTOCONFIGURE_MTU or FIXED_MTU). */
+    open val supportsLinkMtuDiscovery: Boolean = false
+
     /** Whether this is a local shared instance server (Python RNS compatibility). */
     open val isLocalSharedInstance: Boolean = false
 

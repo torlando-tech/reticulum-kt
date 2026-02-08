@@ -14,6 +14,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
+import network.reticulum.Reticulum
 import network.reticulum.transport.Transport
 import network.reticulum.channel.Channel
 import network.reticulum.channel.ChannelOutlet
@@ -219,7 +220,7 @@ class Link private constructor(
         /**
          * Extract MTU from link request packet.
          */
-        private fun mtuFromLrPacket(packet: Packet): Int? {
+        internal fun mtuFromLrPacket(packet: Packet): Int? {
             if (packet.data.size != LinkConstants.ECPUBSIZE + LinkConstants.LINK_MTU_SIZE) {
                 return null
             }
@@ -232,7 +233,7 @@ class Link private constructor(
         /**
          * Extract mode from link request packet.
          */
-        private fun modeFromLrPacket(packet: Packet): Int {
+        internal fun modeFromLrPacket(packet: Packet): Int {
             if (packet.data.size > LinkConstants.ECPUBSIZE) {
                 return (packet.data[LinkConstants.ECPUBSIZE].toInt() and LinkConstants.MODE_BYTEMASK) shr 5
             }
@@ -389,8 +390,15 @@ class Link private constructor(
         establishmentTimeout = LinkConstants.ESTABLISHMENT_TIMEOUT_PER_HOP * maxOf(1, hops) +
             LinkConstants.KEEPALIVE
 
-        // Build request data
-        val signallingBytes = signallingBytes(mtu, mode)
+        // Query next-hop interface MTU for link MTU discovery (Python Link.py:308-314)
+        val nhHwMtu = Transport.nextHopInterfaceHwMtu(destination!!.hash)
+        val signalledMtu = if (Reticulum.LINK_MTU_DISCOVERY && nhHwMtu != null) {
+            log("Signalling link MTU of $nhHwMtu for link")
+            nhHwMtu
+        } else {
+            mtu  // default RnsConstants.MTU (500)
+        }
+        val signallingBytes = signallingBytes(signalledMtu, mode)
         val requestData = pub!! + sigPub!! + signallingBytes
 
         // Create and send link request

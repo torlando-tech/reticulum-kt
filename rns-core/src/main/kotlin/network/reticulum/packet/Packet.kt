@@ -55,7 +55,7 @@ class Packet private constructor(
     /** The transport ID for HEADER_2 packets (16 bytes), null for HEADER_1. */
     val transportId: ByteArray?,
     /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
-    val data: ByteArray,
+    var data: ByteArray,
     /** Whether to create a receipt when sending this packet. */
     val createReceipt: Boolean = true
 ) {
@@ -85,7 +85,7 @@ class Packet private constructor(
      * Populated after pack() is called.
      */
     var raw: ByteArray? = null
-        private set
+        internal set
 
     /**
      * The full hash of the packet's hashable portion.

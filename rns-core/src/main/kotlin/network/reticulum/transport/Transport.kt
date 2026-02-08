@@ -23,6 +23,7 @@ import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
 import org.msgpack.core.MessagePack
@@ -1023,7 +1024,7 @@ object Transport {
      */
     fun nextHopInterfaceHwMtu(destinationHash: ByteArray): Int? {
         val iface = nextHopInterface(destinationHash) ?: return null
-        return iface.hwMtu
+        return if (iface.supportsLinkMtuDiscovery) iface.hwMtu else null
     }
 
     /**
@@ -2618,7 +2619,8 @@ object Transport {
         val destination = findDestination(packet.destinationHash)
 
         if (destination != null) {
-            // Deliver locally
+            // Clamp MTU signalling to receiving interface (Python Transport.py:1938-1963)
+            clampLinkRequestMtuForLocal(packet, interfaceRef)
             deliverPacket(destination, packet)
             return
         }
@@ -2649,8 +2651,11 @@ object Transport {
                 linkTable[linkId.toKey()] = linkEntry
                 log("Forwarding Link request for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (link_id=${linkId.toHexString()})")
 
-                // Forward the packet
-                transmit(outboundInterface, packet.raw ?: packet.pack())
+                // Clamp MTU signalling bytes for the forwarding path (Python Transport.py:1453-1480)
+                val rawToSend = clampLinkRequestMtuForForwarding(
+                    packet.raw ?: packet.pack(), packet, outboundInterface, interfaceRef
+                )
+                transmit(outboundInterface, rawToSend)
                 return
             }
         }
@@ -2678,9 +2683,95 @@ object Transport {
                     linkTable[linkId.toKey()] = linkEntry
                     log("Created link table entry for ${linkId.toHexString()}")
 
+                    // Clamp MTU signalling bytes before forwarding (Python Transport.py:1453-1480)
+                    val outboundIface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
+                    if (outboundIface != null && packet.raw != null) {
+                        packet.raw = clampLinkRequestMtuForForwarding(
+                            packet.raw!!, packet, outboundIface, interfaceRef
+                        )
+                    }
                     forwardPacket(packet, interfaceRef)
                 }
             }
+        }
+    }
+
+    /**
+     * Clamp link MTU signalling bytes in raw wire data for forwarding.
+     * Matches Python Transport.py:1453-1480.
+     *
+     * @param raw The raw wire bytes to potentially modify
+     * @param packet The parsed packet (for accessing data portion)
+     * @param outboundInterface The interface we're forwarding to
+     * @param receivingInterface The interface we received from
+     * @return Modified raw bytes with clamped MTU, or stripped MTU bytes
+     */
+    private fun clampLinkRequestMtuForForwarding(
+        raw: ByteArray,
+        packet: Packet,
+        outboundInterface: InterfaceRef,
+        receivingInterface: InterfaceRef
+    ): ByteArray {
+        val pathMtu = Link.mtuFromLrPacket(packet) ?: return raw
+        val mode = Link.modeFromLrPacket(packet)
+
+        // If outbound interface doesn't support MTU discovery, strip the MTU bytes
+        if (!outboundInterface.supportsLinkMtuDiscovery) {
+            log("Outbound interface ${outboundInterface.name} doesn't support MTU discovery, stripping signalling bytes")
+            return raw.copyOf(raw.size - LinkConstants.LINK_MTU_SIZE)
+        }
+
+        // Clamp to min(next_hop, prev_hop) if either is less than current path MTU
+        val nhMtu = outboundInterface.hwMtu
+        val phMtu = if (receivingInterface.supportsLinkMtuDiscovery) receivingInterface.hwMtu else null
+
+        if (nhMtu < pathMtu || (phMtu != null && phMtu < pathMtu)) {
+            val clampedMtu = if (phMtu != null) minOf(nhMtu, phMtu) else nhMtu
+            return try {
+                val clampedBytes = Link.signallingBytes(clampedMtu, mode)
+                log("Clamping link MTU from $pathMtu to $clampedMtu")
+                val result = raw.copyOf()
+                System.arraycopy(clampedBytes, 0, result, result.size - LinkConstants.LINK_MTU_SIZE, LinkConstants.LINK_MTU_SIZE)
+                result
+            } catch (e: Exception) {
+                log("Error clamping link MTU: ${e.message}, dropping link request")
+                raw // return unmodified on error
+            }
+        }
+
+        return raw
+    }
+
+    /**
+     * Clamp link MTU signalling in packet.data for local delivery.
+     * Matches Python Transport.py:1938-1963.
+     *
+     * Modifies packet.data in-place to clamp signalling bytes to the
+     * receiving interface's MTU.
+     */
+    private fun clampLinkRequestMtuForLocal(packet: Packet, receivingInterface: InterfaceRef) {
+        val pathMtu = Link.mtuFromLrPacket(packet) ?: return
+        val mode = Link.modeFromLrPacket(packet)
+
+        if (receivingInterface.supportsLinkMtuDiscovery) {
+            val nhMtu = receivingInterface.hwMtu
+            if (nhMtu < pathMtu) {
+                try {
+                    val clampedBytes = Link.signallingBytes(nhMtu, mode)
+                    log("Clamping link MTU to $nhMtu for local delivery")
+                    System.arraycopy(
+                        clampedBytes, 0,
+                        packet.data, packet.data.size - LinkConstants.LINK_MTU_SIZE,
+                        LinkConstants.LINK_MTU_SIZE
+                    )
+                } catch (e: Exception) {
+                    log("Error clamping link MTU for local delivery: ${e.message}")
+                }
+            }
+        } else {
+            // Interface doesn't support MTU discovery — strip signalling bytes
+            log("Receiving interface ${receivingInterface.name} doesn't support MTU discovery, stripping")
+            packet.data = packet.data.copyOf(packet.data.size - LinkConstants.LINK_MTU_SIZE)
         }
     }
 
@@ -4075,6 +4166,10 @@ interface InterfaceRef {
     /** Hardware MTU in bytes. */
     val hwMtu: Int
         get() = RnsConstants.MTU
+
+    /** Whether this interface supports link MTU discovery (Python: AUTOCONFIGURE_MTU or FIXED_MTU). */
+    val supportsLinkMtuDiscovery: Boolean
+        get() = false
 
     // IFAC (Interface Access Code) properties
     /** IFAC size in bytes. 0 means IFAC is disabled. */

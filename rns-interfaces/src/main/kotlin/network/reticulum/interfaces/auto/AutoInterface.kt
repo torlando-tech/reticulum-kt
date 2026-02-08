@@ -82,6 +82,7 @@ class AutoInterface(
         get() = configuredBitrate ?: AutoInterfaceConstants.BITRATE_GUESS
 
     override val hwMtu: Int = AutoInterfaceConstants.HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
 
     // Main AutoInterface doesn't send directly - spawned peers handle sending.
     // This prevents duplicate packets when Transport broadcasts to all interfaces.

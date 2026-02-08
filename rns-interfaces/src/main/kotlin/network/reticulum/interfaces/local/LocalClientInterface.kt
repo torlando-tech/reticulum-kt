@@ -93,6 +93,7 @@ class LocalClientInterface : Interface {
 
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
     override val canReceive: Boolean = true
     override val canSend: Boolean = true // Clients can both send and receive
 

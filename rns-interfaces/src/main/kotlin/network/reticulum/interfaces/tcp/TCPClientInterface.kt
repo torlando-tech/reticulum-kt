@@ -68,6 +68,7 @@ class TCPClientInterface(
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
 
     // IFAC credentials - derived lazily from network name/passphrase
     private val _ifacCredentials: IfacCredentials? by lazy {

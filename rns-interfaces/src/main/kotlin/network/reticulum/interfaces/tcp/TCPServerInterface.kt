@@ -42,6 +42,7 @@ class TCPServerInterface(
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
     // Server can receive/send via its spawned client interfaces
     // processOutgoing broadcasts to all connected clients
     override val canReceive: Boolean = true
@@ -222,6 +223,7 @@ class TCPServerClientInterface internal constructor(
 
     override val bitrate: Int = TCPServerInterface.BITRATE_GUESS
     override val hwMtu: Int = TCPServerInterface.HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
 
     private val writing = AtomicBoolean(false)
 

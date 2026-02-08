@@ -1,6 +1,7 @@
 package network.reticulum.interfaces
 
 import network.reticulum.common.InterfaceMode
+import network.reticulum.common.RnsConstants
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import java.util.concurrent.ConcurrentHashMap
@@ -17,6 +18,8 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val online: Boolean get() = iface.online.get()
     override val mode: InterfaceMode get() = iface.mode
     override val announceCap: Double get() = iface.announceCap
+    override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
+    override val supportsLinkMtuDiscovery: Boolean get() = iface.supportsLinkMtuDiscovery
 
     // Tunnel properties - delegate to underlying interface
     override var tunnelId: ByteArray?

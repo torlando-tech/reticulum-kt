@@ -33,6 +33,7 @@ class AutoInterfacePeer(
         get() = parent.configuredBitrate ?: AutoInterfaceConstants.BITRATE_GUESS
 
     override val hwMtu: Int = AutoInterfaceConstants.HW_MTU
+    override val supportsLinkMtuDiscovery: Boolean = true
 
     init {
         parentInterface = parent
