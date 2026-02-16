@@ -57,7 +57,9 @@ class Packet private constructor(
     /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
     var data: ByteArray,
     /** Whether to create a receipt when sending this packet. */
-    val createReceipt: Boolean = true
+    val createReceipt: Boolean = true,
+    /** MTU for this packet. Python sets per-packet from destination.mtu; defaults to global MTU. */
+    val mtu: Int = RnsConstants.MTU
 ) {
     /** The destination this packet is addressed to (null if created from raw). */
     internal var destination: Destination? = null
@@ -156,10 +158,10 @@ class Packet private constructor(
         val packed = result.toByteArray()
         raw = packed
 
-        // Validate MTU
-        if (packed.size > RnsConstants.MTU) {
+        // Validate MTU (per-packet MTU, set from destination/link MTU or global default)
+        if (packed.size > mtu) {
             throw IllegalStateException(
-                "Packet size of ${packed.size} exceeds MTU of ${RnsConstants.MTU} bytes"
+                "Packet size of ${packed.size} exceeds MTU of ${mtu} bytes"
             )
         }
 
@@ -250,7 +252,8 @@ class Packet private constructor(
             headerType: HeaderType = HeaderType.HEADER_1,
             transportId: ByteArray? = null,
             contextFlag: ContextFlag = ContextFlag.UNSET,
-            createReceipt: Boolean = true
+            createReceipt: Boolean = true,
+            mtu: Int = RnsConstants.MTU
         ): Packet {
             require(destinationHash.size == RnsConstants.TRUNCATED_HASH_BYTES) {
                 "Destination hash must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes"
@@ -267,7 +270,8 @@ class Packet private constructor(
                 destinationHash = destinationHash.copyOf(),
                 transportId = transportId?.copyOf(),
                 data = data,
-                createReceipt = createReceipt
+                createReceipt = createReceipt,
+                mtu = mtu
             )
         }
 

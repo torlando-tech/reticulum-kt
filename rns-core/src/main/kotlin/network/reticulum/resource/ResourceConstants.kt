@@ -69,11 +69,12 @@ object ResourceConstants {
     /**
      * Calculate the SDU (Service Data Unit) size for resources.
      * This is the maximum amount of data that can fit in one resource part.
+     * Resource parts are sent as raw packets (already bulk-encrypted), so
+     * only packet header + IFAC overhead applies — not Token encryption overhead.
+     * Python: Resource.SDU = RNS.Packet.MDU = RNS.Reticulum.MDU
      */
-    fun calculateSdu(): Int {
-        // SDU = Packet.MDU (which is smaller than raw MTU due to packet overhead)
-        // For links, MDU accounts for encryption overhead
-        return RnsConstants.MTU - RnsConstants.HEADER_MIN_SIZE - RnsConstants.TOKEN_OVERHEAD - 1
+    fun calculateSdu(mtu: Int = RnsConstants.MTU): Int {
+        return mtu - RnsConstants.HEADER_MAX_SIZE - RnsConstants.IFAC_MIN_SIZE
     }
 
     /**

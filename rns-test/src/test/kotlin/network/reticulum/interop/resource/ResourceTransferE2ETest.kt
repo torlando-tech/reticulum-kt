@@ -144,6 +144,54 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
     }
 
     @Test
+    @DisplayName("Large resource from Kotlin triggers multi-part transfer")
+    @Timeout(90)
+    fun `large resource from kotlin triggers multi-part transfer`() {
+        val link = establishLink()
+
+        link.setResourceStrategy(Link.ACCEPT_ALL)
+
+        // Create data larger than a single SDU (~464 bytes) to force multi-part
+        val testData = ByteArray(2000) { (it % 256).toByte() }
+        val completedLatch = CountDownLatch(1)
+        val completedResource = AtomicReference<Resource>()
+
+        println("  [Test] Sending ${testData.size} byte resource from Kotlin (should be multi-part)...")
+
+        val resource = Resource.create(
+            data = testData,
+            link = link,
+            callback = { r ->
+                completedResource.set(r)
+                completedLatch.countDown()
+            }
+        )
+
+        assertNotNull(resource)
+
+        val completed = completedLatch.await(60, TimeUnit.SECONDS)
+        assertTrue(completed, "Large resource transfer should complete within 60 seconds")
+
+        // Poll Python for received resource
+        val deadline = System.currentTimeMillis() + 15_000
+        var pythonResources: List<ReceivedResource> = emptyList()
+        while (System.currentTimeMillis() < deadline) {
+            pythonResources = getPythonResources()
+            if (pythonResources.isNotEmpty()) break
+            Thread.sleep(500)
+        }
+
+        assertTrue(pythonResources.isNotEmpty(), "Python should receive large resource")
+        assertTrue(
+            testData.contentEquals(pythonResources[0].data),
+            "Received large resource data should match (${testData.size} bytes)"
+        )
+        println("  [Test] Kotlin → Python large resource transfer verified! (${testData.size} bytes)")
+
+        link.teardown()
+    }
+
+    @Test
     @DisplayName("Large resource from Python triggers multi-part transfer")
     @Timeout(90)
     fun `large resource from python triggers multi-part transfer`() {
@@ -167,7 +215,7 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
         }
 
         // Create data larger than a single SDU to force multi-part transfer
-        // Link MDU is ~431 bytes, so 2000 bytes should force 5+ parts
+        // Resource SDU is ~464 bytes (MTU - HEADER_MAX - IFAC_MIN), so 2000 bytes forces multi-part
         val testData = ByteArray(2000) { (it % 256).toByte() }
 
         println("  [Test] Sending ${testData.size} byte resource from Python (should be multi-part)...")

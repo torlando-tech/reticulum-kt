@@ -728,7 +728,8 @@ class Link private constructor(
             data = encrypted,
             packetType = PacketType.DATA,
             destinationType = DestinationType.LINK,
-            createReceipt = true
+            createReceipt = true,
+            mtu = mtu
         )
 
         val receipt = packet.send()
@@ -755,7 +756,8 @@ class Link private constructor(
             data = data,  // Send directly - already resource-level encrypted
             packetType = PacketType.DATA,
             destinationType = DestinationType.LINK,
-            context = PacketContext.RESOURCE
+            context = PacketContext.RESOURCE,
+            mtu = mtu
         )
 
         packet.send()
@@ -801,7 +803,8 @@ class Link private constructor(
                 destinationHash = link.linkId,
                 data = encrypted,
                 packetType = PacketType.DATA,
-                context = PacketContext.CHANNEL
+                context = PacketContext.CHANNEL,
+                mtu = link.mtu
             )
 
             return if (Transport.outbound(packet)) {
@@ -890,7 +893,8 @@ class Link private constructor(
                 data = encrypted,
                 packetType = PacketType.DATA,
                 context = PacketContext.REQUEST,
-                destinationType = DestinationType.LINK
+                destinationType = DestinationType.LINK,
+                mtu = mtu
             )
 
             // Generate request ID from packet's truncated hash (like Python does)
@@ -2324,7 +2328,8 @@ class Link private constructor(
                     data = encrypt(packedResponse),
                     packetType = PacketType.DATA,
                     context = PacketContext.RESPONSE,
-                    destinationType = DestinationType.LINK
+                    destinationType = DestinationType.LINK,
+                    mtu = mtu
                 )
                 Transport.outbound(packet)
                 hadOutbound(isData = true)

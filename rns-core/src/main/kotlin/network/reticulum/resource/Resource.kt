@@ -253,8 +253,11 @@ class Resource private constructor(
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
 
-    // SDU for this resource
-    private val sdu: Int = link.mdu
+    // SDU for this resource — uses plain packet MDU (not link MDU) because
+    // resource parts are already bulk-encrypted before splitting, and are sent
+    // as raw packets that only add header + IFAC overhead (no Token encryption).
+    // Python: self.sdu = self.link.mtu - RNS.Reticulum.HEADER_MAXSIZE - RNS.Reticulum.IFAC_MIN_SIZE
+    private val sdu: Int = link.mtu - RnsConstants.HEADER_MAX_SIZE - RnsConstants.IFAC_MIN_SIZE
 
     // Raw data
     private var uncompressedData: ByteArray? = null
@@ -431,7 +434,8 @@ class Resource private constructor(
             data = encrypted,
             packetType = PacketType.DATA,
             destinationType = DestinationType.LINK,
-            context = PacketContext.RESOURCE_ADV
+            context = PacketContext.RESOURCE_ADV,
+            mtu = link.mtu
         )
 
         log("  packet linkId=${link.linkId.toHexString()}, raw size=${packet.raw?.size ?: "null"}")
@@ -685,7 +689,8 @@ class Resource private constructor(
                 data = encrypted,
                 packetType = PacketType.DATA,
                 destinationType = DestinationType.LINK,
-                context = PacketContext.RESOURCE_REQ
+                context = PacketContext.RESOURCE_REQ,
+                mtu = link.mtu
             )
 
             packet.send()
@@ -822,7 +827,8 @@ class Resource private constructor(
                     data = encrypted,
                     packetType = PacketType.DATA,
                     destinationType = DestinationType.LINK,
-                    context = PacketContext.RESOURCE_HMU
+                    context = PacketContext.RESOURCE_HMU,
+                    mtu = link.mtu
                 )
                 hmuPacket.send()
                 lastActivity = System.currentTimeMillis()
@@ -943,7 +949,8 @@ class Resource private constructor(
                 data = proofPayload,
                 packetType = PacketType.PROOF,
                 destinationType = DestinationType.LINK,
-                context = PacketContext.RESOURCE_PRF
+                context = PacketContext.RESOURCE_PRF,
+                mtu = link.mtu
             )
 
             packet.send()
