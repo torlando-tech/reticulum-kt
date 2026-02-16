@@ -185,21 +185,43 @@ class AnnounceForwardingE2ETest : InteropTestBase() {
         println("  [Teardown] Complete")
     }
 
+    /**
+     * Re-announce and poll until the local client reader has at least one
+     * HEADER_2 ANNOUNCE packet. Returns the list of all received packets.
+     *
+     * This handles timing variability in the announce propagation chain:
+     * Python announce → TCP → Kotlin Transport → LocalServerInterface → Python socket reader
+     */
+    private fun getForwardedAnnouncePackets(maxAttempts: Int = 3): List<String> {
+        repeat(maxAttempts) { attempt ->
+            // Drain any stale packets first, then re-announce
+            python("local_client_read_packets", "timeout_ms" to 100)
+            python("rns_announce_destination")
+            Thread.sleep(2000)
+
+            val result = python("local_client_read_packets", "timeout_ms" to 5000)
+            val packets = result.getList<String>("packets")
+            if (packets.isNotEmpty()) {
+                // Check if any are HEADER_2 announce packets
+                for (packetHex in packets) {
+                    val parsed = python("packet_parse_header", "raw" to packetHex)
+                    if (parsed.getInt("packet_type") == 1 && parsed.getInt("header_type") == 1) {
+                        return packets
+                    }
+                }
+            }
+            println("  [Poll] Attempt ${attempt + 1}/$maxAttempts: no announce packets yet")
+        }
+        return emptyList()
+    }
+
     @Test
     @DisplayName("forwarded announce has HEADER_2 transport headers")
     @Timeout(30)
     fun `forwarded announce has HEADER_2 transport headers`() {
-        // Read all packets the local client reader received
-        val result = python("local_client_read_packets", "timeout_ms" to 5000)
-        val packets = result.getList<String>("packets")
-        assertTrue(packets.isNotEmpty(),
-            "Local client should receive at least one packet. " +
-            "If this fails, the TCP connection to Python may not be stable " +
-            "(known issue with tunnel synthesis)."
-        )
+        val packets = getForwardedAnnouncePackets()
+        assertTrue(packets.isNotEmpty(), "Local client should receive forwarded announce packets")
 
-        // Find the announce packet (packet_type == 1)
-        var foundAnnounce = false
         for (packetHex in packets) {
             val parsed = python("packet_parse_header", "raw" to packetHex)
             if (parsed.getInt("packet_type") == 1) { // ANNOUNCE
@@ -207,31 +229,24 @@ class AnnounceForwardingE2ETest : InteropTestBase() {
                     "Forwarded announce should use HEADER_2 (transport header)")
                 assertEquals(1, parsed.getInt("transport_type"),
                     "Forwarded announce should use TRANSPORT type")
-                foundAnnounce = true
                 println("  [Test] Announce found with correct HEADER_2 + TRANSPORT headers")
-                break
+                return
             }
         }
-        assertTrue(foundAnnounce, "Should find at least one ANNOUNCE packet in forwarded data")
+        assertTrue(false, "Should find at least one ANNOUNCE packet in forwarded data")
     }
 
     @Test
     @DisplayName("transport_id is Kotlin shared instance identity")
     @Timeout(30)
     fun `transport_id is kotlin shared instance identity`() {
-        // Re-announce to generate fresh packet
-        python("rns_announce_destination")
-        Thread.sleep(2000)
-
-        val result = python("local_client_read_packets", "timeout_ms" to 5000)
-        val packets = result.getList<String>("packets")
+        val packets = getForwardedAnnouncePackets()
         assertTrue(packets.isNotEmpty(), "Local client should receive packets")
 
         val kotlinTransportHash = Transport.identity?.hash
         assertNotNull(kotlinTransportHash, "Kotlin Transport should have an identity")
         val kotlinTransportHex = kotlinTransportHash.joinToString("") { "%02x".format(it) }
 
-        // Find announce and check transport_id
         for (packetHex in packets) {
             val parsed = python("packet_parse_header", "raw" to packetHex)
             if (parsed.getInt("packet_type") == 1 && parsed.getInt("header_type") == 1) {
@@ -251,12 +266,7 @@ class AnnounceForwardingE2ETest : InteropTestBase() {
     @DisplayName("hop count preserved in forwarded announce")
     @Timeout(30)
     fun `hop count preserved in forwarded announce`() {
-        // Re-announce
-        python("rns_announce_destination")
-        Thread.sleep(2000)
-
-        val result = python("local_client_read_packets", "timeout_ms" to 5000)
-        val packets = result.getList<String>("packets")
+        val packets = getForwardedAnnouncePackets()
         assertTrue(packets.isNotEmpty(), "Local client should receive packets")
 
         for (packetHex in packets) {
@@ -277,12 +287,7 @@ class AnnounceForwardingE2ETest : InteropTestBase() {
     @DisplayName("destination hash matches announced destination")
     @Timeout(30)
     fun `destination hash matches announced destination`() {
-        // Re-announce
-        python("rns_announce_destination")
-        Thread.sleep(2000)
-
-        val result = python("local_client_read_packets", "timeout_ms" to 5000)
-        val packets = result.getList<String>("packets")
+        val packets = getForwardedAnnouncePackets()
         assertTrue(packets.isNotEmpty(), "Local client should receive packets")
 
         for (packetHex in packets) {

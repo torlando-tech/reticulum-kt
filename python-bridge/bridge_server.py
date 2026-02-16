@@ -3963,19 +3963,34 @@ def cmd_rns_announce_destination(params):
 # ─── Channel Messaging ────────────────────────────────────────────
 
 _channel_messages_received = []
+_BridgeMessageClass = None
 
-class BridgeMessage:
-    """Simple channel message for interop testing."""
-    MSGTYPE = 0x0101
+def _get_bridge_message_class():
+    """Lazily create BridgeMessage as a subclass of RNS.Channel.MessageBase.
 
-    def __init__(self, data=None):
-        self.data = data or b""
+    RNS is lazy-loaded, so we can't inherit from MessageBase at module level.
+    This creates the class once after RNS is available.
+    """
+    global _BridgeMessageClass
+    if _BridgeMessageClass is None:
+        RNS = _get_full_rns()
 
-    def pack(self):
-        return self.data if isinstance(self.data, bytes) else self.data.encode('utf-8')
+        class BridgeMessage(RNS.Channel.MessageBase):
+            """Simple channel message for interop testing."""
+            MSGTYPE = 0x0101
 
-    def unpack(self, raw):
-        self.data = raw
+            def __init__(self, data=None):
+                super().__init__()
+                self.data = data or b""
+
+            def pack(self):
+                return self.data if isinstance(self.data, bytes) else self.data.encode('utf-8')
+
+            def unpack(self, raw):
+                self.data = raw
+
+        _BridgeMessageClass = BridgeMessage
+    return _BridgeMessageClass
 
 
 def cmd_rns_channel_setup(params):
@@ -3999,12 +4014,13 @@ def cmd_rns_channel_setup(params):
 
     _channel_messages_received = []
 
+    BridgeMessage = _get_bridge_message_class()
     channel = _established_link.get_channel()
     channel.register_message_type(BridgeMessage)
 
     def message_handler(message):
         global _channel_messages_received
-        if isinstance(message, BridgeMessage):
+        if isinstance(message, _get_bridge_message_class()):
             _channel_messages_received.append(bytes_to_hex(message.data))
             return True
         return False
@@ -4039,6 +4055,7 @@ def cmd_rns_channel_send(params):
     if not channel.is_ready_to_send():
         return {'sent': False, 'error': 'Channel not ready'}
 
+    BridgeMessage = _get_bridge_message_class()
     msg = BridgeMessage(data)
     channel.send(msg)
 
@@ -4248,6 +4265,7 @@ _local_client_running = False
 
 def _local_client_read_loop(sock):
     """Background thread: read HDLC-framed packets from the socket."""
+    import socket as _socket
     global _local_client_running
     buf = bytearray()
     in_frame = False
@@ -4256,6 +4274,8 @@ def _local_client_read_loop(sock):
         while _local_client_running:
             try:
                 chunk = sock.recv(4096)
+            except _socket.timeout:
+                continue
             except OSError:
                 break
             if not chunk:

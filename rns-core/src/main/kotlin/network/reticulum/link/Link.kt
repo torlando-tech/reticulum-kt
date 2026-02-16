@@ -1190,8 +1190,10 @@ class Link private constructor(
         Transport.deregisterLink(this)
 
         callbacks.linkClosed?.let { callback ->
-            thread(isDaemon = true) {
+            try {
                 callback(this)
+            } catch (e: Exception) {
+                log("Error in link closed callback: ${e.message}")
             }
         }
 

@@ -371,6 +371,8 @@ object Transport {
         discoveryPrTags.clear()
         pendingReceipts.clear()
         announceHandlers.clear()
+        pendingLinks.clear()
+        activeLinks.clear()
 
         // Persist data before clearing
         if (transportEnabled) {
