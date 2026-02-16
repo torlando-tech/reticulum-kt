@@ -94,8 +94,8 @@ class TcpIntegrationTest {
 
         Thread.sleep(300)
 
-        // Send a test packet
-        val testData = byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05)
+        // Send a test packet — must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
+        val testData = ByteArray(24) { (it + 1).toByte() }
         client.processOutgoing(testData)
 
         // Wait for receive
@@ -128,7 +128,8 @@ class TcpIntegrationTest {
         Thread.sleep(300)
 
         // Send a test packet from server (broadcasts to all clients)
-        val testData = byteArrayOf(0x10, 0x20, 0x30, 0x40, 0x50)
+        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
+        val testData = ByteArray(24) { (it + 0x10).toByte() }
         server.processOutgoing(testData)
 
         // Wait for receive
@@ -229,15 +230,16 @@ class TcpIntegrationTest {
         Thread.sleep(300)
 
         // Send 5 packets from client to server
+        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
         for (i in 0 until 5) {
-            val testData = byteArrayOf(0x01, i.toByte())
+            val testData = ByteArray(24) { (it + i).toByte() }
             client.processOutgoing(testData)
             Thread.sleep(50)
         }
 
         // Send 5 packets from server to client
         for (i in 0 until 5) {
-            val testData = byteArrayOf(0x02, i.toByte())
+            val testData = ByteArray(24) { (it + i + 100).toByte() }
             server.processOutgoing(testData)
             Thread.sleep(50)
         }

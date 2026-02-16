@@ -100,10 +100,11 @@ class FramingInteropTest : InteropTestBase() {
         @Test
         @DisplayName("HDLC deframer handles streaming data")
         fun `hdlc deframer handles streaming data`() {
+            // Messages must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
             val messages = listOf(
-                "First message".toByteArray(),
-                "Second message".toByteArray(),
-                byteArrayOf(0x7E, 0x7D, 0x00)
+                "First message padded!!".toByteArray(),
+                "Second message padded!".toByteArray(),
+                ByteArray(20) { (0x7E + it).toByte() }
             )
 
             val receivedMessages = mutableListOf<ByteArray>()
