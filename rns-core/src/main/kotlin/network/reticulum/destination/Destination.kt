@@ -412,20 +412,29 @@ class Destination private constructor(
 
         ratchetFileLock.withLock {
             try {
-                // Serialize ratchets list using MessagePack
-                val packer = MessagePack.newDefaultBufferPacker()
-                packer.packArrayHeader(ratchets.size)
+                // Serialize ratchets list using MessagePack (inner packing)
+                val innerPacker = MessagePack.newDefaultBufferPacker()
+                innerPacker.packArrayHeader(ratchets.size)
                 for (ratchet in ratchets) {
-                    packer.packBinaryHeader(ratchet.size)
-                    packer.writePayload(ratchet)
+                    innerPacker.packBinaryHeader(ratchet.size)
+                    innerPacker.writePayload(ratchet)
                 }
-                val packedRatchets = packer.toByteArray()
+                val packedRatchets = innerPacker.toByteArray()
 
-                // Create signed data: identity_hash + packed_ratchets
-                val signedData = hash + packedRatchets
+                // Sign the packed ratchets (matches Python: self.sign(packed_ratchets))
+                val signature = id.sign(packedRatchets)
 
-                // Sign with identity private key
-                val signature = id.sign(signedData)
+                // Wrap in msgpack dict: {"signature": bytes, "ratchets": bytes}
+                // Matches Python: umsgpack.packb({"signature": ..., "ratchets": ...})
+                val outerPacker = MessagePack.newDefaultBufferPacker()
+                outerPacker.packMapHeader(2)
+                outerPacker.packString("signature")
+                outerPacker.packBinaryHeader(signature.size)
+                outerPacker.writePayload(signature)
+                outerPacker.packString("ratchets")
+                outerPacker.packBinaryHeader(packedRatchets.size)
+                outerPacker.writePayload(packedRatchets)
+                val fileData = outerPacker.toByteArray()
 
                 // Write to temporary file first
                 val file = File(path)
@@ -434,10 +443,10 @@ class Destination private constructor(
                 // Ensure parent directories exist
                 file.parentFile?.mkdirs()
 
-                // Write signature + packed data
-                tempFile.writeBytes(signature + packedRatchets)
+                tempFile.writeBytes(fileData)
 
                 // Atomic rename
+                if (file.exists()) file.delete()
                 Files.move(
                     tempFile.toPath(),
                     file.toPath(),
@@ -469,39 +478,70 @@ class Destination private constructor(
         }
 
         ratchetFileLock.withLock {
-            try {
+            fun loadAttempt() {
                 // Read file
                 val fileData = file.readBytes()
 
-                // Extract signature (first 64 bytes) and packed data
-                if (fileData.size < 64) {
-                    throw java.io.IOException("Ratchet file too small")
+                // Unpack outer msgpack dict: {"signature": bytes, "ratchets": bytes}
+                // Matches Python: umsgpack.unpackb(ratchets_file.read())
+                val outerUnpacker = MessagePack.newDefaultUnpacker(fileData)
+                val mapSize = outerUnpacker.unpackMapHeader()
+
+                var signature: ByteArray? = null
+                var packedRatchets: ByteArray? = null
+
+                repeat(mapSize) {
+                    val key = outerUnpacker.unpackString()
+                    when (key) {
+                        "signature" -> {
+                            val len = outerUnpacker.unpackBinaryHeader()
+                            signature = ByteArray(len)
+                            outerUnpacker.readPayload(signature!!)
+                        }
+                        "ratchets" -> {
+                            val len = outerUnpacker.unpackBinaryHeader()
+                            packedRatchets = ByteArray(len)
+                            outerUnpacker.readPayload(packedRatchets!!)
+                        }
+                        else -> outerUnpacker.skipValue()
+                    }
                 }
 
-                val signature = fileData.copyOfRange(0, 64)
-                val packedRatchets = fileData.copyOfRange(64, fileData.size)
+                val sig = signature ?: throw java.io.IOException("Ratchet file missing signature")
+                val packed = packedRatchets ?: throw java.io.IOException("Ratchet file missing ratchets")
 
-                // Verify signature against identity_hash + packed_ratchets
-                val signedData = hash + packedRatchets
-                if (!id.validate(signature, signedData)) {
+                // Verify signature against packed_ratchets (matches Python: validate(sig, packed_ratchets))
+                if (!id.validate(sig, packed)) {
                     throw SecurityException("Invalid ratchet file signature for $this")
                 }
 
-                // Deserialize ratchet list
-                val unpacker = MessagePack.newDefaultUnpacker(packedRatchets)
-                val arraySize = unpacker.unpackArrayHeader()
+                // Deserialize inner ratchet list
+                // Matches Python: umsgpack.unpackb(persisted_data["ratchets"])
+                val innerUnpacker = MessagePack.newDefaultUnpacker(packed)
+                val arraySize = innerUnpacker.unpackArrayHeader()
                 val loadedRatchets = mutableListOf<ByteArray>()
                 for (i in 0 until arraySize) {
-                    val binarySize = unpacker.unpackBinaryHeader()
+                    val binarySize = innerUnpacker.unpackBinaryHeader()
                     val ratchet = ByteArray(binarySize)
-                    unpacker.readPayload(ratchet)
+                    innerUnpacker.readPayload(ratchet)
                     loadedRatchets.add(ratchet)
                 }
 
                 // Replace current ratchets
                 ratchets.clear()
                 ratchets.addAll(loadedRatchets)
+            }
 
+            try {
+                try {
+                    loadAttempt()
+                } catch (e: Exception) {
+                    // Retry once after 500ms (matches Python I/O conflict handling)
+                    println("First ratchet reload attempt for $this failed. Retrying in 500ms.")
+                    Thread.sleep(500)
+                    loadAttempt()
+                    println("Ratchet reload retry succeeded")
+                }
                 return true
             } catch (e: Exception) {
                 throw java.io.IOException("Could not read ratchet file for $this: ${e.message}", e)
@@ -1032,53 +1072,35 @@ class Destination private constructor(
                     "Cannot decrypt for SINGLE destination without identity"
                 )
 
-                var plaintext: ByteArray? = null
-
-                // If we have ratchet private keys for decryption, try them individually
-                // so we can track which one worked
                 if (ratchets.isNotEmpty()) {
-                    val crypto = defaultCryptoProvider()
+                    // Try decryption with current in-memory ratchets
+                    var plaintext = tryDecryptWithRatchets(id, ciphertext)
 
-                    // Try each ratchet in order (newest first)
-                    for (ratchet in ratchets) {
+                    // If failed and we have a ratchets file, reload and retry
+                    // (matches Python: reload from disk on failure)
+                    if (plaintext == null && ratchetsPath != null) {
                         try {
-                            // Try decrypting with this single ratchet
-                            plaintext = id.decrypt(ciphertext, listOf(ratchet), enforceRatchets = true)
-
+                            println("Decryption with ratchets failed on $this, reloading ratchets from storage and retrying")
+                            reloadRatchets()
+                            plaintext = tryDecryptWithRatchets(id, ciphertext)
                             if (plaintext != null) {
-                                // Success! Compute and store the ratchet ID
-                                val ratchetPublic = crypto.x25519PublicFromPrivate(ratchet)
-                                latestRatchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
-                                break
+                                println("Decryption succeeded after ratchet reload")
                             }
                         } catch (e: Exception) {
-                            // Try next ratchet
-                            continue
+                            println("Decryption still failing after ratchet reload: ${e.message}")
                         }
                     }
 
-                    // If ratchets didn't work and enforcement is off, try base key
-                    if (plaintext == null && !enforceRatchets) {
-                        try {
-                            plaintext = id.decrypt(ciphertext, null, enforceRatchets = false)
-                            // If base key worked, clear ratchet ID
-                            if (plaintext != null) {
-                                latestRatchetId = null
-                            }
-                        } catch (e: Exception) {
-                            // Decryption failed
-                        }
-                    }
+                    plaintext
                 } else {
                     // No ratchets available, use base identity decryption
-                    plaintext = id.decrypt(ciphertext, null, enforceRatchets)
+                    val plaintext = id.decrypt(ciphertext, null, enforceRatchets)
                     // Clear ratchet ID since we used base key
                     if (plaintext != null) {
                         latestRatchetId = null
                     }
+                    plaintext
                 }
-
-                plaintext
             }
 
             DestinationType.GROUP -> {
@@ -1092,6 +1114,47 @@ class Destination private constructor(
                 throw IllegalStateException("Link decryption must be done through the Link class")
             }
         }
+    }
+
+    /**
+     * Try decrypting with the current in-memory ratchets list.
+     * Tests each ratchet individually and tracks which one succeeded.
+     * Falls back to base identity key if enforcement is off.
+     *
+     * @return Decrypted plaintext, or null if all attempts failed
+     */
+    private fun tryDecryptWithRatchets(id: Identity, ciphertext: ByteArray): ByteArray? {
+        val crypto = defaultCryptoProvider()
+
+        // Try each ratchet in order (newest first)
+        for (ratchet in ratchets) {
+            try {
+                val plaintext = id.decrypt(ciphertext, listOf(ratchet), enforceRatchets = true)
+                if (plaintext != null) {
+                    // Success! Compute and store the ratchet ID
+                    val ratchetPublic = crypto.x25519PublicFromPrivate(ratchet)
+                    latestRatchetId = Hashes.fullHash(ratchetPublic).copyOf(RATCHET_ID_SIZE)
+                    return plaintext
+                }
+            } catch (_: Exception) {
+                // Try next ratchet
+            }
+        }
+
+        // If ratchets didn't work and enforcement is off, try base key
+        if (!enforceRatchets) {
+            try {
+                val plaintext = id.decrypt(ciphertext, null, enforceRatchets = false)
+                if (plaintext != null) {
+                    latestRatchetId = null
+                    return plaintext
+                }
+            } catch (_: Exception) {
+                // Decryption failed
+            }
+        }
+
+        return null
     }
 
     /**

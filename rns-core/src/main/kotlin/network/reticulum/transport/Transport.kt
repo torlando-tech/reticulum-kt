@@ -3341,8 +3341,20 @@ object Transport {
     private fun cullTables() {
         val now = System.currentTimeMillis()
 
-        // Remove expired path entries
-        pathTable.entries.removeIf { it.value.isExpired() }
+        // Remove expired path entries and entries whose interface no longer exists
+        // (matches Python Transport.py:707-720)
+        pathTable.entries.removeIf { entry ->
+            val pathEntry = entry.value
+            if (pathEntry.isExpired()) {
+                log("Path to ${entry.key} timed out and was removed")
+                true
+            } else if (findInterfaceByHash(pathEntry.receivingInterfaceHash) == null) {
+                log("Path to ${entry.key} was removed since the attached interface no longer exists")
+                true
+            } else {
+                false
+            }
+        }
 
         // Remove expired reverse entries
         reverseTable.entries.removeIf { it.value.isExpired() }

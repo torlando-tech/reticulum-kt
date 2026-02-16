@@ -1901,6 +1901,113 @@ def cmd_ratchet_extract_from_announce(params):
     return result
 
 
+# Ratchet file format operations (Destination-level ratchet persistence)
+
+def cmd_ratchet_file_write(params):
+    """Write a ratchet file in Python's Destination._persist_ratchets format.
+
+    params:
+        path: str - file path to write
+        ratchet_keys: list of hex strings - ratchet private keys
+        signing_private_key: hex - Ed25519 private key (64 bytes) for signing
+    returns:
+        written: bool
+        path: str
+        ratchet_count: int
+    """
+    path = params['path']
+    ratchet_keys = [hex_to_bytes(k) for k in params['ratchet_keys']]
+    signing_key_bytes = hex_to_bytes(params['signing_private_key'])
+
+    # Ed25519 private key is the second 32 bytes of the 64-byte identity key
+    from pure25519.ed25519_oop import SigningKey
+    ed25519_seed = signing_key_bytes[32:]
+    sk = SigningKey(ed25519_seed)
+
+    # Pack ratchets list (inner packing)
+    packed_ratchets = umsgpack.packb(ratchet_keys)
+
+    # Sign the packed ratchets (matches Destination._persist_ratchets → Identity.sign)
+    signature = sk.sign(packed_ratchets)
+
+    # Wrap in outer msgpack dict
+    persisted_data = {
+        "signature": signature,
+        "ratchets": packed_ratchets
+    }
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+
+    # Write atomically via temp file
+    temp_path = path + ".tmp"
+    with open(temp_path, "wb") as f:
+        f.write(umsgpack.packb(persisted_data))
+    if os.path.isfile(path):
+        os.unlink(path)
+    os.rename(temp_path, path)
+
+    return {
+        'written': True,
+        'path': path,
+        'ratchet_count': len(ratchet_keys)
+    }
+
+
+def cmd_ratchet_file_read(params):
+    """Read and validate a ratchet file in Python's Destination._reload_ratchets format.
+
+    params:
+        path: str - file path to read
+        verify_public_key: hex - Ed25519 public key (32 bytes) for signature verification
+    returns:
+        valid: bool
+        ratchet_keys: list of hex strings
+        ratchet_count: int
+        signature_valid: bool
+    """
+    path = params['path']
+    verify_key_bytes = hex_to_bytes(params['verify_public_key'])
+
+    from pure25519.ed25519_oop import VerifyingKey
+
+    with open(path, "rb") as f:
+        file_data = f.read()
+
+    # Unpack outer msgpack dict
+    persisted_data = umsgpack.unpackb(file_data)
+
+    if "signature" not in persisted_data or "ratchets" not in persisted_data:
+        return {
+            'valid': False,
+            'ratchet_keys': [],
+            'ratchet_count': 0,
+            'signature_valid': False,
+            'error': 'Missing signature or ratchets key in file'
+        }
+
+    signature = persisted_data["signature"]
+    packed_ratchets = persisted_data["ratchets"]
+
+    # Verify signature (VerifyingKey.verify raises on invalid)
+    vk = VerifyingKey(verify_key_bytes)
+    try:
+        vk.verify(signature, packed_ratchets)
+        signature_valid = True
+    except Exception:
+        signature_valid = False
+
+    # Unpack inner ratchets list
+    ratchet_keys = umsgpack.unpackb(packed_ratchets)
+
+    return {
+        'valid': signature_valid,
+        'ratchet_keys': [bytes_to_hex(k) for k in ratchet_keys],
+        'ratchet_count': len(ratchet_keys),
+        'signature_valid': signature_valid
+    }
+
+
 # Channel operations
 
 def cmd_envelope_pack(params):
@@ -3885,6 +3992,8 @@ COMMANDS = {
     'ratchet_decrypt': cmd_ratchet_decrypt,
     'ratchet_storage_format': cmd_ratchet_storage_format,
     'ratchet_extract_from_announce': cmd_ratchet_extract_from_announce,
+    'ratchet_file_write': cmd_ratchet_file_write,
+    'ratchet_file_read': cmd_ratchet_file_read,
     # Announce operations
     'random_hash': cmd_random_hash,
     'announce_pack': cmd_announce_pack,
