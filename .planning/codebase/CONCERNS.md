@@ -338,17 +338,22 @@ const val HASHLIST_MAXSIZE = 1_000_000  // Line 84
 
 ## Untested / Fragile Areas
 
-### 13. IFAC (Interface Authentication Code) - Not Implemented
+### 13. IFAC (Interface Access Code) - Implemented
 
-**Files:** `rns-test/src/test/kotlin/network/reticulum/interop/ifac/IfacInteropTest.kt`
+**Implementation Files:**
+- `rns-interfaces/.../IfacUtils.kt` — HKDF key derivation (matches Python exactly)
+- `rns-interfaces/.../tcp/TCPClientInterface.kt` — IFAC params + lazy credential derivation
+- `rns-interfaces/.../tcp/TCPServerInterface.kt` — IFAC params propagated to spawned clients
+- `rns-interfaces/.../InterfaceAdapter.kt` — Delegates ifacSize/ifacKey/ifacIdentity to InterfaceRef
+- `rns-core/.../transport/Transport.kt` — addIfacMasking() / removeIfacMasking()
 
-**Status:** Implementation exists but marked as optional/low priority in IMPLEMENTATION_STATUS.md
+**Test Coverage:**
+- `rns-test/.../interop/ifac/IfacInteropTest.kt` — Key derivation interop with Python
+- `rns-test/.../integration/IfacTcpIntegrationTest.kt` — Live TCP with matching/mismatched credentials
 
-**Test File:** IfacInteropTest exists but feature is incomplete
+**Status:** Complete. IFAC signing, masking, verification, and credential derivation all match Python RNS.
 
-**Risk Level:** LOW (user said "nice to have")
-
-**Deferred Until:** Specific multi-network isolation need arises
+**Risk Level:** LOW — well-tested
 
 ---
 

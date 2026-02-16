@@ -9,6 +9,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import network.reticulum.identity.Identity
+import network.reticulum.interfaces.IfacCredentials
+import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
@@ -32,13 +35,30 @@ class TCPServerInterface(
     private val bindAddress: String = "0.0.0.0",
     private val bindPort: Int,
     private val useKissFraming: Boolean = false,
-    private val maxClients: Int = 64
+    private val maxClients: Int = 64,
+    // IFAC (Interface Access Code) parameters for network isolation
+    override val ifacNetname: String? = null,
+    override val ifacNetkey: String? = null,
 ) : Interface(name) {
 
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
     }
+
+    // IFAC credentials - derived lazily from network name/passphrase
+    private val _ifacCredentials: IfacCredentials? by lazy {
+        IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
+    }
+
+    override val ifacSize: Int
+        get() = if (_ifacCredentials != null) 16 else 0
+
+    override val ifacKey: ByteArray?
+        get() = _ifacCredentials?.key
+
+    override val ifacIdentity: Identity?
+        get() = _ifacCredentials?.identity
 
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
@@ -220,6 +240,13 @@ class TCPServerClientInterface internal constructor(
     init {
         parentInterface = parentServer
     }
+
+    // IFAC: delegate to parent server (same credentials for all clients on this server)
+    override val ifacNetname: String? get() = parentServer.ifacNetname
+    override val ifacNetkey: String? get() = parentServer.ifacNetkey
+    override val ifacSize: Int get() = parentServer.ifacSize
+    override val ifacKey: ByteArray? get() = parentServer.ifacKey
+    override val ifacIdentity: Identity? get() = parentServer.ifacIdentity
 
     override val bitrate: Int = TCPServerInterface.BITRATE_GUESS
     override val hwMtu: Int = TCPServerInterface.HW_MTU
