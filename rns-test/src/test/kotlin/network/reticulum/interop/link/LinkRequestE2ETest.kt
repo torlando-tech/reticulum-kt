@@ -194,8 +194,10 @@ class LinkRequestE2ETest : RnsLiveTestBase() {
         assertTrue(establishedLatch.await(15, TimeUnit.SECONDS), "Link should establish")
         waitForPythonLink(5000)
 
-        // Register request handler on the Kotlin destination
-        // For initiator links, attachedDestination is the OUT destination we created
+        // For initiator links, attachedDestination is null by default.
+        // Attach the OUT destination so the link can find request handlers on it.
+        // This matches Python where link.attached_interface is publicly writable.
+        link!!.attachedDestination = destination
         val kotlinDest = link!!.attachedDestination
         assertNotNull(kotlinDest, "Link should have an attached destination")
 

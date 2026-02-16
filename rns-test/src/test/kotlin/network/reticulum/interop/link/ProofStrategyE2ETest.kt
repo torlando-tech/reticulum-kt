@@ -56,10 +56,10 @@ class ProofStrategyE2ETest : RnsLiveTestBase() {
         assertTrue(establishedLatch.await(15, TimeUnit.SECONDS), "Link should establish")
         waitForPythonLink(5000)
 
-        // Set PROVE_ALL on the Kotlin-side destination
-        // The owner destination is the Python IN destination (remote side),
-        // but proof strategy is checked on the destination that owns the link.
-        // For Kotlin-initiated links, proof strategy lives on the attached destination.
+        // Set PROVE_ALL on the Kotlin-side destination.
+        // For Kotlin-initiated links, attachedDestination is null by default.
+        // Attach our OUT destination so proof strategy can be checked on it.
+        link!!.attachedDestination = destination
         val dest = link!!.attachedDestination
         assertNotNull(dest, "Should have a destination")
         dest!!.setProofStrategy(Destination.PROVE_ALL)

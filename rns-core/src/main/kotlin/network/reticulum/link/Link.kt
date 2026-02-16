@@ -336,9 +336,9 @@ class Link private constructor(
     var keepalive: Long = LinkConstants.KEEPALIVE
     var staleTime: Long = LinkConstants.STALE_TIME
 
-    // Attached interface/destination
+    // Attached interface/destination (public to allow initiator links to attach a destination
+    // for request handling — matches Python's Link.attached_interface which is also public)
     var attachedDestination: Destination? = null
-        private set
     private var remoteIdentity: Identity? = null
 
     // Cryptographic state
@@ -1630,7 +1630,14 @@ class Link private constructor(
                 return
             }
 
-            val timestamp = unpacker.unpackLong()
+            // Python sends time.time() which is a float; Kotlin uses millis (Long).
+            // Accept both integer and float timestamps from msgpack.
+            val nextFormat = unpacker.nextFormat
+            val timestamp = if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
+                unpacker.unpackDouble().toLong()
+            } else {
+                unpacker.unpackLong()
+            }
             val pathHashSize = unpacker.unpackBinaryHeader()
             val pathHash = ByteArray(pathHashSize)
             unpacker.readPayload(pathHash)
@@ -1674,23 +1681,28 @@ class Link private constructor(
             val requestId = ByteArray(requestIdSize)
             unpacker.readPayload(requestId)
 
-            // Get the position after request_id to extract raw responseData bytes
-            val positionAfterRequestId = unpacker.totalReadBytes.toInt()
-
-            // Read the response value (could be any type) and re-serialize it to bytes
-            // We use ImmutableValue to preserve the original structure
+            // Read the response value — convert to native types like Python's umsgpack.unpackb.
+            // Python: receipt.response = umsgpack.unpackb(plaintext)[1]
+            // For binary data this is raw bytes, for nil it's None, etc.
             val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            // Re-pack the response value to bytes so callbacks can unpack it
-            val responseBuffer = ByteArrayOutputStream()
-            val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
-            responseValue.writeTo(responsePacker)
-            responsePacker.close()
-            val responseData = responseBuffer.toByteArray()
+            val responseData: ByteArray? = when {
+                responseValue.isNilValue -> null
+                responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
+                responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
+                else -> {
+                    // For complex types (arrays, maps), re-serialize to msgpack bytes
+                    val responseBuffer = ByteArrayOutputStream()
+                    val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
+                    responseValue.writeTo(responsePacker)
+                    responsePacker.close()
+                    responseBuffer.toByteArray()
+                }
+            }
 
             // Calculate transfer size
-            val responseDataSize = responseData.size
+            val responseDataSize = responseData?.size ?: 0
             val transferSize = responseDataSize
 
             // Pass to handleResponse
@@ -2508,7 +2520,13 @@ class Link private constructor(
                 return
             }
 
-            val timestamp = unpacker.unpackLong()
+            // Python sends time.time() which is a float; accept both types
+            val nextFormat = unpacker.nextFormat
+            val timestamp = if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
+                unpacker.unpackDouble().toLong()
+            } else {
+                unpacker.unpackLong()
+            }
             val pathHashSize = unpacker.unpackBinaryHeader()
             val pathHash = ByteArray(pathHashSize)
             unpacker.readPayload(pathHash)
@@ -2574,16 +2592,22 @@ class Link private constructor(
             val requestId = ByteArray(requestIdSize)
             unpacker.readPayload(requestId)
 
-            // Read the response value (could be any type) and re-serialize it to bytes
+            // Convert response value to native types (matching Python umsgpack.unpackb behavior)
             val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            // Re-pack the response value to bytes so callbacks can unpack it
-            val responseBuffer = ByteArrayOutputStream()
-            val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
-            responseValue.writeTo(responsePacker)
-            responsePacker.close()
-            val responseData = responseBuffer.toByteArray()
+            val responseData: ByteArray? = when {
+                responseValue.isNilValue -> null
+                responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
+                responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
+                else -> {
+                    val responseBuffer = ByteArrayOutputStream()
+                    val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
+                    responseValue.writeTo(responsePacker)
+                    responsePacker.close()
+                    responseBuffer.toByteArray()
+                }
+            }
 
             // Pass to handleResponse
             handleResponse(requestId, responseData, packedResponse.size, resource.totalSize)

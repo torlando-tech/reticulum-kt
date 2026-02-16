@@ -3035,6 +3035,20 @@ def cmd_rns_start(params):
     # RNS logs go to stdout by default which breaks the bridge protocol
     RNS.loglevel = RNS.LOG_CRITICAL
 
+    # Pre-create config file to:
+    # 1. Prevent Reticulum from detecting/connecting to any running shared instance
+    #    (which makes _add_interface a no-op and causes AttributeError on ifac_size)
+    # 2. Enable transport so this instance routes packets
+    # 3. Avoid the 1.5s sleep that happens when creating the default config
+    config_file = os.path.join(config_path, "config")
+    if not os.path.isfile(config_file):
+        os.makedirs(config_path, exist_ok=True)
+        with open(config_file, "w") as f:
+            f.write("[reticulum]\n")
+            f.write("  enable_transport = Yes\n")
+            f.write("  share_instance = No\n")
+            f.write("\n[interfaces]\n")
+
     # Start Reticulum with transport enabled (minimal logging)
     _rns_instance = RNS.Reticulum(
         configdir=config_path,

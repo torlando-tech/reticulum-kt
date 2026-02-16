@@ -43,7 +43,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | BLE Driver | Complete | GATT server/client, advertising, scanning (API 26+) |
 | Power Management | Complete | Doze handler, battery monitor, WorkManager integration |
 | Sample App | Moved | See [carina](https://github.com/torlando/carina) for the Compose UI sample app |
-| LXMF | Moved | See [lxmf-kt](https://github.com/torlando/lxmf-kt) for the LXMF messaging protocol |
+| LXMF | Moved | See [LXMF-kt](https://github.com/torlando/LXMF-kt) for the LXMF messaging protocol |
 
 ### Remaining Work
 
