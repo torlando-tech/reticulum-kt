@@ -82,12 +82,18 @@ class Resource private constructor(
             advertise: Boolean = true,
             autoCompress: Boolean = true,
             callback: ((Resource) -> Unit)? = null,
-            progressCallback: ((Resource) -> Unit)? = null
+            progressCallback: ((Resource) -> Unit)? = null,
+            requestId: ByteArray? = null,
+            isResponse: Boolean = false,
+            timeout: Long? = null
         ): Resource {
             val resource = Resource(link, initiator = true)
 
             callback?.let { resource.callbacks.completed = it }
             progressCallback?.let { resource.callbacks.progress = it }
+
+            resource.requestId = requestId
+            resource.isResponse = isResponse
 
             resource.initializeForSending(data, metadata, autoCompress)
 

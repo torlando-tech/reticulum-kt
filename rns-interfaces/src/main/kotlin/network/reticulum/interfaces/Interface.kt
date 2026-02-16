@@ -96,6 +96,11 @@ abstract class Interface(
     @Volatile
     var wantsTunnel: Boolean = false
 
+    /** Physical layer signal stats from the most recently received packet. */
+    @Volatile var rStatRssi: Int? = null
+    @Volatile var rStatSnr: Float? = null
+    @Volatile var rStatQ: Float? = null
+
     /** Callback for received packets. */
     var onPacketReceived: ((data: ByteArray, fromInterface: Interface) -> Unit)? = null
 

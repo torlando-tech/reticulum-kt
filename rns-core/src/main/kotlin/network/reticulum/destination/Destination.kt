@@ -1263,6 +1263,29 @@ class Destination private constructor(
         proofRequestedCallback = callback
     }
 
+    /**
+     * Determine whether a proof should be sent for the given packet,
+     * based on the current proof strategy.
+     *
+     * @param packet The packet to evaluate
+     * @return true if a proof should be generated and sent
+     */
+    fun shouldProve(packet: Any): Boolean {
+        return when (proofStrategy) {
+            PROVE_ALL -> true
+            PROVE_APP -> {
+                proofRequestedCallback?.let { callback ->
+                    try {
+                        callback(packet)
+                    } catch (e: Exception) {
+                        false
+                    }
+                } ?: false
+            }
+            else -> false  // PROVE_NONE
+        }
+    }
+
     // ===== Callback Setters =====
 
     /**

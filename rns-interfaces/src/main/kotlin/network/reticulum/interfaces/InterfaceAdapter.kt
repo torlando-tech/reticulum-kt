@@ -40,6 +40,14 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val parentInterface: InterfaceRef?
         get() = iface.parentInterface?.toRef()
 
+    // Physical layer stats
+    override val rStatRssi: Int?
+        get() = iface.rStatRssi
+    override val rStatSnr: Float?
+        get() = iface.rStatSnr
+    override val rStatQ: Float?
+        get() = iface.rStatQ
+
     // IFAC properties - delegate to underlying interface
     override val ifacSize: Int
         get() = iface.ifacSize

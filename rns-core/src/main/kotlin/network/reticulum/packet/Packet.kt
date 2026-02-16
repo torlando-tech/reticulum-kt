@@ -71,6 +71,14 @@ class Packet private constructor(
     var receivingInterfaceHash: ByteArray? = null
         internal set
 
+    /** Physical layer signal stats from receiving interface. */
+    var rssi: Int? = null
+        internal set
+    var snr: Float? = null
+        internal set
+    var q: Float? = null
+        internal set
+
     /** Whether this packet has been sent. */
     var sent: Boolean = false
         private set

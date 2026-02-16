@@ -18,6 +18,7 @@ import network.reticulum.Reticulum
 import network.reticulum.transport.Transport
 import network.reticulum.channel.Channel
 import network.reticulum.channel.ChannelOutlet
+import network.reticulum.channel.MessageState
 import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.toKey
 import kotlinx.coroutines.CoroutineScope
@@ -804,10 +805,14 @@ class Link private constructor(
                 data = encrypted,
                 packetType = PacketType.DATA,
                 context = PacketContext.CHANNEL,
+                destinationType = DestinationType.LINK,
                 mtu = link.mtu
             )
 
-            return if (Transport.outbound(packet)) {
+            // Use packet.send() so a PacketReceipt is created, enabling
+            // delivery confirmation and timeout callbacks for Channel retry logic
+            val receipt = packet.send()
+            return if (receipt != null) {
                 link.hadOutbound(isData = true)
                 packet
             } else {
@@ -822,16 +827,41 @@ class Link private constructor(
         }
 
         override fun getPacketState(packet: Any): Int {
-            // TODO: Implement proper packet state tracking
-            return 0
+            if (packet !is Packet) return MessageState.FAILED
+            val receipt = packet.receipt ?: return MessageState.FAILED
+
+            return when (receipt.status) {
+                PacketReceipt.SENT -> MessageState.SENT
+                PacketReceipt.DELIVERED -> MessageState.DELIVERED
+                PacketReceipt.FAILED, PacketReceipt.CULLED -> MessageState.FAILED
+                else -> MessageState.FAILED
+            }
         }
 
         override fun setPacketTimeoutCallback(packet: Any, callback: ((Any) -> Unit)?, timeout: Long?) {
-            // TODO: Implement packet timeout callback
+            if (packet !is Packet) return
+            val receipt = packet.receipt ?: return
+
+            if (timeout != null) {
+                receipt.setTimeout(timeout / 1000.0)  // Convert ms to seconds
+            }
+
+            if (callback != null) {
+                receipt.setTimeoutCallback { callback(packet) }
+            } else {
+                receipt.callbacks.timeout = null
+            }
         }
 
         override fun setPacketDeliveredCallback(packet: Any, callback: ((Any) -> Unit)?) {
-            // TODO: Implement packet delivered callback
+            if (packet !is Packet) return
+            val receipt = packet.receipt ?: return
+
+            if (callback != null) {
+                receipt.setDeliveryCallback { callback(packet) }
+            } else {
+                receipt.callbacks.delivery = null
+            }
         }
 
         override fun getPacketId(packet: Any): Any {
@@ -928,20 +958,38 @@ class Link private constructor(
             receipt.startedAt = System.currentTimeMillis()
             hadOutbound(isData = true)
 
-            // TODO: Set up timeout monitoring thread
-            // For now, the timeout will be handled by the watchdog or caller
-
+            // Timeout monitoring handled by watchdog checkRequestTimeouts()
             return receipt
 
         } else {
-            // Send as resource
-            // For large requests, use the truncated hash of the packed request as request_id
+            // Send as resource (Python: Link.py:514-527)
             val requestId = Hashes.truncatedHash(packedRequest)
             log("Sending request ${requestId.toHexString()} as resource")
-            // TODO: Implement large request sending via Resource
-            // This requires Resource class to support request_id and is_response flags
-            log("Large requests not yet fully implemented")
-            return null
+
+            val requestResource = network.reticulum.resource.Resource.create(
+                data = packedRequest,
+                link = this,
+                requestId = requestId,
+                isResponse = false,
+                timeout = actualTimeout
+            )
+
+            val receipt = RequestReceipt(
+                link = this,
+                requestId = requestId,
+                requestSize = packedRequest.size,
+                responseCallback = responseCallback,
+                failedCallback = failedCallback,
+                progressCallback = progressCallback,
+                timeout = actualTimeout
+            )
+
+            synchronized(pendingRequests) {
+                pendingRequests.add(receipt)
+            }
+
+            receipt.startedAt = System.currentTimeMillis()
+            return receipt
         }
     }
 
@@ -1310,6 +1358,9 @@ class Link private constructor(
                         log("Link marked stale")
                     }
                 }
+
+                // Check for timed-out pending requests
+                checkRequestTimeouts(now)
             }
 
             LinkConstants.STALE -> {
@@ -1317,6 +1368,29 @@ class Link private constructor(
                 sendTeardownPacket()
                 teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
             }
+        }
+    }
+
+    /**
+     * Check pending requests for timeouts.
+     * Called from the watchdog loop.
+     */
+    private fun checkRequestTimeouts(now: Long) {
+        val timedOut = mutableListOf<RequestReceipt>()
+        synchronized(pendingRequests) {
+            val iter = pendingRequests.iterator()
+            while (iter.hasNext()) {
+                val receipt = iter.next()
+                val started = receipt.startedAt ?: continue
+                if (now - started > receipt.timeout) {
+                    timedOut.add(receipt)
+                    iter.remove()
+                }
+            }
+        }
+        for (receipt in timedOut) {
+            log("Request ${receipt.requestId.toHexString()} timed out after ${receipt.timeout}ms")
+            receipt.requestFailed()
         }
     }
 
@@ -1470,6 +1544,9 @@ class Link private constructor(
     private fun processRegularData(packet: Packet) {
         val plaintext = decrypt(packet.data) ?: return
 
+        // Update physical layer stats
+        updatePhyStats(packet.rssi, packet.snr, packet.q)
+
         // Associate the packet with this link so prove() can work
         packet.link = this
 
@@ -1484,8 +1561,11 @@ class Link private constructor(
             }
         }
 
-        // TODO: Handle proof strategies (PROVE_ALL, PROVE_APP)
-        // This requires Destination proof strategy implementation
+        // Enforce proof strategy (Python: Link.py:1003-1012)
+        val dest = owner ?: attachedDestination
+        if (dest != null && dest.shouldProve(packet)) {
+            packet.prove()
+        }
     }
 
     /**
@@ -2061,12 +2141,21 @@ class Link private constructor(
      * Process channel packets.
      */
     private fun processChannel(packet: Packet) {
-        // TODO: Implement channel handling
-        // This requires:
-        // - Checking if channel is open
-        // - Proving packet receipt
-        // - Decrypting and passing to channel
-        log("Channel handling not yet implemented")
+        if (_channel == null) {
+            log("Channel data received without open channel")
+            return
+        }
+
+        // Prove receipt of the channel packet (Python: Link.py:1173)
+        packet.link = this
+        packet.prove()
+
+        // Decrypt and pass to the channel
+        val plaintext = decrypt(packet.data)
+        if (plaintext != null) {
+            updatePhyStats(packet.rssi, packet.snr, packet.q)
+            _channel!!.receive(plaintext)
+        }
     }
 
     /**
@@ -2334,9 +2423,14 @@ class Link private constructor(
                 Transport.outbound(packet)
                 hadOutbound(isData = true)
             } else {
-                // TODO: Send as resource
-                // This requires implementing Resource class with is_response flag
-                log("Large response not yet implemented (requires Resource)")
+                // Send as resource with is_response flag (Python: Link.py:903-905)
+                network.reticulum.resource.Resource.create(
+                    data = packedResponse,
+                    link = this,
+                    requestId = requestId,
+                    isResponse = true,
+                    autoCompress = autoCompress
+                )
             }
         } catch (e: Exception) {
             log("Error sending response: ${e.message}")
@@ -2398,9 +2492,46 @@ class Link private constructor(
      * @param resource The completed resource
      */
     fun requestResourceConcluded(resource: network.reticulum.resource.Resource) {
-        // TODO: Implement when Resource class has status property
-        // This should unpack the request data and call handleRequest
-        log("Request resource concluded (not yet fully implemented)")
+        if (resource.status == network.reticulum.resource.ResourceConstants.COMPLETE) {
+            val packedRequest = resource.data ?: run {
+                log("Request resource completed but has no data")
+                return
+            }
+
+            // Unpack the request and compute requestId from the packed data
+            // (Python: Link.py:931-940)
+            val requestId = Hashes.truncatedHash(packedRequest)
+            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedRequest)
+            val arraySize = unpacker.unpackArrayHeader()
+            if (arraySize != 3) {
+                log("Invalid resource request format: expected 3 elements, got $arraySize")
+                return
+            }
+
+            val timestamp = unpacker.unpackLong()
+            val pathHashSize = unpacker.unpackBinaryHeader()
+            val pathHash = ByteArray(pathHashSize)
+            unpacker.readPayload(pathHash)
+
+            val requestData = if (unpacker.tryUnpackNil()) {
+                null
+            } else {
+                val dataSize = unpacker.unpackBinaryHeader()
+                val data = ByteArray(dataSize)
+                unpacker.readPayload(data)
+                data
+            }
+            unpacker.close()
+
+            val unpackedRequest = listOf(timestamp, pathHash, requestData)
+
+            // Handle request on a separate thread (Python: Link.py:938-939)
+            thread(isDaemon = true) {
+                handleRequest(requestId, unpackedRequest)
+            }
+        } else {
+            log("Incoming request resource failed with status: ${resource.status}")
+        }
     }
 
     /**

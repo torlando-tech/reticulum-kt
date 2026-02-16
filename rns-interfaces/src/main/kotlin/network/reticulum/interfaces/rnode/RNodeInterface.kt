@@ -82,9 +82,8 @@ class RNodeInterface(
     private var mcu: Int? = null
     private var detected: Boolean = false
 
-    // Statistics
-    @Volatile var rStatRssi: Int? = null; private set
-    @Volatile var rStatSnr: Double? = null; private set
+    // Statistics — use base class rStatRssi/rStatSnr/rStatQ fields from Interface
+    // (removed local declarations; RNodeInterface now sets the inherited fields directly)
     @Volatile var rBatteryState: Int = 0; private set
     @Volatile var rBatteryPercent: Int = 0; private set
 
@@ -434,7 +433,7 @@ class RNodeInterface(
                         rStatRssi = byte - RSSI_OFFSET
                     } else if (command == KISS.CMD_STAT_SNR) {
                         // Signed byte * 0.25
-                        rStatSnr = byte.toByte().toDouble() * 0.25
+                        rStatSnr = (byte.toByte().toFloat() * 0.25f)
                     } else if (command == KISS.CMD_ST_ALOCK) {
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {

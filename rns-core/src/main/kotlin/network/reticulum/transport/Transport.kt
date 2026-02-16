@@ -2060,6 +2060,11 @@ object Transport {
         // Track which interface this packet was received on
         packet.receivingInterfaceHash = interfaceRef.hash
 
+        // Copy physical layer stats from receiving interface to packet
+        interfaceRef.rStatRssi?.let { packet.rssi = it }
+        interfaceRef.rStatSnr?.let { packet.snr = it }
+        interfaceRef.rStatQ?.let { packet.q = it }
+
         // Python RNS: Decrement hops for packets from local client interfaces
         // This makes destinations behind shared instance appear more reachable
         // Matches Python Transport.inbound():1253-1258
@@ -4254,6 +4259,14 @@ interface InterfaceRef {
 
     /** Parent interface for spawned interfaces (Python: parent_interface). */
     val parentInterface: InterfaceRef?
+        get() = null
+
+    /** Physical layer stats from the most recently received packet. */
+    val rStatRssi: Int?
+        get() = null
+    val rStatSnr: Float?
+        get() = null
+    val rStatQ: Float?
         get() = null
 
     /**
