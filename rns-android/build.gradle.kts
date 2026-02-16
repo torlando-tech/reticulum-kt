@@ -48,7 +48,6 @@ dependencies {
     // Project modules
     api(project(":rns-core"))
     api(project(":rns-interfaces"))
-    api(project(":lxmf-core"))
 
     // Android dependencies
     implementation("androidx.core:core-ktx:1.12.0")

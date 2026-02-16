@@ -1,6 +1,6 @@
 # reticulum-kt
 
-A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.network/) and [LXMF](https://github.com/markqvist/lxmf) messaging protocol for building resilient, delay-tolerant mesh networks on Android and JVM.
+A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.network/) for building resilient, delay-tolerant mesh networks on Android and JVM.
 
 ## Implementation Status
 
@@ -18,7 +18,6 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Channel | ~90% | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels |
 | Resource | ~90% | Chunked transfer, BZ2 compression, progress tracking, metadata |
-| LXMF | ~95% | Messages, routing, direct/opportunistic/propagated delivery, stamps, ticket system, access control, persistence, PAPER delivery |
 | Crypto | Complete | BouncyCastle: X25519, Ed25519, HKDF, AES-256-CBC, SHA-256/512 |
 
 ### Interfaces
@@ -43,7 +42,8 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Foreground Service | Complete | Persistent connection with Doze/battery awareness |
 | BLE Driver | Complete | GATT server/client, advertising, scanning (API 26+) |
 | Power Management | Complete | Doze handler, battery monitor, WorkManager integration |
-| Sample App | Complete | Compose UI with BLE device picker, interface management, RSSI charts |
+| Sample App | Moved | See [carina](https://github.com/torlando/carina) for the Compose UI sample app |
+| LXMF | Moved | See [lxmf-kt](https://github.com/torlando/lxmf-kt) for the LXMF messaging protocol |
 
 ### Remaining Work
 
@@ -85,9 +85,6 @@ rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto)
 rns-android/     # Android-specific code (BLE driver, foreground service, power management)
 rns-cli/         # CLI utilities (rnsd-kt daemon)
 rns-test/        # Integration and interop tests
-rns-sample-app/  # Android sample app with Compose UI
-lxmf-core/       # LXMF messaging protocol implementation
-lxmf-examples/   # LXMF example programs (echo bot, sender, propagation node)
 python-bridge/   # Python bridge server for interop testing (120+ commands)
 ```
 
