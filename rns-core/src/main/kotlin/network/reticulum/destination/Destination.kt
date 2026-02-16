@@ -1340,6 +1340,7 @@ class Destination private constructor(
 
             // Store ratchet for this destination
             setRatchetForDestination(hash, ratchet)
+            Identity.rememberRatchet(hash, ratchet)
         } else {
             ratchet = byteArrayOf()
             hasRatchet = false

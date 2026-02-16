@@ -2386,6 +2386,13 @@ object Transport {
             appData = appData
         )
 
+        // Store ratchet if present in announce
+        val ratchet = announceData.ratchet
+        if (ratchet != null) {
+            network.reticulum.destination.Destination.setRatchetForDestination(destHash, ratchet)
+            Identity.rememberRatchet(destHash, ratchet)
+        }
+
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
         // Notify announce handlers
@@ -2990,7 +2997,8 @@ object Transport {
         val identity: Identity,
         val nameHash: ByteArray,
         val randomHash: ByteArray,
-        val appData: ByteArray?
+        val appData: ByteArray?,
+        val ratchet: ByteArray?
     )
 
     private fun validateAnnounce(packet: Packet): AnnounceData? {
@@ -3073,7 +3081,10 @@ object Transport {
             return null
         }
 
-        return AnnounceData(identity, nameHash, randomHash, appData)
+        return AnnounceData(
+            identity, nameHash, randomHash, appData,
+            ratchet = if (hasRatchet && ratchet.isNotEmpty()) ratchet else null
+        )
     }
 
     // ===== Packet Filter (Duplicate Detection) =====

@@ -3462,6 +3462,369 @@ def cmd_propagation_node_announce(params):
     }
 
 
+# ============================================================================
+# Live RNS Protocol Commands (Link, Resource, Ratchet)
+# ============================================================================
+# These commands operate on live Reticulum instances for E2E protocol testing.
+# They manage link establishment, resource transfers, and ratchet operations.
+
+# Global state for live protocol testing
+_link_destination = None
+_link_identity = None
+_established_link = None
+_received_link_packets = []
+_received_resources = []
+
+
+def cmd_rns_create_destination(params):
+    """Create a Destination that accepts link requests.
+
+    params:
+        app_name (str): Application name (e.g. 'testapp')
+        aspects (list[str]): Destination aspects (e.g. ['link', 'test'])
+
+    Returns:
+        destination_hash (hex): Hash of the destination
+        identity_hash (hex): Hash of the identity
+        identity_public_key (hex): Public key of the identity (64 bytes)
+
+    Side effect: stores _link_destination, _link_identity, sets link_established_callback
+    """
+    global _link_destination, _link_identity, _established_link
+    global _received_link_packets, _received_resources
+
+    RNS = _get_full_rns()
+
+    app_name = params.get('app_name', 'testapp')
+    aspects = params.get('aspects', ['link', 'test'])
+
+    # Create identity and destination
+    _link_identity = RNS.Identity()
+    _link_destination = RNS.Destination(
+        _link_identity,
+        RNS.Destination.IN,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects
+    )
+
+    # Reset state
+    _established_link = None
+    _received_link_packets = []
+    _received_resources = []
+
+    # Set link established callback
+    def link_established(link):
+        global _established_link, _received_link_packets, _received_resources
+        _established_link = link
+        _received_link_packets = []
+        _received_resources = []
+
+        # Set packet callback
+        def packet_callback(data, packet):
+            global _received_link_packets
+            _received_link_packets.append(data)
+
+        link.set_packet_callback(packet_callback)
+
+        # Set resource strategy to accept all
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+
+        # Set resource callbacks
+        def resource_started(resource):
+            resource.progress_callback = lambda r: None  # no-op progress
+
+        def resource_concluded(resource):
+            global _received_resources
+            if resource.status == RNS.Resource.COMPLETE:
+                _received_resources.append({
+                    'hash': bytes_to_hex(resource.hash),
+                    'data': bytes_to_hex(resource.data.read()) if resource.data else '',
+                    'size': resource.total_size,
+                })
+
+        link.set_resource_callback(resource_started)
+        link.set_resource_concluded_callback(resource_concluded)
+
+    _link_destination.set_link_established_callback(link_established)
+
+    return {
+        'destination_hash': bytes_to_hex(_link_destination.hash),
+        'identity_hash': bytes_to_hex(_link_identity.hash),
+        'identity_public_key': bytes_to_hex(_link_identity.get_public_key()),
+    }
+
+
+def cmd_rns_get_established_link(params):
+    """Poll for an established link (set by callback from create_destination).
+
+    Returns:
+        status (str): 'active', 'closed', or 'none'
+        link_id (hex|null): Link ID if active
+        rtt (float|null): Round-trip time if available
+    """
+    global _established_link
+
+    if _established_link is None:
+        return {
+            'status': 'none',
+            'link_id': None,
+            'rtt': None,
+        }
+
+    RNS = _get_full_rns()
+
+    status_map = {
+        RNS.Link.PENDING: 'pending',
+        RNS.Link.HANDSHAKE: 'handshake',
+        RNS.Link.ACTIVE: 'active',
+        RNS.Link.STALE: 'stale',
+        RNS.Link.CLOSED: 'closed',
+    }
+
+    link_status = status_map.get(_established_link.status, 'unknown')
+
+    return {
+        'status': link_status,
+        'link_id': bytes_to_hex(_established_link.link_id) if _established_link.link_id else None,
+        'rtt': _established_link.rtt if hasattr(_established_link, 'rtt') else None,
+    }
+
+
+def cmd_rns_link_send(params):
+    """Send raw data over an established link as a packet.
+
+    params:
+        data (hex): Data to send
+
+    Returns:
+        sent (bool): Whether data was sent
+    """
+    global _established_link
+
+    if _established_link is None:
+        return {'sent': False, 'error': 'No established link'}
+
+    RNS = _get_full_rns()
+
+    data = hex_to_bytes(params['data'])
+
+    if _established_link.status != RNS.Link.ACTIVE:
+        return {'sent': False, 'error': 'Link not active'}
+
+    packet = RNS.Packet(_established_link, data)
+    receipt = packet.send()
+
+    return {
+        'sent': receipt is not None,
+    }
+
+
+def cmd_rns_link_get_packets(params):
+    """Get packets received over the link.
+
+    Returns:
+        packets (list[hex]): List of received packet data as hex strings
+        count (int): Number of packets
+    """
+    global _received_link_packets
+
+    return {
+        'packets': [bytes_to_hex(p) for p in _received_link_packets],
+        'count': len(_received_link_packets),
+    }
+
+
+def cmd_rns_link_clear_packets(params):
+    """Clear received packets list."""
+    global _received_link_packets
+    _received_link_packets = []
+    return {'cleared': True}
+
+
+def cmd_rns_link_close(params):
+    """Close the established link.
+
+    Returns:
+        closed (bool): Whether the link was closed
+    """
+    global _established_link
+
+    if _established_link is None:
+        return {'closed': False, 'error': 'No established link'}
+
+    _established_link.teardown()
+
+    return {'closed': True}
+
+
+def cmd_rns_resource_send(params):
+    """Send a Resource over the established link.
+
+    params:
+        data (hex): Data to send as resource
+        compress (bool, optional): Whether to compress (default: true)
+
+    Returns:
+        sent (bool): Whether resource was initiated
+        resource_hash (hex|null): Hash of the resource
+        size (int): Size of the data
+    """
+    global _established_link
+
+    if _established_link is None:
+        return {'sent': False, 'error': 'No established link'}
+
+    RNS = _get_full_rns()
+
+    data = hex_to_bytes(params['data'])
+    compress = params.get('compress', True)
+
+    if _established_link.status != RNS.Link.ACTIVE:
+        return {'sent': False, 'error': 'Link not active'}
+
+    # Pass raw bytes directly — BytesIO lacks .name which Resource expects
+    resource = RNS.Resource(
+        data,
+        _established_link,
+        auto_compress=compress
+    )
+
+    return {
+        'sent': True,
+        'resource_hash': bytes_to_hex(resource.hash) if resource.hash else None,
+        'size': len(data),
+    }
+
+
+def cmd_rns_resource_get_received(params):
+    """Get resources received over the link.
+
+    Returns:
+        resources (list): List of received resource info
+        count (int): Number of resources
+    """
+    global _received_resources
+
+    return {
+        'resources': _received_resources,
+        'count': len(_received_resources),
+    }
+
+
+def cmd_rns_enable_ratchets(params):
+    """Enable ratchets on the link destination.
+
+    params:
+        ratchet_path (str, optional): Path for ratchet storage
+
+    Returns:
+        enabled (bool): Whether ratchets were enabled
+        ratchet_id (hex|null): Current ratchet ID if available
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'enabled': False, 'error': 'No destination created'}
+
+    RNS = _get_full_rns()
+
+    import tempfile
+    # enable_ratchets expects a FILE path, not a directory
+    ratchet_path = params.get('ratchet_path')
+    if not ratchet_path:
+        tmpdir = tempfile.mkdtemp(prefix='rns_ratchet_')
+        ratchet_path = os.path.join(tmpdir, 'ratchets')
+
+    _link_destination.enable_ratchets(ratchet_path)
+    # Set interval to 0 for testing so rotation always works immediately
+    _link_destination.ratchet_interval = 0
+
+    ratchet_id = None
+    if hasattr(_link_destination, 'hash') and RNS.Identity.current_ratchet_id(_link_destination.hash):
+        ratchet_id = bytes_to_hex(RNS.Identity.current_ratchet_id(_link_destination.hash))
+
+    return {
+        'enabled': True,
+        'ratchet_id': ratchet_id,
+    }
+
+
+def cmd_rns_rotate_ratchet(params):
+    """Force ratchet rotation and re-announce.
+
+    Returns:
+        new_ratchet_id (hex|null): New ratchet ID
+        announced (bool): Whether announce was sent
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'announced': False, 'error': 'No destination created'}
+
+    RNS = _get_full_rns()
+
+    # Force rotation to proceed regardless of interval
+    _link_destination.latest_ratchet_time = 0
+    _link_destination.rotate_ratchets()
+    _link_destination.announce()
+
+    new_ratchet_id = None
+    if RNS.Identity.current_ratchet_id(_link_destination.hash):
+        new_ratchet_id = bytes_to_hex(RNS.Identity.current_ratchet_id(_link_destination.hash))
+
+    return {
+        'new_ratchet_id': new_ratchet_id,
+        'announced': True,
+    }
+
+
+def cmd_rns_get_ratchet_info(params):
+    """Get current ratchet state for the link destination.
+
+    Returns:
+        ratchet_id (hex|null): Current ratchet ID
+        has_ratchets (bool): Whether ratchets are enabled
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'error': 'No destination created', 'has_ratchets': False}
+
+    RNS = _get_full_rns()
+
+    ratchet_id = None
+    if RNS.Identity.current_ratchet_id(_link_destination.hash):
+        ratchet_id = bytes_to_hex(RNS.Identity.current_ratchet_id(_link_destination.hash))
+
+    has_ratchets = _link_destination.ratchets is not None
+
+    return {
+        'ratchet_id': ratchet_id,
+        'has_ratchets': has_ratchets,
+    }
+
+
+def cmd_rns_announce_destination(params):
+    """Announce the link destination.
+
+    Returns:
+        announced (bool): Whether announcement was sent
+        destination_hash (hex): Hash of the destination
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'announced': False, 'error': 'No destination created'}
+
+    _link_destination.announce()
+
+    return {
+        'announced': True,
+        'destination_hash': bytes_to_hex(_link_destination.hash),
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -3579,6 +3942,19 @@ COMMANDS = {
     'propagation_node_get_messages': cmd_propagation_node_get_messages,
     'propagation_node_submit_for_recipient': cmd_propagation_node_submit_for_recipient,
     'propagation_node_announce': cmd_propagation_node_announce,
+    # Live RNS protocol operations (link, resource, ratchet)
+    'rns_create_destination': cmd_rns_create_destination,
+    'rns_get_established_link': cmd_rns_get_established_link,
+    'rns_link_send': cmd_rns_link_send,
+    'rns_link_get_packets': cmd_rns_link_get_packets,
+    'rns_link_clear_packets': cmd_rns_link_clear_packets,
+    'rns_link_close': cmd_rns_link_close,
+    'rns_resource_send': cmd_rns_resource_send,
+    'rns_resource_get_received': cmd_rns_resource_get_received,
+    'rns_enable_ratchets': cmd_rns_enable_ratchets,
+    'rns_rotate_ratchet': cmd_rns_rotate_ratchet,
+    'rns_get_ratchet_info': cmd_rns_get_ratchet_info,
+    'rns_announce_destination': cmd_rns_announce_destination,
 }
 
 

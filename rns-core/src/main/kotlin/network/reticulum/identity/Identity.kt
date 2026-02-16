@@ -514,6 +514,7 @@ class Identity private constructor(
                 // Store ratchet if present
                 if (hasRatchet && ratchet.isNotEmpty()) {
                     network.reticulum.destination.Destination.setRatchetForDestination(destinationHash, ratchet)
+                    rememberRatchet(destinationHash, ratchet)
                 }
 
                 announcedIdentity

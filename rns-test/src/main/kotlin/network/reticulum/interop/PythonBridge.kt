@@ -148,7 +148,10 @@ class PythonBridge private constructor(
             writer.flush()
 
             val responseLine = reader.readLine()
-                ?: throw IllegalStateException("Python bridge closed unexpectedly")
+                ?: run {
+                    val stderr = try { process.errorStream.bufferedReader().readText() } catch (_: Exception) { "<unavailable>" }
+                    throw IllegalStateException("Python bridge closed unexpectedly. Stderr: $stderr")
+                }
 
             val responseJson = json.parseToJsonElement(responseLine).jsonObject
             val responseId = responseJson["id"]?.jsonPrimitive?.content ?: "unknown"

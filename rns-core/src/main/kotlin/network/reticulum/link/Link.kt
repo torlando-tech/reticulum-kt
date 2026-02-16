@@ -1130,16 +1130,9 @@ class Link private constructor(
         stopWatchdog()
 
         if (previousStatus == LinkConstants.ACTIVE) {
-            // Send close packet
-            val closeData = linkId
-            val packet = Packet.createRaw(
-                destinationHash = linkId,
-                data = closeData,
-                packetType = PacketType.DATA,
-                context = PacketContext.LINKCLOSE,
-                destinationType = DestinationType.LINK
-            )
-            Transport.outbound(packet)
+            // Send close packet — data must be encrypted like Python's __teardown_packet()
+            // Python: self.decrypt(packet.data) checks if plaintext == self.link_id
+            sendTeardownPacket()
         }
 
         Transport.deregisterLink(this)
