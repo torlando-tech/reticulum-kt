@@ -3454,6 +3454,8 @@ def cmd_propagation_node_submit_for_recipient(params):
         recipient_hash (hex): Destination hash of the recipient (16 bytes)
         content (str): Message content
         title (str, optional): Message title
+        image_hex (hex, optional): Image content as hex string
+        image_extension (str, optional): Image file extension (e.g. "png")
 
     Returns:
         submitted (bool): True if message was stored
@@ -3503,6 +3505,18 @@ def cmd_propagation_node_submit_for_recipient(params):
         title=title,
         desired_method=LXMF.LXMessage.PROPAGATED
     )
+
+    # Add image field if provided
+    image_hex = params.get('image_hex', None)
+    image_extension = params.get('image_extension', None)
+    if image_hex and image_extension:
+        image_bytes = bytes.fromhex(image_hex)
+        message.fields = {
+            LXMF.FIELD_IMAGE: [
+                image_extension.encode('utf-8'),
+                image_bytes
+            ]
+        }
 
     # Pack the message for propagation format
     # This encrypts it for the recipient and creates the propagation format
@@ -3932,6 +3946,281 @@ def cmd_rns_announce_destination(params):
     }
 
 
+# ─── Channel Messaging ────────────────────────────────────────────
+
+_channel_messages_received = []
+
+class BridgeMessage:
+    """Simple channel message for interop testing."""
+    MSGTYPE = 0x0101
+
+    def __init__(self, data=None):
+        self.data = data or b""
+
+    def pack(self):
+        return self.data if isinstance(self.data, bytes) else self.data.encode('utf-8')
+
+    def unpack(self, raw):
+        self.data = raw
+
+
+def cmd_rns_channel_setup(params):
+    """Set up a channel on the established link with message type registration.
+
+    Side effect: registers BridgeMessage (0x0101) and adds a handler that
+    collects received messages into _channel_messages_received.
+
+    Returns:
+        ready (bool): Whether channel is set up
+    """
+    global _established_link, _channel_messages_received
+
+    if _established_link is None:
+        return {'ready': False, 'error': 'No established link'}
+
+    RNS = _get_full_rns()
+
+    if _established_link.status != RNS.Link.ACTIVE:
+        return {'ready': False, 'error': 'Link not active'}
+
+    _channel_messages_received = []
+
+    channel = _established_link.get_channel()
+    channel.register_message_type(BridgeMessage)
+
+    def message_handler(message):
+        global _channel_messages_received
+        if isinstance(message, BridgeMessage):
+            _channel_messages_received.append(bytes_to_hex(message.data))
+            return True
+        return False
+
+    channel.add_message_handler(message_handler)
+
+    return {'ready': True}
+
+
+def cmd_rns_channel_send(params):
+    """Send a message over the channel.
+
+    params:
+        data (hex): Message data as hex string
+
+    Returns:
+        sent (bool): Whether message was sent
+    """
+    global _established_link
+
+    if _established_link is None:
+        return {'sent': False, 'error': 'No established link'}
+
+    RNS = _get_full_rns()
+
+    if _established_link.status != RNS.Link.ACTIVE:
+        return {'sent': False, 'error': 'Link not active'}
+
+    data = hex_to_bytes(params['data'])
+    channel = _established_link.get_channel()
+
+    if not channel.is_ready_to_send():
+        return {'sent': False, 'error': 'Channel not ready'}
+
+    msg = BridgeMessage(data)
+    channel.send(msg)
+
+    return {'sent': True}
+
+
+def cmd_rns_channel_get_messages(params):
+    """Get channel messages received on the Python side.
+
+    Returns:
+        messages (list[hex]): List of received message data as hex strings
+        count (int): Number of messages
+    """
+    global _channel_messages_received
+
+    return {
+        'messages': list(_channel_messages_received),
+        'count': len(_channel_messages_received),
+    }
+
+
+def cmd_rns_channel_clear_messages(params):
+    """Clear received channel messages."""
+    global _channel_messages_received
+    _channel_messages_received = []
+    return {'cleared': True}
+
+
+# ─── Link Request/Response ─────────────────────────────────────────
+
+_request_responses_received = []
+
+def cmd_rns_register_request_handler(params):
+    """Register a request handler on the Python destination.
+
+    params:
+        path (str): Request path (e.g., "/test/echo")
+        response_data (hex, optional): Static response data to return.
+            If not provided, echoes the request data back.
+        large_response_size (int, optional): If set, returns a payload of
+            this many bytes instead of response_data.
+
+    Returns:
+        registered (bool): Whether handler was registered
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'registered': False, 'error': 'No destination created'}
+
+    RNS = _get_full_rns()
+
+    path = params.get('path', '/test/echo')
+    static_response = params.get('response_data', None)
+    large_size = params.get('large_response_size', None)
+
+    def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
+        if large_size is not None:
+            # Return a deterministic payload of the requested size
+            return bytes(range(256)) * (large_size // 256 + 1)
+        if static_response is not None:
+            return hex_to_bytes(static_response)
+        # Echo mode: return the request data
+        return data
+
+    _link_destination.register_request_handler(
+        path,
+        response_generator=response_generator,
+        allow=RNS.Destination.ALLOW_ALL
+    )
+
+    return {'registered': True}
+
+
+def cmd_rns_link_request(params):
+    """Send a request from the Python side over the established link.
+
+    params:
+        path (str): Request path
+        data (hex, optional): Request data
+
+    Returns:
+        sent (bool): Whether request was sent
+        request_id (hex|null): Request ID if sent
+    """
+    global _established_link, _request_responses_received
+
+    if _established_link is None:
+        return {'sent': False, 'error': 'No established link'}
+
+    RNS = _get_full_rns()
+
+    if _established_link.status != RNS.Link.ACTIVE:
+        return {'sent': False, 'error': 'Link not active'}
+
+    path = params.get('path', '/test/echo')
+    data_hex = params.get('data', None)
+    data = hex_to_bytes(data_hex) if data_hex else None
+
+    def got_response(request_receipt):
+        global _request_responses_received
+        response = request_receipt.response
+        if isinstance(response, bytes):
+            _request_responses_received.append({
+                'request_id': bytes_to_hex(request_receipt.request_id),
+                'response': bytes_to_hex(response),
+                'size': len(response),
+            })
+        elif response is not None:
+            resp_bytes = str(response).encode('utf-8')
+            _request_responses_received.append({
+                'request_id': bytes_to_hex(request_receipt.request_id),
+                'response': bytes_to_hex(resp_bytes),
+                'size': len(resp_bytes),
+            })
+
+    def request_failed(request_receipt):
+        global _request_responses_received
+        _request_responses_received.append({
+            'request_id': bytes_to_hex(request_receipt.request_id) if request_receipt.request_id else None,
+            'response': None,
+            'failed': True,
+        })
+
+    receipt = _established_link.request(
+        path,
+        data=data,
+        response_callback=got_response,
+        failed_callback=request_failed,
+    )
+
+    if receipt and receipt != False:
+        return {
+            'sent': True,
+            'request_id': bytes_to_hex(receipt.request_id) if receipt.request_id else None,
+        }
+    else:
+        return {'sent': False, 'error': 'Request failed to send'}
+
+
+def cmd_rns_get_request_responses(params):
+    """Get responses received from requests sent by Python.
+
+    Returns:
+        responses (list): List of response info
+        count (int): Number of responses
+    """
+    global _request_responses_received
+
+    return {
+        'responses': list(_request_responses_received),
+        'count': len(_request_responses_received),
+    }
+
+
+def cmd_rns_clear_request_responses(params):
+    """Clear received request responses."""
+    global _request_responses_received
+    _request_responses_received = []
+    return {'cleared': True}
+
+
+# ─── Proof Strategy ────────────────────────────────────────────────
+
+def cmd_rns_set_proof_strategy(params):
+    """Set the proof strategy on the Python destination.
+
+    params:
+        strategy (str): One of 'prove_all', 'prove_none', 'prove_app'
+
+    Returns:
+        set (bool): Whether strategy was set
+    """
+    global _link_destination
+
+    if _link_destination is None:
+        return {'set': False, 'error': 'No destination created'}
+
+    RNS = _get_full_rns()
+
+    strategy_map = {
+        'prove_all': RNS.Destination.PROVE_ALL,
+        'prove_none': RNS.Destination.PROVE_NONE,
+        'prove_app': RNS.Destination.PROVE_APP,
+    }
+
+    strategy_name = params.get('strategy', 'prove_none')
+    strategy = strategy_map.get(strategy_name)
+    if strategy is None:
+        return {'set': False, 'error': f'Unknown strategy: {strategy_name}'}
+
+    _link_destination.set_proof_strategy(strategy)
+
+    return {'set': True, 'strategy': strategy_name}
+
+
 # ─── Local Client Reader ───────────────────────────────────────────
 # Raw TCP socket that connects to Kotlin's LocalServerInterface as a passive
 # packet reader. Used by E2E tests to inspect forwarded announce headers.
@@ -4257,6 +4546,18 @@ COMMANDS = {
     'rns_rotate_ratchet': cmd_rns_rotate_ratchet,
     'rns_get_ratchet_info': cmd_rns_get_ratchet_info,
     'rns_announce_destination': cmd_rns_announce_destination,
+    # Channel messaging
+    'rns_channel_setup': cmd_rns_channel_setup,
+    'rns_channel_send': cmd_rns_channel_send,
+    'rns_channel_get_messages': cmd_rns_channel_get_messages,
+    'rns_channel_clear_messages': cmd_rns_channel_clear_messages,
+    # Link request/response
+    'rns_register_request_handler': cmd_rns_register_request_handler,
+    'rns_link_request': cmd_rns_link_request,
+    'rns_get_request_responses': cmd_rns_get_request_responses,
+    'rns_clear_request_responses': cmd_rns_clear_request_responses,
+    # Proof strategy
+    'rns_set_proof_strategy': cmd_rns_set_proof_strategy,
     # Local client reader (raw socket for E2E announce forwarding tests)
     'local_client_connect': cmd_local_client_connect,
     'local_client_read_packets': cmd_local_client_read_packets,
