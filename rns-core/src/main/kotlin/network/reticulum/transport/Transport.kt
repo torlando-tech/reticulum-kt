@@ -2095,10 +2095,15 @@ object Transport {
         trafficRxBytes += raw.size
         recordRxBytes(interfaceRef, raw.size)
 
-        // Python RNS: Smart broadcast routing for shared instances
-        // Matches Python Transport.inbound():1300-1308
-        // Applies to ALL broadcast packets (including announces which are SINGLE destination + BROADCAST transport)
-        if (packet.transportType == TransportType.BROADCAST) {
+        // Python RNS: Plain broadcast routing for shared instances
+        // Matches Python Transport.inbound():1384-1398
+        // Only applies to PLAIN+BROADCAST packets (path requests, control packets).
+        // Announces (SINGLE+BROADCAST) are NOT forwarded here — they are handled
+        // by processAnnounce() which re-packages them with HEADER_2 transport headers.
+        if (packet.destinationType == DestinationType.PLAIN
+            && packet.transportType == TransportType.BROADCAST
+            && !controlHashes.contains(packet.destinationHash.toKey())
+        ) {
             log("BROADCAST ROUTING: packet from ${interfaceRef.name}, localClients=${localClientInterfaces.size}")
 
             // Check if packet is from a local client interface
@@ -2414,23 +2419,47 @@ object Transport {
         }
 
         // Python RNS: Immediately retransmit announces to local clients
-        // Matches Python Transport.py:1697-1742
-        // Local clients get instant visibility without queue delays
+        // Matches Python Transport.py:1790-1833
+        // Local clients get instant visibility without queue delays.
+        //
+        // Critical: Re-package with HEADER_2 + TRANSPORT type + our identity as transport_id.
+        // This tells local clients the announce came through a transport node (us),
+        // not directly from the source. Without this, local clients would think
+        // HEADER_1 (direct) destinations are directly reachable.
         if (localClientInterfaces.isNotEmpty()) {
-            log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
-            val rawData = packet.raw ?: packet.pack()
+            // Note: use Transport.identity explicitly — local `identity` variable
+            // is the announced identity (announceData.identity), not Transport's own identity
+            val transportIdentityHash = Transport.identity?.hash
+            if (transportIdentityHash != null) {
+                log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
 
-            for (localInterface in localClientInterfaces) {
-                // Don't send back to the interface it came from
-                if (!localInterface.hash.contentEquals(interfaceRef.hash)) {
-                    try {
-                        // Send the raw announce packet immediately (bypasses queue)
-                        localInterface.send(rawData)
-                        log("Sent announce for ${destHash.toHexString()} to local client ${localInterface.name}")
-                    } catch (e: Exception) {
-                        log("Error sending announce to local client ${localInterface.name}: ${e.message}")
+                val forwardPacket = Packet.createRaw(
+                    destinationHash = packet.destinationHash,
+                    data = packet.data,
+                    packetType = PacketType.ANNOUNCE,
+                    destinationType = packet.destinationType,
+                    context = PacketContext.NONE,
+                    headerType = HeaderType.HEADER_2,
+                    transportType = TransportType.TRANSPORT,
+                    transportId = transportIdentityHash,
+                    contextFlag = packet.contextFlag,
+                    createReceipt = false
+                )
+                forwardPacket.hops = packet.hops
+                val forwardRaw = forwardPacket.pack()
+
+                for (localInterface in localClientInterfaces) {
+                    if (!localInterface.hash.contentEquals(interfaceRef.hash)) {
+                        try {
+                            localInterface.send(forwardRaw)
+                            log("Sent announce for ${destHash.toHexString()} to local client ${localInterface.name}")
+                        } catch (e: Exception) {
+                            log("Error sending announce to local client ${localInterface.name}: ${e.message}")
+                        }
                     }
                 }
+            } else {
+                log("Cannot forward announce to local clients: no transport identity")
             }
         }
 

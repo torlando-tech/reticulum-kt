@@ -3932,6 +3932,199 @@ def cmd_rns_announce_destination(params):
     }
 
 
+# ─── Local Client Reader ───────────────────────────────────────────
+# Raw TCP socket that connects to Kotlin's LocalServerInterface as a passive
+# packet reader. Used by E2E tests to inspect forwarded announce headers.
+
+_local_client_socket = None
+_local_client_thread = None
+_local_client_packets = []      # list of bytes (deframed packets)
+_local_client_lock = __import__('threading').Lock()
+_local_client_running = False
+
+
+def _local_client_read_loop(sock):
+    """Background thread: read HDLC-framed packets from the socket."""
+    global _local_client_running
+    buf = bytearray()
+    in_frame = False
+
+    try:
+        while _local_client_running:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+
+            for b in chunk:
+                if b == HDLC_FLAG:
+                    if in_frame and len(buf) > 0:
+                        # End of frame — unescape and store
+                        unescaped = bytearray()
+                        i = 0
+                        while i < len(buf):
+                            if buf[i] == HDLC_ESC and i + 1 < len(buf):
+                                unescaped.append(buf[i + 1] ^ HDLC_ESC_MASK)
+                                i += 2
+                            else:
+                                unescaped.append(buf[i])
+                                i += 1
+                        with _local_client_lock:
+                            _local_client_packets.append(bytes(unescaped))
+                    # Start new frame
+                    buf = bytearray()
+                    in_frame = True
+                elif in_frame:
+                    buf.append(b)
+    except Exception:
+        pass
+    finally:
+        _local_client_running = False
+
+
+def cmd_local_client_connect(params):
+    """Connect a raw TCP socket to a LocalServerInterface as a passive reader.
+
+    params:
+        host (str): hostname (default '127.0.0.1')
+        port (int): TCP port
+    returns:
+        connected (bool)
+    """
+    import socket
+    import threading
+
+    global _local_client_socket, _local_client_thread
+    global _local_client_packets, _local_client_running
+
+    host = params.get('host', '127.0.0.1')
+    port = int(params['port'])
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    sock.connect((host, port))
+    sock.settimeout(1.0)        # non-blocking-ish for read loop
+
+    _local_client_socket = sock
+    _local_client_running = True
+    with _local_client_lock:
+        _local_client_packets.clear()
+
+    _local_client_thread = threading.Thread(
+        target=_local_client_read_loop, args=(sock,), daemon=True
+    )
+    _local_client_thread.start()
+
+    return {'connected': True}
+
+
+def cmd_local_client_read_packets(params):
+    """Return HDLC-deframed packets received from the shared instance.
+
+    params:
+        timeout_ms (int, optional): max wait for at least one packet (default 5000)
+    returns:
+        packets (list of hex strings)
+        count (int)
+    """
+    import time
+
+    timeout_ms = int(params.get('timeout_ms', 5000))
+    deadline = time.time() + timeout_ms / 1000.0
+
+    # Wait until at least one packet or timeout
+    while time.time() < deadline:
+        with _local_client_lock:
+            if _local_client_packets:
+                break
+        time.sleep(0.05)
+
+    with _local_client_lock:
+        packets = list(_local_client_packets)
+        _local_client_packets.clear()
+
+    return {
+        'packets': [bytes_to_hex(p) for p in packets],
+        'count': len(packets),
+    }
+
+
+def cmd_local_client_disconnect(params):
+    """Close the local client socket."""
+    global _local_client_socket, _local_client_thread, _local_client_running
+
+    _local_client_running = False
+
+    if _local_client_socket:
+        try:
+            _local_client_socket.close()
+        except Exception:
+            pass
+        _local_client_socket = None
+
+    if _local_client_thread:
+        _local_client_thread.join(timeout=2.0)
+        _local_client_thread = None
+
+    return {'disconnected': True}
+
+
+def cmd_packet_parse_header(params):
+    """Parse a raw packet's header fields.
+
+    params:
+        raw (hex): raw packet bytes
+    returns:
+        header_type (int): 0=HEADER_1, 1=HEADER_2
+        transport_type (int): 0=BROADCAST, 1=TRANSPORT
+        destination_type (int): 0=SINGLE, 1=GROUP, 2=PLAIN, 3=LINK
+        packet_type (int): 0=DATA, 1=ANNOUNCE, 2=LINKREQUEST, 3=PROOF
+        context_flag (int): 0=UNSET, 1=SET
+        hops (int)
+        transport_id (hex or null)
+        destination_hash (hex)
+        context (int)
+    """
+    raw = hex_to_bytes(params['raw'])
+
+    if len(raw) < 2:
+        raise ValueError("Packet too short")
+
+    flags = raw[0]
+    hops = raw[1]
+
+    header_type     = (flags >> 6) & 0x01
+    context_flag    = (flags >> 5) & 0x01
+    transport_type  = (flags >> 4) & 0x01
+    destination_type = (flags >> 2) & 0x03
+    packet_type     = flags & 0x03
+
+    HASH_LEN = 16
+
+    if header_type == 0:  # HEADER_1
+        transport_id = None
+        destination_hash = raw[2:2 + HASH_LEN]
+        context = raw[2 + HASH_LEN] if len(raw) > 2 + HASH_LEN else 0
+    else:  # HEADER_2
+        transport_id = raw[2:2 + HASH_LEN]
+        destination_hash = raw[2 + HASH_LEN:2 + 2 * HASH_LEN]
+        context = raw[2 + 2 * HASH_LEN] if len(raw) > 2 + 2 * HASH_LEN else 0
+
+    return {
+        'header_type': header_type,
+        'transport_type': transport_type,
+        'destination_type': destination_type,
+        'packet_type': packet_type,
+        'context_flag': context_flag,
+        'hops': hops,
+        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
+        'destination_hash': bytes_to_hex(destination_hash),
+        'context': context,
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -4064,6 +4257,11 @@ COMMANDS = {
     'rns_rotate_ratchet': cmd_rns_rotate_ratchet,
     'rns_get_ratchet_info': cmd_rns_get_ratchet_info,
     'rns_announce_destination': cmd_rns_announce_destination,
+    # Local client reader (raw socket for E2E announce forwarding tests)
+    'local_client_connect': cmd_local_client_connect,
+    'local_client_read_packets': cmd_local_client_read_packets,
+    'local_client_disconnect': cmd_local_client_disconnect,
+    'packet_parse_header': cmd_packet_parse_header,
 }
 
 
