@@ -48,6 +48,25 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val rStatQ: Float?
         get() = iface.rStatQ
 
+    // Discovery properties - delegate to underlying interface
+    override val supportsDiscovery: Boolean get() = iface.supportsDiscovery
+    override val discoverable: Boolean get() = iface.discoverable
+    override var lastDiscoveryAnnounce: Long
+        get() = iface.lastDiscoveryAnnounce
+        set(value) { iface.lastDiscoveryAnnounce = value }
+    override val discoveryAnnounceInterval: Long get() = iface.discoveryAnnounceInterval
+    override val discoveryName: String? get() = iface.discoveryName
+    override val discoveryEncrypt: Boolean get() = iface.discoveryEncrypt
+    override val discoveryStampValue: Int? get() = iface.discoveryStampValue
+    override val discoveryPublishIfac: Boolean get() = iface.discoveryPublishIfac
+    override val discoveryLatitude: Double? get() = iface.discoveryLatitude
+    override val discoveryLongitude: Double? get() = iface.discoveryLongitude
+    override val discoveryHeight: Double? get() = iface.discoveryHeight
+    override val discoveryInterfaceType: String get() = iface.discoveryInterfaceType
+    override val ifacNetname: String? get() = iface.ifacNetname
+    override val ifacNetkey: String? get() = iface.ifacNetkey
+    override fun getDiscoveryData(): Map<Int, Any>? = iface.getDiscoveryData()
+
     // IFAC properties - delegate to underlying interface
     override val ifacSize: Int
         get() = iface.ifacSize

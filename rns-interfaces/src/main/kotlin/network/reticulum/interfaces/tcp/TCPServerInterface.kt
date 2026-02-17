@@ -63,6 +63,14 @@ class TCPServerInterface(
     override val bitrate: Int = BITRATE_GUESS
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = true
+
+    // Discovery support
+    override val supportsDiscovery: Boolean = true
+    override val discoveryInterfaceType: String = "TCPServerInterface"
+    override fun getDiscoveryData(): Map<Int, Any> = mapOf(
+        network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to bindAddress,
+        network.reticulum.discovery.DiscoveryConstants.PORT to bindPort,
+    )
     // Server can receive/send via its spawned client interfaces
     // processOutgoing broadcasts to all connected clients
     override val canReceive: Boolean = true

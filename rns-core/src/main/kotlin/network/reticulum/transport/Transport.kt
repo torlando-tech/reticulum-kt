@@ -95,6 +95,15 @@ object Transport {
     var transportEnabled: Boolean = false
         private set
 
+    /** Optional network identity for discovery encryption. */
+    var networkIdentity: Identity? = null
+
+    /** Interface discovery announcer. */
+    private var interfaceAnnouncer: network.reticulum.discovery.InterfaceAnnouncer? = null
+
+    /** Interface discovery handler. */
+    private var discoveryHandler: network.reticulum.discovery.InterfaceDiscovery? = null
+
     /** Whether transport has been started. */
     private val started = AtomicBoolean(false)
 
@@ -384,6 +393,12 @@ object Transport {
 
         tunnels.clear()
         tunnelInterfaces.clear()
+
+        // Stop discovery
+        interfaceAnnouncer?.stop()
+        interfaceAnnouncer = null
+        discoveryHandler?.stop()
+        discoveryHandler = null
 
         // Reset speed tracking
         speedRx = 0
@@ -761,6 +776,63 @@ object Transport {
      */
     fun deregisterAnnounceHandler(handler: AnnounceHandler) {
         announceHandlers.remove(handler)
+    }
+
+    // ===== Interface Discovery =====
+
+    /**
+     * Whether a network identity has been configured (for encrypted discovery).
+     */
+    fun hasNetworkIdentity(): Boolean = networkIdentity != null
+
+    /**
+     * Enable interface discovery announcing for discoverable interfaces.
+     * Creates an InterfaceAnnouncer that periodically sends discovery announces.
+     */
+    fun enableDiscovery() {
+        if (interfaceAnnouncer == null) {
+            interfaceAnnouncer = network.reticulum.discovery.InterfaceAnnouncer()
+            interfaceAnnouncer?.start()
+            log("Interface discovery announcing enabled")
+        }
+    }
+
+    /**
+     * Start listening for interface discovery announces.
+     *
+     * @param requiredValue Minimum PoW stamp value to accept
+     * @param discoverySources If non-null, only accept announces from these identity hashes
+     * @param autoConnectFactory Factory to create interfaces from discoveries (null = no auto-connect)
+     * @param maxAutoConnected Maximum number of auto-connected interfaces
+     * @param callback Called for each valid discovery
+     */
+    fun discoverInterfaces(
+        requiredValue: Int = network.reticulum.discovery.DiscoveryConstants.DEFAULT_STAMP_VALUE,
+        discoverySources: Set<ByteArrayKey>? = null,
+        autoConnectFactory: ((network.reticulum.discovery.DiscoveredInterface) -> InterfaceRef?)? = null,
+        maxAutoConnected: Int = 0,
+        callback: ((network.reticulum.discovery.DiscoveredInterface) -> Unit)? = null,
+    ) {
+        if (discoveryHandler == null) {
+            discoveryHandler = network.reticulum.discovery.InterfaceDiscovery(
+                storagePath = storagePath,
+                requiredValue = requiredValue,
+                discoverySources = discoverySources,
+                autoConnectFactory = autoConnectFactory,
+                maxAutoConnected = maxAutoConnected,
+                discoveryCallback = callback,
+            )
+            discoveryHandler?.start()
+            log("Interface discovery listening enabled")
+        }
+    }
+
+    /**
+     * List discovered interfaces (from disk persistence).
+     * Returns list of (DiscoveredInterface, status) pairs.
+     */
+    fun listDiscoveredInterfaces(): List<Pair<network.reticulum.discovery.DiscoveredInterface, String>> {
+        return discoveryHandler?.listDiscovered() ?: emptyList()
     }
 
     // ===== Link Management =====
@@ -4270,6 +4342,51 @@ interface InterfaceRef {
         get() = null
     val rStatQ: Float?
         get() = null
+
+    // Discovery properties
+    /** Whether this interface type supports discovery at all. */
+    val supportsDiscovery: Boolean get() = false
+
+    /** Whether discovery is enabled for this particular instance. */
+    val discoverable: Boolean get() = false
+
+    /** Last time a discovery announce was sent (epoch seconds). */
+    var lastDiscoveryAnnounce: Long
+        get() = 0L
+        set(_) {}
+
+    /** Interval between discovery announces (seconds). */
+    val discoveryAnnounceInterval: Long
+        get() = network.reticulum.discovery.DiscoveryConstants.DEFAULT_ANNOUNCE_INTERVAL
+
+    /** Human-readable name for discovery announces. */
+    val discoveryName: String? get() = null
+
+    /** Whether to encrypt discovery announce payloads. */
+    val discoveryEncrypt: Boolean get() = false
+
+    /** Required stamp value for this interface's announces (null = use default). */
+    val discoveryStampValue: Int? get() = null
+
+    /** Whether to include IFAC credentials in discovery announces. */
+    val discoveryPublishIfac: Boolean get() = false
+
+    /** IFAC network name (for publishing in discovery). */
+    val ifacNetname: String? get() = null
+
+    /** IFAC network key (for publishing in discovery). */
+    val ifacNetkey: String? get() = null
+
+    /** Geographic coordinates for discovery. */
+    val discoveryLatitude: Double? get() = null
+    val discoveryLongitude: Double? get() = null
+    val discoveryHeight: Double? get() = null
+
+    /** The interface type name as it appears in discovery announces. */
+    val discoveryInterfaceType: String get() = "Interface"
+
+    /** Type-specific discovery data (TCP: reachable_on/port, RNode: freq/bw/sf/cr, etc.). */
+    fun getDiscoveryData(): Map<Int, Any>? = null
 
     /**
      * Get a hash uniquely identifying this interface.

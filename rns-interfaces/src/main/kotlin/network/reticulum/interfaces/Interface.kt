@@ -68,6 +68,43 @@ abstract class Interface(
     /** Whether this is a local shared instance server (Python RNS compatibility). */
     open val isLocalSharedInstance: Boolean = false
 
+    // Discovery properties
+    /** Whether this interface type supports discovery. */
+    open val supportsDiscovery: Boolean = false
+
+    /** Whether discovery is enabled for this instance. */
+    open val discoverable: Boolean = false
+
+    /** Last time a discovery announce was sent (epoch seconds). */
+    @Volatile var lastDiscoveryAnnounce: Long = 0L
+
+    /** Interval between discovery announces (seconds). */
+    open val discoveryAnnounceInterval: Long
+        get() = network.reticulum.discovery.DiscoveryConstants.DEFAULT_ANNOUNCE_INTERVAL
+
+    /** Human-readable name for discovery announces. */
+    open val discoveryName: String? = null
+
+    /** Whether to encrypt discovery announce payloads. */
+    open val discoveryEncrypt: Boolean = false
+
+    /** Required stamp value (null = use default). */
+    open val discoveryStampValue: Int? = null
+
+    /** Whether to include IFAC credentials in discovery announces. */
+    open val discoveryPublishIfac: Boolean = false
+
+    /** Geographic coordinates for discovery. */
+    open val discoveryLatitude: Double? = null
+    open val discoveryLongitude: Double? = null
+    open val discoveryHeight: Double? = null
+
+    /** Interface type name for discovery announces. */
+    open val discoveryInterfaceType: String = "Interface"
+
+    /** Type-specific discovery data. */
+    open fun getDiscoveryData(): Map<Int, Any>? = null
+
     /** Creation timestamp in milliseconds. */
     val createdAt: Long = System.currentTimeMillis()
 

@@ -71,6 +71,15 @@ class I2PInterface(
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = false
 
+    // Discovery support
+    override val supportsDiscovery: Boolean = true
+    override val discoveryInterfaceType: String = "I2PInterface"
+    override fun getDiscoveryData(): Map<Int, Any>? {
+        // Only publish reachable_on if connectable and b32 is known
+        if (!connectable || b32 == null) return null
+        return mapOf(network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to b32!!)
+    }
+
     // IFAC credentials
     private val _ifacCredentials: IfacCredentials? by lazy {
         IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)

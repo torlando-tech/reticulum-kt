@@ -68,6 +68,16 @@ class RNodeInterface(
 
     override val hwMtu: Int = 508
 
+    // Discovery support
+    override val supportsDiscovery: Boolean = true
+    override val discoveryInterfaceType: String = "RNodeInterface"
+    override fun getDiscoveryData(): Map<Int, Any> = mapOf(
+        network.reticulum.discovery.DiscoveryConstants.FREQUENCY to frequency,
+        network.reticulum.discovery.DiscoveryConstants.BANDWIDTH to bandwidth,
+        network.reticulum.discovery.DiscoveryConstants.SPREADING_FACTOR to spreadingFactor,
+        network.reticulum.discovery.DiscoveryConstants.CODING_RATE to codingRate,
+    )
+
     override val bitrate: Int
         get() = computedBitrate
 

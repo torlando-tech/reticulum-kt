@@ -70,6 +70,14 @@ class TCPClientInterface(
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = true
 
+    // Discovery support
+    override val supportsDiscovery: Boolean = true
+    override val discoveryInterfaceType: String = "TCPClientInterface"
+    override fun getDiscoveryData(): Map<Int, Any> = mapOf(
+        network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to targetHost,
+        network.reticulum.discovery.DiscoveryConstants.PORT to targetPort,
+    )
+
     // IFAC credentials - derived lazily from network name/passphrase
     private val _ifacCredentials: IfacCredentials? by lazy {
         IfacUtils.deriveIfacCredentials(ifacNetname, ifacNetkey)
