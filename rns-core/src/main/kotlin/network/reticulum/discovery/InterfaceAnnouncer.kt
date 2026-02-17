@@ -54,12 +54,14 @@ class InterfaceAnnouncer {
         if (shouldRun) return
         shouldRun = true
         job = scope.launch { runJob() }
+        log("Started announcer (destination=${discoveryDestination.hash.toHexString().take(12)}...)")
     }
 
     fun stop() {
         shouldRun = false
         job?.cancel()
         job = null
+        log("Stopped announcer")
     }
 
     private suspend fun runJob() {
@@ -67,24 +69,33 @@ class InterfaceAnnouncer {
             delay(DiscoveryConstants.JOB_INTERVAL * 1000)
             try {
                 val now = System.currentTimeMillis() / 1000L
-                val dueInterfaces = Transport.getInterfaces()
-                    .filter { it.supportsDiscovery && it.discoverable }
+                val allInterfaces = Transport.getInterfaces()
+                val discoverable = allInterfaces.filter { it.supportsDiscovery && it.discoverable }
+                val dueInterfaces = discoverable
                     .filter { now > it.lastDiscoveryAnnounce + it.discoveryAnnounceInterval }
                     .sortedByDescending { now - it.lastDiscoveryAnnounce }
 
                 if (dueInterfaces.isNotEmpty()) {
                     val selected = dueInterfaces.first()
+                    log("Announcing: ${selected.discoveryInterfaceType} \"${selected.name}\" " +
+                        "(${dueInterfaces.size} due of ${discoverable.size} discoverable)")
                     selected.lastDiscoveryAnnounce = System.currentTimeMillis() / 1000L
                     val appData = getInterfaceAnnounceData(selected)
                     if (appData != null) {
                         discoveryDestination.announce(appData = appData)
+                        log("Sent discovery announce for \"${selected.name}\" (${appData.size} bytes)")
+                    } else {
+                        log("Failed to build announce data for \"${selected.name}\"")
                     }
                 }
             } catch (e: Exception) {
-                // Log and continue
-                println("[Discovery] Error preparing interface discovery announces: ${e.message}")
+                log("Error preparing interface discovery announces: ${e.message}")
             }
         }
+    }
+
+    private fun log(msg: String) {
+        println("[Discovery:Announcer] $msg")
     }
 
     internal fun getInterfaceAnnounceData(iface: InterfaceRef): ByteArray? {
