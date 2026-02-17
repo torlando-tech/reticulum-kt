@@ -56,6 +56,14 @@ class RNodeInterface(
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
+
+        // Signal quality computation constants (matching Python RNodeInterface)
+        private const val Q_SNR_MIN_BASE = -9f
+        private const val Q_SNR_MAX = 6f
+        private const val Q_SNR_STEP = 2f
+
+        // Temperature offset (firmware sends temp + 120)
+        private const val TEMP_OFFSET = 120
     }
 
     override val hwMtu: Int = 508
@@ -65,7 +73,7 @@ class RNodeInterface(
 
     private var computedBitrate: Int = 0
 
-    // Radio state echoed back from device
+    // Radio state echoed back from device (used for validation and UI display)
     private var rFrequency: Long? = null
     private var rBandwidth: Long? = null
     private var rTxpower: Int? = null
@@ -73,6 +81,17 @@ class RNodeInterface(
     private var rCr: Int? = null
     private var rState: Int? = null
     private var rLock: Int? = null
+
+    /** Confirmed frequency in Hz (echoed back from device after configuration). */
+    val confirmedFrequency: Long? get() = rFrequency
+    /** Confirmed bandwidth in Hz. */
+    val confirmedBandwidth: Long? get() = rBandwidth
+    /** Confirmed spreading factor. */
+    val confirmedSf: Int? get() = rSf
+    /** Confirmed coding rate. */
+    val confirmedCr: Int? get() = rCr
+    /** Confirmed TX power in dBm. */
+    val confirmedTxPower: Int? get() = rTxpower
 
     // Firmware
     private var majVersion: Int = 0
@@ -86,6 +105,26 @@ class RNodeInterface(
     // (removed local declarations; RNodeInterface now sets the inherited fields directly)
     @Volatile var rBatteryState: Int = 0; private set
     @Volatile var rBatteryPercent: Int = 0; private set
+
+    // Channel telemetry (from CMD_STAT_CHTM, ~1/sec)
+    @Volatile var rAirtimeShort: Float = 0f; private set      // Short-term airtime %
+    @Volatile var rAirtimeLong: Float = 0f; private set       // Long-term airtime %
+    @Volatile var rChannelLoadShort: Float = 0f; private set  // Short-term channel load %
+    @Volatile var rChannelLoadLong: Float = 0f; private set   // Long-term channel load %
+    @Volatile var rCurrentRssi: Int? = null; private set      // Continuous RSSI (not per-packet)
+    @Volatile var rNoiseFloor: Int? = null; private set       // Noise floor dBm
+    @Volatile var rInterference: Int? = null; private set     // Interference dBm (null = none)
+
+    // PHY parameters (from CMD_STAT_PHYPRM, on radio config change)
+    @Volatile var rSymbolTimeMs: Float? = null; private set
+    @Volatile var rSymbolRate: Int? = null; private set
+    @Volatile var rPreambleSymbols: Int? = null; private set
+    @Volatile var rPreambleTimeMs: Int? = null; private set
+    @Volatile var rCsmaSlotTimeMs: Int? = null; private set
+    @Volatile var rCsmaDifsMs: Int? = null; private set
+
+    // Temperature (from CMD_STAT_TEMP)
+    @Volatile var rTemperature: Int? = null; private set
 
     // Flow control
     @Volatile private var interfaceReady: Boolean = false
@@ -433,7 +472,17 @@ class RNodeInterface(
                         rStatRssi = byte - RSSI_OFFSET
                     } else if (command == KISS.CMD_STAT_SNR) {
                         // Signed byte * 0.25
-                        rStatSnr = (byte.toByte().toFloat() * 0.25f)
+                        val snr = byte.toByte().toFloat() * 0.25f
+                        rStatSnr = snr
+                        // Compute signal quality % (matching Python formula)
+                        val sf = rSf
+                        if (sf != null) {
+                            val sfs = sf - 7
+                            val qSnrMin = Q_SNR_MIN_BASE - sfs * Q_SNR_STEP
+                            val qSnrSpan = Q_SNR_MAX - qSnrMin
+                            val quality = ((snr - qSnrMin) / qSnrSpan) * 100f
+                            rStatQ = quality.coerceIn(0f, 100f)
+                        }
                     } else if (command == KISS.CMD_ST_ALOCK) {
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {
@@ -450,19 +499,58 @@ class RNodeInterface(
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {
                             commandBuffer.write(byte)
-                            if (commandBuffer.size() == 11) commandBuffer.reset()
+                            if (commandBuffer.size() == 11) {
+                                val b = commandBuffer.toByteArray()
+                                val ats = (b[0].toInt() and 0xFF shl 8) or (b[1].toInt() and 0xFF)
+                                val atl = (b[2].toInt() and 0xFF shl 8) or (b[3].toInt() and 0xFF)
+                                val cus = (b[4].toInt() and 0xFF shl 8) or (b[5].toInt() and 0xFF)
+                                val cul = (b[6].toInt() and 0xFF shl 8) or (b[7].toInt() and 0xFF)
+                                val crs = b[8].toInt() and 0xFF
+                                val nfl = b[9].toInt() and 0xFF
+                                val ntf = b[10].toInt() and 0xFF
+
+                                rAirtimeShort = ats / 100f
+                                rAirtimeLong = atl / 100f
+                                rChannelLoadShort = cus / 100f
+                                rChannelLoadLong = cul / 100f
+                                rCurrentRssi = crs - RSSI_OFFSET
+                                rNoiseFloor = nfl - RSSI_OFFSET
+
+                                rInterference = if (ntf == 0xFF) null else ntf - RSSI_OFFSET
+                                commandBuffer.reset()
+                            }
                         }
                     } else if (command == KISS.CMD_STAT_PHYPRM) {
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {
                             commandBuffer.write(byte)
-                            if (commandBuffer.size() == 12) commandBuffer.reset()
+                            if (commandBuffer.size() == 12) {
+                                val b = commandBuffer.toByteArray()
+                                val lst = (b[0].toInt() and 0xFF shl 8) or (b[1].toInt() and 0xFF)
+                                val lsr = (b[2].toInt() and 0xFF shl 8) or (b[3].toInt() and 0xFF)
+                                val prs = (b[4].toInt() and 0xFF shl 8) or (b[5].toInt() and 0xFF)
+                                val prt = (b[6].toInt() and 0xFF shl 8) or (b[7].toInt() and 0xFF)
+                                val cst = (b[8].toInt() and 0xFF shl 8) or (b[9].toInt() and 0xFF)
+                                val dft = (b[10].toInt() and 0xFF shl 8) or (b[11].toInt() and 0xFF)
+
+                                rSymbolTimeMs = lst / 1000f
+                                rSymbolRate = lsr
+                                rPreambleSymbols = prs
+                                rPreambleTimeMs = prt
+                                rCsmaSlotTimeMs = cst
+                                rCsmaDifsMs = dft
+                                commandBuffer.reset()
+                            }
                         }
                     } else if (command == KISS.CMD_STAT_CSMA) {
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {
                             commandBuffer.write(byte)
-                            if (commandBuffer.size() == 3) commandBuffer.reset()
+                            if (commandBuffer.size() == 3) {
+                                // CSMA contention window: band, min, max
+                                // Stored for future use but not currently displayed
+                                commandBuffer.reset()
+                            }
                         }
                     } else if (command == KISS.CMD_STAT_BAT) {
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
@@ -479,7 +567,10 @@ class RNodeInterface(
                         byte = unescapeByte(byte, escape).also { escape = it.second }.first
                         if (!escape) {
                             commandBuffer.write(byte)
-                            if (commandBuffer.size() == 1) commandBuffer.reset()
+                            if (commandBuffer.size() == 1) {
+                                rTemperature = (commandBuffer.toByteArray()[0].toInt() and 0xFF) - TEMP_OFFSET
+                                commandBuffer.reset()
+                            }
                         }
                     } else if (command == KISS.CMD_RANDOM) {
                         // Random byte from hardware RNG — currently unused
