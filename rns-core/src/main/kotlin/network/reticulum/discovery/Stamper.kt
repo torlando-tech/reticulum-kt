@@ -153,7 +153,7 @@ object Stamper {
     /**
      * HKDF extract + expand (RFC 5869) with HMAC-SHA256.
      */
-    internal fun hkdfExpand(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
+    fun hkdfExpand(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
         val prk = hmacSha256(salt, ikm)
         val hashLen = 32
         val n = (length + hashLen - 1) / hashLen
@@ -181,7 +181,7 @@ object Stamper {
     /**
      * Pack an integer using MessagePack format, matching Python's msgpack.packb(n).
      */
-    internal fun packInt(n: Int): ByteArray {
+    fun packInt(n: Int): ByteArray {
         val packer = MessagePack.newDefaultBufferPacker()
         packer.packInt(n)
         return packer.toByteArray()
