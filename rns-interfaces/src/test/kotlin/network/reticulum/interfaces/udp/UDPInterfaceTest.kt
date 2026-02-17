@@ -379,7 +379,7 @@ class UDPInterfaceTest {
         assertEquals("test-interface", iface.name)
         assertEquals(UDPInterface.BITRATE_GUESS, iface.bitrate)
         assertEquals(UDPInterface.HW_MTU, iface.hwMtu)
-        assertEquals(UDPInterface.HW_MTU, iface.getEffectiveMtu())
+        assertEquals(1064, iface.getEffectiveMtu())
         assertTrue(iface.canReceive)
         assertTrue(iface.canSend)
         assertFalse(iface.online.get())

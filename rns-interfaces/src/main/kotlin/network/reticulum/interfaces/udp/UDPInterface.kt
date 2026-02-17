@@ -50,7 +50,7 @@ class UDPInterface(
 
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
-        const val HW_MTU = 1500 // Standard Ethernet MTU
+        const val HW_MTU = 1064 // Must match Python reference for interop
         const val DEFAULT_BUFFER_SIZE = 4096
 
         /**
