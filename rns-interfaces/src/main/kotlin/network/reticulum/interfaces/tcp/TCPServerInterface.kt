@@ -68,6 +68,16 @@ class TCPServerInterface(
     override val canReceive: Boolean = true
     override val canSend: Boolean = true
 
+    /**
+     * Called when a new client connects. Use to register the spawned interface with Transport.
+     */
+    var onClientConnected: ((Interface) -> Unit)? = null
+
+    /**
+     * Called when a client disconnects. Use to deregister the spawned interface from Transport.
+     */
+    var onClientDisconnected: ((Interface) -> Unit)? = null
+
     private var serverSocket: ServerSocket? = null
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<TCPServerClientInterface>()
@@ -142,6 +152,7 @@ class TCPServerInterface(
                 }
 
                 clientInterface.start()
+                onClientConnected?.invoke(clientInterface)
 
                 val clientAddr = clientSocket.remoteSocketAddress
                 log("Client connected: $clientAddr ($clientName)")
@@ -165,6 +176,7 @@ class TCPServerInterface(
     internal fun clientDisconnected(client: TCPServerClientInterface) {
         clients.remove(client)
         spawnedInterfaces?.remove(client)
+        onClientDisconnected?.invoke(client)
         log("Client disconnected: ${client.name}")
     }
 
