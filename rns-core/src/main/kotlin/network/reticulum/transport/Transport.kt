@@ -143,6 +143,14 @@ object Transport {
     @Volatile
     var useCoroutineJobLoop: Boolean = false
 
+    /** Interface modes that trigger recursive path forwarding for unknown destinations. */
+    // Python: Interface.DISCOVER_PATHS_FOR = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING]
+    private val DISCOVER_PATHS_FOR = setOf(
+        InterfaceMode.ACCESS_POINT,
+        InterfaceMode.GATEWAY,
+        InterfaceMode.ROAMING
+    )
+
     // ===== Tables =====
 
     /** Path table: destination_hash -> PathEntry. */
@@ -172,6 +180,13 @@ object Transport {
         fun isExpired(): Boolean =
             System.currentTimeMillis() - timestamp > TransportConstants.PACKET_CACHE_TIMEOUT
     }
+
+    /** Pending discovery path request entry (Python: discovery_path_requests). */
+    data class DiscoveryPathRequest(
+        val destinationHash: ByteArray,
+        val timeout: Long,
+        val requestingInterface: InterfaceRef
+    )
 
     /** Interface traffic statistics. */
     data class InterfaceTrafficStats(
@@ -233,6 +248,9 @@ object Transport {
 
     /** Held announces awaiting retransmission: dest_hash -> (timestamp, raw_data). */
     private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, Pair<Long, ByteArray>>()
+
+    /** Timestamp of last held announce release. */
+    @Volatile private var lastHeldRelease: Long = 0L
 
     /** Local client interfaces (shared instance clients). */
     private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
@@ -378,6 +396,7 @@ object Transport {
         announceRateTable.clear()
         pathRequests.clear()
         discoveryPrTags.clear()
+        discoveryPathRequests.clear()
         pendingReceipts.clear()
         announceHandlers.clear()
         pendingLinks.clear()
@@ -505,6 +524,7 @@ object Transport {
         // Clear path requests (will be re-requested as needed)
         pathRequests.clear()
         discoveryPrTags.clear()
+        discoveryPathRequests.clear()
 
         // Clear held announces (will be re-announced)
         heldAnnounces.clear()
@@ -1770,6 +1790,9 @@ object Transport {
     /** Discovery path request tags to avoid duplicates. */
     private val discoveryPrTags = CopyOnWriteArrayList<ByteArrayKey>()
 
+    /** Pending discovery path requests: dest_hash_key -> DiscoveryPathRequest. */
+    private val discoveryPathRequests = ConcurrentHashMap<ByteArrayKey, DiscoveryPathRequest>()
+
     /** Path request destination for sending requests. */
     private var pathRequestDestination: Destination? = null
 
@@ -1871,6 +1894,75 @@ object Transport {
     }
 
     /**
+     * Internal path request used for forwarding. Supports explicit tag (to avoid loops)
+     * and recursive mode (which throttles based on announce cap).
+     * Python Transport.py:2541-2588
+     */
+    private fun requestPathInternal(
+        destinationHash: ByteArray,
+        onInterface: InterfaceRef? = null,
+        tag: ByteArray? = null,
+        recursive: Boolean = false
+    ) {
+        val requestTag = tag ?: Hashes.getRandomHash()
+
+        val pathRequestData = if (transportEnabled && identity != null) {
+            concatBytes(destinationHash, identity!!.hash, requestTag)
+        } else {
+            concatBytes(destinationHash, requestTag)
+        }
+
+        val prDest = pathRequestDestination ?: return
+
+        val packet = Packet.createRaw(
+            destinationHash = prDest.hash,
+            data = pathRequestData,
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.PLAIN,
+            transportType = TransportType.BROADCAST
+        )
+
+        // Recursive path requests are throttled by announce cap to avoid flooding
+        // Python Transport.py:2563-2585
+        if (onInterface != null && recursive) {
+            val ifaceKey = onInterface.hash.toKey()
+            val queue = interfaceAnnounceQueues[ifaceKey]
+            if (queue != null && queue.isNotEmpty()) {
+                log("Blocking recursive path request on ${onInterface.name} due to queued announces")
+                return
+            }
+
+            val now = System.currentTimeMillis()
+            val allowedAt = interfaceAnnounceAllowedAt[ifaceKey] ?: 0L
+            if (now < allowedAt) {
+                log("Blocking recursive path request on ${onInterface.name} due to active announce cap")
+                return
+            }
+
+            // Update announce allowed time based on transmission time
+            val bitrate = onInterface.bitrate
+            val announceCap = onInterface.announceCap
+            if (bitrate > 0 && announceCap > 0) {
+                val txTime = ((pathRequestData.size + RnsConstants.HEADER_MIN_SIZE) * 8.0) / bitrate
+                val waitTime = (txTime / announceCap * 1000).toLong()
+                interfaceAnnounceAllowedAt[ifaceKey] = now + waitTime
+            }
+        }
+
+        if (onInterface != null) {
+            try {
+                onInterface.send(packet.pack())
+                pathRequests[destinationHash.toKey()] = System.currentTimeMillis()
+            } catch (e: Exception) {
+                log("Failed to send path request on ${onInterface.name}: ${e.message}")
+            }
+        } else {
+            outbound(packet)
+            pathRequests[destinationHash.toKey()] = System.currentTimeMillis()
+        }
+    }
+
+    /**
      * Handle an incoming path request packet.
      */
     private fun handlePathRequest(
@@ -1915,97 +2007,167 @@ object Transport {
             discoveryPrTags.removeAt(0)
         }
 
+        // Determine if the path request came from a local client
+        val isFromLocalClient = fromLocalClient(receivingInterface)
+
         // Check if we know the path
-        processPathRequest(destinationHash, receivingInterface, requestingTransportId, tagBytes)
+        processPathRequest(destinationHash, isFromLocalClient, receivingInterface, requestingTransportId, tagBytes)
     }
 
     /**
      * Process a path request - check if we know the destination and can announce it.
+     * Python: Transport.path_request()
+     *
+     * Falls through 4 branches after the "known path" case:
+     * 1. From local client → forward to all external interfaces
+     * 2. Should search for unknown → forward on all interfaces (with throttling)
+     * 3. Not from local, local clients exist → forward to local clients
+     * 4. None of the above → log and ignore
      */
     private fun processPathRequest(
         destinationHash: ByteArray,
+        isFromLocalClient: Boolean,
         receivingInterface: InterfaceRef,
         requestingTransportId: ByteArray?,
-        @Suppress("UNUSED_PARAMETER") tag: ByteArray
+        tag: ByteArray
     ) {
-        // Check if this is a local destination
+        val destHex = destinationHash.toHexString()
+
+        // Python Transport.py:2697-2701 — determine if we should forward for unknown destinations
+        val shouldSearchForUnknown = transportEnabled &&
+            receivingInterface.mode in DISCOVER_PATHS_FOR
+
+        // Case 1: Local destination — announce it directly, targeted at the requesting interface
+        // Python: local_destination.announce(path_response=True, tag=tag, attached_interface=attached_interface)
         val localDest = findDestination(destinationHash)
         if (localDest != null) {
-            log("Responding to path request with local destination ${destinationHash.toHexString()}")
+            log("Responding to path request with local destination $destHex on ${receivingInterface.name}")
+            localDest.announce(
+                pathResponse = true,
+                tag = tag,
+                attachedInterface = receivingInterface
+            )
+            return
+        }
 
-            // Create and send an announce
-            val announcePacket = Packet.createAnnounce(localDest)
-            if (announcePacket != null) {
-                outbound(announcePacket)
-                log("Sent announce in response to path request")
-            } else {
-                log("Cannot create announce for ${destinationHash.toHexString()} (no private key)")
+        // Case 2: Known path — forward cached announce
+        // Python Transport.py:2723-2781
+        val pathEntry = pathTable[destinationHash.toKey()]
+        if (pathEntry != null && !pathEntry.isExpired() &&
+            (transportEnabled || isFromLocalClient)) {
+
+            log("Path to $destHex known (${pathEntry.hops} hops), retrieving cached announce")
+            val cachedData = getCachedAnnouncePacket(pathEntry.announcePacketHash)
+
+            if (cachedData == null) {
+                log("Could not retrieve cached announce for $destHex")
+                return
+            }
+
+            val (raw, interfaceName) = cachedData
+            val cachedPacket = Packet.unpack(raw)
+            if (cachedPacket == null) {
+                log("Could not unpack cached announce for $destHex")
+                return
+            }
+
+            // Find the original receiving interface
+            val originalInterface = interfaceName?.let { name ->
+                interfaces.find { it.name == name }
+            }
+
+            // Set hop count from path table (Python line 2736)
+            cachedPacket.hops = pathEntry.hops
+
+            // Roaming mode check: don't answer if path is on the same roaming-mode interface
+            // Python line 2731-2732
+            if (receivingInterface.mode == InterfaceMode.ROAMING &&
+                originalInterface != null &&
+                receivingInterface.hash.contentEquals(originalInterface.hash)) {
+                log("Not answering path request on roaming-mode interface (same interface)")
+                return
+            }
+
+            // Loop prevention: don't answer if next hop is the requestor
+            // Python line 2738-2745
+            if (requestingTransportId != null &&
+                pathEntry.nextHop.contentEquals(requestingTransportId)) {
+                log("Not answering path request, next hop is the requestor")
+                return
+            }
+
+            log("Answering path request for $destHex, forwarding cached announce")
+
+            // Hold any existing announce table entry to avoid losing an in-flight announce
+            // Python line 2777-2779
+            val existingEntry = announceTable[cachedPacket.destinationHash.toKey()]
+            if (existingEntry != null) {
+                holdAnnounce(cachedPacket.destinationHash, existingEntry.raw)
+            }
+
+            // Queue for retransmission via the announce forwarding system
+            queueAnnounceRetransmit(
+                destinationHash,
+                cachedPacket,
+                originalInterface ?: receivingInterface
+            )
+            return
+        }
+
+        // Case 3: From local client, path unknown — forward to all external interfaces
+        // Python Transport.py:2783-2790
+        if (isFromLocalClient) {
+            log("Forwarding path request from local client for $destHex to all other interfaces")
+            val requestTag = Hashes.getRandomHash()
+            for (iface in interfaces) {
+                if (!iface.hash.contentEquals(receivingInterface.hash)) {
+                    requestPathInternal(destinationHash, onInterface = iface, tag = requestTag)
+                }
             }
             return
         }
 
-        // Check if we know a path (transport nodes can forward cached announces)
-        // Python Transport.py:2723-2781
-        val pathEntry = pathTable[destinationHash.toKey()]
-        if (pathEntry != null && !pathEntry.isExpired()) {
-            if (transportEnabled || localClientInterfaces.isNotEmpty()) {
-                log("Path to ${destinationHash.toHexString()} known (${pathEntry.hops} hops), retrieving cached announce")
-                val cachedData = getCachedAnnouncePacket(pathEntry.announcePacketHash)
-
-                if (cachedData == null) {
-                    log("Could not retrieve cached announce for ${destinationHash.toHexString()}")
-                    return
-                }
-
-                val (raw, interfaceName) = cachedData
-                val cachedPacket = Packet.unpack(raw)
-                if (cachedPacket == null) {
-                    log("Could not unpack cached announce for ${destinationHash.toHexString()}")
-                    return
-                }
-
-                // Find the original receiving interface
-                val originalInterface = interfaceName?.let { name ->
-                    interfaces.find { it.name == name }
-                }
-
-                // Set hop count from path table (Python line 2736)
-                cachedPacket.hops = pathEntry.hops
-
-                // Roaming mode check: don't answer if path is on the same roaming-mode interface
-                // Python line 2731-2732
-                if (receivingInterface.mode == InterfaceMode.ROAMING &&
-                    originalInterface != null &&
-                    receivingInterface.hash.contentEquals(originalInterface.hash)) {
-                    log("Not answering path request on roaming-mode interface (same interface)")
-                    return
-                }
-
-                // Loop prevention: don't answer if next hop is the requestor
-                // Python line 2738-2745
-                if (requestingTransportId != null &&
-                    pathEntry.nextHop.contentEquals(requestingTransportId)) {
-                    log("Not answering path request, next hop is the requestor")
-                    return
-                }
-
-                log("Answering path request for ${destinationHash.toHexString()}, forwarding cached announce")
-
-                // Hold any existing announce table entry to avoid losing an in-flight announce
-                // Python line 2777-2779
-                val existingEntry = announceTable[cachedPacket.destinationHash.toKey()]
-                if (existingEntry != null) {
-                    holdAnnounce(cachedPacket.destinationHash, existingEntry.raw)
-                }
-
-                // Queue for retransmission via the announce forwarding system
-                queueAnnounceRetransmit(
-                    destinationHash,
-                    cachedPacket,
-                    originalInterface ?: receivingInterface
+        // Case 4: Transport node, path unknown — recursive forwarding to discover
+        // Python Transport.py:2792-2806
+        if (shouldSearchForUnknown) {
+            val destKey = destinationHash.toKey()
+            if (discoveryPathRequests.containsKey(destKey)) {
+                log("Already a waiting path request for $destHex, not forwarding again")
+            } else {
+                log("Attempting to discover unknown path to $destHex via recursive forwarding")
+                discoveryPathRequests[destKey] = DiscoveryPathRequest(
+                    destinationHash = destinationHash,
+                    timeout = System.currentTimeMillis() + TransportConstants.PATH_REQUEST_TIMEOUT,
+                    requestingInterface = receivingInterface
                 )
+
+                for (iface in interfaces) {
+                    if (!iface.hash.contentEquals(receivingInterface.hash)) {
+                        // Re-use the original tag to avoid loops
+                        requestPathInternal(
+                            destinationHash,
+                            onInterface = iface,
+                            tag = tag,
+                            recursive = true
+                        )
+                    }
+                }
             }
+            return
         }
+
+        // Case 5: External request, local clients exist — forward to local clients
+        // Python Transport.py:2808-2813
+        if (!isFromLocalClient && localClientInterfaces.isNotEmpty()) {
+            log("Forwarding path request for $destHex to ${localClientInterfaces.size} local clients")
+            for (iface in localClientInterfaces) {
+                requestPathInternal(destinationHash, onInterface = iface)
+            }
+            return
+        }
+
+        // Case 6: No path known, nothing to do
+        log("Ignoring path request for $destHex, no path known")
     }
 
     // ===== Packet Processing =====
@@ -2303,23 +2465,37 @@ object Transport {
         }
 
         if (!sent) {
-            // Broadcast on all interfaces
             addPacketHash(packet.packetHash)
-            val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
-            log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
-            for (iface in interfaces) {
-                if (!iface.canSend || !iface.online) continue
-
-                // Mode-based announce filtering for locally-originated announces
-                // (Python Transport.py:1040-1084)
-                if (packet.packetType == PacketType.ANNOUNCE) {
-                    val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
-                    if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
+            // If packet has an attached interface, only send on that interface
+            // Python: attached_interface restricts announce to a single interface
+            val targetInterface = packet.attachedInterface
+            if (targetInterface != null) {
+                log("Sending to $destHex on attached interface ${targetInterface.name} (${packedData.size} bytes)")
+                if (targetInterface.canSend && targetInterface.online) {
+                    transmit(targetInterface, packedData)
+                    sent = true
+                } else {
+                    log("Attached interface ${targetInterface.name} is not available")
                 }
+            } else {
+                // Broadcast on all interfaces
+                val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
+                log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
-                transmit(iface, packedData)
-                sent = true
+                for (iface in interfaces) {
+                    if (!iface.canSend || !iface.online) continue
+
+                    // Mode-based announce filtering for locally-originated announces
+                    // (Python Transport.py:1040-1084)
+                    if (packet.packetType == PacketType.ANNOUNCE) {
+                        val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
+                        if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
+                    }
+
+                    transmit(iface, packedData)
+                    sent = true
+                }
             }
         }
 
@@ -2440,6 +2616,19 @@ object Transport {
         val destHash = packet.destinationHash
         val identity = announceData.identity
         val appData = announceData.appData
+
+        // Record incoming announce for frequency tracking
+        interfaceRef.recordIncomingAnnounce()
+
+        // Apply ingress limiting for unknown destinations
+        // Python Transport.py:1563-1571 — only limit announces for destinations
+        // not already in the path table (known destinations use normal rate limiting)
+        val isKnownDestination = pathTable.containsKey(destHash.toKey())
+        if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
+            log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
+            holdAnnounce(destHash, packet.raw ?: packet.pack())
+            return
+        }
 
         // Update path table
         val pathEntry = PathEntry(
@@ -3409,12 +3598,39 @@ object Transport {
     }
 
     /**
-     * Process held announces - expire old ones.
+     * Process held announces - release one at a time at intervals, expire old ones.
+     * Python: Interface.process_held_announces() releases one per IC_HELD_RELEASE_INTERVAL.
      */
     private fun processHeldAnnounces(now: Long) {
+        if (heldAnnounces.isEmpty()) return
+
+        // Expire old held announces
         val expireCutoff = now - TransportConstants.HELD_ANNOUNCE_TIMEOUT
         val expired = heldAnnounces.entries.filter { it.value.first < expireCutoff }
         expired.forEach { heldAnnounces.remove(it.key) }
+
+        // Release one held announce per interval
+        if (now > lastHeldRelease + TransportConstants.HELD_RELEASE_INTERVAL) {
+            // Find the oldest held announce to release
+            val oldest = heldAnnounces.entries.minByOrNull { it.value.first }
+            if (oldest != null) {
+                val destHex = oldest.key.bytes.toHexString()
+                log("Releasing held announce for $destHex")
+                heldAnnounces.remove(oldest.key)
+                lastHeldRelease = now
+
+                // Re-inject the held announce into the inbound processing pipeline
+                // Find any available interface to attribute it to
+                val iface = interfaces.firstOrNull()
+                if (iface != null) {
+                    try {
+                        inbound(oldest.value.second, iface)
+                    } catch (e: Exception) {
+                        log("Error re-injecting held announce: ${e.message}")
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -3482,6 +3698,9 @@ object Transport {
                 false
             }
         }
+
+        // Remove expired discovery path requests
+        discoveryPathRequests.entries.removeIf { now > it.value.timeout }
 
         // Remove expired tunnels
         cleanExpiredTunnels()
@@ -4395,6 +4614,15 @@ interface InterfaceRef {
     fun getInterfaceHash(): ByteArray {
         return Hashes.fullHash(name.toByteArray(Charsets.UTF_8))
     }
+
+    // Ingress control methods — implemented by Interface (via InterfaceAdapter),
+    // no-ops by default for test/stub interfaces.
+
+    /** Check if incoming announces should be rate-limited (burst detection). */
+    fun shouldIngressLimit(): Boolean = false
+
+    /** Record that an announce was received on this interface (for frequency tracking). */
+    fun recordIncomingAnnounce() {}
 
     fun send(data: ByteArray)
 }

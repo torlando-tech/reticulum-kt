@@ -1272,7 +1272,10 @@ class Link private constructor(
      */
     private fun updateKeepalive() {
         val linkRtt = rtt ?: return
-        val rttKeepalive = (linkRtt * LinkConstants.KEEPALIVE_MAX_RTT).toLong()
+        // Python: keepalive = max(min(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MAX), KEEPALIVE_MIN)
+        // Python uses seconds; Kotlin RTT is in ms, KEEPALIVE_MAX is in ms, KEEPALIVE_MAX_RTT is in seconds.
+        // Scale factor: KEEPALIVE_MAX_ms / (KEEPALIVE_MAX_RTT_s * 1000) = 360000 / 1750 ≈ 205.7
+        val rttKeepalive = (linkRtt * (LinkConstants.KEEPALIVE_MAX.toDouble() / (LinkConstants.KEEPALIVE_MAX_RTT * 1000.0))).toLong()
         keepalive = maxOf(LinkConstants.KEEPALIVE_MIN, minOf(rttKeepalive, LinkConstants.KEEPALIVE_MAX))
         staleTime = LinkConstants.STALE_FACTOR * keepalive
     }
@@ -1453,7 +1456,7 @@ class Link private constructor(
 
         val packet = Packet.createRaw(
             destinationHash = linkId,
-            data = ByteArray(0),
+            data = byteArrayOf(0xFF.toByte()),
             packetType = PacketType.DATA,
             context = PacketContext.KEEPALIVE,
             destinationType = DestinationType.LINK

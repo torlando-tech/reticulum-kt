@@ -67,6 +67,9 @@ class Packet private constructor(
     /** The link this packet is associated with (null if not a link packet). */
     internal var link: Link? = null
 
+    /** If set, Transport will only send this packet on this specific interface. */
+    var attachedInterface: network.reticulum.transport.InterfaceRef? = null
+
     /** Hash of the interface this packet was received on (set during inbound processing). */
     var receivingInterfaceHash: ByteArray? = null
         internal set
@@ -377,10 +380,11 @@ class Packet private constructor(
         fun createAnnounce(
             destination: Destination,
             appData: ByteArray? = null,
-            pathResponse: Boolean = false
+            pathResponse: Boolean = false,
+            attachedInterface: network.reticulum.transport.InterfaceRef? = null
         ): Packet? {
             return try {
-                destination.announce(appData = appData, pathResponse = pathResponse, send = false)
+                destination.announce(appData = appData, pathResponse = pathResponse, attachedInterface = attachedInterface, send = false)
             } catch (e: Exception) {
                 null
             }
