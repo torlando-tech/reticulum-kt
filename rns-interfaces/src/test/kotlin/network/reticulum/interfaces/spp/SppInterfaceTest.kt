@@ -198,7 +198,7 @@ class SppInterfaceTest {
         val secondConnection = createPipedConnection("AA:BB:CC:DD:EE:FF", "Device")
 
         val driver = object : SppDriver {
-            override suspend fun connect(address: String): SppConnection {
+            override suspend fun connect(address: String, secure: Boolean): SppConnection {
                 val count = connectCount.incrementAndGet()
                 return when (count) {
                     1 -> firstConnection
@@ -207,7 +207,7 @@ class SppInterfaceTest {
                 }
             }
 
-            override suspend fun accept(serviceName: String, uuid: UUID): SppConnection {
+            override suspend fun accept(serviceName: String, uuid: UUID, secure: Boolean): SppConnection {
                 throw UnsupportedOperationException("Not in server mode")
             }
 
@@ -327,12 +327,12 @@ class SppInterfaceTest {
         private val connectException: Exception? = null,
     ) : SppDriver {
 
-        override suspend fun connect(address: String): SppConnection {
+        override suspend fun connect(address: String, secure: Boolean): SppConnection {
             connectException?.let { throw it }
             return connectResult ?: throw IOException("No mock connection configured")
         }
 
-        override suspend fun accept(serviceName: String, uuid: UUID): SppConnection {
+        override suspend fun accept(serviceName: String, uuid: UUID, secure: Boolean): SppConnection {
             return acceptResult ?: throw IOException("No mock accept configured")
         }
 

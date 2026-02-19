@@ -48,19 +48,22 @@ class AndroidSppDriver(
     private var isShutdown = false
 
     @SuppressLint("MissingPermission")
-    override suspend fun connect(address: String): SppConnection {
+    override suspend fun connect(address: String, secure: Boolean): SppConnection {
         check(!isShutdown) { "Driver has been shut down" }
 
         return withContext(Dispatchers.IO) {
-            Log.d(TAG, "Connecting to SPP device $address...")
+            val mode = if (secure) "secure" else "insecure"
+            Log.d(TAG, "Connecting to SPP device $address ($mode)...")
             val device = bluetoothAdapter.getRemoteDevice(address)
-            val socket = device.createRfcommSocketToServiceRecord(
-                SppInterface.SPP_UUID
-            )
+            val socket = if (secure) {
+                device.createRfcommSocketToServiceRecord(SppInterface.SPP_UUID)
+            } else {
+                device.createInsecureRfcommSocketToServiceRecord(SppInterface.SPP_UUID)
+            }
 
             // connect() is blocking — can take 1-12 seconds
             socket.connect()
-            Log.d(TAG, "SPP connection established with ${device.name ?: address}")
+            Log.d(TAG, "SPP connection established with ${device.name ?: address} ($mode)")
 
             SppConnection(
                 inputStream = socket.inputStream,
@@ -73,12 +76,17 @@ class AndroidSppDriver(
     }
 
     @SuppressLint("MissingPermission")
-    override suspend fun accept(serviceName: String, uuid: UUID): SppConnection {
+    override suspend fun accept(serviceName: String, uuid: UUID, secure: Boolean): SppConnection {
         check(!isShutdown) { "Driver has been shut down" }
 
         return withContext(Dispatchers.IO) {
-            Log.d(TAG, "Listening for incoming SPP connection (service=$serviceName)...")
-            val server = bluetoothAdapter.listenUsingRfcommWithServiceRecord(serviceName, uuid)
+            val mode = if (secure) "secure" else "insecure"
+            Log.d(TAG, "Listening for incoming SPP connection (service=$serviceName, $mode)...")
+            val server = if (secure) {
+                bluetoothAdapter.listenUsingRfcommWithServiceRecord(serviceName, uuid)
+            } else {
+                bluetoothAdapter.listenUsingInsecureRfcommWithServiceRecord(serviceName, uuid)
+            }
             serverSocket = server
 
             try {

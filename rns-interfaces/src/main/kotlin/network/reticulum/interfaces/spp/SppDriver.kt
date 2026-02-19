@@ -21,16 +21,16 @@ import java.util.UUID
 interface SppDriver {
 
     /**
-     * Connect to a paired device by MAC address (client mode).
+     * Connect to a device by MAC address (client mode).
      *
-     * The device must already be bonded via Android Settings.
      * This is a blocking operation that should be called from [Dispatchers.IO].
      *
      * @param address Bluetooth MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+     * @param secure true for encrypted RFCOMM (requires pairing), false for insecure RFCOMM
      * @return Active SPP connection with streams
-     * @throws Exception if connection fails (device not bonded, not in range, etc.)
+     * @throws Exception if connection fails (device not in range, etc.)
      */
-    suspend fun connect(address: String): SppConnection
+    suspend fun connect(address: String, secure: Boolean = true): SppConnection
 
     /**
      * Listen for an incoming SPP connection (server mode).
@@ -40,10 +40,11 @@ interface SppDriver {
      *
      * @param serviceName Human-readable name for the SDP service record
      * @param uuid Service UUID for the SDP service record
+     * @param secure true for encrypted RFCOMM (requires pairing), false for insecure RFCOMM
      * @return Connection from the accepted client
      * @throws Exception if accept fails or is cancelled
      */
-    suspend fun accept(serviceName: String, uuid: UUID): SppConnection
+    suspend fun accept(serviceName: String, uuid: UUID, secure: Boolean = true): SppConnection
 
     /**
      * Cancel any pending [accept] call.

@@ -55,6 +55,7 @@ class SppInterface(
     private val driver: SppDriver,
     private val targetAddress: String,
     private val serverMode: Boolean = false,
+    private val secure: Boolean = true,
     private val maxReconnectAttempts: Int? = null,
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
@@ -197,9 +198,9 @@ class SppInterface(
 
             val conn = withContext(Dispatchers.IO) {
                 if (serverMode) {
-                    driver.accept(SERVICE_NAME, SPP_UUID)
+                    driver.accept(SERVICE_NAME, SPP_UUID, secure)
                 } else {
-                    driver.connect(targetAddress)
+                    driver.connect(targetAddress, secure)
                 }
             }
 
