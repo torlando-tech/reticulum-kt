@@ -86,7 +86,7 @@ class Link private constructor(
 
         // Shared coroutine scope for all link watchdogs (battery efficient on Android)
         private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        private val activeWatchdogs = ConcurrentHashMap<ByteArrayKey, Job>()
+        private val activeWatchdogs = ConcurrentHashMap<Int, Job>()
 
         /**
          * Cancel all watchdog coroutines. Used during shutdown.
@@ -181,6 +181,9 @@ class Link private constructor(
 
                 log("Validating link request ${link.linkId.toHexString()}")
 
+                // Set attached interface (Python: link.attached_interface = packet.receiving_interface)
+                link.attachedInterfaceHash = packet.receivingInterfaceHash
+
                 // Register path for this link BEFORE sending proof so proof goes via correct interface
                 // This ensures Python's attached_interface matches the interface we'll use later
                 packet.receivingInterfaceHash?.let { interfaceHash ->
@@ -265,6 +268,9 @@ class Link private constructor(
         }
     }
 
+    // Unique per-instance ID (avoids watchdog collisions when two links share the same linkId)
+    private val instanceId: Int = linkCounter.getAndIncrement()
+
     // Link identity
     var linkId: ByteArray = ByteArray(0)
         private set
@@ -339,6 +345,8 @@ class Link private constructor(
     // Attached interface/destination (public to allow initiator links to attach a destination
     // for request handling — matches Python's Link.attached_interface which is also public)
     var attachedDestination: Destination? = null
+    // Hash of the interface this link is attached to (Python: link.attached_interface)
+    var attachedInterfaceHash: ByteArray? = null
     private var remoteIdentity: Identity? = null
 
     // Cryptographic state
@@ -583,6 +591,9 @@ class Link private constructor(
 
             Transport.activateLink(this)
 
+            // Set attached interface (Python: self.attached_interface = packet.receiving_interface)
+            attachedInterfaceHash = packet.receivingInterfaceHash
+
             // Register path for this link so outbound packets use correct interface
             packet.receivingInterfaceHash?.let { interfaceHash ->
                 Transport.registerLinkPath(linkId, interfaceHash, packet.hops)
@@ -732,6 +743,7 @@ class Link private constructor(
             createReceipt = true,
             mtu = mtu
         )
+        packet.link = this
 
         val receipt = packet.send()
         if (receipt != null) {
@@ -760,6 +772,7 @@ class Link private constructor(
             context = PacketContext.RESOURCE,
             mtu = mtu
         )
+        packet.link = this
 
         packet.send()
         hadOutbound(isData = true)
@@ -927,6 +940,8 @@ class Link private constructor(
                 mtu = mtu
             )
 
+            packet.link = this
+
             // Generate request ID from packet's truncated hash (like Python does)
             // This must be calculated AFTER creating the packet with encrypted data
             val requestId = packet.truncatedHash
@@ -1037,6 +1052,7 @@ class Link private constructor(
             context = PacketContext.LINKIDENTIFY,
             destinationType = DestinationType.LINK
         )
+        packet.link = this
 
         return Transport.outbound(packet).also { sent ->
             if (sent) {
@@ -1285,11 +1301,8 @@ class Link private constructor(
      * This is more battery-efficient than per-link threads on Android.
      */
     private fun startWatchdog() {
-        val id = linkId ?: return
-        val key = id.toKey()
-
-        // Cancel existing watchdog if any
-        activeWatchdogs[key]?.cancel()
+        // Cancel existing watchdog for this instance if any
+        activeWatchdogs[instanceId]?.cancel()
 
         // Start new watchdog coroutine in shared scope
         val job = watchdogScope.launch {
@@ -1306,16 +1319,14 @@ class Link private constructor(
             }
         }
 
-        activeWatchdogs[key] = job
+        activeWatchdogs[instanceId] = job
     }
 
     /**
      * Stop the watchdog coroutine for this link.
      */
     private fun stopWatchdog() {
-        val id = linkId ?: return
-        val key = id.toKey()
-        activeWatchdogs.remove(key)?.cancel()
+        activeWatchdogs.remove(instanceId)?.cancel()
     }
 
     /**
@@ -1412,6 +1423,7 @@ class Link private constructor(
                 context = PacketContext.LINKCLOSE,
                 destinationType = DestinationType.LINK
             )
+            packet.link = this
             Transport.outbound(packet)
         } catch (e: Exception) {
             log("Error sending teardown packet: ${e.message}")
@@ -1442,6 +1454,7 @@ class Link private constructor(
             context = PacketContext.LRRTT,
             destinationType = DestinationType.LINK
         )
+        packet.link = this
 
         Transport.outbound(packet)
         hadOutbound()
@@ -1461,6 +1474,7 @@ class Link private constructor(
             context = PacketContext.KEEPALIVE,
             destinationType = DestinationType.LINK
         )
+        packet.link = this
 
         Transport.outbound(packet)
         hadOutbound(isKeepalive = true)
@@ -2148,6 +2162,7 @@ class Link private constructor(
                 context = PacketContext.KEEPALIVE,
                 destinationType = DestinationType.LINK
             )
+            keepaliveResponse.link = this
             Transport.outbound(keepaliveResponse)
             hadOutbound(isKeepalive = true)
         }
@@ -2437,6 +2452,7 @@ class Link private constructor(
                     destinationType = DestinationType.LINK,
                     mtu = mtu
                 )
+                packet.link = this
                 Transport.outbound(packet)
                 hadOutbound(isData = true)
             } else {

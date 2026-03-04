@@ -53,7 +53,7 @@ class Packet private constructor(
     /** The destination hash (16 bytes). */
     val destinationHash: ByteArray,
     /** The transport ID for HEADER_2 packets (16 bytes), null for HEADER_1. */
-    val transportId: ByteArray?,
+    var transportId: ByteArray?,
     /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
     var data: ByteArray,
     /** Whether to create a receipt when sending this packet. */

@@ -233,8 +233,10 @@ object Transport {
     private val queuedAnnounces = CopyOnWriteArrayList<QueuedAnnounce>()
 
     /** Registered links: link_id -> Link. */
-    private val pendingLinks = ConcurrentHashMap<ByteArrayKey, Any>()
-    private val activeLinks = ConcurrentHashMap<ByteArrayKey, Any>()
+    // Python uses lists (not maps) so multiple links with the same link_id can coexist
+    // (e.g., client + server links in the same process when connecting to own hub)
+    private val pendingLinks = mutableListOf<Any>()
+    private val activeLinks = mutableListOf<Any>()
 
     /** Pending receipts: packet_hash -> ProofCallback. */
     private val pendingReceipts = ConcurrentHashMap<ByteArrayKey, ProofCallback>()
@@ -864,8 +866,18 @@ object Transport {
         // Use Any type to avoid circular dependency with Link class
         // The link provides its hash via reflection or interface
         val linkId = getLinkId(link) ?: return
-        pendingLinks[linkId.toKey()] = link
-        log("Registered pending link: ${linkId.toHexString()}")
+        // Python Transport.py:2244-2247: initiator links go to pending_links,
+        // non-initiator (server) links go to active_links
+        val isInitiator = try {
+            link::class.java.getMethod("getInitiator").invoke(link) as? Boolean ?: true
+        } catch (_: Exception) { true }
+        if (isInitiator) {
+            pendingLinks.add(link)
+            log("Registered pending link: ${linkId.toHexString()}")
+        } else {
+            activeLinks.add(link)
+            log("Registered active link: ${linkId.toHexString()}")
+        }
     }
 
     /**
@@ -873,9 +885,8 @@ object Transport {
      */
     fun activateLink(link: Any) {
         val linkId = getLinkId(link) ?: return
-        val key = linkId.toKey()
-        pendingLinks.remove(key)
-        activeLinks[key] = link
+        pendingLinks.remove(link)
+        activeLinks.add(link)
         log("Activated link: ${linkId.toHexString()}")
     }
 
@@ -903,9 +914,8 @@ object Transport {
      */
     fun deregisterLink(link: Any) {
         val linkId = getLinkId(link) ?: return
-        val key = linkId.toKey()
-        pendingLinks.remove(key)
-        activeLinks.remove(key)
+        pendingLinks.remove(link)
+        activeLinks.remove(link)
         log("Deregistered link: ${linkId.toHexString()}")
     }
 
@@ -914,7 +924,8 @@ object Transport {
      */
     fun findLink(linkId: ByteArray): Any? {
         val key = linkId.toKey()
-        return activeLinks[key] ?: pendingLinks[key]
+        return activeLinks.find { getLinkId(it)?.toKey() == key }
+            ?: pendingLinks.find { getLinkId(it)?.toKey() == key }
     }
 
     /**
@@ -2301,9 +2312,13 @@ object Transport {
         interfaceRef.rStatSnr?.let { packet.snr = it }
         interfaceRef.rStatQ?.let { packet.q = it }
 
+        // Increment hop count (Python Transport.py:1319)
+        packet.hops++
+
         // Python RNS: Decrement hops for packets from local client interfaces
-        // This makes destinations behind shared instance appear more reachable
-        // Matches Python Transport.inbound():1253-1258
+        // This makes destinations behind shared instance appear directly reachable (hops=0)
+        // Must happen AFTER increment to match Python order: +1 then -1 = net 0
+        // Matches Python Transport.inbound():1343-1348
         if (localClientInterfaces.isNotEmpty()) {
             if (interfaceRef.parentInterface?.isLocalSharedInstance == true) {
                 packet.hops = maxOf(0, packet.hops - 1)
@@ -2312,9 +2327,6 @@ object Transport {
             // Client connected to shared instance (not server-spawned)
             packet.hops = maxOf(0, packet.hops - 1)
         }
-
-        // Increment hop count
-        packet.hops++
 
         // Check for duplicates
         if (!packetFilter(packet)) {
@@ -2380,6 +2392,15 @@ object Transport {
             } else {
                 log("BROADCAST ROUTING: No local clients to forward to")
             }
+        }
+
+        // Detect packets for local clients (Python Transport.py:1379)
+        val forLocalClient = packet.packetType != PacketType.ANNOUNCE &&
+            pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
+
+        // Synthesize transport_id for local client routing (Python Transport.py:1413-1414)
+        if (packet.transportId == null && forLocalClient) {
+            packet.transportId = identity?.hash
         }
 
         // Route based on packet type
@@ -2485,6 +2506,20 @@ object Transport {
 
                 for (iface in interfaces) {
                     if (!iface.canSend || !iface.online) continue
+
+                    // LINK packets should only be sent on the link's attached interface
+                    // (Python Transport.py:1031-1035)
+                    if (packet.destinationType == DestinationType.LINK) {
+                        val linkObj = packet.link
+                        if (linkObj != null) {
+                            val attachedHash = try {
+                                linkObj::class.java.getMethod("getAttachedInterfaceHash").invoke(linkObj) as? ByteArray
+                            } catch (_: Exception) { null }
+                            if (attachedHash != null && !iface.hash.contentEquals(attachedHash)) {
+                                continue
+                            }
+                        }
+                    }
 
                     // Mode-based announce filtering for locally-originated announces
                     // (Python Transport.py:1040-1084)
@@ -2852,14 +2887,26 @@ object Transport {
         }
 
         // Check if this is data for a local link (destination hash is a link_id)
-        val localLink = findLink(packet.destinationHash)
-        if (localLink != null) {
-            log("Delivering link data to local link ${packet.destinationHash.toHexString()}")
-            try {
-                val receiveMethod = localLink::class.java.getMethod("receive", Packet::class.java)
-                receiveMethod.invoke(localLink, packet)
-            } catch (e: Exception) {
-                log("Failed to deliver to local link: ${e.message}")
+        // Python iterates ALL matching links and checks attached_interface (Transport.py:1971-1984)
+        val key = packet.destinationHash.toKey()
+        val matchingLinks = activeLinks.filter { getLinkId(it)?.toKey() == key }
+        if (matchingLinks.isNotEmpty()) {
+            for (link in matchingLinks) {
+                // Python: if link.attached_interface == packet.receiving_interface
+                val attachedHash = try {
+                    link::class.java.getMethod("getAttachedInterfaceHash").invoke(link) as? ByteArray
+                } catch (_: Exception) { null }
+                val pktIfaceHash = packet.receivingInterfaceHash
+                if (attachedHash != null && pktIfaceHash != null && !attachedHash.contentEquals(pktIfaceHash)) {
+                    log("WARNING: Link interface mismatch on ${packet.destinationHash.toHexString()}, potential communication manipulation or misconfiguration")
+                    continue
+                }
+                try {
+                    val receiveMethod = link::class.java.getMethod("receive", Packet::class.java)
+                    receiveMethod.invoke(link, packet)
+                } catch (e: Exception) {
+                    log("Failed to deliver to local link: ${e.message}")
+                }
             }
             return
         }
@@ -2886,31 +2933,43 @@ object Transport {
             }
         }
 
-        // Check if this is link data for forwarding (destination hash is a link_id)
-        val linkEntry = linkTable[packet.destinationHash.toKey()]
-        if (linkEntry != null) {
-            // This is link data - forward to the appropriate interface based on which
-            // interface the packet came from (bidirectional routing)
-            val outboundInterfaceHash = if (interfaceRef.hash.contentEquals(linkEntry.receivingInterfaceHash)) {
-                // Packet came from the link initiator side, forward to the destination side
-                linkEntry.nextHopInterfaceHash
-            } else {
-                // Packet came from the destination side, forward to the initiator side
-                linkEntry.receivingInterfaceHash
-            }
-
-            val outboundInterface = findInterfaceByHash(outboundInterfaceHash)
-            if (outboundInterface != null) {
-                log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                transmit(outboundInterface, packet.raw ?: packet.pack())
-                return
-            } else {
-                log("Link data forward failed: interface ${outboundInterfaceHash.toHexString()} not found")
+        // Link transport handling: forward data/proof via link_table entries
+        // (Python Transport.py:1514-1548)
+        if (packet.packetType != PacketType.ANNOUNCE &&
+            packet.packetType != PacketType.LINKREQUEST &&
+            packet.context != PacketContext.LRPROOF
+        ) {
+            val linkEntry = linkTable[packet.destinationHash.toKey()]
+            if (linkEntry != null) {
+                val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+                val rcvdIface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                val outboundInterface = when {
+                    // Same interface for both directions — just repeat (Python lines 1521-1525)
+                    nhIface != null && rcvdIface != null &&
+                        nhIface.hash.contentEquals(rcvdIface.hash) -> nhIface
+                    // Different interfaces — transmit on opposite side (Python lines 1526-1537)
+                    nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> rcvdIface
+                    rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> nhIface
+                    else -> null
+                }
+                if (outboundInterface != null) {
+                    val raw = packet.raw ?: packet.pack()
+                    val newRaw = raw.copyOf()
+                    newRaw[1] = packet.hops.toByte()
+                    transmit(outboundInterface, newRaw)
+                    linkTable[packet.destinationHash.toKey()] = linkEntry.copy(
+                        timestamp = System.currentTimeMillis()
+                    )
+                    log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                    return
+                }
             }
         }
 
-        // Transport-mode forwarding (when we're an intermediate hop)
-        if (transportEnabled && packet.transportId != null) {
+        // Transport-mode forwarding (Python Transport.py:1404,1427)
+        // Allow when transport enabled OR when packet has our transport_id
+        // (synthesized for local client routing even without transport enabled)
+        if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash
             if (myHash != null && packet.transportId.contentEquals(myHash)) {
                 forwardPacket(packet, interfaceRef)
@@ -2964,8 +3023,10 @@ object Transport {
             }
         }
 
-        // Transport-mode forwarding (when we're an intermediate hop)
-        if (transportEnabled && packet.transportId != null) {
+        // Transport-mode forwarding (Python Transport.py:1404,1427)
+        // Allow when transport enabled OR when packet has our transport_id
+        // (synthesized for local client routing even without transport enabled)
+        if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash
             if (myHash != null && packet.transportId.contentEquals(myHash)) {
                 // Record in link table for return path
@@ -3098,7 +3159,7 @@ object Transport {
             }
 
             // Check if we can deliver it to a local pending link
-            val pendingLink = pendingLinks[packet.destinationHash.toKey()]
+            val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
             if (pendingLink != null) {
                 log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
                 try {
@@ -3123,7 +3184,7 @@ object Transport {
         // Handle RESOURCE_PRF (Resource Proof) - deliver to active link
         // Resource proofs are sent with the link ID as destination
         if (packet.context == PacketContext.RESOURCE_PRF) {
-            val activeLink = activeLinks[packet.destinationHash.toKey()]
+            val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
             if (activeLink != null) {
                 log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
                 try {
@@ -3194,26 +3255,35 @@ object Transport {
 
         val raw = packet.raw ?: return
 
-        if (pathEntry.hops > 1) {
-            // Update transport header with next hop
-            val newRaw = raw.copyOf()
-            newRaw[1] = packet.hops.toByte()
-            System.arraycopy(pathEntry.nextHop, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
-            transmit(outboundInterface, newRaw)
-        } else {
-            // Strip transport header (convert to HEADER_1)
-            val newFlags = (HeaderType.HEADER_1.value shl 6) or
-                           (TransportType.BROADCAST.value shl 4) or
-                           (raw[0].toInt() and 0x0F)
-            val newRaw = ByteArray(raw.size - RnsConstants.TRUNCATED_HASH_BYTES)
-            newRaw[0] = newFlags.toByte()
-            newRaw[1] = packet.hops.toByte()
-            System.arraycopy(
-                raw, 2 + RnsConstants.TRUNCATED_HASH_BYTES,
-                newRaw, 2,
-                raw.size - 2 - RnsConstants.TRUNCATED_HASH_BYTES
-            )
-            transmit(outboundInterface, newRaw)
+        when {
+            pathEntry.hops > 1 -> {
+                // Update transport header with next hop (Python Transport.py:1433-1438)
+                val newRaw = raw.copyOf()
+                newRaw[1] = packet.hops.toByte()
+                System.arraycopy(pathEntry.nextHop, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
+                transmit(outboundInterface, newRaw)
+            }
+            pathEntry.hops == 1 -> {
+                // Strip transport header, convert to HEADER_1 (Python Transport.py:1439-1444)
+                val newFlags = (HeaderType.HEADER_1.value shl 6) or
+                               (TransportType.BROADCAST.value shl 4) or
+                               (raw[0].toInt() and 0x0F)
+                val newRaw = ByteArray(raw.size - RnsConstants.TRUNCATED_HASH_BYTES)
+                newRaw[0] = newFlags.toByte()
+                newRaw[1] = packet.hops.toByte()
+                System.arraycopy(
+                    raw, 2 + RnsConstants.TRUNCATED_HASH_BYTES,
+                    newRaw, 2,
+                    raw.size - 2 - RnsConstants.TRUNCATED_HASH_BYTES
+                )
+                transmit(outboundInterface, newRaw)
+            }
+            else -> {
+                // hops==0: local client, just update hop count (Python Transport.py:1445-1449)
+                val newRaw = raw.copyOf()
+                newRaw[1] = packet.hops.toByte()
+                transmit(outboundInterface, newRaw)
+            }
         }
 
         // Record reverse entry for proofs
@@ -4478,6 +4548,7 @@ object Transport {
     private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? {
         val key = hash.toKey()
         return interfaces.find { it.hash.toKey() == key }
+            ?: localClientInterfaces.find { it.hash.toKey() == key }
     }
 
     private fun log(message: String) {
