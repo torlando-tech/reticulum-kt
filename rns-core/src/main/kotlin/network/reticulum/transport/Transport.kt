@@ -3027,11 +3027,12 @@ object Transport {
         }
 
         // Transport-mode forwarding (Python Transport.py:1404,1427)
-        // Allow when transport enabled OR when packet has our transport_id
-        // (synthesized for local client routing even without transport enabled)
+        // Gate on transportEnabled, except for local client routing where
+        // transport_id was synthesized (Python line 1404 allows for_local_client)
         if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash
-            if (myHash != null && packet.transportId.contentEquals(myHash)) {
+            val forLocalClient = pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
+            if (myHash != null && packet.transportId.contentEquals(myHash) && (transportEnabled || forLocalClient)) {
                 // Record in link table for return path
                 if (pathEntry != null) {
                     // Use proper link_id calculation
