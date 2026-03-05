@@ -2295,11 +2295,6 @@ object Transport {
             return
         }
 
-        // DEBUG: Log packet type from external interface
-        if (interfaceRef.name == "Beleth RNS Hub") {
-            log("DEBUG: Unpacked ${packet.packetType} from ${interfaceRef.name} (destType=${packet.destinationType}, transport=${packet.transportType})")
-        }
-
         // Track which interface this packet was received on
         packet.receivingInterfaceHash = interfaceRef.hash
 
@@ -2514,6 +2509,8 @@ object Transport {
                             if (attachedHash != null && !iface.hash.contentEquals(attachedHash)) {
                                 continue
                             }
+                        } else {
+                            log("WARNING: LINK packet missing link reference, broadcasting on all interfaces")
                         }
                     }
 

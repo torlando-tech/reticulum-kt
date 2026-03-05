@@ -509,6 +509,7 @@ class Link private constructor(
             context = PacketContext.LRPROOF,
             destinationType = DestinationType.LINK
         )
+        proof.link = this
 
         Transport.outbound(proof)
         establishmentCost += proof.raw?.size ?: 0
