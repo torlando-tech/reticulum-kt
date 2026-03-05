@@ -10,6 +10,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.link.Link
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import java.nio.file.Files
@@ -22,7 +23,7 @@ import java.nio.file.Files
  *   stderr: JSON control/status messages (one per line)
  *
  * Environment variables:
- *   PIPE_PEER_ACTION:    announce | listen | transport
+ *   PIPE_PEER_ACTION:    announce | listen | link_listen | transport
  *   PIPE_PEER_APP_NAME:  app name for destination (default: pipetest)
  *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
@@ -112,6 +113,47 @@ fun main() {
                     put("identity_public_key", identity.getPublicKey().toHexString())
                 })
 
+                pathTableDumper()
+            }
+            "link_listen" -> {
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+                destination.setLinkEstablishedCallback { linkAny ->
+                    val link = linkAny as Link
+                    emit(buildJsonObject {
+                        put("type", "link_established")
+                        put("link_id", link.linkId.toHexString())
+                        put("destination_hash", destination.hash.toHexString())
+                    })
+                    link.setLinkClosedCallback { closedLink ->
+                        emit(buildJsonObject {
+                            put("type", "link_closed")
+                            put("link_id", closedLink.linkId.toHexString())
+                            put("destination_hash", destination.hash.toHexString())
+                        })
+                    }
+                    link.setPacketCallback { data, _ ->
+                        emit(buildJsonObject {
+                            put("type", "link_data")
+                            put("link_id", link.linkId.toHexString())
+                            put("data_hex", data.toHexString())
+                            put("data_utf8", data.decodeToString())
+                        })
+                    }
+                }
+                destination.announce()
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
                 pathTableDumper()
             }
             "listen" -> pathTableDumper()

@@ -11,20 +11,26 @@ Protocol:
 
 The script accepts commands via environment variables:
   PIPE_PEER_ACTION: What to do after startup
-    "announce" - Create a destination and announce it
-    "listen"   - Just listen and report what arrives
-    "transport" - Enable transport mode and forward
+    "announce"     - Create a destination and announce it
+    "listen"       - Just listen and report what arrives
+    "link_listen"  - Create a destination, announce it, and accept incoming links
+    "transport"    - Enable transport mode and forward
 
   PIPE_PEER_APP_NAME: App name for destination (default: "pipetest")
   PIPE_PEER_ASPECTS: Comma-separated aspects (default: "routing")
   PIPE_PEER_TRANSPORT: Enable transport (default: "false")
 
+  PIPE_PEER_MODE: Interface mode (default: "full")
+    "full" | "ap" | "roaming" | "boundary" | "gateway" | "p2p"
+
 Status messages on stderr (JSON, one per line):
   {"type": "ready", "identity_hash": "..."}
   {"type": "announced", "destination_hash": "...", "identity_hash": "...", "identity_public_key": "..."}
-  {"type": "path_learned", "destination_hash": "...", "hops": N, "next_hop": "..."}
   {"type": "announce_received", "destination_hash": "...", "hops": N, "identity_hash": "..."}
   {"type": "path_table", "entries": [...]}
+  {"type": "link_established", "link_id": "...", "destination_hash": "..."}
+  {"type": "link_closed", "link_id": "...", "destination_hash": "..."}
+  {"type": "link_data", "link_id": "...", "data_hex": "...", "data_utf8": "..."}
   {"type": "error", "message": "..."}
 """
 
@@ -133,6 +139,26 @@ def main():
     elif action == "listen":
         _path_table_dumper(RNS)
 
+    elif action == "link_listen":
+        # Create destination that accepts incoming links
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects
+        )
+        destination.set_link_established_callback(_link_established)
+        destination.announce()
+        emit({
+            "type": "announced",
+            "destination_hash": bytes_to_hex(destination.hash),
+            "identity_hash": bytes_to_hex(identity.hash),
+            "identity_public_key": bytes_to_hex(identity.get_public_key()),
+        })
+        _path_table_dumper(RNS)
+
     elif action == "transport":
         _path_table_dumper(RNS)
 
@@ -158,6 +184,43 @@ class _AnnounceHandler:
             "identity_hash": bytes_to_hex(announced_identity.hash) if announced_identity else "",
             "hops": hops,
         })
+
+
+def _link_established(link):
+    """Called when a link is established to our destination."""
+    link_id = link.link_id.hex() if link.link_id else ""
+    dest_hash = link.destination.hash.hex() if link.destination else ""
+    emit({
+        "type": "link_established",
+        "link_id": link_id,
+        "destination_hash": dest_hash,
+    })
+    link.set_link_closed_callback(_link_closed)
+    link.set_packet_callback(_link_data)
+
+
+def _link_closed(link):
+    """Called when a link is closed."""
+    link_id = link.link_id.hex() if link.link_id else ""
+    dest_hash = link.destination.hash.hex() if link.destination else ""
+    emit({
+        "type": "link_closed",
+        "link_id": link_id,
+        "destination_hash": dest_hash,
+    })
+
+
+def _link_data(message, packet):
+    """Called when data is received on a link."""
+    link = packet.link
+    link_id = link.link_id.hex() if link and link.link_id else ""
+    data = message if isinstance(message, bytes) else bytes(message)
+    emit({
+        "type": "link_data",
+        "link_id": link_id,
+        "data_hex": data.hex(),
+        "data_utf8": data.decode("utf-8", errors="replace"),
+    })
 
 
 def _path_table_dumper(RNS):

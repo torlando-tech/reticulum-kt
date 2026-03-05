@@ -729,6 +729,11 @@ object Transport {
      * Register a destination with transport.
      */
     fun registerDestination(destination: Destination) {
+        // Prevent duplicate registration (matches Python Transport.py:2223-2225)
+        val key = destination.hash.toKey()
+        if (destinations.any { it.hash.toKey() == key }) {
+            return
+        }
         destinations.add(destination)
         log("Registered destination: ${destination.hexHash}")
     }
@@ -3244,52 +3249,48 @@ object Transport {
         val pathMtu = Link.mtuFromLrPacket(packet) ?: return
         val mode = Link.modeFromLrPacket(packet)
 
-        if (receivingInterface.supportsLinkMtuDiscovery) {
-            val nhMtu = receivingInterface.hwMtu
-            if (nhMtu < pathMtu) {
-                try {
-                    val clampedBytes = Link.signallingBytes(nhMtu, mode)
-                    log("Clamping link MTU to $nhMtu for local delivery")
-                    System.arraycopy(
-                        clampedBytes, 0,
-                        packet.data, packet.data.size - LinkConstants.LINK_MTU_SIZE,
-                        LinkConstants.LINK_MTU_SIZE
-                    )
-                } catch (e: Exception) {
-                    log("Error clamping link MTU for local delivery: ${e.message}")
-                }
-            }
+        // Match Python Transport.py:1938-1963
+        // Python checks: if HW_MTU is None → strip signalling bytes
+        //                 elif AUTOCONFIGURE_MTU or FIXED_MTU → use HW_MTU for clamping
+        //                 else → use default MTU (500) for clamping
+        val nhMtu = if (receivingInterface.supportsLinkMtuDiscovery) {
+            receivingInterface.hwMtu
+        } else if (receivingInterface.hwMtu > 0) {
+            // Interface has a HW_MTU but doesn't auto-configure — use default MTU
+            RnsConstants.MTU
         } else {
-            // Interface doesn't support MTU discovery — strip signalling bytes
-            log("Receiving interface ${receivingInterface.name} doesn't support MTU discovery, stripping")
+            // No HW_MTU at all — strip signalling bytes (Python: HW_MTU == None)
+            log("No next-hop HW MTU, stripping link MTU signalling bytes")
             packet.data = packet.data.copyOf(packet.data.size - LinkConstants.LINK_MTU_SIZE)
+            return
+        }
+
+        if (nhMtu < pathMtu) {
+            try {
+                val clampedBytes = Link.signallingBytes(nhMtu, mode)
+                log("Clamping link MTU to $nhMtu for local delivery")
+                System.arraycopy(
+                    clampedBytes, 0,
+                    packet.data, packet.data.size - LinkConstants.LINK_MTU_SIZE,
+                    LinkConstants.LINK_MTU_SIZE
+                )
+            } catch (e: Exception) {
+                log("Error clamping link MTU for local delivery: ${e.message}")
+            }
         }
     }
 
     private fun processProof(packet: Packet, interfaceRef: InterfaceRef) {
         log("Processing proof: dest=${packet.destinationHash.toHexString()}, context=${packet.context}, from ${interfaceRef.name}")
 
-        // Handle LRPROOF (Link Request Proof) - look up in link table
+        // Handle LRPROOF (Link Request Proof)
+        // Check pending links FIRST — when hub and client share the same Transport
+        // (same-process), the proof must be delivered locally before attempting to forward.
         if (packet.context == PacketContext.LRPROOF) {
-            val linkEntry = linkTable[packet.destinationHash.toKey()]
-            if (linkEntry != null) {
-                // Forward proof back to the originating interface
-                val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
-                if (outboundInterface != null) {
-                    log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                    transmit(outboundInterface, packet.raw ?: packet.pack())
-                }
-                // Mark link as validated
-                linkEntry.validated = true
-                return
-            }
-
-            // Check if we can deliver it to a local pending link
             val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
             if (pendingLink != null) {
                 log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
                 try {
-                    // Use reflection to call validateProof on the link
                     val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
                     validateMethod.invoke(pendingLink, packet)
                 } catch (e: Exception) {
@@ -3298,13 +3299,19 @@ object Transport {
                 return
             }
 
-            // Debug: show what's in the link table
-            if (linkTable.isNotEmpty()) {
-                val keys = linkTable.keys.take(3).map { it.toString().take(16) + "..." }
-                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table. Keys: $keys")
-            } else {
-                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table or pending_links")
+            // No local pending link — forward via link table
+            val linkEntry = linkTable[packet.destinationHash.toKey()]
+            if (linkEntry != null) {
+                val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                if (outboundInterface != null) {
+                    log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                    transmit(outboundInterface, packet.raw ?: packet.pack())
+                }
+                linkEntry.validated = true
+                return
             }
+
+            log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links or link_table")
         }
 
         // Handle RESOURCE_PRF (Resource Proof) - deliver to active link

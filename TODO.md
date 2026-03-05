@@ -13,7 +13,7 @@ Last updated: 2026-02-18
 - [x] **#4 Recursive path requests** — Fixed: added `processPathRequest()` fallthrough branches for local client forwarding, recursive unknown-path discovery with announce-cap throttling, and local client notification. Added `discoveryPathRequests` tracking and `requestPathInternal()` with tag/recursive support.
 - [x] **#5 Announce rate control** — Fixed: wired `shouldIngressLimit()` into `processAnnounce()` for unknown destinations, added `recordIncomingAnnounce()` to `InterfaceRef`, enhanced `processHeldAnnounces()` to release one held announce per 30s interval.
 - [ ] **#6 Implicit proof mode** — `PacketReceipt` validates both formats, but `Packet.prove()` always sends explicit proofs. Works today (Python accepts both), but doesn't save bandwidth.
-- [ ] **#7 Destination auto-registration** — Python auto-registers with Transport on construction; Kotlin requires manual `Transport.registerDestination()`. API divergence.
+- [x] **#7 Destination auto-registration** — Fixed: `Destination.create()` now auto-registers IN destinations with Transport, matching Python `Destination.__init__`. `Transport.registerDestination()` has duplicate guard.
 - [x] **#8 Destination.announce(attached_interface)** — Fixed: added `attachedInterface` parameter to `Destination.announce()` and `Packet.createAnnounce()`, stored on `Packet`, respected in `Transport.processOutbound()`. Path response announces now target the requesting interface.
 - [x] **#9 PacketReceipt link-aware timeout** — Fixed: `calculateTimeout()` now uses `max(link.rtt * TRAFFIC_TIMEOUT_FACTOR, TRAFFIC_TIMEOUT_MIN_MS/1000)` for LINK destinations, populating `link` from `packet.link`.
 

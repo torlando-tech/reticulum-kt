@@ -316,3 +316,33 @@ class PipeSession:
         """Recall identity from Python's identity storage."""
         dest_bytes = bytes.fromhex(dest_hash_hex)
         return self.RNS.Identity.recall(dest_bytes)
+
+    def python_create_link(self, dest_hash_hex):
+        """Create a Link to the target's destination. Returns the Link object."""
+        dest_bytes = bytes.fromhex(dest_hash_hex)
+        identity = self.RNS.Identity.recall(dest_bytes)
+        if identity is None:
+            raise ValueError(f"Cannot recall identity for {dest_hash_hex}")
+        dest = self.RNS.Destination(
+            identity,
+            self.RNS.Destination.OUT,
+            self.RNS.Destination.SINGLE,
+            "pipetest",  # must match target's app_name
+            "routing",   # must match target's aspects
+        )
+        link = self.RNS.Link(dest)
+        return link
+
+    # ─── Link Message Waiting ──────────────────────────────────────
+
+    def wait_for_link_established(self, timeout=15):
+        """Wait for the target to report a link establishment."""
+        return self.wait_for_message("link_established", timeout=timeout)
+
+    def wait_for_link_closed(self, timeout=15):
+        """Wait for the target to report a link closure."""
+        return self.wait_for_message("link_closed", timeout=timeout)
+
+    def wait_for_link_data(self, timeout=15):
+        """Wait for the target to report receiving data on a link."""
+        return self.wait_for_message("link_data", timeout=timeout)
