@@ -2442,15 +2442,15 @@ object Transport {
         // server-side of the local socket), so Python's interface check in processData
         // (Transport.py:1973) naturally delivers to only the correct endpoint.
         //
-        // In Kotlin, the shared instance server and clients are separate Android
-        // processes. When an app acts as both shared instance server and client (e.g.
+        // In Kotlin, the shared instance transport node and clients are separate
+        // Android processes. When an app acts as both transport node and client (e.g.
         // an RRC app which is both hub and client), a link to its own destination has
         // both endpoints in the client process. The LINKREQUEST is bounced through the
-        // shared instance server, so both links end up with the same
-        // attachedInterfaceHash (SharedInstanceClient). If the packet goes through the
-        // server, link_table forwarding bounces it back, and the client delivers to
-        // BOTH endpoints — the initiator re-processes its own sent data, triggering
-        // new outbound packets in an infinite loop.
+        // transport node, so both links end up with the same attachedInterfaceHash
+        // (SharedInstanceClient). If the packet goes through the transport node,
+        // link_table forwarding bounces it back, and the client delivers to BOTH
+        // endpoints — the initiator re-processes its own sent data, triggering new
+        // outbound packets in an infinite loop.
         //
         // Fix: detect when both endpoints are local (another active link exists for
         // the same link_id) and deliver directly to the peer without going external.
