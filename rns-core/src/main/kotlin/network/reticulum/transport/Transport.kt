@@ -2433,6 +2433,45 @@ object Transport {
             log("Outbound LINK packet: dest=$destHex, context=${packet.context}, size=${packedData.size}")
         }
 
+        // Local loopback for links with both endpoints in this process.
+        //
+        // In Python's shared instance model, a single process hosts both the shared
+        // instance server and all local clients, so link packets between two local
+        // destinations route internally through the loopback interface. The initiator
+        // and responder links have different attached_interface values (client-side vs
+        // server-side of the local socket), so Python's interface check in processData
+        // (Transport.py:1973) naturally delivers to only the correct endpoint.
+        //
+        // In Kotlin, the hub and clients are separate Android processes. When a client
+        // (e.g. Ara) links to its own destination (e.g. its LXMF propagation node),
+        // both link endpoints live in the client's process, but the LINKREQUEST is
+        // bounced through the hub. This causes both links to have the same
+        // attachedInterfaceHash (SharedInstanceClient), so if the packet goes through
+        // the hub, the hub's link_table forwarding bounces it back, and the client
+        // delivers to BOTH endpoints — the initiator re-processes its own sent data,
+        // triggering new outbound packets in an infinite loop.
+        //
+        // Fix: detect when both endpoints are local (another active link exists for
+        // the same link_id) and deliver directly to the peer without going external.
+        if (packet.destinationType == DestinationType.LINK && packet.link != null) {
+            val key = packet.destinationHash.toKey()
+            val senderLink = packet.link
+            val peerLink = activeLinks.find {
+                getLinkId(it)?.toKey() == key && it !== senderLink
+            }
+            if (peerLink != null) {
+                try {
+                    val receiveMethod = peerLink::class.java.getMethod("receive", Packet::class.java)
+                    receiveMethod.invoke(peerLink, packet)
+                    sent = true
+                    log("Local loopback delivery for $destHex")
+                } catch (e: Exception) {
+                    log("Failed local loopback: ${e.message}")
+                }
+                if (sent) return true
+            }
+        }
+
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
@@ -2967,13 +3006,15 @@ object Transport {
         }
 
         // Transport-mode forwarding (Python Transport.py:1404,1427)
-        // Gate on transportEnabled, except for local client routing where
-        // transport_id was synthesized above (Python line 1404 allows for_local_client)
+        // Gate on transportEnabled OR from_local_client (Python line 1404).
+        // from_local_client is used because for LINK DATA packets, destinationHash
+        // is the link_id which won't be in pathTable, so for_local_client can't be
+        // computed from the path table for these packets.
         if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash
-            val forLocalClient = pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
+            val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
             if (myHash != null && packet.transportId.contentEquals(myHash)) {
-                if (transportEnabled || forLocalClient) {
+                if (transportEnabled || fromLocalClient) {
                     forwardPacket(packet, interfaceRef)
                 }
             }
@@ -3027,39 +3068,38 @@ object Transport {
         }
 
         // Transport-mode forwarding (Python Transport.py:1404,1427)
-        // Gate on transportEnabled, except for local client routing where
-        // transport_id was synthesized (Python line 1404 allows for_local_client)
+        // Gate on transportEnabled OR from_local_client (Python line 1404)
         if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash
-            val forLocalClient = pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
-            if (myHash != null && packet.transportId.contentEquals(myHash) && (transportEnabled || forLocalClient)) {
+            val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
+            if (myHash != null && packet.transportId.contentEquals(myHash) && (transportEnabled || fromLocalClient)) {
                 // Record in link table for return path
                 if (pathEntry != null) {
-                    // Use proper link_id calculation
-                    val linkId = Link.linkIdFromLrPacket(packet)
-                    // Create link table entry for return routing of proofs
-                    val linkEntry = LinkEntry(
-                        timestamp = System.currentTimeMillis(),
-                        nextHop = pathEntry.nextHop,
-                        nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
-                        remainingHops = pathEntry.hops,
-                        receivingInterfaceHash = interfaceRef.hash,
-                        takenHops = packet.hops,
-                        destinationHash = packet.destinationHash,
-                        validated = false,
-                        proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
-                    )
-                    linkTable[linkId.toKey()] = linkEntry
-                    log("Created link table entry for ${linkId.toHexString()}")
-
-                    // Clamp MTU signalling bytes before forwarding (Python Transport.py:1453-1480)
                     val outboundIface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
-                    if (outboundIface != null && packet.raw != null) {
-                        packet.raw = clampLinkRequestMtuForForwarding(
-                            packet.raw!!, packet, outboundIface, interfaceRef
+                    if (outboundIface != null) {
+                        val linkId = Link.linkIdFromLrPacket(packet)
+                        val linkEntry = LinkEntry(
+                            timestamp = System.currentTimeMillis(),
+                            nextHop = pathEntry.nextHop,
+                            nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
+                            remainingHops = pathEntry.hops,
+                            receivingInterfaceHash = interfaceRef.hash,
+                            takenHops = packet.hops,
+                            destinationHash = packet.destinationHash,
+                            validated = false,
+                            proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
                         )
+                        linkTable[linkId.toKey()] = linkEntry
+                        log("Created link table entry for ${linkId.toHexString()}")
+
+                        // Clamp MTU signalling bytes before forwarding (Python Transport.py:1453-1480)
+                        if (packet.raw != null) {
+                            packet.raw = clampLinkRequestMtuForForwarding(
+                                packet.raw!!, packet, outboundIface, interfaceRef
+                            )
+                        }
+                        forwardPacket(packet, interfaceRef)
                     }
-                    forwardPacket(packet, interfaceRef)
                 }
             }
         }
