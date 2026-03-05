@@ -13,6 +13,8 @@ import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.nio.file.Files
 
 /**
@@ -23,11 +25,14 @@ import java.nio.file.Files
  *   stderr: JSON control/status messages (one per line)
  *
  * Environment variables:
- *   PIPE_PEER_ACTION:    announce | listen | link_listen | transport
+ *   PIPE_PEER_ACTION:    announce | listen | link_listen | link_serve | transport
  *   PIPE_PEER_APP_NAME:  app name for destination (default: pipetest)
  *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
  *   PIPE_PEER_MODE:      interface mode: full | ap | roaming | boundary | gateway | p2p
+ *   PIPE_PEER_NUM_IFACES:      number of fd-pair interfaces (0 = use stdin/stdout)
+ *   PIPE_PEER_IFACE_{n}_FD_IN:  read fd for interface n
+ *   PIPE_PEER_IFACE_{n}_FD_OUT: write fd for interface n
  */
 fun main() {
     val action = System.getenv("PIPE_PEER_ACTION") ?: "announce"
@@ -55,18 +60,35 @@ fun main() {
             enableTransport = enableTransport
         )
 
-        // Create PipeInterface on stdin/stdout with requested mode
-        val pipeInterface = PipeInterface(
-            name = "StdioPipe",
-            inputStream = System.`in`,
-            outputStream = System.out,
-            interfaceMode = mode
-        )
-
-        // Register and start
-        val ifaceRef = pipeInterface.toRef()
-        Transport.registerInterface(ifaceRef)
-        pipeInterface.start()
+        // Create PipeInterface(s)
+        val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
+        if (numIfaces > 0) {
+            // Multi-interface mode: create N interfaces from fd pairs
+            for (i in 0 until numIfaces) {
+                val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
+                val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
+                val input = FileInputStream("/proc/self/fd/$fdIn")
+                val output = FileOutputStream("/proc/self/fd/$fdOut")
+                val iface = PipeInterface(
+                    name = "Pipe$i",
+                    inputStream = input,
+                    outputStream = output,
+                    interfaceMode = mode
+                )
+                Transport.registerInterface(iface.toRef())
+                iface.start()
+            }
+        } else {
+            // Single interface mode: stdin/stdout
+            val pipeInterface = PipeInterface(
+                name = "StdioPipe",
+                inputStream = System.`in`,
+                outputStream = System.out,
+                interfaceMode = mode
+            )
+            Transport.registerInterface(pipeInterface.toRef())
+            pipeInterface.start()
+        }
 
         // Register announce handler
         Transport.registerAnnounceHandler(object : AnnounceHandler {

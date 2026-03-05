@@ -81,14 +81,6 @@ def main():
     # Start Reticulum
     reticulum = RNS.Reticulum(configdir=config_path, loglevel=RNS.LOG_CRITICAL)
 
-    # Create a custom pipe interface that reads from stdin and writes to stdout
-    pipe_iface = _create_stdio_pipe_interface(RNS)
-
-    # Set owner to Transport so inbound packets are delivered.
-    # Python's real PipeInterface receives owner as a constructor arg;
-    # _add_interface() does NOT set it.
-    pipe_iface.owner = RNS.Transport
-
     # Map mode string to RNS interface mode constant
     mode_map = {
         "full": RNS.Interfaces.Interface.Interface.MODE_FULL,
@@ -102,8 +94,28 @@ def main():
     }
     iface_mode = mode_map.get(mode_str, RNS.Interfaces.Interface.Interface.MODE_FULL)
 
-    # Register with Transport
-    reticulum._add_interface(pipe_iface, mode=iface_mode)
+    # Create pipe interface(s)
+    num_ifaces = int(os.environ.get("PIPE_PEER_NUM_IFACES", "0"))
+    if num_ifaces > 0:
+        # Multi-interface mode: create N interfaces from fd pairs
+        for i in range(num_ifaces):
+            fd_in = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_IN"])
+            fd_out = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_OUT"])
+            iface = _create_pipe_interface(
+                RNS,
+                os.fdopen(fd_in, 'rb', buffering=0),
+                os.fdopen(fd_out, 'wb', buffering=0),
+                f"Pipe{i}"
+            )
+            iface.owner = RNS.Transport
+            reticulum._add_interface(iface, mode=iface_mode)
+    else:
+        # Single interface mode: stdin/stdout
+        pipe_iface = _create_pipe_interface(
+            RNS, sys.stdin.buffer, sys.stdout.buffer, "StdioPipe"
+        )
+        pipe_iface.owner = RNS.Transport
+        reticulum._add_interface(pipe_iface, mode=iface_mode)
 
     identity_hash = bytes_to_hex(RNS.Transport.identity.hash) if RNS.Transport.identity else ""
     emit({"type": "ready", "identity_hash": identity_hash})
@@ -325,41 +337,33 @@ def _path_table_dumper(RNS):
         pass
 
 
-def _create_stdio_pipe_interface(RNS):
-    """Create a PipeInterface-like object that uses stdin/stdout.
+def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):
+    """Create a PipeInterface-like object from input/output binary streams.
 
-    Python's PipeInterface spawns a subprocess and talks to it.
-    We ARE the subprocess, so we flip the direction: we read from our
-    stdin and write to our stdout. We create a minimal Interface subclass
-    that does this.
+    Used for both stdin/stdout (single interface) and fd-backed streams
+    (multi-interface mode).
     """
     from RNS.Interfaces.Interface import Interface as BaseInterface
 
-    class StdioPipeInterface(BaseInterface):
-        """Interface that communicates via stdin/stdout using HDLC framing."""
+    class StreamPipeInterface(BaseInterface):
+        """Interface that communicates via HDLC framing over binary streams."""
 
         FLAG = 0x7E
         ESC = 0x7D
         ESC_MASK = 0x20
-        MAX_CHUNK = 32768
 
         def __init__(self):
             super().__init__()
             self.HW_MTU = 1064
-            self.name = "StdioPipe"
+            self.name = name
             self.online = False
             self.bitrate = 1000000
             self.IN = True
             self.OUT = True
-
-            # Use binary stdin/stdout
-            self._stdin = sys.stdin.buffer
-            self._stdout = sys.stdout.buffer
-
-            # Start read thread
+            self._stdin = pin
+            self._stdout = pout
             self.online = True
-            read_thread = threading.Thread(target=self._read_loop, daemon=True)
-            read_thread.start()
+            threading.Thread(target=self._read_loop, daemon=True).start()
 
         def process_outgoing(self, data):
             if self.online:
@@ -420,9 +424,9 @@ def _create_stdio_pipe_interface(RNS):
                 self.owner.inbound(data, self)
 
         def __str__(self):
-            return "StdioPipeInterface[StdioPipe]"
+            return f"StreamPipeInterface[{name}]"
 
-    return StdioPipeInterface()
+    return StreamPipeInterface()
 
 
 if __name__ == "__main__":
