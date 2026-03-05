@@ -346,3 +346,63 @@ class PipeSession:
     def wait_for_link_data(self, timeout=15):
         """Wait for the target to report receiving data on a link."""
         return self.wait_for_message("link_data", timeout=timeout)
+
+    def wait_for_link_sent(self, timeout=15):
+        """Wait for the target to report sending data on a link."""
+        return self.wait_for_message("link_sent", timeout=timeout)
+
+    # ─── Python-side Link Data Receiving ──────────────────────────────
+
+    def setup_python_link_callbacks(self, link):
+        """Set up data and closed callbacks on a Python-side Link.
+
+        After calling this, use wait_for_python_link_data() and
+        wait_for_python_link_closed() to check received data.
+        """
+        if not hasattr(self, '_python_link_data'):
+            self._python_link_data = []
+            self._python_link_lock = threading.Lock()
+            self._python_link_cond = threading.Condition(self._python_link_lock)
+            self._python_link_closed = False
+
+        def on_data(message, packet):
+            data = message if isinstance(message, bytes) else bytes(message)
+            with self._python_link_cond:
+                self._python_link_data.append(data)
+                self._python_link_cond.notify_all()
+
+        def on_closed(link):
+            with self._python_link_cond:
+                self._python_link_closed = True
+                self._python_link_cond.notify_all()
+
+        link.set_packet_callback(on_data)
+        link.set_link_closed_callback(on_closed)
+
+    def wait_for_python_link_data(self, timeout=15):
+        """Wait for the Python-side Link to receive data. Returns bytes or None."""
+        if not hasattr(self, '_python_link_data'):
+            return None
+        deadline = time.time() + timeout
+        with self._python_link_cond:
+            while time.time() < deadline:
+                if self._python_link_data:
+                    return self._python_link_data.pop(0)
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    self._python_link_cond.wait(timeout=min(remaining, 0.5))
+        return None
+
+    def wait_for_python_link_closed(self, timeout=15):
+        """Wait for the Python-side Link to report closure. Returns True/False."""
+        if not hasattr(self, '_python_link_data'):
+            return False
+        deadline = time.time() + timeout
+        with self._python_link_cond:
+            while time.time() < deadline:
+                if self._python_link_closed:
+                    return True
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    self._python_link_cond.wait(timeout=min(remaining, 0.5))
+        return False

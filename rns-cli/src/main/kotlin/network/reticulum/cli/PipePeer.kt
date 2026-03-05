@@ -156,6 +156,81 @@ fun main() {
                 })
                 pathTableDumper()
             }
+            "link_serve" -> {
+                // Transport node with its own link-accepting destination.
+                // Sends a welcome message on link establishment and echoes received data.
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+                destination.setLinkEstablishedCallback { linkAny ->
+                    val link = linkAny as Link
+                    emit(buildJsonObject {
+                        put("type", "link_established")
+                        put("link_id", link.linkId.toHexString())
+                        put("destination_hash", destination.hash.toHexString())
+                    })
+                    link.setLinkClosedCallback { closedLink ->
+                        emit(buildJsonObject {
+                            put("type", "link_closed")
+                            put("link_id", closedLink.linkId.toHexString())
+                            put("destination_hash", destination.hash.toHexString())
+                        })
+                    }
+                    link.setPacketCallback { data, _ ->
+                        emit(buildJsonObject {
+                            put("type", "link_data")
+                            put("link_id", link.linkId.toHexString())
+                            put("data_hex", data.toHexString())
+                            put("data_utf8", data.decodeToString())
+                        })
+                        // Echo data back over the link
+                        try {
+                            link.send(data)
+                            emit(buildJsonObject {
+                                put("type", "link_sent")
+                                put("link_id", link.linkId.toHexString())
+                                put("data_hex", data.toHexString())
+                            })
+                        } catch (e: Exception) {
+                            emit(buildJsonObject {
+                                put("type", "error")
+                                put("message", "Echo send failed: ${e.message}")
+                            })
+                        }
+                    }
+                    // Send welcome message after a short delay
+                    Thread {
+                        Thread.sleep(500)
+                        try {
+                            val welcome = "welcome".toByteArray()
+                            link.send(welcome)
+                            emit(buildJsonObject {
+                                put("type", "link_sent")
+                                put("link_id", link.linkId.toHexString())
+                                put("data_hex", welcome.toHexString())
+                            })
+                        } catch (e: Exception) {
+                            emit(buildJsonObject {
+                                put("type", "error")
+                                put("message", "Welcome send failed: ${e.message}")
+                            })
+                        }
+                    }.apply { isDaemon = true }.start()
+                }
+                destination.announce()
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
+                pathTableDumper()
+            }
             "listen" -> pathTableDumper()
             "transport" -> pathTableDumper()
         }

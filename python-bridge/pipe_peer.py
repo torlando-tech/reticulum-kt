@@ -159,6 +159,28 @@ def main():
         })
         _path_table_dumper(RNS)
 
+    elif action == "link_serve":
+        # Transport node with its own link-accepting destination.
+        # Sends a welcome message on link establishment and echoes received data.
+        # Simulates a hub (like Carina/RRC) that is also a transport node.
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects
+        )
+        destination.set_link_established_callback(_link_serve_established)
+        destination.announce()
+        emit({
+            "type": "announced",
+            "destination_hash": bytes_to_hex(destination.hash),
+            "identity_hash": bytes_to_hex(identity.hash),
+            "identity_public_key": bytes_to_hex(identity.get_public_key()),
+        })
+        _path_table_dumper(RNS)
+
     elif action == "transport":
         _path_table_dumper(RNS)
 
@@ -197,6 +219,58 @@ def _link_established(link):
     })
     link.set_link_closed_callback(_link_closed)
     link.set_packet_callback(_link_data)
+
+
+def _link_serve_established(link):
+    """Called when a link is established in link_serve mode.
+
+    Sends a welcome message, then echoes back any received data.
+    This simulates a hub (like RRC) that sends data to the client.
+    """
+    import RNS as _RNS
+
+    link_id = link.link_id.hex() if link.link_id else ""
+    dest_hash = link.destination.hash.hex() if link.destination else ""
+    emit({
+        "type": "link_established",
+        "link_id": link_id,
+        "destination_hash": dest_hash,
+    })
+    link.set_link_closed_callback(_link_closed)
+
+    def _serve_data(message, packet):
+        """Report received data and echo it back."""
+        lnk = packet.link
+        lid = lnk.link_id.hex() if lnk and lnk.link_id else ""
+        data = message if isinstance(message, bytes) else bytes(message)
+        emit({
+            "type": "link_data",
+            "link_id": lid,
+            "data_hex": data.hex(),
+            "data_utf8": data.decode("utf-8", errors="replace"),
+        })
+        # Echo data back over the link
+        try:
+            _RNS.Packet(lnk, data).send()
+            emit({"type": "link_sent", "link_id": lid, "data_hex": data.hex()})
+        except Exception as e:
+            emit({"type": "error", "message": f"Echo send failed: {e}"})
+
+    link.set_packet_callback(_serve_data)
+
+    # Send welcome message after a short delay (let link fully activate)
+    import threading
+    def send_welcome():
+        import time
+        time.sleep(0.5)
+        try:
+            welcome = b"welcome"
+            _RNS.Packet(link, welcome).send()
+            emit({"type": "link_sent", "link_id": link_id, "data_hex": welcome.hex()})
+        except Exception as e:
+            emit({"type": "error", "message": f"Welcome send failed: {e}"})
+
+    threading.Thread(target=send_welcome, daemon=True).start()
 
 
 def _link_closed(link):
