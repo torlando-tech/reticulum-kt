@@ -315,8 +315,6 @@ class Reticulum private constructor(
 
         try {
             val clientInterface = factory(sharedInstancePort, "127.0.0.1")
-            sharedInterface = clientInterface
-            isConnectedToSharedInstance = true
 
             // Start Transport (without transport routing) so inbound() works
             Transport.start(transportIdentity = transportIdentity, enableTransport = false)
@@ -332,10 +330,15 @@ class Reticulum private constructor(
                 log("WARNING: No interface registrar set, packets will not be processed")
             }
 
+            // Set state only after all steps succeed (matches Python Reticulum.py:414-416)
+            sharedInterface = clientInterface
+            isConnectedToSharedInstance = true
+
             log("Connected to shared instance")
             return true
         } catch (e: Exception) {
             log("Failed to connect to shared instance: ${e.message}")
+            isConnectedToSharedInstance = false
             return false
         }
     }
