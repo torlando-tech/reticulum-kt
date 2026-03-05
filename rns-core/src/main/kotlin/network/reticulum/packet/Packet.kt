@@ -92,7 +92,7 @@ class Packet private constructor(
 
     /** The receipt for tracking delivery (null if createReceipt=false). */
     var receipt: PacketReceipt? = null
-        private set
+        internal set
     /**
      * The raw packed bytes of this packet.
      * Populated after pack() is called.
@@ -413,14 +413,8 @@ class Packet private constructor(
             pack()
         }
 
-        // Create receipt if requested
-        if (createReceipt) {
-            receipt = PacketReceipt(this)
-            // Register with Transport for proof handling
-            Transport.registerReceipt(receipt!!)
-        }
-
-        // Send via Transport
+        // Send via Transport (receipt creation handled by Transport.processOutbound
+        // with proper guards matching Python Transport.py:947-956)
         val success = Transport.outbound(this)
 
         if (success) {

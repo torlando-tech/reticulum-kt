@@ -2563,6 +2563,17 @@ object Transport {
             }
         }
 
+        // Create receipt after successful transmit, with guards matching Python Transport.py:947-956
+        if (sent && packet.createReceipt &&
+            packet.packetType == PacketType.DATA &&
+            packet.destination?.type != DestinationType.PLAIN &&
+            !(packet.context.value in PacketContext.KEEPALIVE.value..PacketContext.LRPROOF.value) &&
+            !(packet.context.value in PacketContext.RESOURCE.value..PacketContext.RESOURCE_RCL.value)
+        ) {
+            packet.receipt = PacketReceipt(packet)
+            registerReceipt(packet.receipt!!)
+        }
+
         return sent
     }
 
@@ -2795,9 +2806,12 @@ object Transport {
             }
         }
 
-        // Retransmit if transport is enabled and under hop limit
-        if (transportEnabled && packet.hops < TransportConstants.PATHFINDER_M) {
-            queueAnnounceRetransmit(destHash, packet, interfaceRef)
+        // Retransmit if transport is enabled OR announce came from a local client
+        // Python Transport.py:1741 — local client announces are always retransmitted
+        // to external interfaces, even when transport routing is disabled
+        val fromLocal = fromLocalClient(interfaceRef)
+        if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
+            queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
         }
     }
 
@@ -2807,7 +2821,8 @@ object Transport {
     private fun queueAnnounceRetransmit(
         destinationHash: ByteArray,
         packet: Packet,
-        receivingInterface: InterfaceRef
+        receivingInterface: InterfaceRef,
+        fromLocalClient: Boolean = false
     ) {
         val destKey = destinationHash.toKey()
         val now = System.currentTimeMillis()
@@ -2982,13 +2997,21 @@ object Transport {
                 val outboundInterface = when {
                     // Same interface for both directions — just repeat (Python lines 1521-1525)
                     nhIface != null && rcvdIface != null &&
-                        nhIface.hash.contentEquals(rcvdIface.hash) -> nhIface
+                        nhIface.hash.contentEquals(rcvdIface.hash) -> {
+                        if (packet.hops == linkEntry.remainingHops || packet.hops == linkEntry.takenHops) nhIface
+                        else null
+                    }
                     // Different interfaces — transmit on opposite side (Python lines 1526-1537)
-                    nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> rcvdIface
-                    rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> nhIface
+                    nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> {
+                        if (packet.hops == linkEntry.remainingHops) rcvdIface else null
+                    }
+                    rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> {
+                        if (packet.hops == linkEntry.takenHops) nhIface else null
+                    }
                     else -> null
                 }
                 if (outboundInterface != null) {
+                    addPacketHash(packet.packetHash)  // Python line 1543
                     val raw = packet.raw ?: packet.pack()
                     val newRaw = raw.copyOf()
                     newRaw[1] = packet.hops.toByte()
@@ -3259,24 +3282,29 @@ object Transport {
         }
 
         // Check if there's a pending receipt for this proof (local destination)
-        // Try multiple lookups:
-        // 1. By proof destination hash (truncated hash)
-        // 2. By full packet hash from proof data (for explicit proofs)
-        var callback = pendingReceipts.remove(packet.destinationHash.toKey())
+        // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
+        var matchedKey: ByteArrayKey? = null
+        var callback = pendingReceipts[packet.destinationHash.toKey()]
+        if (callback != null) {
+            matchedKey = packet.destinationHash.toKey()
+        }
 
         if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
             // Extract full packet hash from explicit proof data
             val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
-            callback = pendingReceipts.remove(fullHash.toKey())
+            val fullHashKey = fullHash.toKey()
+            callback = pendingReceipts[fullHashKey]
             if (callback != null) {
+                matchedKey = fullHashKey
                 log("Found pending receipt by full hash from proof data")
             }
         }
 
-        if (callback != null) {
+        if (callback != null && matchedKey != null) {
             try {
                 val validated = callback.onProofReceived(packet)
                 if (validated) {
+                    pendingReceipts.remove(matchedKey)  // only remove on success
                     log("Proof validated for ${packet.destinationHash.toHexString()}")
                     markPathResponsive(packet.destinationHash)
                 } else {
@@ -3499,15 +3527,55 @@ object Transport {
 
     private fun packetFilter(packet: Packet): Boolean {
         // Python RNS: Bypass local filtering if connected to shared instance
-        // Let the shared instance server handle centralized duplicate filtering
-        // Matches Python Transport.packet_filter():1091-1094
+        // (Python Transport.py:1187-1190)
         if (interfaces.any { it.isConnectedToSharedInstance }) {
-            return true  // Accept all packets, let server filter
+            return true
         }
 
-        // Normal duplicate detection for standalone instances or servers
+        // Filter packets intended for other transport instances (Python:1192-1196)
+        if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+            val myHash = identity?.hash ?: return false
+            if (!packet.transportId!!.contentEquals(myHash)) {
+                return false
+            }
+        }
+
+        // Context-based bypass (Python:1198-1203)
+        when (packet.context) {
+            PacketContext.KEEPALIVE, PacketContext.RESOURCE_REQ,
+            PacketContext.RESOURCE_PRF, PacketContext.RESOURCE,
+            PacketContext.CACHE_REQUEST, PacketContext.CHANNEL -> return true
+            else -> {}
+        }
+
+        // PLAIN destination validation (Python:1205-1214)
+        if (packet.destinationType == DestinationType.PLAIN) {
+            if (packet.packetType != PacketType.ANNOUNCE) {
+                return packet.hops <= 1
+            } else {
+                return false
+            }
+        }
+
+        // GROUP destination validation (Python:1216-1225)
+        if (packet.destinationType == DestinationType.GROUP) {
+            if (packet.packetType != PacketType.ANNOUNCE) {
+                return packet.hops <= 1
+            } else {
+                return false
+            }
+        }
+
+        // Hashlist dedup (Python:1227-1238)
         val key = packet.packetHash.toKey()
-        return !packetHashlist.contains(key) && !packetHashlistPrev.contains(key)
+        if (!packetHashlist.contains(key) && !packetHashlistPrev.contains(key)) {
+            return true
+        } else if (packet.packetType == PacketType.ANNOUNCE &&
+                   packet.destinationType == DestinationType.SINGLE) {
+            return true  // Allow duplicate SINGLE announces through
+        }
+
+        return false
     }
 
     private fun addPacketHash(hash: ByteArray) {

@@ -1504,6 +1504,15 @@ class Link private constructor(
             return
         }
 
+        // Verify packet arrived on expected interface (Python: Link.py:982-983)
+        val expectedIface = attachedInterfaceHash
+        val receivedIface = packet.receivingInterfaceHash
+        if (expectedIface != null && receivedIface != null &&
+            !expectedIface.contentEquals(receivedIface)) {
+            log("Link packet received on unexpected interface, ignoring")
+            return
+        }
+
         // Record inbound activity
         lastInbound = System.currentTimeMillis()
         if (packet.context != PacketContext.KEEPALIVE) {
