@@ -2435,25 +2435,21 @@ object Transport {
 
         // Local loopback for links with both endpoints in this process.
         //
-        // In Python's shared instance model, a single process hosts both the shared
-        // instance server and all local clients, so link packets between two local
-        // destinations route internally through the loopback interface. The initiator
-        // and responder links have different attached_interface values (client-side vs
-        // server-side of the local socket), so Python's interface check in processData
-        // (Transport.py:1973) naturally delivers to only the correct endpoint.
+        // When an app acts as both shared instance transport node and client (e.g.
+        // an RRC app which is both hub and client), a link to its own destination
+        // has both endpoints in the client process. Without this optimization, LINK
+        // DATA packets would round-trip through the transport node: the client sends
+        // to the transport node, the transport node's link_table forwarding bounces
+        // it back, and the client delivers to both link endpoints. The Python
+        // reference handles this bounce correctly, but the Kotlin implementation
+        // currently has issues with bounced packets being delivered to both the
+        // initiator and responder, causing an infinite send loop.
         //
-        // In Kotlin, the shared instance transport node and clients are separate
-        // Android processes. When an app acts as both transport node and client (e.g.
-        // an RRC app which is both hub and client), a link to its own destination has
-        // both endpoints in the client process. The LINKREQUEST is bounced through the
-        // transport node, so both links end up with the same attachedInterfaceHash
-        // (SharedInstanceClient). If the packet goes through the transport node,
-        // link_table forwarding bounces it back, and the client delivers to BOTH
-        // endpoints — the initiator re-processes its own sent data, triggering new
-        // outbound packets in an infinite loop.
-        //
-        // Fix: detect when both endpoints are local (another active link exists for
-        // the same link_id) and deliver directly to the peer without going external.
+        // This local loopback avoids the round-trip entirely by delivering directly
+        // to the peer link endpoint when both are in the same process. This is also
+        // more efficient than bouncing through the transport node.
+        // TODO: investigate why bounced link packets cause a send loop — the Python
+        // reference handles the same scenario without issues.
         if (packet.destinationType == DestinationType.LINK && packet.link != null) {
             val key = packet.destinationHash.toKey()
             val senderLink = packet.link
