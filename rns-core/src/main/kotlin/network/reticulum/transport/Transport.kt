@@ -2320,7 +2320,7 @@ object Transport {
         }
 
         // Check for duplicates
-        if (!packetFilter(packet)) {
+        if (!packetFilter(packet, interfaceRef)) {
             return
         }
 
@@ -3525,7 +3525,7 @@ object Transport {
 
     // ===== Packet Filter (Duplicate Detection) =====
 
-    private fun packetFilter(packet: Packet): Boolean {
+    private fun packetFilter(packet: Packet, receivingInterface: InterfaceRef): Boolean {
         // Python RNS: Bypass local filtering if connected to shared instance
         // (Python Transport.py:1187-1190)
         if (interfaces.any { it.isConnectedToSharedInstance }) {
@@ -3533,7 +3533,11 @@ object Transport {
         }
 
         // Filter packets intended for other transport instances (Python:1192-1196)
-        if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+        // Skip this check for packets from local clients — they may have incorrect
+        // transport headers since the Kotlin client builds its own path table
+        // (unlike Python where clients delegate routing to the shared instance)
+        val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(receivingInterface.hash) }
+        if (!fromLocalClient && packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
             val myHash = identity?.hash ?: return false
             if (!packet.transportId!!.contentEquals(myHash)) {
                 return false
