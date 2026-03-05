@@ -98,6 +98,36 @@ class Reticulum private constructor(
         private var instance: Reticulum? = null
         private val started = AtomicBoolean(false)
 
+        // Pre-set factories (set before start, applied to instance during init)
+        private var pendingLocalClientFactory: ((Int, String) -> Any)? = null
+        private var pendingLocalServerFactory: ((Int) -> Any)? = null
+        private var pendingInterfaceRegistrar: ((Any) -> Unit)? = null
+
+        /**
+         * Set the LocalClientInterface factory before calling start().
+         * This allows apps to connect to an existing shared Reticulum instance.
+         */
+        fun setLocalClientFactory(factory: (port: Int, host: String) -> Any) {
+            pendingLocalClientFactory = factory
+        }
+
+        /**
+         * Set the LocalServerInterface factory before calling start().
+         * This allows apps to share their Reticulum instance with others.
+         */
+        fun setLocalServerFactory(factory: (port: Int) -> Any) {
+            pendingLocalServerFactory = factory
+        }
+
+        /**
+         * Set an interface registrar that can adapt and register interfaces with Transport.
+         * This bridges rns-core and rns-interfaces by allowing the app to provide
+         * the InterfaceAdapter.toRef() + Transport.registerInterface() logic.
+         */
+        fun setInterfaceRegistrar(registrar: (Any) -> Unit) {
+            pendingInterfaceRegistrar = registrar
+        }
+
         /**
          * Get the current Reticulum instance.
          * @throws IllegalStateException if not started
@@ -132,6 +162,12 @@ class Reticulum private constructor(
                 val dir = configDir ?: getDefaultConfigDir()
                 val rns = Reticulum(dir, enableTransport, shareInstance, sharedInstancePort, connectToSharedInstance)
                 instance = rns
+
+                // Apply pre-set factories before initialize
+                pendingLocalClientFactory?.let { rns.localClientInterfaceFactory = it }
+                pendingLocalServerFactory?.let { rns.localServerInterfaceFactory = it }
+                pendingInterfaceRegistrar?.let { rns.interfaceRegistrar = it }
+
                 rns.initialize()
                 return rns
             }
@@ -221,6 +257,9 @@ class Reticulum private constructor(
     /** Callback to create LocalClientInterface (set by rns-interfaces module). */
     var localClientInterfaceFactory: ((Int, String) -> Any)? = null
 
+    /** Callback to adapt an interface and register it with Transport. */
+    var interfaceRegistrar: ((Any) -> Unit)? = null
+
     /**
      * Initialize the Reticulum instance.
      */
@@ -230,22 +269,22 @@ class Reticulum private constructor(
         // Ensure directories exist
         ensureDirectories()
 
-        // Check if we should connect to an existing shared instance
-        if (connectToSharedInstance) {
-            if (tryConnectToSharedInstance()) {
-                log("Connected to shared instance on port $sharedInstancePort")
-                return
-            } else {
-                log("No shared instance found, starting standalone")
-            }
-        }
-
         // Load or create transport identity
         val transportIdentity = loadOrCreateTransportIdentity()
 
         // Configure Transport paths
         Transport.setCachePath(cachePath)
         Transport.setStoragePath(storagePath)
+
+        // Check if we should connect to an existing shared instance
+        if (connectToSharedInstance) {
+            if (tryConnectToSharedInstance(transportIdentity)) {
+                log("Connected to shared instance on port $sharedInstancePort")
+                return
+            } else {
+                log("No shared instance found, starting standalone")
+            }
+        }
 
         // Start Transport with identity
         Transport.start(transportIdentity = transportIdentity, enableTransport = enableTransport)
@@ -263,7 +302,7 @@ class Reticulum private constructor(
      *
      * @return true if connected successfully
      */
-    private fun tryConnectToSharedInstance(): Boolean {
+    private fun tryConnectToSharedInstance(transportIdentity: Identity): Boolean {
         val factory = localClientInterfaceFactory
         if (factory == null) {
             log("LocalClientInterface factory not set, cannot connect to shared instance")
@@ -279,8 +318,19 @@ class Reticulum private constructor(
             sharedInterface = clientInterface
             isConnectedToSharedInstance = true
 
-            // Start the interface if it has a start method
+            // Start Transport (without transport routing) so inbound() works
+            Transport.start(transportIdentity = transportIdentity, enableTransport = false)
+
+            // Start the interface
             clientInterface::class.java.getMethod("start").invoke(clientInterface)
+
+            // Register with Transport so packets flow through
+            val registrar = interfaceRegistrar
+            if (registrar != null) {
+                registrar(clientInterface)
+            } else {
+                log("WARNING: No interface registrar set, packets will not be processed")
+            }
 
             log("Connected to shared instance")
             return true
@@ -308,14 +358,12 @@ class Reticulum private constructor(
             // Start the interface
             serverInterface::class.java.getMethod("start").invoke(serverInterface)
 
-            // Register with Transport if possible
-            try {
-                val toRefMethod = serverInterface::class.java.getMethod("toRef")
-                val interfaceRef = toRefMethod.invoke(serverInterface)
-                Transport.registerInterface(interfaceRef as network.reticulum.transport.InterfaceRef)
-            } catch (e: Exception) {
-                // May not have toRef method, that's OK
-                log("Could not register shared interface with Transport: ${e.message}")
+            // Register with Transport
+            val registrar = interfaceRegistrar
+            if (registrar != null) {
+                registrar(serverInterface)
+            } else {
+                log("WARNING: No interface registrar set for server interface")
             }
 
             log("Started shared instance server on port $sharedInstancePort")

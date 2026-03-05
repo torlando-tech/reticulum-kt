@@ -142,7 +142,7 @@ abstract class Interface(
     var onPacketReceived: ((data: ByteArray, fromInterface: Interface) -> Unit)? = null
 
     // Ingress control for announce rate limiting
-    private val ingressControl = AtomicBoolean(true)
+    protected val ingressControl = AtomicBoolean(true)
     private val incomingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val outgoingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val burstActive = AtomicBoolean(false)
