@@ -1,8 +1,15 @@
 package network.reticulum.interfaces
 
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.InterfaceMode
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
+import network.reticulum.transport.HeldAnnounce
+import network.reticulum.transport.InterfaceRef
+import network.reticulum.transport.Transport
+import network.reticulum.transport.TransportConstants
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -147,7 +154,10 @@ abstract class Interface(
     private val outgoingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val burstActive = AtomicBoolean(false)
     private var burstActivatedAt: Long = 0
-    private var heldReleaseAt: Long = 0
+    @Volatile private var heldReleaseAt: Long = 0
+
+    /** Per-interface held announces for ingress control: dest_hash -> HeldAnnounce. */
+    private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, HeldAnnounce>()
 
     companion object {
         /** How many samples for announce frequency calculation. */
@@ -300,6 +310,69 @@ abstract class Interface(
             return false
         }
     }
+
+    /**
+     * Hold an announce for later release when ingress burst subsides.
+     * Matches Python Interface.hold_announce() (Interface.py:170-174).
+     */
+    fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) {
+        val key = destinationHash.toKey()
+        val held = HeldAnnounce(destinationHash.copyOf(), raw.copyOf(), hops, receivingInterface)
+        if (heldAnnounces.containsKey(key)) {
+            // Update existing entry (newer announce replaces old)
+            heldAnnounces[key] = held
+        } else if (heldAnnounces.size < MAX_HELD_ANNOUNCES) {
+            heldAnnounces[key] = held
+        }
+        // else: silently drop (Python behavior — old entries stay, newest is dropped)
+    }
+
+    /**
+     * Process held announces: release one (min-hops first) when burst has subsided.
+     * Matches Python Interface.process_held_announces() (Interface.py:176-200).
+     */
+    fun processHeldAnnounces() {
+        try {
+            if (shouldIngressLimit() || heldAnnounces.isEmpty()) return
+
+            val now = System.currentTimeMillis()
+            if (now <= heldReleaseAt) return
+
+            val freqThreshold = if (age() < IC_NEW_TIME) IC_BURST_FREQ_NEW else IC_BURST_FREQ
+            val iaFreq = incomingAnnounceFrequency()
+            if (iaFreq >= freqThreshold) return
+
+            // Select announce with minimum hops (Python: PATHFINDER_M as initial max)
+            var minHops = TransportConstants.PATHFINDER_M
+            var selectedKey: ByteArrayKey? = null
+            var selectedAnnounce: HeldAnnounce? = null
+            for ((key, announce) in heldAnnounces) {
+                if (announce.hops < minHops) {
+                    minHops = announce.hops
+                    selectedKey = key
+                    selectedAnnounce = announce
+                }
+            }
+
+            if (selectedAnnounce != null && selectedKey != null) {
+                heldReleaseAt = now + IC_HELD_RELEASE_INTERVAL
+                heldAnnounces.remove(selectedKey)
+                // Re-inject via daemon thread to avoid re-entrancy (matches Python)
+                val raw = selectedAnnounce.raw
+                val iface = selectedAnnounce.receivingInterface
+                Thread {
+                    Transport.inbound(raw, iface)
+                }.apply { isDaemon = true }.start()
+            }
+        } catch (e: Exception) {
+            println("An error occurred while processing held announces for $this: ${e.message}")
+        }
+    }
+
+    /**
+     * Number of announces currently held on this interface.
+     */
+    fun heldAnnounceCount(): Int = heldAnnounces.size
 
     /**
      * Get the effective MTU for this interface.

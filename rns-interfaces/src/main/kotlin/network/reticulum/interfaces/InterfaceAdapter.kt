@@ -97,6 +97,12 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override fun shouldIngressLimit(): Boolean = iface.shouldIngressLimit()
     override fun recordIncomingAnnounce() = iface.recordIncomingAnnounce()
 
+    // Held announce delegation
+    override fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) =
+        iface.holdAnnounce(destinationHash, raw, hops, receivingInterface)
+    override fun processHeldAnnounces() = iface.processHeldAnnounces()
+    override fun heldAnnounceCount(): Int = iface.heldAnnounceCount()
+
     override fun send(data: ByteArray) {
         iface.processOutgoing(data)
     }

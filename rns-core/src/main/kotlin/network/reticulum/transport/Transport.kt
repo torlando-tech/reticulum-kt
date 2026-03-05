@@ -252,13 +252,6 @@ object Transport {
      *  dest_hash -> AnnounceEntry. Restored to announceTable after rebroadcast. */
     private val heldAnnounceEntries = ConcurrentHashMap<ByteArrayKey, AnnounceEntry>()
 
-    /** Mechanism 2: Raw announces held per-interface for ingress control.
-     *  dest_hash -> (timestamp, raw_data, receiving_interface). Released via inbound(). */
-    private val ingressHeldAnnounces = ConcurrentHashMap<ByteArrayKey, Triple<Long, ByteArray, InterfaceRef>>()
-
-    /** Timestamp of last held announce release (mechanism 2). */
-    @Volatile private var lastHeldRelease: Long = 0L
-
     /** Local client interfaces (shared instance clients). */
     private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
 
@@ -398,7 +391,6 @@ object Transport {
         packetHashlistPrev.clear()
         announceAllowedAt.clear()
         heldAnnounceEntries.clear()
-        ingressHeldAnnounces.clear()
         localClientInterfaces.clear()
         queuedAnnounces.clear()
         announceRateTable.clear()
@@ -536,7 +528,6 @@ object Transport {
 
         // Clear held announces (will be re-announced)
         heldAnnounceEntries.clear()
-        ingressHeldAnnounces.clear()
 
         // Clear announce rate table
         announceRateTable.clear()
@@ -1379,17 +1370,9 @@ object Transport {
     // ===== Held Announces =====
 
     /**
-     * Hold a raw announce for later re-injection via inbound() (ingress control, mechanism 2).
-     */
-    private fun holdIngressAnnounce(destinationHash: ByteArray, rawData: ByteArray, receivingInterface: InterfaceRef) {
-        ingressHeldAnnounces[destinationHash.toKey()] = Triple(System.currentTimeMillis(), rawData.copyOf(), receivingInterface)
-        log("Held announce for ${destinationHash.toHexString()} on ${receivingInterface.name}")
-    }
-
-    /**
      * Get count of held announces (both mechanisms combined).
      */
-    fun heldAnnounceCount(): Int = heldAnnounceEntries.size + ingressHeldAnnounces.size
+    fun heldAnnounceCount(): Int = heldAnnounceEntries.size + interfaces.sumOf { it.heldAnnounceCount() }
 
     // ===== Traffic Statistics =====
 
@@ -2802,7 +2785,7 @@ object Transport {
         val isKnownDestination = pathTable.containsKey(destHash.toKey())
         if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
             log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
-            holdIngressAnnounce(destHash, packet.raw ?: packet.pack(), interfaceRef)
+            interfaceRef.holdAnnounce(destHash, packet.raw ?: packet.pack(), packet.hops, interfaceRef)
             return
         }
 
@@ -3804,8 +3787,10 @@ object Transport {
         // Process queued announces
         processQueuedAnnounces(now)
 
-        // Process held announces (expire old ones)
-        processHeldAnnounces(now)
+        // Process per-interface held announces
+        for (iface in interfaces) {
+            iface.processHeldAnnounces()
+        }
 
         // Update traffic speed
         updateTrafficSpeed(now)
@@ -3859,35 +3844,6 @@ object Transport {
         receipts.removeAll(toRemove)
     }
 
-    /**
-     * Process ingress-held announces (mechanism 2) - release one at a time at intervals, expire old ones.
-     * Python: Interface.process_held_announces() releases one per IC_HELD_RELEASE_INTERVAL.
-     */
-    private fun processHeldAnnounces(now: Long) {
-        if (ingressHeldAnnounces.isEmpty()) return
-
-        // Expire old held announces
-        val expireCutoff = now - TransportConstants.HELD_ANNOUNCE_TIMEOUT
-        ingressHeldAnnounces.entries.removeIf { it.value.first < expireCutoff }
-
-        // Release one held announce per interval
-        if (now > lastHeldRelease + TransportConstants.HELD_RELEASE_INTERVAL) {
-            val oldest = ingressHeldAnnounces.entries.minByOrNull { it.value.first }
-            if (oldest != null) {
-                val destHex = oldest.key.bytes.toHexString()
-                log("Releasing held announce for $destHex")
-                ingressHeldAnnounces.remove(oldest.key)
-                lastHeldRelease = now
-
-                val iface = oldest.value.third
-                try {
-                    inbound(oldest.value.second, iface)
-                } catch (e: Exception) {
-                    log("Error re-injecting held announce: ${e.message}")
-                }
-            }
-        }
-    }
 
     /**
      * Update traffic speed calculations.
@@ -4881,8 +4837,31 @@ interface InterfaceRef {
     /** Record that an announce was received on this interface (for frequency tracking). */
     fun recordIncomingAnnounce() {}
 
+    // Held announce methods — per-interface storage for ingress-controlled announces.
+    // Implemented by Interface (via InterfaceAdapter), no-ops for test/stub interfaces.
+
+    /** Hold an announce for later release when burst subsides. */
+    fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) {}
+
+    /** Process held announces: release one (min-hops) if burst has subsided. */
+    fun processHeldAnnounces() {}
+
+    /** Number of announces currently held on this interface. */
+    fun heldAnnounceCount(): Int = 0
+
     fun send(data: ByteArray)
 }
+
+/**
+ * A raw announce held for later re-injection when ingress burst subsides.
+ * Stored per-interface, keyed by destination hash.
+ */
+data class HeldAnnounce(
+    val destinationHash: ByteArray,
+    val raw: ByteArray,
+    val hops: Int,
+    val receivingInterface: InterfaceRef
+)
 
 /**
  * Wrapper for ByteArray to use as map key.
