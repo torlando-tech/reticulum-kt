@@ -57,6 +57,10 @@ class InterfaceDiscovery(
             discoverySources = discoverySources,
         )
         Transport.registerAnnounceHandler(handler!!)
+        log("Started discovery listener (requiredValue=$requiredValue, " +
+            "sources=${discoverySources?.size ?: "any"}, " +
+            "autoConnect=${if (autoConnectFactory != null) "max $maxAutoConnected" else "disabled"}, " +
+            "storagePath=$storagePath)")
 
         // Reconnect previously discovered interfaces
         if (autoConnectFactory != null && maxAutoConnected > 0) {
@@ -69,6 +73,7 @@ class InterfaceDiscovery(
         handler = null
         monitorJob?.cancel()
         monitorJob = null
+        log("Stopped discovery listener")
     }
 
     /**
@@ -104,7 +109,7 @@ class InterfaceDiscovery(
 
                 results.add(info to status)
             } catch (e: Exception) {
-                println("[Discovery] Error loading discovered interface data from ${file.name}: ${e.message}")
+                log("Error loading discovered interface data from ${file.name}: ${e.message}")
             }
         }
 
@@ -117,6 +122,11 @@ class InterfaceDiscovery(
             statusOrder[it.second] ?: 0
         }.thenByDescending { it.first.stampValue }.thenByDescending { it.first.lastHeard })
 
+        val available = results.count { it.second == "available" }
+        val unknown = results.count { it.second == "unknown" }
+        val stale = results.count { it.second == "stale" }
+        log("Listed ${results.size} discovered interfaces (available=$available, unknown=$unknown, stale=$stale)")
+
         return results
     }
 
@@ -125,7 +135,8 @@ class InterfaceDiscovery(
             val filename = info.discoveryHash.toHexString()
             val file = File(discoveryDir, filename)
 
-            if (!file.exists()) {
+            val isNew = !file.exists()
+            if (isNew) {
                 info.discovered = info.received
                 info.lastHeard = info.received
                 info.heardCount = 0
@@ -137,8 +148,10 @@ class InterfaceDiscovery(
             }
 
             saveDiscoveredInterface(file, info)
+            log("${if (isNew) "New" else "Updated"} discovered interface: " +
+                "${info.type} \"${info.name}\" (heard=${info.heardCount}, file=$filename)")
         } catch (e: Exception) {
-            println("[Discovery] Error persisting discovered interface: ${e.message}")
+            log("Error persisting discovered interface: ${e.message}")
             return
         }
 
@@ -147,16 +160,22 @@ class InterfaceDiscovery(
         try {
             discoveryCallback?.invoke(info)
         } catch (e: Exception) {
-            println("[Discovery] Error in external discovery callback: ${e.message}")
+            log("Error in external discovery callback: ${e.message}")
         }
     }
 
     private fun autoconnect(info: DiscoveredInterface) {
         if (autoConnectFactory == null || maxAutoConnected <= 0) return
-        if (info.type !in DiscoveryConstants.AUTOCONNECT_TYPES) return
+        if (info.type !in DiscoveryConstants.AUTOCONNECT_TYPES) {
+            log("Skipping auto-connect for ${info.name}: type ${info.type} not auto-connectable")
+            return
+        }
 
         val currentAutoconnected = monitoredInterfaces.size
-        if (currentAutoconnected >= maxAutoConnected) return
+        if (currentAutoconnected >= maxAutoConnected) {
+            log("Skipping auto-connect for ${info.name}: at limit ($currentAutoconnected/$maxAutoConnected)")
+            return
+        }
 
         // Check for duplicate endpoint
         val endpointSpecifier = buildString {
@@ -168,27 +187,36 @@ class InterfaceDiscovery(
         val alreadyExists = monitoredInterfaces.any {
             it.endpointHash.contentEquals(endpointHash)
         }
-        if (alreadyExists) return
+        if (alreadyExists) {
+            log("Skipping auto-connect for ${info.name}: endpoint $endpointSpecifier already connected")
+            return
+        }
 
         try {
-            val iface = autoConnectFactory.invoke(info) ?: return
+            log("Auto-connecting discovered interface: ${info.type} \"${info.name}\" at $endpointSpecifier")
+            val iface = autoConnectFactory.invoke(info) ?: run {
+                log("Auto-connect factory returned null for ${info.name}")
+                return
+            }
             val monitored = MonitoredInterface(iface, endpointHash)
             monitoredInterfaces.add(monitored)
+            log("Auto-connected ${info.name} (${monitoredInterfaces.size}/$maxAutoConnected)")
             startMonitorIfNeeded()
         } catch (e: Exception) {
-            println("[Discovery] Error auto-connecting discovered interface: ${e.message}")
+            log("Error auto-connecting discovered interface: ${e.message}")
         }
     }
 
     private fun connectDiscovered() {
         try {
             val discovered = listDiscovered()
+            log("Reconnecting from ${discovered.size} previously discovered interfaces")
             for ((info, _) in discovered) {
                 if (monitoredInterfaces.size >= maxAutoConnected) break
                 autoconnect(info)
             }
         } catch (e: Exception) {
-            println("[Discovery] Error reconnecting discovered interfaces: ${e.message}")
+            log("Error reconnecting discovered interfaces: ${e.message}")
         }
     }
 
@@ -219,7 +247,7 @@ class InterfaceDiscovery(
                         }
                     }
                 } catch (e: Exception) {
-                    println("[Discovery] Error checking auto-connected interface state: ${e.message}")
+                    log("Error checking auto-connected interface state: ${e.message}")
                 }
             }
 
@@ -227,6 +255,10 @@ class InterfaceDiscovery(
                 monitoredInterfaces.remove(m)
             }
         }
+    }
+
+    private fun log(msg: String) {
+        println("[Discovery:Manager] $msg")
     }
 
     // ==================== Persistence ====================

@@ -93,6 +93,10 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
         }
     }
 
+    // Ingress control delegation
+    override fun shouldIngressLimit(): Boolean = iface.shouldIngressLimit()
+    override fun recordIncomingAnnounce() = iface.recordIncomingAnnounce()
+
     override fun send(data: ByteArray) {
         iface.processOutgoing(data)
     }

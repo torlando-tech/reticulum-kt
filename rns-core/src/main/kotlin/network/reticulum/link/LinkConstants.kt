@@ -68,11 +68,12 @@ object LinkConstants {
      * This accounts for encryption overhead.
      */
     fun calculateMdu(mtu: Int = RnsConstants.MTU): Int {
-        // MDU = floor((MTU - header_size - token_overhead) / block_size) * block_size - 1
+        // MDU = floor((MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE - 1
+        val ifacMin = RnsConstants.IFAC_MIN_SIZE
         val headerMin = RnsConstants.HEADER_MIN_SIZE
         val tokenOverhead = RnsConstants.TOKEN_OVERHEAD
         val blockSize = RnsConstants.AES_BLOCK_SIZE
-        return ((mtu - headerMin - tokenOverhead) / blockSize) * blockSize - 1
+        return ((mtu - ifacMin - headerMin - tokenOverhead) / blockSize) * blockSize - 1
     }
 
     /**

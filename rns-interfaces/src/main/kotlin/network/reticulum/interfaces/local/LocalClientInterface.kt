@@ -127,6 +127,8 @@ class LocalClientInterface : Interface {
         }
 
         this.isSharedInstanceClient.set(true)
+        // Shared instance already handles ingress control
+        this.ingressControl.set(false)
     }
 
     /**
@@ -146,6 +148,8 @@ class LocalClientInterface : Interface {
         this.tcpHost = tcpHost
         this.tcpPort = tcpPort
         this.isSharedInstanceClient.set(true)
+        // Shared instance already handles ingress control
+        this.ingressControl.set(false)
     }
 
     /**

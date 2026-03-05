@@ -6,6 +6,7 @@ import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.transport.Transport
 import network.reticulum.transport.TransportConstants
 import kotlin.concurrent.thread
@@ -69,7 +70,7 @@ class PacketReceipt internal constructor(
     private val destination: Destination? = packet.destination
 
     /** The link this packet was sent over (if applicable). */
-    private var link: Link? = null
+    private var link: Link? = packet.link
 
     /** Callbacks for delivery and timeout events. */
     val callbacks = PacketReceiptCallbacks()
@@ -94,10 +95,18 @@ class PacketReceipt internal constructor(
      * Calculate the timeout based on destination type and hops.
      */
     private fun calculateTimeout(): Double {
-        // For link destinations, use the link's timeout
+        // For link destinations, use link RTT * traffic timeout factor
+        // Python: max(packet.destination.rtt * packet.destination.traffic_timeout_factor, Link.TRAFFIC_TIMEOUT_MIN_MS/1000)
         if (destination?.type == DestinationType.LINK) {
-            // Link timeout is handled differently - for now use default
-            // In full implementation, would access link.rtt * link.trafficTimeoutFactor
+            val linkRef = link
+            if (linkRef != null) {
+                val rttSeconds = (linkRef.rtt ?: 0L) / 1000.0
+                return maxOf(
+                    rttSeconds * LinkConstants.TRAFFIC_TIMEOUT_FACTOR,
+                    LinkConstants.TRAFFIC_TIMEOUT_MIN_MS / 1000.0
+                )
+            }
+            // Fallback if no link reference
             return TransportConstants.DEFAULT_PER_HOP_TIMEOUT / 1000.0
         }
 

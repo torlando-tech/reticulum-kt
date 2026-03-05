@@ -1462,7 +1462,7 @@ class Destination private constructor(
      * @return The announce Packet if send=false, null otherwise
      * @throws IllegalStateException if destination cannot announce
      */
-    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, tag: ByteArray? = null, send: Boolean = true): network.reticulum.packet.Packet? {
+    fun announce(appData: ByteArray? = null, pathResponse: Boolean = false, tag: ByteArray? = null, attachedInterface: network.reticulum.transport.InterfaceRef? = null, send: Boolean = true): network.reticulum.packet.Packet? {
         require(type == DestinationType.SINGLE) { "Only SINGLE destination types can be announced" }
         require(direction == DestinationDirection.IN) { "Only IN destination types can be announced" }
 
@@ -1525,6 +1525,7 @@ class Destination private constructor(
             transportType = network.reticulum.common.TransportType.BROADCAST,
             contextFlag = contextFlag
         )
+        announcePacket.attachedInterface = attachedInterface
 
         if (send) {
             // Send via Transport

@@ -47,13 +47,21 @@ class InterfaceAnnounceHandler(
             val expectedHash = Destination.computeHash(nameHash, announcedIdentity.hash)
             if (!destinationHash.contentEquals(expectedHash)) return false
 
+            log("Received discovery announce from ${announcedIdentity.hash.toHexString().take(12)}...")
+
             // Check authorized sources
             if (discoverySources != null) {
                 val idKey = ByteArrayKey(announcedIdentity.hash)
-                if (idKey !in discoverySources) return false
+                if (idKey !in discoverySources) {
+                    log("Rejected: source ${announcedIdentity.hash.toHexString().take(12)}... not in authorized sources")
+                    return false
+                }
             }
 
-            if (appData == null || appData.size <= Stamper.STAMP_SIZE + 1) return false
+            if (appData == null || appData.size <= Stamper.STAMP_SIZE + 1) {
+                log("Rejected: appData too short (${appData?.size ?: 0} bytes, need >${Stamper.STAMP_SIZE + 1})")
+                return false
+            }
 
             // Extract flags byte
             val flags = appData[0]
@@ -62,11 +70,23 @@ class InterfaceAnnounceHandler(
 
             // Decrypt if encrypted
             if (encrypted) {
-                val networkId = Transport.networkIdentity ?: return false
-                data = networkId.decrypt(data) ?: return false
+                val networkId = Transport.networkIdentity
+                if (networkId == null) {
+                    log("Rejected: encrypted announce but no network identity configured")
+                    return false
+                }
+                val decrypted = networkId.decrypt(data)
+                if (decrypted == null) {
+                    log("Rejected: decryption failed")
+                    return false
+                }
+                data = decrypted
             }
 
-            if (data.size <= Stamper.STAMP_SIZE) return false
+            if (data.size <= Stamper.STAMP_SIZE) {
+                log("Rejected: decrypted data too short (${data.size} bytes)")
+                return false
+            }
 
             // Split: packed info | stamp (last 32 bytes)
             val stamp = data.copyOfRange(data.size - Stamper.STAMP_SIZE, data.size)
@@ -78,7 +98,10 @@ class InterfaceAnnounceHandler(
             val value = Stamper.stampValue(workblock, stamp)
             val valid = Stamper.stampValid(stamp, requiredValue, workblock)
 
-            if (!valid || value < requiredValue) return false
+            if (!valid || value < requiredValue) {
+                log("Rejected: stamp invalid (value=$value, required=$requiredValue, valid=$valid)")
+                return false
+            }
 
             // Unpack msgpack
             val unpacker = MessagePack.newDefaultUnpacker(packed)
@@ -89,11 +112,18 @@ class InterfaceAnnounceHandler(
                 fields[key] = unpackValue(unpacker)
             }
 
-            val interfaceType = fields[DiscoveryConstants.INTERFACE_TYPE] as? String ?: return false
+            val interfaceType = fields[DiscoveryConstants.INTERFACE_TYPE] as? String
+            if (interfaceType == null) {
+                log("Rejected: missing INTERFACE_TYPE field in msgpack data")
+                return false
+            }
             val transportId = fields[DiscoveryConstants.TRANSPORT_ID]
             val transportIdHex = when (transportId) {
                 is ByteArray -> transportId.toHexString()
-                else -> return false
+                else -> {
+                    log("Rejected: missing or invalid TRANSPORT_ID field")
+                    return false
+                }
             }
 
             val name = fields[DiscoveryConstants.NAME] as? String
@@ -104,6 +134,8 @@ class InterfaceAnnounceHandler(
                 (transportIdHex + name).toByteArray(Charsets.UTF_8)
             )
 
+            val hops = Transport.hopsTo(destinationHash) ?: 0
+
             val info = DiscoveredInterface(
                 type = interfaceType,
                 transport = fields[DiscoveryConstants.TRANSPORT] as? Boolean ?: false,
@@ -112,7 +144,7 @@ class InterfaceAnnounceHandler(
                 stampValue = value,
                 transportId = transportIdHex,
                 networkId = announcedIdentity.hash.toHexString(),
-                hops = Transport.hopsTo(destinationHash) ?: 0,
+                hops = hops,
                 latitude = (fields[DiscoveryConstants.LATITUDE] as? Number)?.toDouble(),
                 longitude = (fields[DiscoveryConstants.LONGITUDE] as? Number)?.toDouble(),
                 height = (fields[DiscoveryConstants.HEIGHT] as? Number)?.toDouble(),
@@ -129,6 +161,10 @@ class InterfaceAnnounceHandler(
                 discoveryHash = discoveryHash,
             )
 
+            log("Discovered: $interfaceType \"$name\" from ${transportIdHex.take(12)}... " +
+                "(stamp=$value, hops=$hops, encrypted=$encrypted" +
+                "${info.reachableOn?.let { ", reachable=$it:${info.port}" } ?: ""})")
+
             callback?.invoke(info)
             return true
 
@@ -136,6 +172,10 @@ class InterfaceAnnounceHandler(
             println("[Discovery] Error decoding discovered interface: ${e.message}")
             return false
         }
+    }
+
+    private fun log(msg: String) {
+        println("[Discovery:Handler] $msg")
     }
 
     private fun unpackValue(unpacker: org.msgpack.core.MessageUnpacker): Any? {

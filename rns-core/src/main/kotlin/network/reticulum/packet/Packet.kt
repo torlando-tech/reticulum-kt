@@ -53,7 +53,7 @@ class Packet private constructor(
     /** The destination hash (16 bytes). */
     val destinationHash: ByteArray,
     /** The transport ID for HEADER_2 packets (16 bytes), null for HEADER_1. */
-    val transportId: ByteArray?,
+    var transportId: ByteArray?,
     /** The packet data (ciphertext for encrypted, plaintext for announce/linkrequest). */
     var data: ByteArray,
     /** Whether to create a receipt when sending this packet. */
@@ -66,6 +66,9 @@ class Packet private constructor(
 
     /** The link this packet is associated with (null if not a link packet). */
     internal var link: Link? = null
+
+    /** If set, Transport will only send this packet on this specific interface. */
+    var attachedInterface: network.reticulum.transport.InterfaceRef? = null
 
     /** Hash of the interface this packet was received on (set during inbound processing). */
     var receivingInterfaceHash: ByteArray? = null
@@ -89,7 +92,7 @@ class Packet private constructor(
 
     /** The receipt for tracking delivery (null if createReceipt=false). */
     var receipt: PacketReceipt? = null
-        private set
+        internal set
     /**
      * The raw packed bytes of this packet.
      * Populated after pack() is called.
@@ -377,10 +380,11 @@ class Packet private constructor(
         fun createAnnounce(
             destination: Destination,
             appData: ByteArray? = null,
-            pathResponse: Boolean = false
+            pathResponse: Boolean = false,
+            attachedInterface: network.reticulum.transport.InterfaceRef? = null
         ): Packet? {
             return try {
-                destination.announce(appData = appData, pathResponse = pathResponse, send = false)
+                destination.announce(appData = appData, pathResponse = pathResponse, attachedInterface = attachedInterface, send = false)
             } catch (e: Exception) {
                 null
             }
@@ -409,14 +413,8 @@ class Packet private constructor(
             pack()
         }
 
-        // Create receipt if requested
-        if (createReceipt) {
-            receipt = PacketReceipt(this)
-            // Register with Transport for proof handling
-            Transport.registerReceipt(receipt!!)
-        }
-
-        // Send via Transport
+        // Send via Transport (receipt creation handled by Transport.processOutbound
+        // with proper guards matching Python Transport.py:947-956)
         val success = Transport.outbound(this)
 
         if (success) {

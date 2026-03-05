@@ -121,6 +121,9 @@ object TransportConstants {
     /** Held announce timeout in milliseconds (30 seconds). */
     const val HELD_ANNOUNCE_TIMEOUT = 30_000L
 
+    /** Interval between releasing individual held announces (30 seconds). */
+    const val HELD_RELEASE_INTERVAL = 30_000L
+
     /** Traffic speed update interval in milliseconds (1 second). */
     const val SPEED_UPDATE_INTERVAL = 1000L
 

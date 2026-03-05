@@ -143,6 +143,14 @@ object Transport {
     @Volatile
     var useCoroutineJobLoop: Boolean = false
 
+    /** Interface modes that trigger recursive path forwarding for unknown destinations. */
+    // Python: Interface.DISCOVER_PATHS_FOR = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING]
+    private val DISCOVER_PATHS_FOR = setOf(
+        InterfaceMode.ACCESS_POINT,
+        InterfaceMode.GATEWAY,
+        InterfaceMode.ROAMING
+    )
+
     // ===== Tables =====
 
     /** Path table: destination_hash -> PathEntry. */
@@ -172,6 +180,13 @@ object Transport {
         fun isExpired(): Boolean =
             System.currentTimeMillis() - timestamp > TransportConstants.PACKET_CACHE_TIMEOUT
     }
+
+    /** Pending discovery path request entry (Python: discovery_path_requests). */
+    data class DiscoveryPathRequest(
+        val destinationHash: ByteArray,
+        val timeout: Long,
+        val requestingInterface: InterfaceRef
+    )
 
     /** Interface traffic statistics. */
     data class InterfaceTrafficStats(
@@ -218,8 +233,10 @@ object Transport {
     private val queuedAnnounces = CopyOnWriteArrayList<QueuedAnnounce>()
 
     /** Registered links: link_id -> Link. */
-    private val pendingLinks = ConcurrentHashMap<ByteArrayKey, Any>()
-    private val activeLinks = ConcurrentHashMap<ByteArrayKey, Any>()
+    // Python uses lists (not maps) so multiple links with the same link_id can coexist
+    // (e.g., client + server links in the same process when connecting to own hub)
+    private val pendingLinks = CopyOnWriteArrayList<Any>()
+    private val activeLinks = CopyOnWriteArrayList<Any>()
 
     /** Pending receipts: packet_hash -> ProofCallback. */
     private val pendingReceipts = ConcurrentHashMap<ByteArrayKey, ProofCallback>()
@@ -231,8 +248,16 @@ object Transport {
     /** Announce timing per destination: dest_hash -> allowed_at timestamp. */
     private val announceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
 
-    /** Held announces awaiting retransmission: dest_hash -> (timestamp, raw_data). */
-    private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, Pair<Long, ByteArray>>()
+    /** Mechanism 1: Announce table entries held during path request handling.
+     *  dest_hash -> AnnounceEntry. Restored to announceTable after rebroadcast. */
+    private val heldAnnounceEntries = ConcurrentHashMap<ByteArrayKey, AnnounceEntry>()
+
+    /** Mechanism 2: Raw announces held per-interface for ingress control.
+     *  dest_hash -> (timestamp, raw_data, receiving_interface). Released via inbound(). */
+    private val ingressHeldAnnounces = ConcurrentHashMap<ByteArrayKey, Triple<Long, ByteArray, InterfaceRef>>()
+
+    /** Timestamp of last held announce release (mechanism 2). */
+    @Volatile private var lastHeldRelease: Long = 0L
 
     /** Local client interfaces (shared instance clients). */
     private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
@@ -372,12 +397,14 @@ object Transport {
         packetHashlist.clear()
         packetHashlistPrev.clear()
         announceAllowedAt.clear()
-        heldAnnounces.clear()
+        heldAnnounceEntries.clear()
+        ingressHeldAnnounces.clear()
         localClientInterfaces.clear()
         queuedAnnounces.clear()
         announceRateTable.clear()
         pathRequests.clear()
         discoveryPrTags.clear()
+        discoveryPathRequests.clear()
         pendingReceipts.clear()
         announceHandlers.clear()
         pendingLinks.clear()
@@ -505,9 +532,11 @@ object Transport {
         // Clear path requests (will be re-requested as needed)
         pathRequests.clear()
         discoveryPrTags.clear()
+        discoveryPathRequests.clear()
 
         // Clear held announces (will be re-announced)
-        heldAnnounces.clear()
+        heldAnnounceEntries.clear()
+        ingressHeldAnnounces.clear()
 
         // Clear announce rate table
         announceRateTable.clear()
@@ -844,8 +873,18 @@ object Transport {
         // Use Any type to avoid circular dependency with Link class
         // The link provides its hash via reflection or interface
         val linkId = getLinkId(link) ?: return
-        pendingLinks[linkId.toKey()] = link
-        log("Registered pending link: ${linkId.toHexString()}")
+        // Python Transport.py:2244-2247: initiator links go to pending_links,
+        // non-initiator (server) links go to active_links
+        val isInitiator = try {
+            link::class.java.getMethod("getInitiator").invoke(link) as? Boolean ?: true
+        } catch (_: Exception) { true }
+        if (isInitiator) {
+            pendingLinks.add(link)
+            log("Registered pending link: ${linkId.toHexString()}")
+        } else {
+            activeLinks.add(link)
+            log("Registered active link: ${linkId.toHexString()}")
+        }
     }
 
     /**
@@ -853,9 +892,8 @@ object Transport {
      */
     fun activateLink(link: Any) {
         val linkId = getLinkId(link) ?: return
-        val key = linkId.toKey()
-        pendingLinks.remove(key)
-        activeLinks[key] = link
+        pendingLinks.remove(link)
+        activeLinks.add(link)
         log("Activated link: ${linkId.toHexString()}")
     }
 
@@ -883,9 +921,8 @@ object Transport {
      */
     fun deregisterLink(link: Any) {
         val linkId = getLinkId(link) ?: return
-        val key = linkId.toKey()
-        pendingLinks.remove(key)
-        activeLinks.remove(key)
+        pendingLinks.remove(link)
+        activeLinks.remove(link)
         log("Deregistered link: ${linkId.toHexString()}")
     }
 
@@ -894,7 +931,8 @@ object Transport {
      */
     fun findLink(linkId: ByteArray): Any? {
         val key = linkId.toKey()
-        return activeLinks[key] ?: pendingLinks[key]
+        return activeLinks.find { getLinkId(it)?.toKey() == key }
+            ?: pendingLinks.find { getLinkId(it)?.toKey() == key }
     }
 
     /**
@@ -1341,28 +1379,17 @@ object Transport {
     // ===== Held Announces =====
 
     /**
-     * Hold an announce for later retransmission.
+     * Hold a raw announce for later re-injection via inbound() (ingress control, mechanism 2).
      */
-    fun holdAnnounce(destinationHash: ByteArray, rawData: ByteArray) {
-        heldAnnounces[destinationHash.toKey()] = Pair(System.currentTimeMillis(), rawData.copyOf())
-        log("Held announce for ${destinationHash.toHexString()}")
+    private fun holdIngressAnnounce(destinationHash: ByteArray, rawData: ByteArray, receivingInterface: InterfaceRef) {
+        ingressHeldAnnounces[destinationHash.toKey()] = Triple(System.currentTimeMillis(), rawData.copyOf(), receivingInterface)
+        log("Held announce for ${destinationHash.toHexString()} on ${receivingInterface.name}")
     }
 
     /**
-     * Release a held announce for transmission.
+     * Get count of held announces (both mechanisms combined).
      */
-    fun releaseHeldAnnounce(destinationHash: ByteArray): ByteArray? {
-        val held = heldAnnounces.remove(destinationHash.toKey())
-        if (held != null) {
-            log("Released held announce for ${destinationHash.toHexString()}")
-        }
-        return held?.second
-    }
-
-    /**
-     * Get count of held announces.
-     */
-    fun heldAnnounceCount(): Int = heldAnnounces.size
+    fun heldAnnounceCount(): Int = heldAnnounceEntries.size + ingressHeldAnnounces.size
 
     // ===== Traffic Statistics =====
 
@@ -1770,6 +1797,9 @@ object Transport {
     /** Discovery path request tags to avoid duplicates. */
     private val discoveryPrTags = CopyOnWriteArrayList<ByteArrayKey>()
 
+    /** Pending discovery path requests: dest_hash_key -> DiscoveryPathRequest. */
+    private val discoveryPathRequests = ConcurrentHashMap<ByteArrayKey, DiscoveryPathRequest>()
+
     /** Path request destination for sending requests. */
     private var pathRequestDestination: Destination? = null
 
@@ -1871,6 +1901,75 @@ object Transport {
     }
 
     /**
+     * Internal path request used for forwarding. Supports explicit tag (to avoid loops)
+     * and recursive mode (which throttles based on announce cap).
+     * Python Transport.py:2541-2588
+     */
+    private fun requestPathInternal(
+        destinationHash: ByteArray,
+        onInterface: InterfaceRef? = null,
+        tag: ByteArray? = null,
+        recursive: Boolean = false
+    ) {
+        val requestTag = tag ?: Hashes.getRandomHash()
+
+        val pathRequestData = if (transportEnabled && identity != null) {
+            concatBytes(destinationHash, identity!!.hash, requestTag)
+        } else {
+            concatBytes(destinationHash, requestTag)
+        }
+
+        val prDest = pathRequestDestination ?: return
+
+        val packet = Packet.createRaw(
+            destinationHash = prDest.hash,
+            data = pathRequestData,
+            packetType = PacketType.DATA,
+            destinationType = DestinationType.PLAIN,
+            transportType = TransportType.BROADCAST
+        )
+
+        // Recursive path requests are throttled by announce cap to avoid flooding
+        // Python Transport.py:2563-2585
+        if (onInterface != null && recursive) {
+            val ifaceKey = onInterface.hash.toKey()
+            val queue = interfaceAnnounceQueues[ifaceKey]
+            if (queue != null && queue.isNotEmpty()) {
+                log("Blocking recursive path request on ${onInterface.name} due to queued announces")
+                return
+            }
+
+            val now = System.currentTimeMillis()
+            val allowedAt = interfaceAnnounceAllowedAt[ifaceKey] ?: 0L
+            if (now < allowedAt) {
+                log("Blocking recursive path request on ${onInterface.name} due to active announce cap")
+                return
+            }
+
+            // Update announce allowed time based on transmission time
+            val bitrate = onInterface.bitrate
+            val announceCap = onInterface.announceCap
+            if (bitrate > 0 && announceCap > 0) {
+                val txTime = ((pathRequestData.size + RnsConstants.HEADER_MIN_SIZE) * 8.0) / bitrate
+                val waitTime = (txTime / announceCap * 1000).toLong()
+                interfaceAnnounceAllowedAt[ifaceKey] = now + waitTime
+            }
+        }
+
+        if (onInterface != null) {
+            try {
+                onInterface.send(packet.pack())
+                pathRequests[destinationHash.toKey()] = System.currentTimeMillis()
+            } catch (e: Exception) {
+                log("Failed to send path request on ${onInterface.name}: ${e.message}")
+            }
+        } else {
+            outbound(packet)
+            pathRequests[destinationHash.toKey()] = System.currentTimeMillis()
+        }
+    }
+
+    /**
      * Handle an incoming path request packet.
      */
     private fun handlePathRequest(
@@ -1915,97 +2014,167 @@ object Transport {
             discoveryPrTags.removeAt(0)
         }
 
+        // Determine if the path request came from a local client
+        val isFromLocalClient = fromLocalClient(receivingInterface)
+
         // Check if we know the path
-        processPathRequest(destinationHash, receivingInterface, requestingTransportId, tagBytes)
+        processPathRequest(destinationHash, isFromLocalClient, receivingInterface, requestingTransportId, tagBytes)
     }
 
     /**
      * Process a path request - check if we know the destination and can announce it.
+     * Python: Transport.path_request()
+     *
+     * Falls through 4 branches after the "known path" case:
+     * 1. From local client → forward to all external interfaces
+     * 2. Should search for unknown → forward on all interfaces (with throttling)
+     * 3. Not from local, local clients exist → forward to local clients
+     * 4. None of the above → log and ignore
      */
     private fun processPathRequest(
         destinationHash: ByteArray,
+        isFromLocalClient: Boolean,
         receivingInterface: InterfaceRef,
         requestingTransportId: ByteArray?,
-        @Suppress("UNUSED_PARAMETER") tag: ByteArray
+        tag: ByteArray
     ) {
-        // Check if this is a local destination
+        val destHex = destinationHash.toHexString()
+
+        // Python Transport.py:2697-2701 — determine if we should forward for unknown destinations
+        val shouldSearchForUnknown = transportEnabled &&
+            receivingInterface.mode in DISCOVER_PATHS_FOR
+
+        // Case 1: Local destination — announce it directly, targeted at the requesting interface
+        // Python: local_destination.announce(path_response=True, tag=tag, attached_interface=attached_interface)
         val localDest = findDestination(destinationHash)
         if (localDest != null) {
-            log("Responding to path request with local destination ${destinationHash.toHexString()}")
+            log("Responding to path request with local destination $destHex on ${receivingInterface.name}")
+            localDest.announce(
+                pathResponse = true,
+                tag = tag,
+                attachedInterface = receivingInterface
+            )
+            return
+        }
 
-            // Create and send an announce
-            val announcePacket = Packet.createAnnounce(localDest)
-            if (announcePacket != null) {
-                outbound(announcePacket)
-                log("Sent announce in response to path request")
-            } else {
-                log("Cannot create announce for ${destinationHash.toHexString()} (no private key)")
+        // Case 2: Known path — forward cached announce
+        // Python Transport.py:2723-2781
+        val pathEntry = pathTable[destinationHash.toKey()]
+        if (pathEntry != null && !pathEntry.isExpired() &&
+            (transportEnabled || isFromLocalClient)) {
+
+            log("Path to $destHex known (${pathEntry.hops} hops), retrieving cached announce")
+            val cachedData = getCachedAnnouncePacket(pathEntry.announcePacketHash)
+
+            if (cachedData == null) {
+                log("Could not retrieve cached announce for $destHex")
+                return
+            }
+
+            val (raw, interfaceName) = cachedData
+            val cachedPacket = Packet.unpack(raw)
+            if (cachedPacket == null) {
+                log("Could not unpack cached announce for $destHex")
+                return
+            }
+
+            // Find the original receiving interface
+            val originalInterface = interfaceName?.let { name ->
+                interfaces.find { it.name == name }
+            }
+
+            // Set hop count from path table (Python line 2736)
+            cachedPacket.hops = pathEntry.hops
+
+            // Roaming mode check: don't answer if path is on the same roaming-mode interface
+            // Python line 2731-2732
+            if (receivingInterface.mode == InterfaceMode.ROAMING &&
+                originalInterface != null &&
+                receivingInterface.hash.contentEquals(originalInterface.hash)) {
+                log("Not answering path request on roaming-mode interface (same interface)")
+                return
+            }
+
+            // Loop prevention: don't answer if next hop is the requestor
+            // Python line 2738-2745
+            if (requestingTransportId != null &&
+                pathEntry.nextHop.contentEquals(requestingTransportId)) {
+                log("Not answering path request, next hop is the requestor")
+                return
+            }
+
+            log("Answering path request for $destHex, forwarding cached announce")
+
+            // Hold any existing announce table entry to avoid losing an in-flight announce
+            // Python line 2777-2779 (mechanism 1: transport-level held entries)
+            val existingEntry = announceTable[cachedPacket.destinationHash.toKey()]
+            if (existingEntry != null) {
+                heldAnnounceEntries[cachedPacket.destinationHash.toKey()] = existingEntry
+            }
+
+            // Queue for retransmission via the announce forwarding system
+            queueAnnounceRetransmit(
+                destinationHash,
+                cachedPacket,
+                originalInterface ?: receivingInterface
+            )
+            return
+        }
+
+        // Case 3: From local client, path unknown — forward to all external interfaces
+        // Python Transport.py:2783-2790
+        if (isFromLocalClient) {
+            log("Forwarding path request from local client for $destHex to all other interfaces")
+            val requestTag = Hashes.getRandomHash()
+            for (iface in interfaces) {
+                if (!iface.hash.contentEquals(receivingInterface.hash)) {
+                    requestPathInternal(destinationHash, onInterface = iface, tag = requestTag)
+                }
             }
             return
         }
 
-        // Check if we know a path (transport nodes can forward cached announces)
-        // Python Transport.py:2723-2781
-        val pathEntry = pathTable[destinationHash.toKey()]
-        if (pathEntry != null && !pathEntry.isExpired()) {
-            if (transportEnabled || localClientInterfaces.isNotEmpty()) {
-                log("Path to ${destinationHash.toHexString()} known (${pathEntry.hops} hops), retrieving cached announce")
-                val cachedData = getCachedAnnouncePacket(pathEntry.announcePacketHash)
-
-                if (cachedData == null) {
-                    log("Could not retrieve cached announce for ${destinationHash.toHexString()}")
-                    return
-                }
-
-                val (raw, interfaceName) = cachedData
-                val cachedPacket = Packet.unpack(raw)
-                if (cachedPacket == null) {
-                    log("Could not unpack cached announce for ${destinationHash.toHexString()}")
-                    return
-                }
-
-                // Find the original receiving interface
-                val originalInterface = interfaceName?.let { name ->
-                    interfaces.find { it.name == name }
-                }
-
-                // Set hop count from path table (Python line 2736)
-                cachedPacket.hops = pathEntry.hops
-
-                // Roaming mode check: don't answer if path is on the same roaming-mode interface
-                // Python line 2731-2732
-                if (receivingInterface.mode == InterfaceMode.ROAMING &&
-                    originalInterface != null &&
-                    receivingInterface.hash.contentEquals(originalInterface.hash)) {
-                    log("Not answering path request on roaming-mode interface (same interface)")
-                    return
-                }
-
-                // Loop prevention: don't answer if next hop is the requestor
-                // Python line 2738-2745
-                if (requestingTransportId != null &&
-                    pathEntry.nextHop.contentEquals(requestingTransportId)) {
-                    log("Not answering path request, next hop is the requestor")
-                    return
-                }
-
-                log("Answering path request for ${destinationHash.toHexString()}, forwarding cached announce")
-
-                // Hold any existing announce table entry to avoid losing an in-flight announce
-                // Python line 2777-2779
-                val existingEntry = announceTable[cachedPacket.destinationHash.toKey()]
-                if (existingEntry != null) {
-                    holdAnnounce(cachedPacket.destinationHash, existingEntry.raw)
-                }
-
-                // Queue for retransmission via the announce forwarding system
-                queueAnnounceRetransmit(
-                    destinationHash,
-                    cachedPacket,
-                    originalInterface ?: receivingInterface
+        // Case 4: Transport node, path unknown — recursive forwarding to discover
+        // Python Transport.py:2792-2806
+        if (shouldSearchForUnknown) {
+            val destKey = destinationHash.toKey()
+            if (discoveryPathRequests.containsKey(destKey)) {
+                log("Already a waiting path request for $destHex, not forwarding again")
+            } else {
+                log("Attempting to discover unknown path to $destHex via recursive forwarding")
+                discoveryPathRequests[destKey] = DiscoveryPathRequest(
+                    destinationHash = destinationHash,
+                    timeout = System.currentTimeMillis() + TransportConstants.PATH_REQUEST_TIMEOUT,
+                    requestingInterface = receivingInterface
                 )
+
+                for (iface in interfaces) {
+                    if (!iface.hash.contentEquals(receivingInterface.hash)) {
+                        // Re-use the original tag to avoid loops
+                        requestPathInternal(
+                            destinationHash,
+                            onInterface = iface,
+                            tag = tag,
+                            recursive = true
+                        )
+                    }
+                }
             }
+            return
         }
+
+        // Case 5: External request, local clients exist — forward to local clients
+        // Python Transport.py:2808-2813
+        if (!isFromLocalClient && localClientInterfaces.isNotEmpty()) {
+            log("Forwarding path request for $destHex to ${localClientInterfaces.size} local clients")
+            for (iface in localClientInterfaces) {
+                requestPathInternal(destinationHash, onInterface = iface)
+            }
+            return
+        }
+
+        // Case 6: No path known, nothing to do
+        log("Ignoring path request for $destHex, no path known")
     }
 
     // ===== Packet Processing =====
@@ -2126,11 +2295,6 @@ object Transport {
             return
         }
 
-        // DEBUG: Log packet type from external interface
-        if (interfaceRef.name == "Beleth RNS Hub") {
-            log("DEBUG: Unpacked ${packet.packetType} from ${interfaceRef.name} (destType=${packet.destinationType}, transport=${packet.transportType})")
-        }
-
         // Track which interface this packet was received on
         packet.receivingInterfaceHash = interfaceRef.hash
 
@@ -2139,9 +2303,13 @@ object Transport {
         interfaceRef.rStatSnr?.let { packet.snr = it }
         interfaceRef.rStatQ?.let { packet.q = it }
 
+        // Increment hop count (Python Transport.py:1319)
+        packet.hops++
+
         // Python RNS: Decrement hops for packets from local client interfaces
-        // This makes destinations behind shared instance appear more reachable
-        // Matches Python Transport.inbound():1253-1258
+        // This makes destinations behind shared instance appear directly reachable (hops=0)
+        // Must happen AFTER increment to match Python order: +1 then -1 = net 0
+        // Matches Python Transport.inbound():1343-1348
         if (localClientInterfaces.isNotEmpty()) {
             if (interfaceRef.parentInterface?.isLocalSharedInstance == true) {
                 packet.hops = maxOf(0, packet.hops - 1)
@@ -2151,11 +2319,9 @@ object Transport {
             packet.hops = maxOf(0, packet.hops - 1)
         }
 
-        // Increment hop count
-        packet.hops++
-
         // Check for duplicates
-        if (!packetFilter(packet)) {
+        if (!packetFilter(packet, interfaceRef)) {
+            log("FILTERED: ${packet.packetType} dest=${packet.destinationHash.toHexString()} from ${interfaceRef.name}")
             return
         }
 
@@ -2220,7 +2386,116 @@ object Transport {
             }
         }
 
-        // Route based on packet type
+        // Detect packets for local clients (Python Transport.py:1378-1382)
+        val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(interfaceRef.hash) }
+        val forLocalClient = packet.packetType != PacketType.ANNOUNCE &&
+            pathTable[packet.destinationHash.toKey()]?.let { it.hops == 0 } == true
+        val forLocalClientLink = packet.packetType != PacketType.ANNOUNCE &&
+            linkTable[packet.destinationHash.toKey()]?.let { entry ->
+                localClientInterfaces.any { it.hash.contentEquals(entry.receivingInterfaceHash) } ||
+                localClientInterfaces.any { it.hash.contentEquals(entry.nextHopInterfaceHash) }
+            } == true
+
+        // Synthesize transport_id for local client routing (Python Transport.py:1413-1414)
+        // When a HEADER_1 packet arrives for a destination behind a local client,
+        // we insert our identity as transport_id so the transport forwarding can handle it.
+        if (packet.transportId == null && forLocalClient) {
+            packet.transportId = identity?.hash
+        }
+
+        // General transport handling (Python Transport.py:1404-1510)
+        // This runs for ALL packet types (LINKREQUEST, DATA, PROOF) before type-specific handling.
+        // It forwards packets where we are the designated next transport hop.
+        if (transportEnabled || fromLocalClient || forLocalClient || forLocalClientLink) {
+            if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+                val myHash = identity?.hash
+                if (myHash != null && packet.transportId!!.contentEquals(myHash)) {
+                    val pathEntry = pathTable[packet.destinationHash.toKey()]
+                    if (pathEntry != null) {
+                        val outboundInterface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
+                        if (outboundInterface != null) {
+                            val packetRaw = packet.raw
+                            if (packetRaw != null) {
+                                // Build forwarded raw based on remaining hops (Python:1433-1449)
+                                val newRaw = when {
+                                    pathEntry.hops > 1 -> {
+                                        // Keep HEADER_2, update next hop
+                                        val nr = packetRaw.copyOf()
+                                        nr[1] = packet.hops.toByte()
+                                        System.arraycopy(pathEntry.nextHop, 0, nr, 2, RnsConstants.TRUNCATED_HASH_BYTES)
+                                        nr
+                                    }
+                                    pathEntry.hops == 1 -> {
+                                        // Strip transport header → HEADER_1
+                                        // Destination is one hop away, no transport needed
+                                        val newFlags = (HeaderType.HEADER_1.value shl 6) or
+                                                       (TransportType.BROADCAST.value shl 4) or
+                                                       (packetRaw[0].toInt() and 0x0F)
+                                        val nr = ByteArray(packetRaw.size - RnsConstants.TRUNCATED_HASH_BYTES)
+                                        nr[0] = newFlags.toByte()
+                                        nr[1] = packet.hops.toByte()
+                                        System.arraycopy(
+                                            packetRaw, 2 + RnsConstants.TRUNCATED_HASH_BYTES,
+                                            nr, 2,
+                                            packetRaw.size - 2 - RnsConstants.TRUNCATED_HASH_BYTES
+                                        )
+                                        nr
+                                    }
+                                    else -> {
+                                        // hops==0: destination is behind a local client.
+                                        // Just update hop count in original raw (Python:1446-1449).
+                                        // The raw may be HEADER_1 (if transport_id was synthesized)
+                                        // or HEADER_2 — keep its format as-is.
+                                        val nr = packetRaw.copyOf()
+                                        nr[1] = packet.hops.toByte()
+                                        nr
+                                    }
+                                }
+
+                                // For LINKREQUEST: create link_table entry (Python:1453-1493)
+                                if (packet.packetType == PacketType.LINKREQUEST) {
+                                    val linkId = Link.linkIdFromLrPacket(packet)
+                                    val now = System.currentTimeMillis()
+                                    val proofTimeout = now + LinkConstants.ESTABLISHMENT_TIMEOUT_PER_HOP * maxOf(1, pathEntry.hops)
+                                    val linkEntry = LinkEntry(
+                                        timestamp = now,
+                                        nextHop = pathEntry.nextHop,
+                                        nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
+                                        remainingHops = pathEntry.hops,
+                                        receivingInterfaceHash = interfaceRef.hash,
+                                        takenHops = packet.hops,
+                                        destinationHash = packet.destinationHash,
+                                        validated = false,
+                                        proofTimeout = proofTimeout
+                                    )
+                                    linkTable[linkId.toKey()] = linkEntry
+                                    log("Created link table entry for ${linkId.toHexString()} (remaining=${pathEntry.hops}, taken=${packet.hops})")
+                                } else {
+                                    // For other types: create reverse_table entry (Python:1495-1501)
+                                    val reverseEntry = ReverseEntry(
+                                        receivingInterfaceHash = interfaceRef.hash,
+                                        outboundInterfaceHash = outboundInterface.hash,
+                                        timestamp = System.currentTimeMillis()
+                                    )
+                                    reverseTable[packet.truncatedHash.toKey()] = reverseEntry
+                                }
+
+                                transmit(outboundInterface, newRaw)
+                                pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
+                                log("Transport forwarding ${packet.packetType} for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (remaining_hops=${pathEntry.hops})")
+                            }
+                        } else {
+                            log("Transport forwarding: path exists for ${packet.destinationHash.toHexString()} but interface not found")
+                        }
+                    } else {
+                        log("Got packet in transport, but no known path to ${packet.destinationHash.toHexString()}")
+                    }
+                }
+            }
+        }
+
+        // Route based on packet type (Python:1559+, 1937+, 1968+)
+        // This runs AFTER transport forwarding — a packet may be both forwarded and delivered locally.
         when (packet.packetType) {
             PacketType.ANNOUNCE -> processAnnounce(packet, interfaceRef)
             PacketType.LINKREQUEST -> processLinkRequest(packet, interfaceRef)
@@ -2257,6 +2532,42 @@ object Transport {
         // Debug for LINK packets
         if (packet.destinationType == DestinationType.LINK) {
             log("Outbound LINK packet: dest=$destHex, context=${packet.context}, size=${packedData.size}")
+        }
+
+        // Local loopback for links with both endpoints in this process.
+        //
+        // When an app acts as both shared instance transport node and client (e.g.
+        // an RRC app which is both hub and client), a link to its own destination
+        // has both endpoints in the client process. Without this optimization, LINK
+        // DATA packets would round-trip through the transport node: the client sends
+        // to the transport node, the transport node's link_table forwarding bounces
+        // it back, and the client delivers to both link endpoints. The Python
+        // reference handles this bounce correctly, but the Kotlin implementation
+        // currently has issues with bounced packets being delivered to both the
+        // initiator and responder, causing an infinite send loop.
+        //
+        // This local loopback avoids the round-trip entirely by delivering directly
+        // to the peer link endpoint when both are in the same process. This is also
+        // more efficient than bouncing through the transport node.
+        // TODO: investigate why bounced link packets cause a send loop — the Python
+        // reference handles the same scenario without issues.
+        if (packet.destinationType == DestinationType.LINK && packet.link != null) {
+            val key = packet.destinationHash.toKey()
+            val senderLink = packet.link
+            val peerLink = activeLinks.find {
+                getLinkId(it)?.toKey() == key && it !== senderLink
+            }
+            if (peerLink != null) {
+                try {
+                    val receiveMethod = peerLink::class.java.getMethod("receive", Packet::class.java)
+                    receiveMethod.invoke(peerLink, packet)
+                    sent = true
+                    log("Local loopback delivery for $destHex")
+                } catch (e: Exception) {
+                    log("Failed local loopback: ${e.message}")
+                }
+                if (sent) return true
+            }
         }
 
         // Check if we have a known path
@@ -2303,24 +2614,65 @@ object Transport {
         }
 
         if (!sent) {
-            // Broadcast on all interfaces
             addPacketHash(packet.packetHash)
-            val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
-            log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
-            for (iface in interfaces) {
-                if (!iface.canSend || !iface.online) continue
-
-                // Mode-based announce filtering for locally-originated announces
-                // (Python Transport.py:1040-1084)
-                if (packet.packetType == PacketType.ANNOUNCE) {
-                    val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
-                    if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
+            // If packet has an attached interface, only send on that interface
+            // Python: attached_interface restricts announce to a single interface
+            val targetInterface = packet.attachedInterface
+            if (targetInterface != null) {
+                log("Sending to $destHex on attached interface ${targetInterface.name} (${packedData.size} bytes)")
+                if (targetInterface.canSend && targetInterface.online) {
+                    transmit(targetInterface, packedData)
+                    sent = true
+                } else {
+                    log("Attached interface ${targetInterface.name} is not available")
                 }
+            } else {
+                // Broadcast on all interfaces
+                val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
+                log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
-                transmit(iface, packedData)
-                sent = true
+                for (iface in interfaces) {
+                    if (!iface.canSend || !iface.online) continue
+
+                    // LINK packets should only be sent on the link's attached interface
+                    // (Python Transport.py:1031-1035)
+                    if (packet.destinationType == DestinationType.LINK) {
+                        val linkObj = packet.link
+                        if (linkObj != null) {
+                            val attachedHash = try {
+                                linkObj::class.java.getMethod("getAttachedInterfaceHash").invoke(linkObj) as? ByteArray
+                            } catch (_: Exception) { null }
+                            if (attachedHash != null && !iface.hash.contentEquals(attachedHash)) {
+                                continue
+                            }
+                        } else {
+                            log("WARNING: LINK packet missing link reference, broadcasting on all interfaces")
+                        }
+                    }
+
+                    // Mode-based announce filtering for locally-originated announces
+                    // (Python Transport.py:1040-1084)
+                    if (packet.packetType == PacketType.ANNOUNCE) {
+                        val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
+                        if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
+                    }
+
+                    transmit(iface, packedData)
+                    sent = true
+                }
             }
+        }
+
+        // Create receipt after successful transmit, with guards matching Python Transport.py:947-956
+        if (sent && packet.createReceipt &&
+            packet.packetType == PacketType.DATA &&
+            packet.destination?.type != DestinationType.PLAIN &&
+            !(packet.context.value in PacketContext.KEEPALIVE.value..PacketContext.LRPROOF.value) &&
+            !(packet.context.value in PacketContext.RESOURCE.value..PacketContext.RESOURCE_RCL.value)
+        ) {
+            packet.receipt = PacketReceipt(packet)
+            registerReceipt(packet.receipt!!)
         }
 
         return sent
@@ -2441,13 +2793,72 @@ object Transport {
         val identity = announceData.identity
         val appData = announceData.appData
 
+        // Record incoming announce for frequency tracking
+        interfaceRef.recordIncomingAnnounce()
+
+        // Apply ingress limiting for unknown destinations
+        // Python Transport.py:1563-1571 — only limit announces for destinations
+        // not already in the path table (known destinations use normal rate limiting)
+        val isKnownDestination = pathTable.containsKey(destHash.toKey())
+        if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
+            log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
+            holdIngressAnnounce(destHash, packet.raw ?: packet.pack(), interfaceRef)
+            return
+        }
+
+        // Determine next hop: transport_id for HEADER_2 announces, dest hash for direct
+        // Python Transport.py:1575-1600
+        val receivedFrom = if (packet.transportId != null) {
+            packet.transportId!!.copyOf()
+        } else {
+            destHash.copyOf()
+        }
+
+        // Check if this announce should update the path table (Python:1604-1686)
+        val existingEntry = pathTable[destHash.toKey()]
+        val shouldAdd = if (existingEntry != null) {
+            if (packet.hops <= existingEntry.hops) {
+                // Better or equal path — update if we haven't seen this random blob
+                !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+            } else {
+                // Worse path — only update if existing is expired or unresponsive
+                val now = System.currentTimeMillis()
+                if (now >= existingEntry.expires) {
+                    !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+                } else if (isPathUnresponsive(destHash)) {
+                    true
+                } else {
+                    false
+                }
+            }
+        } else {
+            true // Unknown destination, always add
+        }
+
+        if (!shouldAdd) {
+            // Python: when should_add is False, no retransmission or path update happens.
+            // Do NOT retransmit to local clients here — doing so would cause clients
+            // to learn incorrect multi-hop paths to their own destinations from bounced
+            // announces, breaking self-connect through shared instances.
+            return
+        }
+
         // Update path table
+        val randomBlobs = existingEntry?.randomBlobs?.toMutableList() ?: mutableListOf()
+        if (!randomBlobs.any { it.contentEquals(announceData.randomHash) }) {
+            randomBlobs.add(announceData.randomHash)
+        }
+        // Keep only the most recent random blobs (Python: MAX_RANDOM_BLOBS = 64)
+        while (randomBlobs.size > 64) {
+            randomBlobs.removeAt(0)
+        }
+
         val pathEntry = PathEntry(
             timestamp = System.currentTimeMillis(),
-            nextHop = destHash.copyOf(), // For direct announces, next hop is the destination
+            nextHop = receivedFrom,
             hops = packet.hops,
             expires = System.currentTimeMillis() + AnnounceFilter.pathExpiryForMode(interfaceRef.mode),
-            randomBlobs = mutableListOf(announceData.randomHash),
+            randomBlobs = randomBlobs,
             receivingInterfaceHash = interfaceRef.hash,
             announcePacketHash = packet.packetHash
         )
@@ -2497,54 +2908,62 @@ object Transport {
             cacheAnnouncePacket(packet, interfaceRef)
         }
 
-        // Python RNS: Immediately retransmit announces to local clients
-        // Matches Python Transport.py:1790-1833
-        // Local clients get instant visibility without queue delays.
-        //
-        // Critical: Re-package with HEADER_2 + TRANSPORT type + our identity as transport_id.
-        // This tells local clients the announce came through a transport node (us),
-        // not directly from the source. Without this, local clients would think
-        // HEADER_1 (direct) destinations are directly reachable.
-        if (localClientInterfaces.isNotEmpty()) {
-            // Note: use Transport.identity explicitly — local `identity` variable
-            // is the announced identity (announceData.identity), not Transport's own identity
-            val transportIdentityHash = Transport.identity?.hash
-            if (transportIdentityHash != null) {
-                log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
+        retransmitAnnounceToLocalClients(packet, interfaceRef)
 
-                val forwardPacket = Packet.createRaw(
-                    destinationHash = packet.destinationHash,
-                    data = packet.data,
-                    packetType = PacketType.ANNOUNCE,
-                    destinationType = packet.destinationType,
-                    context = PacketContext.NONE,
-                    headerType = HeaderType.HEADER_2,
-                    transportType = TransportType.TRANSPORT,
-                    transportId = transportIdentityHash,
-                    contextFlag = packet.contextFlag,
-                    createReceipt = false
-                )
-                forwardPacket.hops = packet.hops
-                val forwardRaw = forwardPacket.pack()
+        // Retransmit if transport is enabled OR announce came from a local client
+        // Python Transport.py:1741 — local client announces are always retransmitted
+        // to external interfaces, even when transport routing is disabled
+        val fromLocal = fromLocalClient(interfaceRef)
+        if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
+            queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
+        }
+    }
 
-                for (localInterface in localClientInterfaces) {
-                    if (!localInterface.hash.contentEquals(interfaceRef.hash)) {
-                        try {
-                            localInterface.send(forwardRaw)
-                            log("Sent announce for ${destHash.toHexString()} to local client ${localInterface.name}")
-                        } catch (e: Exception) {
-                            log("Error sending announce to local client ${localInterface.name}: ${e.message}")
-                        }
-                    }
-                }
-            } else {
-                log("Cannot forward announce to local clients: no transport identity")
-            }
+    /**
+     * Immediately retransmit an announce to all local client interfaces.
+     * Python Transport.py:1790-1833
+     *
+     * Re-packages with HEADER_2 + TRANSPORT type + our identity as transport_id,
+     * so local clients know the announce came through a transport node (us).
+     */
+    private fun retransmitAnnounceToLocalClients(
+        packet: Packet,
+        receivingInterface: InterfaceRef,
+    ) {
+        if (localClientInterfaces.isEmpty()) return
+
+        val transportIdentityHash = Transport.identity?.hash
+        if (transportIdentityHash == null) {
+            log("Cannot forward announce to local clients: no transport identity")
+            return
         }
 
-        // Retransmit if transport is enabled and under hop limit
-        if (transportEnabled && packet.hops < TransportConstants.PATHFINDER_M) {
-            queueAnnounceRetransmit(destHash, packet, interfaceRef)
+        log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
+
+        val forwardPacket = Packet.createRaw(
+            destinationHash = packet.destinationHash,
+            data = packet.data,
+            packetType = PacketType.ANNOUNCE,
+            destinationType = packet.destinationType,
+            context = PacketContext.NONE,
+            headerType = HeaderType.HEADER_2,
+            transportType = TransportType.TRANSPORT,
+            transportId = transportIdentityHash,
+            contextFlag = packet.contextFlag,
+            createReceipt = false
+        )
+        forwardPacket.hops = packet.hops
+        val forwardRaw = forwardPacket.pack()
+
+        for (localInterface in localClientInterfaces) {
+            if (!localInterface.hash.contentEquals(receivingInterface.hash)) {
+                try {
+                    localInterface.send(forwardRaw)
+                    log("Sent announce for ${packet.destinationHash.toHexString()} to local client ${localInterface.name}")
+                } catch (e: Exception) {
+                    log("Error sending announce to local client ${localInterface.name}: ${e.message}")
+                }
+            }
         }
     }
 
@@ -2554,7 +2973,8 @@ object Transport {
     private fun queueAnnounceRetransmit(
         destinationHash: ByteArray,
         packet: Packet,
-        receivingInterface: InterfaceRef
+        receivingInterface: InterfaceRef,
+        fromLocalClient: Boolean = false
     ) {
         val destKey = destinationHash.toKey()
         val now = System.currentTimeMillis()
@@ -2610,14 +3030,26 @@ object Transport {
         )
         announceTable[destKey] = announceEntry
 
+        // Python lines 570-573: reinstate held announce entry after rebroadcast
+        val heldEntry = heldAnnounceEntries.remove(destKey)
+        if (heldEntry != null) {
+            announceTable[destKey] = heldEntry
+            log("Reinserting held announce into table for ${destinationHash.toHexString()}")
+        }
+
         // Queue on all interfaces except the receiving one, applying mode-based filtering
         // Matches Python Transport.py:1040-1084
+        // Python: announce retransmit goes through outbound() which checks `interface.OUT`.
+        // Spawned local client interfaces have OUT=False in Python (LocalInterface.py:417),
+        // so they are excluded from announce retransmission. Local clients receive announces
+        // through retransmitAnnounceToLocalClients() instead.
         val isLocal = destinations.any { it.hash.contentEquals(destinationHash) }
         val sourceMode = nextHopInterface(destinationHash)?.mode
 
         for (iface in interfaces) {
             if (!iface.canSend || !iface.online ||
-                iface.hash.contentEquals(receivingInterface.hash)) continue
+                iface.hash.contentEquals(receivingInterface.hash) ||
+                isLocalClientInterface(iface)) continue
 
             if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
                 queueAnnounce(
@@ -2663,14 +3095,26 @@ object Transport {
         }
 
         // Check if this is data for a local link (destination hash is a link_id)
-        val localLink = findLink(packet.destinationHash)
-        if (localLink != null) {
-            log("Delivering link data to local link ${packet.destinationHash.toHexString()}")
-            try {
-                val receiveMethod = localLink::class.java.getMethod("receive", Packet::class.java)
-                receiveMethod.invoke(localLink, packet)
-            } catch (e: Exception) {
-                log("Failed to deliver to local link: ${e.message}")
+        // Python iterates ALL matching links and checks attached_interface (Transport.py:1971-1984)
+        val key = packet.destinationHash.toKey()
+        val matchingLinks = activeLinks.filter { getLinkId(it)?.toKey() == key }
+        if (matchingLinks.isNotEmpty()) {
+            for (link in matchingLinks) {
+                // Python: if link.attached_interface == packet.receiving_interface
+                val attachedHash = try {
+                    link::class.java.getMethod("getAttachedInterfaceHash").invoke(link) as? ByteArray
+                } catch (_: Exception) { null }
+                val pktIfaceHash = packet.receivingInterfaceHash
+                if (attachedHash != null && pktIfaceHash != null && !attachedHash.contentEquals(pktIfaceHash)) {
+                    log("WARNING: Link interface mismatch on ${packet.destinationHash.toHexString()}, potential communication manipulation or misconfiguration")
+                    continue
+                }
+                try {
+                    val receiveMethod = link::class.java.getMethod("receive", Packet::class.java)
+                    receiveMethod.invoke(link, packet)
+                } catch (e: Exception) {
+                    log("Failed to deliver to local link: ${e.message}")
+                }
             }
             return
         }
@@ -2697,117 +3141,66 @@ object Transport {
             }
         }
 
-        // Check if this is link data for forwarding (destination hash is a link_id)
-        val linkEntry = linkTable[packet.destinationHash.toKey()]
-        if (linkEntry != null) {
-            // This is link data - forward to the appropriate interface based on which
-            // interface the packet came from (bidirectional routing)
-            val outboundInterfaceHash = if (interfaceRef.hash.contentEquals(linkEntry.receivingInterfaceHash)) {
-                // Packet came from the link initiator side, forward to the destination side
-                linkEntry.nextHopInterfaceHash
-            } else {
-                // Packet came from the destination side, forward to the initiator side
-                linkEntry.receivingInterfaceHash
-            }
-
-            val outboundInterface = findInterfaceByHash(outboundInterfaceHash)
-            if (outboundInterface != null) {
-                log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                transmit(outboundInterface, packet.raw ?: packet.pack())
-                return
-            } else {
-                log("Link data forward failed: interface ${outboundInterfaceHash.toHexString()} not found")
+        // Link transport handling: forward data/proof via link_table entries
+        // (Python Transport.py:1514-1548)
+        if (packet.packetType != PacketType.ANNOUNCE &&
+            packet.packetType != PacketType.LINKREQUEST &&
+            packet.context != PacketContext.LRPROOF
+        ) {
+            val linkEntry = linkTable[packet.destinationHash.toKey()]
+            if (linkEntry != null) {
+                val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+                val rcvdIface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                val outboundInterface = when {
+                    // Same interface for both directions — just repeat (Python lines 1521-1525)
+                    nhIface != null && rcvdIface != null &&
+                        nhIface.hash.contentEquals(rcvdIface.hash) -> {
+                        if (packet.hops == linkEntry.remainingHops || packet.hops == linkEntry.takenHops) nhIface
+                        else null
+                    }
+                    // Different interfaces — transmit on opposite side (Python lines 1526-1537)
+                    nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> {
+                        if (packet.hops == linkEntry.remainingHops) rcvdIface else null
+                    }
+                    rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> {
+                        if (packet.hops == linkEntry.takenHops) nhIface else null
+                    }
+                    else -> null
+                }
+                if (outboundInterface != null) {
+                    addPacketHash(packet.packetHash)  // Python line 1543
+                    val raw = packet.raw ?: packet.pack()
+                    val newRaw = raw.copyOf()
+                    newRaw[1] = packet.hops.toByte()
+                    transmit(outboundInterface, newRaw)
+                    linkTable[packet.destinationHash.toKey()] = linkEntry.copy(
+                        timestamp = System.currentTimeMillis()
+                    )
+                    log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                    return
+                }
             }
         }
 
-        // Transport-mode forwarding (when we're an intermediate hop)
-        if (transportEnabled && packet.transportId != null) {
-            val myHash = identity?.hash
-            if (myHash != null && packet.transportId.contentEquals(myHash)) {
-                forwardPacket(packet, interfaceRef)
-            }
-        }
+        // NOTE: Transport-mode forwarding for transport_id-based path routing is now handled
+        // in processInbound() BEFORE type dispatch, matching Python Transport.py:1404-1510.
+        // This ensures LINKREQUEST, PROOF, and DATA packets all get transport forwarding.
     }
 
     private fun processLinkRequest(packet: Packet, interfaceRef: InterfaceRef) {
-        // Check if this is for a local destination
-        val destination = findDestination(packet.destinationHash)
+        // Python Transport.py:1937-1966: Only deliver locally if transport_id is null
+        // (HEADER_1/direct) or matches our identity (we are the final transport hop).
+        // Transport forwarding for HEADER_2 packets is handled in processInbound().
+        val myHash = identity?.hash
+        if (packet.transportId != null && (myHash == null || !packet.transportId!!.contentEquals(myHash))) {
+            return
+        }
 
+        val destination = findDestination(packet.destinationHash)
         if (destination != null) {
             // Clamp MTU signalling to receiving interface (Python Transport.py:1938-1963)
             clampLinkRequestMtuForLocal(packet, interfaceRef)
             deliverPacket(destination, packet)
-            return
-        }
-
-        // Check if we have a path to forward this Link request
-        val pathEntry = pathTable[packet.destinationHash.toKey()]
-        if (pathEntry != null) {
-            val outboundInterface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
-            if (outboundInterface != null && !outboundInterface.hash.contentEquals(interfaceRef.hash)) {
-                // Calculate link_id properly using Link.linkIdFromLrPacket
-                // This is the truncated hash of the hashable part, potentially
-                // excluding MTU signalling bytes from the data
-                val linkId = Link.linkIdFromLrPacket(packet)
-
-                // Create link table entry for return routing of proofs (for local client traffic)
-                // The LRPROOF will have this link_id as its destination_hash
-                val linkEntry = LinkEntry(
-                    timestamp = System.currentTimeMillis(),
-                    nextHop = pathEntry.nextHop,
-                    nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
-                    remainingHops = pathEntry.hops,
-                    receivingInterfaceHash = interfaceRef.hash,
-                    takenHops = packet.hops,
-                    destinationHash = packet.destinationHash,
-                    validated = false,
-                    proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
-                )
-                linkTable[linkId.toKey()] = linkEntry
-                log("Forwarding Link request for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (link_id=${linkId.toHexString()})")
-
-                // Clamp MTU signalling bytes for the forwarding path (Python Transport.py:1453-1480)
-                val rawToSend = clampLinkRequestMtuForForwarding(
-                    packet.raw ?: packet.pack(), packet, outboundInterface, interfaceRef
-                )
-                transmit(outboundInterface, rawToSend)
-                return
-            }
-        }
-
-        // Transport-mode forwarding (when we're an intermediate hop)
-        if (transportEnabled && packet.transportId != null) {
-            val myHash = identity?.hash
-            if (myHash != null && packet.transportId.contentEquals(myHash)) {
-                // Record in link table for return path
-                if (pathEntry != null) {
-                    // Use proper link_id calculation
-                    val linkId = Link.linkIdFromLrPacket(packet)
-                    // Create link table entry for return routing of proofs
-                    val linkEntry = LinkEntry(
-                        timestamp = System.currentTimeMillis(),
-                        nextHop = pathEntry.nextHop,
-                        nextHopInterfaceHash = pathEntry.receivingInterfaceHash,
-                        remainingHops = pathEntry.hops,
-                        receivingInterfaceHash = interfaceRef.hash,
-                        takenHops = packet.hops,
-                        destinationHash = packet.destinationHash,
-                        validated = false,
-                        proofTimeout = System.currentTimeMillis() + TransportConstants.LINK_PROOF_TIMEOUT
-                    )
-                    linkTable[linkId.toKey()] = linkEntry
-                    log("Created link table entry for ${linkId.toHexString()}")
-
-                    // Clamp MTU signalling bytes before forwarding (Python Transport.py:1453-1480)
-                    val outboundIface = findInterfaceByHash(pathEntry.receivingInterfaceHash)
-                    if (outboundIface != null && packet.raw != null) {
-                        packet.raw = clampLinkRequestMtuForForwarding(
-                            packet.raw!!, packet, outboundIface, interfaceRef
-                        )
-                    }
-                    forwardPacket(packet, interfaceRef)
-                }
-            }
         }
     }
 
@@ -2909,7 +3302,7 @@ object Transport {
             }
 
             // Check if we can deliver it to a local pending link
-            val pendingLink = pendingLinks[packet.destinationHash.toKey()]
+            val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
             if (pendingLink != null) {
                 log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
                 try {
@@ -2934,7 +3327,7 @@ object Transport {
         // Handle RESOURCE_PRF (Resource Proof) - deliver to active link
         // Resource proofs are sent with the link ID as destination
         if (packet.context == PacketContext.RESOURCE_PRF) {
-            val activeLink = activeLinks[packet.destinationHash.toKey()]
+            val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
             if (activeLink != null) {
                 log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
                 try {
@@ -2968,24 +3361,29 @@ object Transport {
         }
 
         // Check if there's a pending receipt for this proof (local destination)
-        // Try multiple lookups:
-        // 1. By proof destination hash (truncated hash)
-        // 2. By full packet hash from proof data (for explicit proofs)
-        var callback = pendingReceipts.remove(packet.destinationHash.toKey())
+        // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
+        var matchedKey: ByteArrayKey? = null
+        var callback = pendingReceipts[packet.destinationHash.toKey()]
+        if (callback != null) {
+            matchedKey = packet.destinationHash.toKey()
+        }
 
         if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
             // Extract full packet hash from explicit proof data
             val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
-            callback = pendingReceipts.remove(fullHash.toKey())
+            val fullHashKey = fullHash.toKey()
+            callback = pendingReceipts[fullHashKey]
             if (callback != null) {
+                matchedKey = fullHashKey
                 log("Found pending receipt by full hash from proof data")
             }
         }
 
-        if (callback != null) {
+        if (callback != null && matchedKey != null) {
             try {
                 val validated = callback.onProofReceived(packet)
                 if (validated) {
+                    pendingReceipts.remove(matchedKey)  // only remove on success
                     log("Proof validated for ${packet.destinationHash.toHexString()}")
                     markPathResponsive(packet.destinationHash)
                 } else {
@@ -3005,26 +3403,35 @@ object Transport {
 
         val raw = packet.raw ?: return
 
-        if (pathEntry.hops > 1) {
-            // Update transport header with next hop
-            val newRaw = raw.copyOf()
-            newRaw[1] = packet.hops.toByte()
-            System.arraycopy(pathEntry.nextHop, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
-            transmit(outboundInterface, newRaw)
-        } else {
-            // Strip transport header (convert to HEADER_1)
-            val newFlags = (HeaderType.HEADER_1.value shl 6) or
-                           (TransportType.BROADCAST.value shl 4) or
-                           (raw[0].toInt() and 0x0F)
-            val newRaw = ByteArray(raw.size - RnsConstants.TRUNCATED_HASH_BYTES)
-            newRaw[0] = newFlags.toByte()
-            newRaw[1] = packet.hops.toByte()
-            System.arraycopy(
-                raw, 2 + RnsConstants.TRUNCATED_HASH_BYTES,
-                newRaw, 2,
-                raw.size - 2 - RnsConstants.TRUNCATED_HASH_BYTES
-            )
-            transmit(outboundInterface, newRaw)
+        when {
+            pathEntry.hops > 1 -> {
+                // Update transport header with next hop (Python Transport.py:1433-1438)
+                val newRaw = raw.copyOf()
+                newRaw[1] = packet.hops.toByte()
+                System.arraycopy(pathEntry.nextHop, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
+                transmit(outboundInterface, newRaw)
+            }
+            pathEntry.hops == 1 -> {
+                // Strip transport header, convert to HEADER_1 (Python Transport.py:1439-1444)
+                val newFlags = (HeaderType.HEADER_1.value shl 6) or
+                               (TransportType.BROADCAST.value shl 4) or
+                               (raw[0].toInt() and 0x0F)
+                val newRaw = ByteArray(raw.size - RnsConstants.TRUNCATED_HASH_BYTES)
+                newRaw[0] = newFlags.toByte()
+                newRaw[1] = packet.hops.toByte()
+                System.arraycopy(
+                    raw, 2 + RnsConstants.TRUNCATED_HASH_BYTES,
+                    newRaw, 2,
+                    raw.size - 2 - RnsConstants.TRUNCATED_HASH_BYTES
+                )
+                transmit(outboundInterface, newRaw)
+            }
+            else -> {
+                // hops==0: local client, just update hop count (Python Transport.py:1445-1449)
+                val newRaw = raw.copyOf()
+                newRaw[1] = packet.hops.toByte()
+                transmit(outboundInterface, newRaw)
+            }
         }
 
         // Record reverse entry for proofs
@@ -3197,17 +3604,61 @@ object Transport {
 
     // ===== Packet Filter (Duplicate Detection) =====
 
-    private fun packetFilter(packet: Packet): Boolean {
+    private fun packetFilter(packet: Packet, receivingInterface: InterfaceRef): Boolean {
         // Python RNS: Bypass local filtering if connected to shared instance
-        // Let the shared instance server handle centralized duplicate filtering
-        // Matches Python Transport.packet_filter():1091-1094
+        // (Python Transport.py:1187-1190)
         if (interfaces.any { it.isConnectedToSharedInstance }) {
-            return true  // Accept all packets, let server filter
+            return true
         }
 
-        // Normal duplicate detection for standalone instances or servers
+        // Filter packets intended for other transport instances (Python:1192-1196)
+        // Skip this check for packets from local clients — they may have incorrect
+        // transport headers since the Kotlin client builds its own path table
+        // (unlike Python where clients delegate routing to the shared instance)
+        val fromLocalClient = localClientInterfaces.any { it.hash.contentEquals(receivingInterface.hash) }
+        if (!fromLocalClient && packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+            val myHash = identity?.hash ?: return false
+            if (!packet.transportId!!.contentEquals(myHash)) {
+                return false
+            }
+        }
+
+        // Context-based bypass (Python:1198-1203)
+        when (packet.context) {
+            PacketContext.KEEPALIVE, PacketContext.RESOURCE_REQ,
+            PacketContext.RESOURCE_PRF, PacketContext.RESOURCE,
+            PacketContext.CACHE_REQUEST, PacketContext.CHANNEL -> return true
+            else -> {}
+        }
+
+        // PLAIN destination validation (Python:1205-1214)
+        if (packet.destinationType == DestinationType.PLAIN) {
+            if (packet.packetType != PacketType.ANNOUNCE) {
+                return packet.hops <= 1
+            } else {
+                return false
+            }
+        }
+
+        // GROUP destination validation (Python:1216-1225)
+        if (packet.destinationType == DestinationType.GROUP) {
+            if (packet.packetType != PacketType.ANNOUNCE) {
+                return packet.hops <= 1
+            } else {
+                return false
+            }
+        }
+
+        // Hashlist dedup (Python:1227-1238)
         val key = packet.packetHash.toKey()
-        return !packetHashlist.contains(key) && !packetHashlistPrev.contains(key)
+        if (!packetHashlist.contains(key) && !packetHashlistPrev.contains(key)) {
+            return true
+        } else if (packet.packetType == PacketType.ANNOUNCE &&
+                   packet.destinationType == DestinationType.SINGLE) {
+            return true  // Allow duplicate SINGLE announces through
+        }
+
+        return false
     }
 
     private fun addPacketHash(hash: ByteArray) {
@@ -3409,12 +3860,33 @@ object Transport {
     }
 
     /**
-     * Process held announces - expire old ones.
+     * Process ingress-held announces (mechanism 2) - release one at a time at intervals, expire old ones.
+     * Python: Interface.process_held_announces() releases one per IC_HELD_RELEASE_INTERVAL.
      */
     private fun processHeldAnnounces(now: Long) {
+        if (ingressHeldAnnounces.isEmpty()) return
+
+        // Expire old held announces
         val expireCutoff = now - TransportConstants.HELD_ANNOUNCE_TIMEOUT
-        val expired = heldAnnounces.entries.filter { it.value.first < expireCutoff }
-        expired.forEach { heldAnnounces.remove(it.key) }
+        ingressHeldAnnounces.entries.removeIf { it.value.first < expireCutoff }
+
+        // Release one held announce per interval
+        if (now > lastHeldRelease + TransportConstants.HELD_RELEASE_INTERVAL) {
+            val oldest = ingressHeldAnnounces.entries.minByOrNull { it.value.first }
+            if (oldest != null) {
+                val destHex = oldest.key.bytes.toHexString()
+                log("Releasing held announce for $destHex")
+                ingressHeldAnnounces.remove(oldest.key)
+                lastHeldRelease = now
+
+                val iface = oldest.value.third
+                try {
+                    inbound(oldest.value.second, iface)
+                } catch (e: Exception) {
+                    log("Error re-injecting held announce: ${e.message}")
+                }
+            }
+        }
     }
 
     /**
@@ -3482,6 +3954,9 @@ object Transport {
                 false
             }
         }
+
+        // Remove expired discovery path requests
+        discoveryPathRequests.entries.removeIf { now > it.value.timeout }
 
         // Remove expired tunnels
         cleanExpiredTunnels()
@@ -4259,6 +4734,7 @@ object Transport {
     private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? {
         val key = hash.toKey()
         return interfaces.find { it.hash.toKey() == key }
+            ?: localClientInterfaces.find { it.hash.toKey() == key }
     }
 
     private fun log(message: String) {
@@ -4395,6 +4871,15 @@ interface InterfaceRef {
     fun getInterfaceHash(): ByteArray {
         return Hashes.fullHash(name.toByteArray(Charsets.UTF_8))
     }
+
+    // Ingress control methods — implemented by Interface (via InterfaceAdapter),
+    // no-ops by default for test/stub interfaces.
+
+    /** Check if incoming announces should be rate-limited (burst detection). */
+    fun shouldIngressLimit(): Boolean = false
+
+    /** Record that an announce was received on this interface (for frequency tracking). */
+    fun recordIncomingAnnounce() {}
 
     fun send(data: ByteArray)
 }
