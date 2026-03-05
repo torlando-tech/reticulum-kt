@@ -2186,6 +2186,7 @@ object Transport {
      * @param interfaceRef Interface that received the packet
      */
     fun inbound(raw: ByteArray, interfaceRef: InterfaceRef) {
+        log("INBOUND: ${raw.size} bytes from ${interfaceRef.name} flags=0x${String.format("%02x", raw[0].toInt() and 0xFF)}")
         if (!started.get()) {
             log("Transport not started, dropping packet")
             return
@@ -2321,6 +2322,7 @@ object Transport {
 
         // Check for duplicates
         if (!packetFilter(packet, interfaceRef)) {
+            log("FILTERED: ${packet.packetType} dest=${packet.destinationHash.toHexString()} from ${interfaceRef.name}")
             return
         }
 
@@ -2426,6 +2428,7 @@ object Transport {
                                     }
                                     pathEntry.hops == 1 -> {
                                         // Strip transport header → HEADER_1
+                                        // Destination is one hop away, no transport needed
                                         val newFlags = (HeaderType.HEADER_1.value shl 6) or
                                                        (TransportType.BROADCAST.value shl 4) or
                                                        (packetRaw[0].toInt() and 0x0F)
@@ -2440,7 +2443,10 @@ object Transport {
                                         nr
                                     }
                                     else -> {
-                                        // hops==0: just update hop count
+                                        // hops==0: destination is behind a local client.
+                                        // Just update hop count in original raw (Python:1446-1449).
+                                        // The raw may be HEADER_1 (if transport_id was synthesized)
+                                        // or HEADER_2 — keep its format as-is.
                                         val nr = packetRaw.copyOf()
                                         nr[1] = packet.hops.toByte()
                                         nr
@@ -2801,13 +2807,59 @@ object Transport {
             return
         }
 
+        // Determine next hop: transport_id for HEADER_2 announces, dest hash for direct
+        // Python Transport.py:1575-1600
+        val receivedFrom = if (packet.transportId != null) {
+            packet.transportId!!.copyOf()
+        } else {
+            destHash.copyOf()
+        }
+
+        // Check if this announce should update the path table (Python:1604-1686)
+        val existingEntry = pathTable[destHash.toKey()]
+        val shouldAdd = if (existingEntry != null) {
+            if (packet.hops <= existingEntry.hops) {
+                // Better or equal path — update if we haven't seen this random blob
+                !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+            } else {
+                // Worse path — only update if existing is expired or unresponsive
+                val now = System.currentTimeMillis()
+                if (now >= existingEntry.expires) {
+                    !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+                } else if (isPathUnresponsive(destHash)) {
+                    true
+                } else {
+                    false
+                }
+            }
+        } else {
+            true // Unknown destination, always add
+        }
+
+        if (!shouldAdd) {
+            // Python: when should_add is False, no retransmission or path update happens.
+            // Do NOT retransmit to local clients here — doing so would cause clients
+            // to learn incorrect multi-hop paths to their own destinations from bounced
+            // announces, breaking self-connect through shared instances.
+            return
+        }
+
         // Update path table
+        val randomBlobs = existingEntry?.randomBlobs?.toMutableList() ?: mutableListOf()
+        if (!randomBlobs.any { it.contentEquals(announceData.randomHash) }) {
+            randomBlobs.add(announceData.randomHash)
+        }
+        // Keep only the most recent random blobs (Python: MAX_RANDOM_BLOBS = 64)
+        while (randomBlobs.size > 64) {
+            randomBlobs.removeAt(0)
+        }
+
         val pathEntry = PathEntry(
             timestamp = System.currentTimeMillis(),
-            nextHop = destHash.copyOf(), // For direct announces, next hop is the destination
+            nextHop = receivedFrom,
             hops = packet.hops,
             expires = System.currentTimeMillis() + AnnounceFilter.pathExpiryForMode(interfaceRef.mode),
-            randomBlobs = mutableListOf(announceData.randomHash),
+            randomBlobs = randomBlobs,
             receivingInterfaceHash = interfaceRef.hash,
             announcePacketHash = packet.packetHash
         )
@@ -2857,50 +2909,7 @@ object Transport {
             cacheAnnouncePacket(packet, interfaceRef)
         }
 
-        // Python RNS: Immediately retransmit announces to local clients
-        // Matches Python Transport.py:1790-1833
-        // Local clients get instant visibility without queue delays.
-        //
-        // Critical: Re-package with HEADER_2 + TRANSPORT type + our identity as transport_id.
-        // This tells local clients the announce came through a transport node (us),
-        // not directly from the source. Without this, local clients would think
-        // HEADER_1 (direct) destinations are directly reachable.
-        if (localClientInterfaces.isNotEmpty()) {
-            // Note: use Transport.identity explicitly — local `identity` variable
-            // is the announced identity (announceData.identity), not Transport's own identity
-            val transportIdentityHash = Transport.identity?.hash
-            if (transportIdentityHash != null) {
-                log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
-
-                val forwardPacket = Packet.createRaw(
-                    destinationHash = packet.destinationHash,
-                    data = packet.data,
-                    packetType = PacketType.ANNOUNCE,
-                    destinationType = packet.destinationType,
-                    context = PacketContext.NONE,
-                    headerType = HeaderType.HEADER_2,
-                    transportType = TransportType.TRANSPORT,
-                    transportId = transportIdentityHash,
-                    contextFlag = packet.contextFlag,
-                    createReceipt = false
-                )
-                forwardPacket.hops = packet.hops
-                val forwardRaw = forwardPacket.pack()
-
-                for (localInterface in localClientInterfaces) {
-                    if (!localInterface.hash.contentEquals(interfaceRef.hash)) {
-                        try {
-                            localInterface.send(forwardRaw)
-                            log("Sent announce for ${destHash.toHexString()} to local client ${localInterface.name}")
-                        } catch (e: Exception) {
-                            log("Error sending announce to local client ${localInterface.name}: ${e.message}")
-                        }
-                    }
-                }
-            } else {
-                log("Cannot forward announce to local clients: no transport identity")
-            }
-        }
+        retransmitAnnounceToLocalClients(packet, interfaceRef, announceData)
 
         // Retransmit if transport is enabled OR announce came from a local client
         // Python Transport.py:1741 — local client announces are always retransmitted
@@ -2908,6 +2917,56 @@ object Transport {
         val fromLocal = fromLocalClient(interfaceRef)
         if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
             queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
+        }
+    }
+
+    /**
+     * Immediately retransmit an announce to all local client interfaces.
+     * Python Transport.py:1790-1833
+     *
+     * Re-packages with HEADER_2 + TRANSPORT type + our identity as transport_id,
+     * so local clients know the announce came through a transport node (us).
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun retransmitAnnounceToLocalClients(
+        packet: Packet,
+        receivingInterface: InterfaceRef,
+        announceData: AnnounceData
+    ) {
+        if (localClientInterfaces.isEmpty()) return
+
+        val transportIdentityHash = Transport.identity?.hash
+        if (transportIdentityHash == null) {
+            log("Cannot forward announce to local clients: no transport identity")
+            return
+        }
+
+        log("Immediately retransmitting announce to ${localClientInterfaces.size} local clients")
+
+        val forwardPacket = Packet.createRaw(
+            destinationHash = packet.destinationHash,
+            data = packet.data,
+            packetType = PacketType.ANNOUNCE,
+            destinationType = packet.destinationType,
+            context = PacketContext.NONE,
+            headerType = HeaderType.HEADER_2,
+            transportType = TransportType.TRANSPORT,
+            transportId = transportIdentityHash,
+            contextFlag = packet.contextFlag,
+            createReceipt = false
+        )
+        forwardPacket.hops = packet.hops
+        val forwardRaw = forwardPacket.pack()
+
+        for (localInterface in localClientInterfaces) {
+            if (!localInterface.hash.contentEquals(receivingInterface.hash)) {
+                try {
+                    localInterface.send(forwardRaw)
+                    log("Sent announce for ${packet.destinationHash.toHexString()} to local client ${localInterface.name}")
+                } catch (e: Exception) {
+                    log("Error sending announce to local client ${localInterface.name}: ${e.message}")
+                }
+            }
         }
     }
 
@@ -2983,12 +3042,17 @@ object Transport {
 
         // Queue on all interfaces except the receiving one, applying mode-based filtering
         // Matches Python Transport.py:1040-1084
+        // Python: announce retransmit goes through outbound() which checks `interface.OUT`.
+        // Spawned local client interfaces have OUT=False in Python (LocalInterface.py:417),
+        // so they are excluded from announce retransmission. Local clients receive announces
+        // through retransmitAnnounceToLocalClients() instead.
         val isLocal = destinations.any { it.hash.contentEquals(destinationHash) }
         val sourceMode = nextHopInterface(destinationHash)?.mode
 
         for (iface in interfaces) {
             if (!iface.canSend || !iface.online ||
-                iface.hash.contentEquals(receivingInterface.hash)) continue
+                iface.hash.contentEquals(receivingInterface.hash) ||
+                isLocalClientInterface(iface)) continue
 
             if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
                 queueAnnounce(

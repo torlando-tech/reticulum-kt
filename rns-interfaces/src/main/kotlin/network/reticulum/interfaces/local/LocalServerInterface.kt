@@ -110,7 +110,7 @@ class LocalServerInterface : Interface {
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = true
     override val canReceive: Boolean = true
-    override val canSend: Boolean = true // Broadcasts to all connected clients
+    override val canSend: Boolean = false // Python: OUT = False. Server only receives; sending to clients is via spawned interfaces.
     override val isLocalSharedInstance: Boolean = true // Python RNS compatibility
 
     /**
