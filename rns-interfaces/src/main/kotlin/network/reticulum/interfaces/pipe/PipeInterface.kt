@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.pipe
 
+import network.reticulum.common.InterfaceMode
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.IOException
@@ -25,7 +26,6 @@ import java.io.OutputStream
  * @param outputStream Stream to write framed packets to
  * @param bitrateEstimate Estimated bitrate in bits/sec (default 1 Mbps, matching Python)
  */
-import network.reticulum.common.InterfaceMode
 
 class PipeInterface(
     name: String,

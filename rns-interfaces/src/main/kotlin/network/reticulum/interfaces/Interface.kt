@@ -365,7 +365,7 @@ abstract class Interface(
                 }.apply { isDaemon = true }.start()
             }
         } catch (e: Exception) {
-            println("An error occurred while processing held announces for $this: ${e.message}")
+            System.err.println("An error occurred while processing held announces for $this: ${e.message}")
         }
     }
 

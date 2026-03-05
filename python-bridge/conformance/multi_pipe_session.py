@@ -16,6 +16,7 @@ Topology:
 """
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -39,7 +40,7 @@ class _RemotePeer:
 
     def start(self):
         self.process = subprocess.Popen(
-            self._cmd.split(),
+            shlex.split(self._cmd),
             stdin=self._fd_in,
             stdout=self._fd_out,
             stderr=subprocess.PIPE,
@@ -177,7 +178,7 @@ class MultiPipeSession:
             all_target_fds.extend([r_in, w_out])
 
         self.target_process = subprocess.Popen(
-            self.target_cmd.split(),
+            shlex.split(self.target_cmd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

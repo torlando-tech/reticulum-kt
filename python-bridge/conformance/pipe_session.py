@@ -11,6 +11,7 @@ JSON on stderr.
 """
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -210,7 +211,7 @@ class PipeSession:
         env.update(self.peer_env)
 
         self.process = subprocess.Popen(
-            self.peer_cmd.split(),
+            shlex.split(self.peer_cmd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

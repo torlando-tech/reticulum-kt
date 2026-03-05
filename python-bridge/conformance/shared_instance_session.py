@@ -14,6 +14,7 @@ LocalClientInterface) instead of pipe-based interfaces.
 """
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -34,7 +35,7 @@ class _Client:
 
     def start(self):
         self.process = subprocess.Popen(
-            self._cmd.split(),
+            shlex.split(self._cmd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
