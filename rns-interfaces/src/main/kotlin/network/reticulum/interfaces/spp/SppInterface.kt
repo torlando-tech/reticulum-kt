@@ -145,9 +145,6 @@ class SppInterface(
 
     // Coroutine scope for I/O operations
     private val ioScope: CoroutineScope = createScope(parentScope).also {
-        parentScope?.coroutineContext?.get(Job)?.invokeOnCompletion {
-            detach()
-        }
         parentScope?.launch {
             try {
                 kotlinx.coroutines.awaitCancellation()
