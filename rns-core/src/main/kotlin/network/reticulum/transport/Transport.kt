@@ -3862,6 +3862,7 @@ object Transport {
     /**
      * Process ingress-held announces (mechanism 2) - release one at a time at intervals, expire old ones.
      * Python: Interface.process_held_announces() releases one per IC_HELD_RELEASE_INTERVAL.
+     * TODO(#3): This should be per-interface with burst detection, not global. See issue #3.
      */
     private fun processHeldAnnounces(now: Long) {
         if (ingressHeldAnnounces.isEmpty()) return
