@@ -64,6 +64,7 @@ def main():
     aspects = os.environ.get("PIPE_PEER_ASPECTS", "routing").split(",")
     enable_transport = os.environ.get("PIPE_PEER_TRANSPORT", "false").lower() == "true"
     mode_str = os.environ.get("PIPE_PEER_MODE", "full").lower()
+    shared_port = int(os.environ.get("PIPE_PEER_SHARED_PORT", "0"))
 
     # Suppress RNS logging to avoid polluting stdout (which is the data channel)
     RNS.loglevel = RNS.LOG_CRITICAL
@@ -75,7 +76,17 @@ def main():
     with open(config_file, "w") as f:
         f.write("[reticulum]\n")
         f.write(f"  enable_transport = {'Yes' if enable_transport else 'No'}\n")
-        f.write("  share_instance = No\n")
+        if shared_port > 0:
+            # Use shared instance on this port.
+            # Python Reticulum: the first process to bind the port becomes
+            # the server (LocalServerInterface); subsequent processes fail
+            # to bind and fall back to connecting as clients
+            # (LocalClientInterface). So ALL processes use share_instance=Yes.
+            f.write("  share_instance = Yes\n")
+            f.write(f"  shared_instance_port = {shared_port}\n")
+            f.write("  shared_instance_type = tcp\n")
+        else:
+            f.write("  share_instance = No\n")
         f.write("\n[interfaces]\n")
 
     # Start Reticulum
@@ -94,28 +105,33 @@ def main():
     }
     iface_mode = mode_map.get(mode_str, RNS.Interfaces.Interface.Interface.MODE_FULL)
 
-    # Create pipe interface(s)
-    num_ifaces = int(os.environ.get("PIPE_PEER_NUM_IFACES", "0"))
-    if num_ifaces > 0:
-        # Multi-interface mode: create N interfaces from fd pairs
-        for i in range(num_ifaces):
-            fd_in = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_IN"])
-            fd_out = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_OUT"])
-            iface = _create_pipe_interface(
-                RNS,
-                os.fdopen(fd_in, 'rb', buffering=0),
-                os.fdopen(fd_out, 'wb', buffering=0),
-                f"Pipe{i}"
-            )
-            iface.owner = RNS.Transport
-            reticulum._add_interface(iface, mode=iface_mode)
+    # Create interfaces: shared instance or pipe-based
+    if shared_port > 0:
+        # Shared instance client mode: Reticulum already connected via config
+        pass
     else:
-        # Single interface mode: stdin/stdout
-        pipe_iface = _create_pipe_interface(
-            RNS, sys.stdin.buffer, sys.stdout.buffer, "StdioPipe"
-        )
-        pipe_iface.owner = RNS.Transport
-        reticulum._add_interface(pipe_iface, mode=iface_mode)
+        # Pipe interface mode
+        num_ifaces = int(os.environ.get("PIPE_PEER_NUM_IFACES", "0"))
+        if num_ifaces > 0:
+            # Multi-interface mode: create N interfaces from fd pairs
+            for i in range(num_ifaces):
+                fd_in = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_IN"])
+                fd_out = int(os.environ[f"PIPE_PEER_IFACE_{i}_FD_OUT"])
+                iface = _create_pipe_interface(
+                    RNS,
+                    os.fdopen(fd_in, 'rb', buffering=0),
+                    os.fdopen(fd_out, 'wb', buffering=0),
+                    f"Pipe{i}"
+                )
+                iface.owner = RNS.Transport
+                reticulum._add_interface(iface, mode=iface_mode)
+        else:
+            # Single interface mode: stdin/stdout
+            pipe_iface = _create_pipe_interface(
+                RNS, sys.stdin.buffer, sys.stdout.buffer, "StdioPipe"
+            )
+            pipe_iface.owner = RNS.Transport
+            reticulum._add_interface(pipe_iface, mode=iface_mode)
 
     identity_hash = bytes_to_hex(RNS.Transport.identity.hash) if RNS.Transport.identity else ""
     emit({"type": "ready", "identity_hash": identity_hash})
@@ -192,6 +208,166 @@ def main():
             "identity_public_key": bytes_to_hex(identity.get_public_key()),
         })
         _path_table_dumper(RNS)
+
+    elif action == "self_link":
+        # Create a destination AND a link to itself.
+        # Both link endpoints will be in this process.
+        # The LINKREQUEST bounces through the shared instance/pipe and returns.
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects
+        )
+        destination.set_link_established_callback(_link_established)
+        destination.announce()
+        emit({
+            "type": "announced",
+            "destination_hash": bytes_to_hex(destination.hash),
+            "identity_hash": bytes_to_hex(identity.hash),
+            "identity_public_key": bytes_to_hex(identity.get_public_key()),
+        })
+
+        # Give the announce time to propagate through the shared instance.
+        # The shared instance stores the path; we don't need it locally.
+        # Transport.outbound() will broadcast the LINKREQUEST on all
+        # interfaces (no path_table entry needed), and the shared instance
+        # routes it back to us.
+        time.sleep(2)
+
+        # Create a link to our own destination.
+        # The LINKREQUEST goes out via LocalClientInterface to the shared
+        # instance, which forwards it back. The responder side (same
+        # process) handles it and sends a LINKPROOF back through the
+        # shared instance. Both endpoints live in this process.
+        link = RNS.Link(destination)
+        emit({
+            "type": "self_link_initiated",
+            "destination_hash": bytes_to_hex(destination.hash),
+            "link_id": bytes_to_hex(link.link_id) if link.link_id else "",
+        })
+
+        # Wait for link to become active
+        link_deadline = time.time() + 20
+        while time.time() < link_deadline:
+            if link.status == RNS.Link.ACTIVE:
+                break
+            time.sleep(0.1)
+
+        if link.status == RNS.Link.ACTIVE:
+            emit({
+                "type": "self_link_active",
+                "link_id": bytes_to_hex(link.link_id),
+            })
+
+            # Set up data callback on the initiator link
+            received_data = []
+            def on_initiator_data(message, packet):
+                data = message if isinstance(message, bytes) else bytes(message)
+                received_data.append(data)
+                emit({
+                    "type": "self_link_data_received",
+                    "link_id": bytes_to_hex(link.link_id),
+                    "data_hex": data.hex(),
+                    "data_utf8": data.decode("utf-8", errors="replace"),
+                    "side": "initiator",
+                })
+            link.set_packet_callback(on_initiator_data)
+
+            # Send test data on the link
+            test_data = b"self-link-test-data"
+            RNS.Packet(link, test_data).send()
+            emit({
+                "type": "self_link_data_sent",
+                "link_id": bytes_to_hex(link.link_id),
+                "data_hex": test_data.hex(),
+            })
+
+            _path_table_dumper(RNS)
+        else:
+            emit({
+                "type": "error",
+                "message": f"Self-link did not become active, status={link.status}",
+            })
+            _path_table_dumper(RNS)
+
+    elif action == "link_initiate":
+        # Wait for a destination to appear, then create a link to it.
+        # Used with shared instance tests where another client announces.
+        emit({"type": "waiting_for_destination"})
+
+        # Wait for a path to any destination matching our app/aspects
+        dest_hash = None
+        dest_identity = None
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            for dh in RNS.Transport.path_table:
+                dest_hash = dh
+                dest_identity = RNS.Identity.recall(dh)
+                if dest_identity is not None:
+                    break
+            if dest_identity is not None:
+                break
+            time.sleep(0.2)
+
+        if dest_identity is None:
+            emit({"type": "error", "message": "No destination found within timeout"})
+            _path_table_dumper(RNS)
+        else:
+            dest_hash_hex = bytes_to_hex(dest_hash)
+            emit({"type": "destination_found", "destination_hash": dest_hash_hex})
+
+            # Create OUT destination for linking
+            out_dest = RNS.Destination(
+                dest_identity,
+                RNS.Destination.OUT,
+                RNS.Destination.SINGLE,
+                app_name,
+                *aspects
+            )
+            link = RNS.Link(out_dest)
+            emit({
+                "type": "link_initiated",
+                "destination_hash": dest_hash_hex,
+                "link_id": bytes_to_hex(link.link_id) if link.link_id else "",
+            })
+
+            # Wait for link to become active
+            link_deadline = time.time() + 20
+            while time.time() < link_deadline:
+                if link.status == RNS.Link.ACTIVE:
+                    break
+                time.sleep(0.1)
+
+            if link.status == RNS.Link.ACTIVE:
+                emit({
+                    "type": "link_established",
+                    "link_id": bytes_to_hex(link.link_id),
+                    "destination_hash": dest_hash_hex,
+                })
+
+                # Set up data receiving
+                link.set_packet_callback(_link_data)
+                link.set_link_closed_callback(_link_closed)
+
+                # Send test data
+                test_data = b"hello-from-initiator"
+                RNS.Packet(link, test_data).send()
+                emit({
+                    "type": "link_sent",
+                    "link_id": bytes_to_hex(link.link_id),
+                    "data_hex": test_data.hex(),
+                })
+
+                _path_table_dumper(RNS)
+            else:
+                emit({
+                    "type": "error",
+                    "message": f"Link did not become active, status={link.status}",
+                })
+                _path_table_dumper(RNS)
 
     elif action == "transport":
         _path_table_dumper(RNS)

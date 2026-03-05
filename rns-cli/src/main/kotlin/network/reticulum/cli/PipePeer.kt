@@ -8,6 +8,7 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
@@ -40,6 +41,7 @@ fun main() {
     val aspects = (System.getenv("PIPE_PEER_ASPECTS") ?: "routing").split(",").toTypedArray()
     val enableTransport = System.getenv("PIPE_PEER_TRANSPORT")?.lowercase() == "true"
     val modeStr = System.getenv("PIPE_PEER_MODE") ?: "full"
+    val sharedPort = System.getenv("PIPE_PEER_SHARED_PORT")?.toIntOrNull() ?: 0
 
     val mode = when (modeStr.lowercase()) {
         "ap", "access_point" -> InterfaceMode.ACCESS_POINT
@@ -60,34 +62,42 @@ fun main() {
             enableTransport = enableTransport
         )
 
-        // Create PipeInterface(s)
-        val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
-        if (numIfaces > 0) {
-            // Multi-interface mode: create N interfaces from fd pairs
-            for (i in 0 until numIfaces) {
-                val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
-                val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
-                val input = FileInputStream("/proc/self/fd/$fdIn")
-                val output = FileOutputStream("/proc/self/fd/$fdOut")
-                val iface = PipeInterface(
-                    name = "Pipe$i",
-                    inputStream = input,
-                    outputStream = output,
+        // Create interfaces: shared instance server or pipe-based
+        if (sharedPort > 0) {
+            // Shared instance server mode: start LocalServerInterface on TCP port
+            val server = LocalServerInterface(name = "SharedInstance", tcpPort = sharedPort)
+            Transport.registerInterface(server.toRef())
+            server.start()
+        } else {
+            // Pipe interface mode
+            val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
+            if (numIfaces > 0) {
+                // Multi-interface mode: create N interfaces from fd pairs
+                for (i in 0 until numIfaces) {
+                    val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
+                    val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
+                    val input = FileInputStream("/proc/self/fd/$fdIn")
+                    val output = FileOutputStream("/proc/self/fd/$fdOut")
+                    val iface = PipeInterface(
+                        name = "Pipe$i",
+                        inputStream = input,
+                        outputStream = output,
+                        interfaceMode = mode
+                    )
+                    Transport.registerInterface(iface.toRef())
+                    iface.start()
+                }
+            } else {
+                // Single interface mode: stdin/stdout
+                val pipeInterface = PipeInterface(
+                    name = "StdioPipe",
+                    inputStream = System.`in`,
+                    outputStream = System.out,
                     interfaceMode = mode
                 )
-                Transport.registerInterface(iface.toRef())
-                iface.start()
+                Transport.registerInterface(pipeInterface.toRef())
+                pipeInterface.start()
             }
-        } else {
-            // Single interface mode: stdin/stdout
-            val pipeInterface = PipeInterface(
-                name = "StdioPipe",
-                inputStream = System.`in`,
-                outputStream = System.out,
-                interfaceMode = mode
-            )
-            Transport.registerInterface(pipeInterface.toRef())
-            pipeInterface.start()
         }
 
         // Register announce handler
@@ -252,6 +262,202 @@ fun main() {
                     put("identity_public_key", identity.getPublicKey().toHexString())
                 })
                 pathTableDumper()
+            }
+            "self_link" -> {
+                // Create a destination AND a link to it within the same process.
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+                destination.setLinkEstablishedCallback { linkAny ->
+                    val link = linkAny as Link
+                    emit(buildJsonObject {
+                        put("type", "link_established")
+                        put("link_id", link.linkId.toHexString())
+                        put("destination_hash", destination.hash.toHexString())
+                    })
+                    link.setLinkClosedCallback { closedLink ->
+                        emit(buildJsonObject {
+                            put("type", "link_closed")
+                            put("link_id", closedLink.linkId.toHexString())
+                        })
+                    }
+                    link.setPacketCallback { data, _ ->
+                        emit(buildJsonObject {
+                            put("type", "link_data")
+                            put("link_id", link.linkId.toHexString())
+                            put("data_hex", data.toHexString())
+                            put("data_utf8", data.decodeToString())
+                            put("side", "responder")
+                        })
+                    }
+                }
+                destination.announce()
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
+
+                // Give the announce time to propagate through the shared instance.
+                // Transport.outbound() broadcasts the LINKREQUEST on all interfaces
+                // (no path_table entry needed); the shared instance routes it back.
+                Thread.sleep(2000)
+
+                // Create a link to our own destination.
+                // The LINKREQUEST goes out via LocalClientInterface to the shared
+                // instance, which forwards it back. Both endpoints are in this process.
+                var selfLinkActive = false
+                val selfLink = Link.create(
+                    destination = destination,
+                    establishedCallback = { link ->
+                        selfLinkActive = true
+                        emit(buildJsonObject {
+                            put("type", "self_link_active")
+                            put("link_id", link.linkId.toHexString())
+                        })
+                        // Set up data callback on the initiator link
+                        link.setPacketCallback { data, _ ->
+                            emit(buildJsonObject {
+                                put("type", "self_link_data_received")
+                                put("link_id", link.linkId.toHexString())
+                                put("data_hex", data.toHexString())
+                                put("data_utf8", data.decodeToString())
+                                put("side", "initiator")
+                            })
+                        }
+                        // Send test data on the link
+                        val testData = "self-link-test-data".toByteArray()
+                        link.send(testData)
+                        emit(buildJsonObject {
+                            put("type", "self_link_data_sent")
+                            put("link_id", link.linkId.toHexString())
+                            put("data_hex", testData.toHexString())
+                        })
+                    }
+                )
+                emit(buildJsonObject {
+                    put("type", "self_link_initiated")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("link_id", selfLink.linkId.toHexString())
+                })
+
+                // Wait for link to become active
+                val linkDeadline = System.currentTimeMillis() + 20_000
+                while (System.currentTimeMillis() < linkDeadline && !selfLinkActive) {
+                    Thread.sleep(100)
+                }
+
+                if (!selfLinkActive) {
+                    emit(buildJsonObject {
+                        put("type", "error")
+                        put("message", "Self-link did not become active, status=${selfLink.status}")
+                    })
+                }
+                pathTableDumper()
+            }
+            "link_initiate" -> {
+                // Wait for a destination to appear, then create a link to it.
+                emit(buildJsonObject { put("type", "waiting_for_destination") })
+
+                // Wait for a path to any destination
+                var destHash: ByteArray? = null
+                var destIdentity: Identity? = null
+                val deadline = System.currentTimeMillis() + 20_000
+                while (System.currentTimeMillis() < deadline) {
+                    for ((key, _) in Transport.pathTable) {
+                        val hash = key.bytes
+                        val id = Identity.recall(hash)
+                        if (id != null) {
+                            destHash = hash
+                            destIdentity = id
+                            break
+                        }
+                    }
+                    if (destIdentity != null) break
+                    Thread.sleep(200)
+                }
+
+                if (destIdentity == null || destHash == null) {
+                    emit(buildJsonObject {
+                        put("type", "error")
+                        put("message", "No destination found within timeout")
+                    })
+                    pathTableDumper()
+                } else {
+                    val destHashHex = destHash.toHexString()
+                    emit(buildJsonObject {
+                        put("type", "destination_found")
+                        put("destination_hash", destHashHex)
+                    })
+
+                    val outDest = Destination.create(
+                        identity = destIdentity,
+                        direction = DestinationDirection.OUT,
+                        type = DestinationType.SINGLE,
+                        appName = appName,
+                        aspects = aspects
+                    )
+
+                    var linkActive = false
+                    val link = Link.create(
+                        destination = outDest,
+                        establishedCallback = { lnk ->
+                            linkActive = true
+                            emit(buildJsonObject {
+                                put("type", "link_established")
+                                put("link_id", lnk.linkId.toHexString())
+                                put("destination_hash", destHashHex)
+                            })
+                            lnk.setPacketCallback { data, _ ->
+                                emit(buildJsonObject {
+                                    put("type", "link_data")
+                                    put("link_id", lnk.linkId.toHexString())
+                                    put("data_hex", data.toHexString())
+                                    put("data_utf8", data.decodeToString())
+                                })
+                            }
+                            lnk.setLinkClosedCallback { closedLink ->
+                                emit(buildJsonObject {
+                                    put("type", "link_closed")
+                                    put("link_id", closedLink.linkId.toHexString())
+                                })
+                            }
+                            // Send test data
+                            val testData = "hello-from-initiator".toByteArray()
+                            lnk.send(testData)
+                            emit(buildJsonObject {
+                                put("type", "link_sent")
+                                put("link_id", lnk.linkId.toHexString())
+                                put("data_hex", testData.toHexString())
+                            })
+                        }
+                    )
+                    emit(buildJsonObject {
+                        put("type", "link_initiated")
+                        put("destination_hash", destHashHex)
+                        put("link_id", link.linkId.toHexString())
+                    })
+
+                    // Wait for link to become active
+                    val linkDeadline = System.currentTimeMillis() + 20_000
+                    while (System.currentTimeMillis() < linkDeadline && !linkActive) {
+                        Thread.sleep(100)
+                    }
+
+                    if (!linkActive) {
+                        emit(buildJsonObject {
+                            put("type", "error")
+                            put("message", "Link did not become active, status=${link.status}")
+                        })
+                    }
+                    pathTableDumper()
+                }
             }
             "listen" -> pathTableDumper()
             "transport" -> pathTableDumper()
