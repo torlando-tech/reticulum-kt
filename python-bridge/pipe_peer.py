@@ -57,6 +57,7 @@ def main():
     app_name = os.environ.get("PIPE_PEER_APP_NAME", "pipetest")
     aspects = os.environ.get("PIPE_PEER_ASPECTS", "routing").split(",")
     enable_transport = os.environ.get("PIPE_PEER_TRANSPORT", "false").lower() == "true"
+    mode_str = os.environ.get("PIPE_PEER_MODE", "full").lower()
 
     # Suppress RNS logging to avoid polluting stdout (which is the data channel)
     RNS.loglevel = RNS.LOG_CRITICAL
@@ -82,8 +83,21 @@ def main():
     # _add_interface() does NOT set it.
     pipe_iface.owner = RNS.Transport
 
+    # Map mode string to RNS interface mode constant
+    mode_map = {
+        "full": RNS.Interfaces.Interface.Interface.MODE_FULL,
+        "ap": RNS.Interfaces.Interface.Interface.MODE_ACCESS_POINT,
+        "access_point": RNS.Interfaces.Interface.Interface.MODE_ACCESS_POINT,
+        "roaming": RNS.Interfaces.Interface.Interface.MODE_ROAMING,
+        "boundary": RNS.Interfaces.Interface.Interface.MODE_BOUNDARY,
+        "gateway": RNS.Interfaces.Interface.Interface.MODE_GATEWAY,
+        "p2p": RNS.Interfaces.Interface.Interface.MODE_POINT_TO_POINT,
+        "point_to_point": RNS.Interfaces.Interface.Interface.MODE_POINT_TO_POINT,
+    }
+    iface_mode = mode_map.get(mode_str, RNS.Interfaces.Interface.Interface.MODE_FULL)
+
     # Register with Transport
-    reticulum._add_interface(pipe_iface)
+    reticulum._add_interface(pipe_iface, mode=iface_mode)
 
     identity_hash = bytes_to_hex(RNS.Transport.identity.hash) if RNS.Transport.identity else ""
     emit({"type": "ready", "identity_hash": identity_hash})

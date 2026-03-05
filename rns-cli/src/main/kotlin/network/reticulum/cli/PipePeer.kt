@@ -1,0 +1,160 @@
+package network.reticulum.cli
+
+import kotlinx.serialization.json.*
+import network.reticulum.Reticulum
+import network.reticulum.common.DestinationDirection
+import network.reticulum.common.DestinationType
+import network.reticulum.common.InterfaceMode
+import network.reticulum.common.toHexString
+import network.reticulum.destination.Destination
+import network.reticulum.identity.Identity
+import network.reticulum.interfaces.pipe.PipeInterface
+import network.reticulum.interfaces.toRef
+import network.reticulum.transport.AnnounceHandler
+import network.reticulum.transport.Transport
+import java.nio.file.Files
+
+/**
+ * Kotlin Reticulum Pipe Peer for conformance testing.
+ *
+ * Speaks the same protocol as pipe_peer.py:
+ *   stdin/stdout: HDLC-framed RNS packets
+ *   stderr: JSON control/status messages (one per line)
+ *
+ * Environment variables:
+ *   PIPE_PEER_ACTION:    announce | listen | transport
+ *   PIPE_PEER_APP_NAME:  app name for destination (default: pipetest)
+ *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
+ *   PIPE_PEER_TRANSPORT: true | false (default: false)
+ *   PIPE_PEER_MODE:      interface mode: full | ap | roaming | boundary | gateway | p2p
+ */
+fun main() {
+    val action = System.getenv("PIPE_PEER_ACTION") ?: "announce"
+    val appName = System.getenv("PIPE_PEER_APP_NAME") ?: "pipetest"
+    val aspects = (System.getenv("PIPE_PEER_ASPECTS") ?: "routing").split(",").toTypedArray()
+    val enableTransport = System.getenv("PIPE_PEER_TRANSPORT")?.lowercase() == "true"
+    val modeStr = System.getenv("PIPE_PEER_MODE") ?: "full"
+
+    val mode = when (modeStr.lowercase()) {
+        "ap", "access_point" -> InterfaceMode.ACCESS_POINT
+        "roaming" -> InterfaceMode.ROAMING
+        "boundary" -> InterfaceMode.BOUNDARY
+        "gateway" -> InterfaceMode.GATEWAY
+        "p2p", "point_to_point" -> InterfaceMode.POINT_TO_POINT
+        else -> InterfaceMode.FULL
+    }
+
+    // Create temp config
+    val configDir = Files.createTempDirectory("rns-kt-pipe-peer-").toFile()
+
+    try {
+        // Start Reticulum
+        Reticulum.start(
+            configDir = configDir.absolutePath,
+            enableTransport = enableTransport
+        )
+
+        // Create PipeInterface on stdin/stdout with requested mode
+        val pipeInterface = PipeInterface(
+            name = "StdioPipe",
+            inputStream = System.`in`,
+            outputStream = System.out,
+            interfaceMode = mode
+        )
+
+        // Register and start
+        val ifaceRef = pipeInterface.toRef()
+        Transport.registerInterface(ifaceRef)
+        pipeInterface.start()
+
+        // Register announce handler
+        Transport.registerAnnounceHandler(object : AnnounceHandler {
+            override fun handleAnnounce(
+                destinationHash: ByteArray,
+                announcedIdentity: Identity,
+                appData: ByteArray?
+            ): Boolean {
+                val hops = if (Transport.hasPath(destinationHash)) Transport.hopsTo(destinationHash) else -1
+                emit(buildJsonObject {
+                    put("type", "announce_received")
+                    put("destination_hash", destinationHash.toHexString())
+                    put("identity_hash", announcedIdentity.hash.toHexString())
+                    put("hops", hops)
+                })
+                return false // allow other handlers to process
+            }
+        })
+
+        // Emit ready
+        val identityHash = Transport.identity?.hash?.toHexString() ?: ""
+        emit(buildJsonObject {
+            put("type", "ready")
+            put("identity_hash", identityHash)
+        })
+
+        when (action) {
+            "announce" -> {
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+
+                destination.announce()
+
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
+
+                pathTableDumper()
+            }
+            "listen" -> pathTableDumper()
+            "transport" -> pathTableDumper()
+        }
+    } finally {
+        Reticulum.stop()
+        configDir.deleteRecursively()
+    }
+}
+
+private fun emit(json: JsonObject) {
+    System.err.println(json.toString())
+    System.err.flush()
+}
+
+private fun pathTableDumper() {
+    var lastDump = ""
+    try {
+        while (true) {
+            Thread.sleep(1000)
+
+            val entries = buildJsonArray {
+                for ((key, entry) in Transport.pathTable) {
+                    add(buildJsonObject {
+                        put("destination_hash", key.toString())
+                        put("hops", entry.hops)
+                        put("next_hop", entry.nextHop.toHexString())
+                        put("expired", entry.isExpired())
+                    })
+                }
+            }
+
+            val current = entries.toString()
+            if (current != lastDump) {
+                emit(buildJsonObject {
+                    put("type", "path_table")
+                    put("entries", entries)
+                })
+                lastDump = current
+            }
+        }
+    } catch (_: InterruptedException) {
+        // Shutdown
+    }
+}

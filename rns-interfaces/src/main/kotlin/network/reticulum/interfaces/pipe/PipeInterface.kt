@@ -25,12 +25,17 @@ import java.io.OutputStream
  * @param outputStream Stream to write framed packets to
  * @param bitrateEstimate Estimated bitrate in bits/sec (default 1 Mbps, matching Python)
  */
+import network.reticulum.common.InterfaceMode
+
 class PipeInterface(
     name: String,
     private val inputStream: InputStream,
     private val outputStream: OutputStream,
     bitrateEstimate: Int = BITRATE_GUESS,
+    interfaceMode: InterfaceMode = InterfaceMode.FULL,
 ) : Interface(name) {
+
+    override val mode: InterfaceMode = interfaceMode
 
     companion object {
         /** Maximum read chunk size (matches Python PipeInterface.MAX_CHUNK). */
