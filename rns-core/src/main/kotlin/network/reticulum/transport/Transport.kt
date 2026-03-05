@@ -2186,7 +2186,6 @@ object Transport {
      * @param interfaceRef Interface that received the packet
      */
     fun inbound(raw: ByteArray, interfaceRef: InterfaceRef) {
-        log("INBOUND: ${raw.size} bytes from ${interfaceRef.name} flags=0x${String.format("%02x", raw[0].toInt() and 0xFF)}")
         if (!started.get()) {
             log("Transport not started, dropping packet")
             return
@@ -2909,7 +2908,7 @@ object Transport {
             cacheAnnouncePacket(packet, interfaceRef)
         }
 
-        retransmitAnnounceToLocalClients(packet, interfaceRef, announceData)
+        retransmitAnnounceToLocalClients(packet, interfaceRef)
 
         // Retransmit if transport is enabled OR announce came from a local client
         // Python Transport.py:1741 — local client announces are always retransmitted
@@ -2927,11 +2926,9 @@ object Transport {
      * Re-packages with HEADER_2 + TRANSPORT type + our identity as transport_id,
      * so local clients know the announce came through a transport node (us).
      */
-    @Suppress("UNUSED_PARAMETER")
     private fun retransmitAnnounceToLocalClients(
         packet: Packet,
         receivingInterface: InterfaceRef,
-        announceData: AnnounceData
     ) {
         if (localClientInterfaces.isEmpty()) return
 
