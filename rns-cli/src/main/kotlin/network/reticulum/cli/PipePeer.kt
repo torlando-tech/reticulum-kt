@@ -35,6 +35,12 @@ import java.nio.file.Files
  *   PIPE_PEER_IFACE_{n}_FD_IN:  read fd for interface n
  *   PIPE_PEER_IFACE_{n}_FD_OUT: write fd for interface n
  */
+/** Resolve an fd number to a filesystem path, portable across Linux and macOS. */
+private fun fdPath(fd: Int): String = when {
+    System.getProperty("os.name").startsWith("Mac", ignoreCase = true) -> "/dev/fd/$fd"
+    else -> "/proc/self/fd/$fd"
+}
+
 fun main() {
     val action = System.getenv("PIPE_PEER_ACTION") ?: "announce"
     val appName = System.getenv("PIPE_PEER_APP_NAME") ?: "pipetest"
@@ -76,8 +82,8 @@ fun main() {
                 for (i in 0 until numIfaces) {
                     val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
                     val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
-                    val input = FileInputStream("/proc/self/fd/$fdIn")
-                    val output = FileOutputStream("/proc/self/fd/$fdOut")
+                    val input = FileInputStream(fdPath(fdIn))
+                    val output = FileOutputStream(fdPath(fdOut))
                     val iface = PipeInterface(
                         name = "Pipe$i",
                         inputStream = input,

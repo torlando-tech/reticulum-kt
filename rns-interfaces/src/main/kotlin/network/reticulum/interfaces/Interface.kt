@@ -318,13 +318,11 @@ abstract class Interface(
     fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) {
         val key = destinationHash.toKey()
         val held = HeldAnnounce(destinationHash.copyOf(), raw.copyOf(), hops, receivingInterface)
-        if (heldAnnounces.containsKey(key)) {
-            // Update existing entry (newer announce replaces old)
-            heldAnnounces[key] = held
-        } else if (heldAnnounces.size < MAX_HELD_ANNOUNCES) {
-            heldAnnounces[key] = held
+        heldAnnounces.compute(key) { _, existing ->
+            if (existing != null) held                              // update existing
+            else if (heldAnnounces.size < MAX_HELD_ANNOUNCES) held  // insert new
+            else existing                                           // full — drop new (Python behavior)
         }
-        // else: silently drop (Python behavior — old entries stay, newest is dropped)
     }
 
     /**

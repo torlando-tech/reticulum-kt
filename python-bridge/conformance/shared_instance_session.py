@@ -109,8 +109,9 @@ class SharedInstanceSession:
     def __init__(self, target_cmd, rns_path, tcp_port=None):
         self.target_cmd = target_cmd
         self.rns_path = rns_path
-        # Pick a random-ish port to avoid conflicts
-        self.tcp_port = tcp_port or (37450 + int(time.time() * 1000) % 500)
+        # Pick a random port to avoid conflicts in parallel test runs
+        import random
+        self.tcp_port = tcp_port or random.randint(37450, 47450)
 
         # Target subprocess (shared instance server)
         self.target = None
