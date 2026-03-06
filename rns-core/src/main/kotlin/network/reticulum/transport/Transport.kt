@@ -2387,7 +2387,10 @@ object Transport {
         // Synthesize transport_id for local client routing (Python Transport.py:1413-1414)
         // When a HEADER_1 packet arrives for a destination behind a local client,
         // we insert our identity as transport_id so the transport forwarding can handle it.
-        if (packet.transportId == null && forLocalClient) {
+        // LRPROOF is excluded: it is forwarded exclusively via link_table in processProof,
+        // never via pathTable-based general transport forwarding.
+        if (packet.transportId == null && forLocalClient &&
+            packet.context != PacketContext.LRPROOF) {
             packet.transportId = identity?.hash
         }
 
@@ -2395,7 +2398,11 @@ object Transport {
         // This runs for ALL packet types (LINKREQUEST, DATA, PROOF) before type-specific handling.
         // It forwards packets where we are the designated next transport hop.
         if (transportEnabled || fromLocalClient || forLocalClient || forLocalClientLink) {
-            if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+            // LRPROOF is forwarded exclusively via link_table in processProof
+            // (Python Transport.py:2016-2039), never via pathTable. Without this guard,
+            // LRPROOF can loop because it is not added to the packet hash filter.
+            if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE &&
+                packet.context != PacketContext.LRPROOF) {
                 val myHash = identity?.hash
                 if (myHash != null && packet.transportId!!.contentEquals(myHash)) {
                     val pathEntry = pathTable[packet.destinationHash.toKey()]
@@ -2791,6 +2798,16 @@ object Transport {
         if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
             log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
             interfaceRef.holdAnnounce(destHash, packet.raw ?: packet.pack(), packet.hops, interfaceRef)
+            return
+        }
+
+        // Skip announces for our own local destinations (Python Transport.py:1573-1574).
+        // When connected to a shared instance, our own announces bounce back from the
+        // transport node. Processing them would create erroneous 0-hop pathTable entries
+        // that cause forwarding loops (e.g., LRPROOF loop via spurious link_table entries).
+        val isLocalDestination = destinations.any { it.hash.contentEquals(destHash) }
+        if (isLocalDestination) {
+            log("Skipping announce for local destination ${destHash.toHexString()}")
             return
         }
 
