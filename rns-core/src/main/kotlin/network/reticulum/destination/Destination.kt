@@ -10,6 +10,7 @@ import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.Token
 import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.identity.Identity
+import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
 import java.io.File
 import java.nio.file.Files
@@ -818,13 +819,24 @@ class Destination private constructor(
                 }
             }
 
-            return Destination(
+            val destination = Destination(
                 identity = identity,
                 direction = direction,
                 type = type,
                 appName = appName,
                 aspects = aspects.toList()
             )
+
+            // Auto-register inbound destinations with Transport (matches Python Destination.py:196)
+            if (direction == DestinationDirection.IN) {
+                try {
+                    Transport.registerDestination(destination)
+                } catch (_: Exception) {
+                    // Transport may not be started yet (e.g. unit tests)
+                }
+            }
+
+            return destination
         }
 
         /**

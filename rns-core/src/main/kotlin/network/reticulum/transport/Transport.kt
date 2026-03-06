@@ -252,13 +252,6 @@ object Transport {
      *  dest_hash -> AnnounceEntry. Restored to announceTable after rebroadcast. */
     private val heldAnnounceEntries = ConcurrentHashMap<ByteArrayKey, AnnounceEntry>()
 
-    /** Mechanism 2: Raw announces held per-interface for ingress control.
-     *  dest_hash -> (timestamp, raw_data, receiving_interface). Released via inbound(). */
-    private val ingressHeldAnnounces = ConcurrentHashMap<ByteArrayKey, Triple<Long, ByteArray, InterfaceRef>>()
-
-    /** Timestamp of last held announce release (mechanism 2). */
-    @Volatile private var lastHeldRelease: Long = 0L
-
     /** Local client interfaces (shared instance clients). */
     private val localClientInterfaces = CopyOnWriteArrayList<InterfaceRef>()
 
@@ -398,7 +391,6 @@ object Transport {
         packetHashlistPrev.clear()
         announceAllowedAt.clear()
         heldAnnounceEntries.clear()
-        ingressHeldAnnounces.clear()
         localClientInterfaces.clear()
         queuedAnnounces.clear()
         announceRateTable.clear()
@@ -536,7 +528,6 @@ object Transport {
 
         // Clear held announces (will be re-announced)
         heldAnnounceEntries.clear()
-        ingressHeldAnnounces.clear()
 
         // Clear announce rate table
         announceRateTable.clear()
@@ -738,6 +729,11 @@ object Transport {
      * Register a destination with transport.
      */
     fun registerDestination(destination: Destination) {
+        // Prevent duplicate registration (matches Python Transport.py:2223-2225)
+        val key = destination.hash.toKey()
+        if (destinations.any { it.hash.toKey() == key }) {
+            return
+        }
         destinations.add(destination)
         log("Registered destination: ${destination.hexHash}")
     }
@@ -1379,17 +1375,9 @@ object Transport {
     // ===== Held Announces =====
 
     /**
-     * Hold a raw announce for later re-injection via inbound() (ingress control, mechanism 2).
-     */
-    private fun holdIngressAnnounce(destinationHash: ByteArray, rawData: ByteArray, receivingInterface: InterfaceRef) {
-        ingressHeldAnnounces[destinationHash.toKey()] = Triple(System.currentTimeMillis(), rawData.copyOf(), receivingInterface)
-        log("Held announce for ${destinationHash.toHexString()} on ${receivingInterface.name}")
-    }
-
-    /**
      * Get count of held announces (both mechanisms combined).
      */
-    fun heldAnnounceCount(): Int = heldAnnounceEntries.size + ingressHeldAnnounces.size
+    fun heldAnnounceCount(): Int = heldAnnounceEntries.size + interfaces.sumOf { it.heldAnnounceCount() }
 
     // ===== Traffic Statistics =====
 
@@ -2399,7 +2387,10 @@ object Transport {
         // Synthesize transport_id for local client routing (Python Transport.py:1413-1414)
         // When a HEADER_1 packet arrives for a destination behind a local client,
         // we insert our identity as transport_id so the transport forwarding can handle it.
-        if (packet.transportId == null && forLocalClient) {
+        // LRPROOF is excluded: it is forwarded exclusively via link_table in processProof,
+        // never via pathTable-based general transport forwarding.
+        if (packet.transportId == null && forLocalClient &&
+            packet.context != PacketContext.LRPROOF) {
             packet.transportId = identity?.hash
         }
 
@@ -2407,7 +2398,11 @@ object Transport {
         // This runs for ALL packet types (LINKREQUEST, DATA, PROOF) before type-specific handling.
         // It forwards packets where we are the designated next transport hop.
         if (transportEnabled || fromLocalClient || forLocalClient || forLocalClientLink) {
-            if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE) {
+            // LRPROOF is forwarded exclusively via link_table in processProof
+            // (Python Transport.py:2016-2039), never via pathTable. Without this guard,
+            // LRPROOF can loop because it is not added to the packet hash filter.
+            if (packet.transportId != null && packet.packetType != PacketType.ANNOUNCE &&
+                packet.context != PacketContext.LRPROOF) {
                 val myHash = identity?.hash
                 if (myHash != null && packet.transportId!!.contentEquals(myHash)) {
                     val pathEntry = pathTable[packet.destinationHash.toKey()]
@@ -2802,7 +2797,17 @@ object Transport {
         val isKnownDestination = pathTable.containsKey(destHash.toKey())
         if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
             log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
-            holdIngressAnnounce(destHash, packet.raw ?: packet.pack(), interfaceRef)
+            interfaceRef.holdAnnounce(destHash, packet.raw ?: packet.pack(), packet.hops, interfaceRef)
+            return
+        }
+
+        // Skip announces for our own local destinations (Python Transport.py:1573-1574).
+        // When connected to a shared instance, our own announces bounce back from the
+        // transport node. Processing them would create erroneous 0-hop pathTable entries
+        // that cause forwarding loops (e.g., LRPROOF loop via spurious link_table entries).
+        val isLocalDestination = destinations.any { it.hash.contentEquals(destHash) }
+        if (isLocalDestination) {
+            log("Skipping announce for local destination ${destHash.toHexString()}")
             return
         }
 
@@ -3037,6 +3042,32 @@ object Transport {
             log("Reinserting held announce into table for ${destinationHash.toHexString()}")
         }
 
+        // Create a HEADER_2 retransmission packet with our transport identity.
+        // Matches Python Transport.py:544-556 — transport nodes always re-wrap
+        // announces as HEADER_2 with transport_type=TRANSPORT and their own
+        // identity hash as transport_id, so recipients know the announce came
+        // through a transport node and can route back through it.
+        val transportIdentityHash = Transport.identity?.hash
+        if (transportIdentityHash == null) {
+            log("Cannot retransmit announce: no transport identity")
+            return
+        }
+
+        val retransmitPacket = Packet.createRaw(
+            destinationHash = packet.destinationHash,
+            data = packet.data,
+            packetType = PacketType.ANNOUNCE,
+            destinationType = packet.destinationType,
+            context = PacketContext.NONE,
+            headerType = HeaderType.HEADER_2,
+            transportType = TransportType.TRANSPORT,
+            transportId = transportIdentityHash,
+            contextFlag = packet.contextFlag,
+            createReceipt = false
+        )
+        retransmitPacket.hops = packet.hops
+        val retransmitRaw = retransmitPacket.pack()
+
         // Queue on all interfaces except the receiving one, applying mode-based filtering
         // Matches Python Transport.py:1040-1084
         // Python: announce retransmit goes through outbound() which checks `interface.OUT`.
@@ -3054,7 +3085,7 @@ object Transport {
             if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
                 queueAnnounce(
                     destinationHash = destinationHash,
-                    raw = announceEntry.raw,
+                    raw = retransmitRaw,
                     interfaceRef = iface,
                     hops = packet.hops,
                     emitted = now
@@ -3261,139 +3292,164 @@ object Transport {
         val pathMtu = Link.mtuFromLrPacket(packet) ?: return
         val mode = Link.modeFromLrPacket(packet)
 
-        if (receivingInterface.supportsLinkMtuDiscovery) {
-            val nhMtu = receivingInterface.hwMtu
-            if (nhMtu < pathMtu) {
-                try {
-                    val clampedBytes = Link.signallingBytes(nhMtu, mode)
-                    log("Clamping link MTU to $nhMtu for local delivery")
-                    System.arraycopy(
-                        clampedBytes, 0,
-                        packet.data, packet.data.size - LinkConstants.LINK_MTU_SIZE,
-                        LinkConstants.LINK_MTU_SIZE
-                    )
-                } catch (e: Exception) {
-                    log("Error clamping link MTU for local delivery: ${e.message}")
-                }
-            }
+        // Match Python Transport.py:1938-1963
+        // Python checks: if HW_MTU is None → strip signalling bytes
+        //                 elif AUTOCONFIGURE_MTU or FIXED_MTU → use HW_MTU for clamping
+        //                 else → use default MTU (500) for clamping
+        val nhMtu = if (receivingInterface.supportsLinkMtuDiscovery) {
+            receivingInterface.hwMtu
+        } else if (receivingInterface.hwMtu > 0) {
+            // Interface has a HW_MTU but doesn't auto-configure — use default MTU
+            RnsConstants.MTU
         } else {
-            // Interface doesn't support MTU discovery — strip signalling bytes
-            log("Receiving interface ${receivingInterface.name} doesn't support MTU discovery, stripping")
+            // No HW_MTU at all — strip signalling bytes (Python: HW_MTU == None)
+            log("No next-hop HW MTU, stripping link MTU signalling bytes")
             packet.data = packet.data.copyOf(packet.data.size - LinkConstants.LINK_MTU_SIZE)
+            return
+        }
+
+        if (nhMtu < pathMtu) {
+            try {
+                val clampedBytes = Link.signallingBytes(nhMtu, mode)
+                log("Clamping link MTU to $nhMtu for local delivery")
+                System.arraycopy(
+                    clampedBytes, 0,
+                    packet.data, packet.data.size - LinkConstants.LINK_MTU_SIZE,
+                    LinkConstants.LINK_MTU_SIZE
+                )
+            } catch (e: Exception) {
+                log("Error clamping link MTU for local delivery: ${e.message}")
+            }
         }
     }
 
     private fun processProof(packet: Packet, interfaceRef: InterfaceRef) {
         log("Processing proof: dest=${packet.destinationHash.toHexString()}, context=${packet.context}, from ${interfaceRef.name}")
 
-        // Handle LRPROOF (Link Request Proof) - look up in link table
-        if (packet.context == PacketContext.LRPROOF) {
-            val linkEntry = linkTable[packet.destinationHash.toKey()]
-            if (linkEntry != null) {
-                // Forward proof back to the originating interface
-                val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
-                if (outboundInterface != null) {
-                    log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                    transmit(outboundInterface, packet.raw ?: packet.pack())
+        // Proof handling uses when {} to match the Python if/elif/else structure
+        // (Transport.py:2013-2115). This prevents LRPROOF and RESOURCE_PRF from
+        // ever falling through to the reverse_table handler — in Python, only the
+        // else branch (non-LRPROOF, non-RESOURCE_PRF) reaches reverse_table.
+        // Without this structure, an unroutable LRPROOF on a shared instance client
+        // would bounce via reverse_table back to the server in an infinite loop.
+        when (packet.context) {
+            // LRPROOF (Link Request Proof) — Transport.py:2013-2073
+            // Check pending links FIRST — when hub and client share the same Transport
+            // (same-process), the proof must be delivered locally before attempting to forward.
+            PacketContext.LRPROOF -> {
+                val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
+                if (pendingLink != null) {
+                    log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
+                    try {
+                        val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
+                        validateMethod.invoke(pendingLink, packet)
+                    } catch (e: Exception) {
+                        log("Error validating link proof: ${e.message}")
+                    }
+                    return
                 }
-                // Mark link as validated
-                linkEntry.validated = true
-                return
-            }
 
-            // Check if we can deliver it to a local pending link
-            val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
-            if (pendingLink != null) {
-                log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
-                try {
-                    // Use reflection to call validateProof on the link
-                    val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
-                    validateMethod.invoke(pendingLink, packet)
-                } catch (e: Exception) {
-                    log("Error validating link proof: ${e.message}")
+                // No local pending link — forward via link table
+                // Matches Python Transport.py:2016-2039
+                val linkEntry = linkTable[packet.destinationHash.toKey()]
+                if (linkEntry != null) {
+                    // Check hop count matches remaining hops (Python:2018)
+                    if (packet.hops != linkEntry.remainingHops) {
+                        log("LRPROOF hop mismatch: packet.hops=${packet.hops} != remainingHops=${linkEntry.remainingHops}, dropping")
+                        return
+                    }
+
+                    // Check proof arrived on the expected next-hop interface (Python:2019)
+                    val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+                    if (nhIface == null || !interfaceRef.hash.contentEquals(nhIface.hash)) {
+                        log("LRPROOF received on wrong interface, not transporting it")
+                        return
+                    }
+
+                    val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                    if (outboundInterface != null) {
+                        // Update hop byte in raw before forwarding (Python:2035-2036)
+                        val raw = packet.raw ?: packet.pack()
+                        val newRaw = raw.copyOf()
+                        newRaw[1] = packet.hops.toByte()
+                        log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                        transmit(outboundInterface, newRaw)
+                    }
+                    linkEntry.validated = true
+                    return
                 }
-                return
+
+                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links or link_table")
             }
 
-            // Debug: show what's in the link table
-            if (linkTable.isNotEmpty()) {
-                val keys = linkTable.keys.take(3).map { it.toString().take(16) + "..." }
-                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table. Keys: $keys")
-            } else {
-                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in link_table or pending_links")
-            }
-        }
-
-        // Handle RESOURCE_PRF (Resource Proof) - deliver to active link
-        // Resource proofs are sent with the link ID as destination
-        if (packet.context == PacketContext.RESOURCE_PRF) {
-            val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
-            if (activeLink != null) {
-                log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
-                try {
-                    // Call receive() on the Link to process the proof
-                    val receiveMethod = activeLink::class.java.getMethod("receive", Packet::class.java)
-                    receiveMethod.invoke(activeLink, packet)
-                } catch (e: Exception) {
-                    log("Error delivering resource proof to link: ${e.message}")
+            // RESOURCE_PRF (Resource Proof) — Transport.py:2075-2078
+            PacketContext.RESOURCE_PRF -> {
+                val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
+                if (activeLink != null) {
+                    log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
+                    try {
+                        val receiveMethod = activeLink::class.java.getMethod("receive", Packet::class.java)
+                        receiveMethod.invoke(activeLink, packet)
+                    } catch (e: Exception) {
+                        log("Error delivering resource proof to link: ${e.message}")
+                    }
                 }
-                return
             }
-        }
 
-        // For other proof types, try reverse table
-        var reverseEntry = reverseTable[packet.destinationHash.toKey()]
-        if (reverseEntry == null) {
-            reverseEntry = reverseTable[packet.truncatedHash.toKey()]
-        }
+            // All other proof types — Transport.py:2079-2115
+            // Try reverse table, then pending receipts
+            else -> {
+                var reverseEntry = reverseTable[packet.destinationHash.toKey()]
+                if (reverseEntry == null) {
+                    reverseEntry = reverseTable[packet.truncatedHash.toKey()]
+                }
 
-        if (reverseEntry != null) {
-            // Forward proof back to the originating interface
-            val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
-            if (outboundInterface != null) {
-                log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                transmit(outboundInterface, packet.raw ?: packet.pack())
-            }
-            // Remove the reverse entry after use
-            reverseTable.remove(packet.destinationHash.toKey())
-            reverseTable.remove(packet.truncatedHash.toKey())
-            return
-        }
+                if (reverseEntry != null) {
+                    val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
+                    if (outboundInterface != null) {
+                        log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                        transmit(outboundInterface, packet.raw ?: packet.pack())
+                    }
+                    reverseTable.remove(packet.destinationHash.toKey())
+                    reverseTable.remove(packet.truncatedHash.toKey())
+                    return
+                }
 
-        // Check if there's a pending receipt for this proof (local destination)
-        // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
-        var matchedKey: ByteArrayKey? = null
-        var callback = pendingReceipts[packet.destinationHash.toKey()]
-        if (callback != null) {
-            matchedKey = packet.destinationHash.toKey()
-        }
+                // Check if there's a pending receipt for this proof (local destination)
+                // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
+                var matchedKey: ByteArrayKey? = null
+                var callback = pendingReceipts[packet.destinationHash.toKey()]
+                if (callback != null) {
+                    matchedKey = packet.destinationHash.toKey()
+                }
 
-        if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
-            // Extract full packet hash from explicit proof data
-            val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
-            val fullHashKey = fullHash.toKey()
-            callback = pendingReceipts[fullHashKey]
-            if (callback != null) {
-                matchedKey = fullHashKey
-                log("Found pending receipt by full hash from proof data")
-            }
-        }
+                if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
+                    val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
+                    val fullHashKey = fullHash.toKey()
+                    callback = pendingReceipts[fullHashKey]
+                    if (callback != null) {
+                        matchedKey = fullHashKey
+                        log("Found pending receipt by full hash from proof data")
+                    }
+                }
 
-        if (callback != null && matchedKey != null) {
-            try {
-                val validated = callback.onProofReceived(packet)
-                if (validated) {
-                    pendingReceipts.remove(matchedKey)  // only remove on success
-                    log("Proof validated for ${packet.destinationHash.toHexString()}")
-                    markPathResponsive(packet.destinationHash)
+                if (callback != null && matchedKey != null) {
+                    try {
+                        val validated = callback.onProofReceived(packet)
+                        if (validated) {
+                            pendingReceipts.remove(matchedKey)
+                            log("Proof validated for ${packet.destinationHash.toHexString()}")
+                            markPathResponsive(packet.destinationHash)
+                        } else {
+                            log("Proof validation failed for ${packet.destinationHash.toHexString()}")
+                        }
+                    } catch (e: Exception) {
+                        log("Proof callback error: ${e.message}")
+                    }
                 } else {
-                    log("Proof validation failed for ${packet.destinationHash.toHexString()}")
+                    log("Proof dest=${packet.destinationHash.toHexString()} not found in link_table (${linkTable.size} entries) or reverse_table (${reverseTable.size} entries)")
                 }
-            } catch (e: Exception) {
-                log("Proof callback error: ${e.message}")
             }
-        } else {
-            log("Proof dest=${packet.destinationHash.toHexString()} not found in link_table (${linkTable.size} entries) or reverse_table (${reverseTable.size} entries)")
         }
     }
 
@@ -3804,8 +3860,10 @@ object Transport {
         // Process queued announces
         processQueuedAnnounces(now)
 
-        // Process held announces (expire old ones)
-        processHeldAnnounces(now)
+        // Process per-interface held announces
+        for (iface in interfaces) {
+            iface.processHeldAnnounces()
+        }
 
         // Update traffic speed
         updateTrafficSpeed(now)
@@ -3859,35 +3917,6 @@ object Transport {
         receipts.removeAll(toRemove)
     }
 
-    /**
-     * Process ingress-held announces (mechanism 2) - release one at a time at intervals, expire old ones.
-     * Python: Interface.process_held_announces() releases one per IC_HELD_RELEASE_INTERVAL.
-     */
-    private fun processHeldAnnounces(now: Long) {
-        if (ingressHeldAnnounces.isEmpty()) return
-
-        // Expire old held announces
-        val expireCutoff = now - TransportConstants.HELD_ANNOUNCE_TIMEOUT
-        ingressHeldAnnounces.entries.removeIf { it.value.first < expireCutoff }
-
-        // Release one held announce per interval
-        if (now > lastHeldRelease + TransportConstants.HELD_RELEASE_INTERVAL) {
-            val oldest = ingressHeldAnnounces.entries.minByOrNull { it.value.first }
-            if (oldest != null) {
-                val destHex = oldest.key.bytes.toHexString()
-                log("Releasing held announce for $destHex")
-                ingressHeldAnnounces.remove(oldest.key)
-                lastHeldRelease = now
-
-                val iface = oldest.value.third
-                try {
-                    inbound(oldest.value.second, iface)
-                } catch (e: Exception) {
-                    log("Error re-injecting held announce: ${e.message}")
-                }
-            }
-        }
-    }
 
     /**
      * Update traffic speed calculations.
@@ -4741,7 +4770,7 @@ object Transport {
         val timestamp = java.time.LocalDateTime.now().format(
             java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
         )
-        println("[$timestamp] [Transport] $message")
+        System.err.println("[$timestamp] [Transport] $message")
     }
 }
 
@@ -4881,8 +4910,31 @@ interface InterfaceRef {
     /** Record that an announce was received on this interface (for frequency tracking). */
     fun recordIncomingAnnounce() {}
 
+    // Held announce methods — per-interface storage for ingress-controlled announces.
+    // Implemented by Interface (via InterfaceAdapter), no-ops for test/stub interfaces.
+
+    /** Hold an announce for later release when burst subsides. */
+    fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) {}
+
+    /** Process held announces: release one (min-hops) if burst has subsided. */
+    fun processHeldAnnounces() {}
+
+    /** Number of announces currently held on this interface. */
+    fun heldAnnounceCount(): Int = 0
+
     fun send(data: ByteArray)
 }
+
+/**
+ * A raw announce held for later re-injection when ingress burst subsides.
+ * Stored per-interface, keyed by destination hash.
+ */
+data class HeldAnnounce(
+    val destinationHash: ByteArray,
+    val raw: ByteArray,
+    val hops: Int,
+    val receivingInterface: InterfaceRef
+)
 
 /**
  * Wrapper for ByteArray to use as map key.
