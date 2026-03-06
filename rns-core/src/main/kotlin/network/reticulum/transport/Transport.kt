@@ -3309,125 +3309,130 @@ object Transport {
     private fun processProof(packet: Packet, interfaceRef: InterfaceRef) {
         log("Processing proof: dest=${packet.destinationHash.toHexString()}, context=${packet.context}, from ${interfaceRef.name}")
 
-        // Handle LRPROOF (Link Request Proof)
-        // Check pending links FIRST — when hub and client share the same Transport
-        // (same-process), the proof must be delivered locally before attempting to forward.
-        if (packet.context == PacketContext.LRPROOF) {
-            val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
-            if (pendingLink != null) {
-                log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
-                try {
-                    val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
-                    validateMethod.invoke(pendingLink, packet)
-                } catch (e: Exception) {
-                    log("Error validating link proof: ${e.message}")
-                }
-                return
-            }
-
-            // No local pending link — forward via link table
-            // Matches Python Transport.py:2016-2039
-            val linkEntry = linkTable[packet.destinationHash.toKey()]
-            if (linkEntry != null) {
-                // Check hop count matches remaining hops (Python:2018)
-                if (packet.hops != linkEntry.remainingHops) {
-                    log("LRPROOF hop mismatch: packet.hops=${packet.hops} != remainingHops=${linkEntry.remainingHops}, dropping")
+        // Proof handling uses when {} to match the Python if/elif/else structure
+        // (Transport.py:2013-2115). This prevents LRPROOF and RESOURCE_PRF from
+        // ever falling through to the reverse_table handler — in Python, only the
+        // else branch (non-LRPROOF, non-RESOURCE_PRF) reaches reverse_table.
+        // Without this structure, an unroutable LRPROOF on a shared instance client
+        // would bounce via reverse_table back to the server in an infinite loop.
+        when (packet.context) {
+            // LRPROOF (Link Request Proof) — Transport.py:2013-2073
+            // Check pending links FIRST — when hub and client share the same Transport
+            // (same-process), the proof must be delivered locally before attempting to forward.
+            PacketContext.LRPROOF -> {
+                val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
+                if (pendingLink != null) {
+                    log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
+                    try {
+                        val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
+                        validateMethod.invoke(pendingLink, packet)
+                    } catch (e: Exception) {
+                        log("Error validating link proof: ${e.message}")
+                    }
                     return
                 }
 
-                // Check proof arrived on the expected next-hop interface (Python:2019)
-                val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
-                if (nhIface == null || !interfaceRef.hash.contentEquals(nhIface.hash)) {
-                    log("LRPROOF received on wrong interface, not transporting it")
+                // No local pending link — forward via link table
+                // Matches Python Transport.py:2016-2039
+                val linkEntry = linkTable[packet.destinationHash.toKey()]
+                if (linkEntry != null) {
+                    // Check hop count matches remaining hops (Python:2018)
+                    if (packet.hops != linkEntry.remainingHops) {
+                        log("LRPROOF hop mismatch: packet.hops=${packet.hops} != remainingHops=${linkEntry.remainingHops}, dropping")
+                        return
+                    }
+
+                    // Check proof arrived on the expected next-hop interface (Python:2019)
+                    val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+                    if (nhIface == null || !interfaceRef.hash.contentEquals(nhIface.hash)) {
+                        log("LRPROOF received on wrong interface, not transporting it")
+                        return
+                    }
+
+                    val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                    if (outboundInterface != null) {
+                        // Update hop byte in raw before forwarding (Python:2035-2036)
+                        val raw = packet.raw ?: packet.pack()
+                        val newRaw = raw.copyOf()
+                        newRaw[1] = packet.hops.toByte()
+                        log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                        transmit(outboundInterface, newRaw)
+                    }
+                    linkEntry.validated = true
                     return
                 }
 
-                val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
-                if (outboundInterface != null) {
-                    // Update hop byte in raw before forwarding (Python:2035-2036)
-                    val raw = packet.raw ?: packet.pack()
-                    val newRaw = raw.copyOf()
-                    newRaw[1] = packet.hops.toByte()
-                    log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                    transmit(outboundInterface, newRaw)
+                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links or link_table")
+            }
+
+            // RESOURCE_PRF (Resource Proof) — Transport.py:2075-2078
+            PacketContext.RESOURCE_PRF -> {
+                val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
+                if (activeLink != null) {
+                    log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
+                    try {
+                        val receiveMethod = activeLink::class.java.getMethod("receive", Packet::class.java)
+                        receiveMethod.invoke(activeLink, packet)
+                    } catch (e: Exception) {
+                        log("Error delivering resource proof to link: ${e.message}")
+                    }
                 }
-                linkEntry.validated = true
-                return
             }
 
-            log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links or link_table")
-        }
-
-        // Handle RESOURCE_PRF (Resource Proof) - deliver to active link
-        // Resource proofs are sent with the link ID as destination
-        if (packet.context == PacketContext.RESOURCE_PRF) {
-            val activeLink = activeLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
-            if (activeLink != null) {
-                log("Delivering RESOURCE_PRF to active link ${packet.destinationHash.toHexString()}")
-                try {
-                    // Call receive() on the Link to process the proof
-                    val receiveMethod = activeLink::class.java.getMethod("receive", Packet::class.java)
-                    receiveMethod.invoke(activeLink, packet)
-                } catch (e: Exception) {
-                    log("Error delivering resource proof to link: ${e.message}")
+            // All other proof types — Transport.py:2079-2115
+            // Try reverse table, then pending receipts
+            else -> {
+                var reverseEntry = reverseTable[packet.destinationHash.toKey()]
+                if (reverseEntry == null) {
+                    reverseEntry = reverseTable[packet.truncatedHash.toKey()]
                 }
-                return
-            }
-        }
 
-        // For other proof types, try reverse table
-        var reverseEntry = reverseTable[packet.destinationHash.toKey()]
-        if (reverseEntry == null) {
-            reverseEntry = reverseTable[packet.truncatedHash.toKey()]
-        }
+                if (reverseEntry != null) {
+                    val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
+                    if (outboundInterface != null) {
+                        log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
+                        transmit(outboundInterface, packet.raw ?: packet.pack())
+                    }
+                    reverseTable.remove(packet.destinationHash.toKey())
+                    reverseTable.remove(packet.truncatedHash.toKey())
+                    return
+                }
 
-        if (reverseEntry != null) {
-            // Forward proof back to the originating interface
-            val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
-            if (outboundInterface != null) {
-                log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                transmit(outboundInterface, packet.raw ?: packet.pack())
-            }
-            // Remove the reverse entry after use
-            reverseTable.remove(packet.destinationHash.toKey())
-            reverseTable.remove(packet.truncatedHash.toKey())
-            return
-        }
+                // Check if there's a pending receipt for this proof (local destination)
+                // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
+                var matchedKey: ByteArrayKey? = null
+                var callback = pendingReceipts[packet.destinationHash.toKey()]
+                if (callback != null) {
+                    matchedKey = packet.destinationHash.toKey()
+                }
 
-        // Check if there's a pending receipt for this proof (local destination)
-        // Peek first, only remove on successful validation (Python Transport.py:2102-2115)
-        var matchedKey: ByteArrayKey? = null
-        var callback = pendingReceipts[packet.destinationHash.toKey()]
-        if (callback != null) {
-            matchedKey = packet.destinationHash.toKey()
-        }
+                if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
+                    val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
+                    val fullHashKey = fullHash.toKey()
+                    callback = pendingReceipts[fullHashKey]
+                    if (callback != null) {
+                        matchedKey = fullHashKey
+                        log("Found pending receipt by full hash from proof data")
+                    }
+                }
 
-        if (callback == null && packet.data.size >= RnsConstants.FULL_HASH_BYTES) {
-            // Extract full packet hash from explicit proof data
-            val fullHash = packet.data.copyOfRange(0, RnsConstants.FULL_HASH_BYTES)
-            val fullHashKey = fullHash.toKey()
-            callback = pendingReceipts[fullHashKey]
-            if (callback != null) {
-                matchedKey = fullHashKey
-                log("Found pending receipt by full hash from proof data")
-            }
-        }
-
-        if (callback != null && matchedKey != null) {
-            try {
-                val validated = callback.onProofReceived(packet)
-                if (validated) {
-                    pendingReceipts.remove(matchedKey)  // only remove on success
-                    log("Proof validated for ${packet.destinationHash.toHexString()}")
-                    markPathResponsive(packet.destinationHash)
+                if (callback != null && matchedKey != null) {
+                    try {
+                        val validated = callback.onProofReceived(packet)
+                        if (validated) {
+                            pendingReceipts.remove(matchedKey)
+                            log("Proof validated for ${packet.destinationHash.toHexString()}")
+                            markPathResponsive(packet.destinationHash)
+                        } else {
+                            log("Proof validation failed for ${packet.destinationHash.toHexString()}")
+                        }
+                    } catch (e: Exception) {
+                        log("Proof callback error: ${e.message}")
+                    }
                 } else {
-                    log("Proof validation failed for ${packet.destinationHash.toHexString()}")
+                    log("Proof dest=${packet.destinationHash.toHexString()} not found in link_table (${linkTable.size} entries) or reverse_table (${reverseTable.size} entries)")
                 }
-            } catch (e: Exception) {
-                log("Proof callback error: ${e.message}")
             }
-        } else {
-            log("Proof dest=${packet.destinationHash.toHexString()} not found in link_table (${linkTable.size} entries) or reverse_table (${reverseTable.size} entries)")
         }
     }
 

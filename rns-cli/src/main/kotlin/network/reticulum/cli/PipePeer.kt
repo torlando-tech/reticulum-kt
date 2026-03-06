@@ -68,42 +68,43 @@ fun main() {
             enableTransport = enableTransport
         )
 
-        // Create interfaces: shared instance server or pipe-based
+        // Create interfaces: shared instance server and/or pipe-based.
+        // These are NOT mutually exclusive — a target can serve as both a
+        // shared instance server (TCP) for local clients AND have pipe
+        // interfaces for external peers (e.g. Carina with Ara + external).
         if (sharedPort > 0) {
-            // Shared instance server mode: start LocalServerInterface on TCP port
             val server = LocalServerInterface(name = "SharedInstance", tcpPort = sharedPort)
             Transport.registerInterface(server.toRef())
             server.start()
-        } else {
-            // Pipe interface mode
-            val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
-            if (numIfaces > 0) {
-                // Multi-interface mode: create N interfaces from fd pairs
-                for (i in 0 until numIfaces) {
-                    val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
-                    val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
-                    val input = FileInputStream(fdPath(fdIn))
-                    val output = FileOutputStream(fdPath(fdOut))
-                    val iface = PipeInterface(
-                        name = "Pipe$i",
-                        inputStream = input,
-                        outputStream = output,
-                        interfaceMode = mode
-                    )
-                    Transport.registerInterface(iface.toRef())
-                    iface.start()
-                }
-            } else {
-                // Single interface mode: stdin/stdout
-                val pipeInterface = PipeInterface(
-                    name = "StdioPipe",
-                    inputStream = System.`in`,
-                    outputStream = System.out,
+        }
+
+        // Pipe interfaces (can coexist with shared instance server)
+        val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
+        if (numIfaces > 0) {
+            for (i in 0 until numIfaces) {
+                val fdIn = System.getenv("PIPE_PEER_IFACE_${i}_FD_IN")?.toIntOrNull() ?: continue
+                val fdOut = System.getenv("PIPE_PEER_IFACE_${i}_FD_OUT")?.toIntOrNull() ?: continue
+                val input = FileInputStream(fdPath(fdIn))
+                val output = FileOutputStream(fdPath(fdOut))
+                val iface = PipeInterface(
+                    name = "Pipe$i",
+                    inputStream = input,
+                    outputStream = output,
                     interfaceMode = mode
                 )
-                Transport.registerInterface(pipeInterface.toRef())
-                pipeInterface.start()
+                Transport.registerInterface(iface.toRef())
+                iface.start()
             }
+        } else if (sharedPort <= 0) {
+            // Single interface mode: stdin/stdout (only when no shared instance and no fd pairs)
+            val pipeInterface = PipeInterface(
+                name = "StdioPipe",
+                inputStream = System.`in`,
+                outputStream = System.out,
+                interfaceMode = mode
+            )
+            Transport.registerInterface(pipeInterface.toRef())
+            pipeInterface.start()
         }
 
         // Register announce handler
