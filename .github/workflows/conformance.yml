@@ -1,0 +1,41 @@
+name: Conformance Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install rns pytest
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build pipe peer JAR
+        run: ./gradlew :rns-cli:pipePeerJar
+
+      - name: Run conformance tests (Kotlin target)
+        run: |
+          pytest python-bridge/conformance/ \
+            --peer-cmd "java -jar rns-cli/build/libs/kt-pipe-peer.jar" \
+            -v --tb=short

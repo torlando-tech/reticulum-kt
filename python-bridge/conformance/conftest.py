@@ -82,4 +82,12 @@ def rns_path(project_root):
     ]:
         if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "RNS")):
             return candidate
-    pytest.skip("Cannot find Python RNS. Set PYTHON_RNS_PATH env var.")
+    # Fall back to pip-installed package location (for CI)
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("RNS")
+        if spec and spec.origin:
+            return os.path.dirname(os.path.dirname(spec.origin))
+    except (ImportError, ValueError):
+        pass
+    pytest.skip("Cannot find Python RNS. Install with: pip install rns")
