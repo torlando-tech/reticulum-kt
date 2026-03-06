@@ -481,6 +481,8 @@ private fun emit(json: JsonObject) {
 }
 
 private fun pathTableDumper() {
+    val mainThread = Thread.currentThread()
+    Runtime.getRuntime().addShutdownHook(Thread { mainThread.interrupt() })
     var lastDump = ""
     try {
         while (true) {

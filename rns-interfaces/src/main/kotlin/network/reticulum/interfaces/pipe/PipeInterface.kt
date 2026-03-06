@@ -62,8 +62,13 @@ class PipeInterface(
 
         val framed = HDLC.frame(data)
         synchronized(outputStream) {
-            outputStream.write(framed)
-            outputStream.flush()
+            try {
+                outputStream.write(framed)
+                outputStream.flush()
+            } catch (_: IOException) {
+                online.set(false)
+                return
+            }
         }
         txBytes.addAndGet(data.size.toLong())
     }
