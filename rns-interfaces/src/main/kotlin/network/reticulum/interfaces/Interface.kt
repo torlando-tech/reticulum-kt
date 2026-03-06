@@ -360,7 +360,10 @@ abstract class Interface(
                 val iface = selectedAnnounce.receivingInterface
                 Thread {
                     Transport.inbound(raw, iface)
-                }.apply { isDaemon = true }.start()
+                }.apply {
+                    isDaemon = true
+                    name = "HeldRelease-${this@Interface.name}"
+                }.start()
             }
         } catch (e: Exception) {
             System.err.println("An error occurred while processing held announces for $this: ${e.message}")
