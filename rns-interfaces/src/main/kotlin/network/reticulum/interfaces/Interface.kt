@@ -153,7 +153,7 @@ abstract class Interface(
     private val incomingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val outgoingAnnounceTimestamps = ConcurrentLinkedDeque<Long>()
     private val burstActive = AtomicBoolean(false)
-    private var burstActivatedAt: Long = 0
+    @Volatile private var burstActivatedAt: Long = 0
     @Volatile private var heldReleaseAt: Long = 0
 
     /** Per-interface held announces for ingress control: dest_hash -> HeldAnnounce. */
