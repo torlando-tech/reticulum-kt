@@ -17,10 +17,8 @@ The target's Transport must:
 This is the core multi-hop link routing test that validates Transport's
 link_table forwarding logic.
 
-NOTE: As of this writing, the Kotlin implementation does not yet forward
-LINKREQUEST packets between interfaces (link_table forwarding). These
-tests pass against the Python reference and will help verify the Kotlin
-fix when implemented.
+The Kotlin implementation forwards LINKREQUEST packets between interfaces
+using link_table forwarding, matching the Python reference Transport.
 """
 import time
 import pytest

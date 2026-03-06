@@ -3025,6 +3025,32 @@ object Transport {
             log("Reinserting held announce into table for ${destinationHash.toHexString()}")
         }
 
+        // Create a HEADER_2 retransmission packet with our transport identity.
+        // Matches Python Transport.py:544-556 — transport nodes always re-wrap
+        // announces as HEADER_2 with transport_type=TRANSPORT and their own
+        // identity hash as transport_id, so recipients know the announce came
+        // through a transport node and can route back through it.
+        val transportIdentityHash = Transport.identity?.hash
+        if (transportIdentityHash == null) {
+            log("Cannot retransmit announce: no transport identity")
+            return
+        }
+
+        val retransmitPacket = Packet.createRaw(
+            destinationHash = packet.destinationHash,
+            data = packet.data,
+            packetType = PacketType.ANNOUNCE,
+            destinationType = packet.destinationType,
+            context = PacketContext.NONE,
+            headerType = HeaderType.HEADER_2,
+            transportType = TransportType.TRANSPORT,
+            transportId = transportIdentityHash,
+            contextFlag = packet.contextFlag,
+            createReceipt = false
+        )
+        retransmitPacket.hops = packet.hops
+        val retransmitRaw = retransmitPacket.pack()
+
         // Queue on all interfaces except the receiving one, applying mode-based filtering
         // Matches Python Transport.py:1040-1084
         // Python: announce retransmit goes through outbound() which checks `interface.OUT`.
@@ -3042,7 +3068,7 @@ object Transport {
             if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
                 queueAnnounce(
                     destinationHash = destinationHash,
-                    raw = announceEntry.raw,
+                    raw = retransmitRaw,
                     interfaceRef = iface,
                     hops = packet.hops,
                     emitted = now
@@ -3300,12 +3326,30 @@ object Transport {
             }
 
             // No local pending link — forward via link table
+            // Matches Python Transport.py:2016-2039
             val linkEntry = linkTable[packet.destinationHash.toKey()]
             if (linkEntry != null) {
+                // Check hop count matches remaining hops (Python:2018)
+                if (packet.hops != linkEntry.remainingHops) {
+                    log("LRPROOF hop mismatch: packet.hops=${packet.hops} != remainingHops=${linkEntry.remainingHops}, dropping")
+                    return
+                }
+
+                // Check proof arrived on the expected next-hop interface (Python:2019)
+                val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+                if (nhIface == null || !interfaceRef.hash.contentEquals(nhIface.hash)) {
+                    log("LRPROOF received on wrong interface, not transporting it")
+                    return
+                }
+
                 val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
                 if (outboundInterface != null) {
+                    // Update hop byte in raw before forwarding (Python:2035-2036)
+                    val raw = packet.raw ?: packet.pack()
+                    val newRaw = raw.copyOf()
+                    newRaw[1] = packet.hops.toByte()
                     log("Forwarding LRPROOF for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                    transmit(outboundInterface, packet.raw ?: packet.pack())
+                    transmit(outboundInterface, newRaw)
                 }
                 linkEntry.validated = true
                 return
@@ -4704,7 +4748,7 @@ object Transport {
         val timestamp = java.time.LocalDateTime.now().format(
             java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
         )
-        println("[$timestamp] [Transport] $message")
+        System.err.println("[$timestamp] [Transport] $message")
     }
 }
 
