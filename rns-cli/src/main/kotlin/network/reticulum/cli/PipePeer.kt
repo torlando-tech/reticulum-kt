@@ -8,6 +8,7 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.toRef
@@ -31,6 +32,7 @@ import java.nio.file.Files
  *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
  *   PIPE_PEER_MODE:      interface mode: full | ap | roaming | boundary | gateway | p2p
+ *   PIPE_PEER_SHARED_CLIENT_PORT: TCP port to connect to as LocalClientInterface client
  *   PIPE_PEER_NUM_IFACES:      number of fd-pair interfaces (0 = use stdin/stdout)
  *   PIPE_PEER_IFACE_{n}_FD_IN:  read fd for interface n
  *   PIPE_PEER_IFACE_{n}_FD_OUT: write fd for interface n
@@ -48,6 +50,7 @@ fun main() {
     val enableTransport = System.getenv("PIPE_PEER_TRANSPORT")?.lowercase() == "true"
     val modeStr = System.getenv("PIPE_PEER_MODE") ?: "full"
     val sharedPort = System.getenv("PIPE_PEER_SHARED_PORT")?.toIntOrNull() ?: 0
+    val sharedClientPort = System.getenv("PIPE_PEER_SHARED_CLIENT_PORT")?.toIntOrNull() ?: 0
 
     val mode = when (modeStr.lowercase()) {
         "ap", "access_point" -> InterfaceMode.ACCESS_POINT
@@ -78,6 +81,16 @@ fun main() {
             server.start()
         }
 
+        // Connect as client to an existing shared instance (e.g., Python rnsd)
+        if (sharedClientPort > 0) {
+            val client = LocalClientInterface(
+                name = "SharedClient",
+                tcpPort = sharedClientPort
+            )
+            Transport.registerInterface(client.toRef())
+            client.start()
+        }
+
         // Pipe interfaces (can coexist with shared instance server)
         val numIfaces = System.getenv("PIPE_PEER_NUM_IFACES")?.toIntOrNull() ?: 0
         if (numIfaces > 0) {
@@ -95,8 +108,8 @@ fun main() {
                 Transport.registerInterface(iface.toRef())
                 iface.start()
             }
-        } else if (sharedPort <= 0) {
-            // Single interface mode: stdin/stdout (only when no shared instance and no fd pairs)
+        } else if (sharedPort <= 0 && sharedClientPort <= 0) {
+            // Single interface mode: stdin/stdout (only when no shared instance/client and no fd pairs)
             val pipeInterface = PipeInterface(
                 name = "StdioPipe",
                 inputStream = System.`in`,
