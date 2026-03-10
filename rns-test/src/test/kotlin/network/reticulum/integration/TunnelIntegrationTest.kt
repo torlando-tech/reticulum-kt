@@ -179,9 +179,13 @@ class TunnelIntegrationTest {
 
         assertTrue(client.online.get(), "Client should be online")
 
-        // Send announce from server
+        // Build announce, then deregister destination so Transport doesn't skip
+        // it as local (in a real setup, server and client have separate Transport instances)
         println("Sending announce...")
-        destination.announce()
+        val announcePacket = destination.announce(send = false)
+        Transport.deregisterDestination(destination)
+        val packedAnnounce = announcePacket!!.raw ?: announcePacket.pack()
+        server.processOutgoing(packedAnnounce)
 
         // Wait for announce
         assertTrue(announceLatch.await(10, TimeUnit.SECONDS), "Should receive announce")
