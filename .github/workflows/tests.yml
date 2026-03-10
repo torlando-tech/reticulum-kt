@@ -65,12 +65,16 @@ jobs:
       - name: Clone Reticulum reference implementation
         run: git clone --depth 1 https://github.com/markqvist/Reticulum.git /tmp/Reticulum
 
+      - name: Clone LXMF reference implementation
+        run: git clone --depth 1 https://github.com/markqvist/LXMF.git /tmp/LXMF
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run rns-test tests
         env:
           PYTHON_RNS_PATH: /tmp/Reticulum
+          PYTHON_LXMF_PATH: /tmp/LXMF
         run: ./gradlew :rns-test:test
 
       - name: Upload test reports
