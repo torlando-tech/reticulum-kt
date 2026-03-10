@@ -189,6 +189,10 @@ class TcpIntegrationTest {
         val announcePacket = Packet.createAnnounce(destination)
         assertNotNull(announcePacket, "Should create announce packet")
 
+        // Deregister so server-side Transport doesn't skip it as local
+        // (in a real setup, client and server have separate Transport instances)
+        Transport.deregisterDestination(destination)
+
         // Send the announce
         val packedAnnounce = announcePacket.pack()
         client.processOutgoing(packedAnnounce)
