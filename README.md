@@ -1,5 +1,7 @@
 # reticulum-kt
 
+[![Conformance](https://github.com/torlando-tech/reticulum-kt/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/reticulum-kt/actions/workflows/conformance.yml)
+
 A Kotlin/JVM implementation of the [Reticulum Network Stack](https://reticulum.network/) for building resilient, delay-tolerant mesh networks on Android and JVM.
 
 ## Implementation Status

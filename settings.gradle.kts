@@ -23,3 +23,6 @@ include(":rns-cli")
 
 // Android module for battery-optimized mobile deployment
 include(":rns-android")
+
+// Conformance test bridge
+include(":conformance-bridge")
