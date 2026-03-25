@@ -19,7 +19,7 @@ import kotlin.test.assertTrue
 /**
  * Live integration test against an external Reticulum TCP server.
  *
- * Set environment variable RNS_LIVE_HOST=10.0.4.63 (or any host) to enable.
+ * Set environment variable RNS_LIVE_HOST=your.host.here (or any host) to enable.
  * Default port: 4243.
  *
  * This test connects the full Kotlin Reticulum stack to a real server and
@@ -34,7 +34,7 @@ class LiveTcpServerTest {
     private var tcpClient: TCPClientInterface? = null
     private val discoveredPaths = CopyOnWriteArrayList<String>()
 
-    private val host: String get() = System.getenv("RNS_LIVE_HOST") ?: "10.0.4.63"
+    private val host: String get() = System.getenv("RNS_LIVE_HOST") ?: "127.0.0.1"
     private val port: Int get() = System.getenv("RNS_LIVE_PORT")?.toIntOrNull() ?: 4243
 
     @BeforeAll
