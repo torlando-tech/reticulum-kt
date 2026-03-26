@@ -93,6 +93,11 @@ class AndroidNearbyDriver(
                 info: ConnectionInfo,
             ) {
                 Log.i(TAG, "Connection initiated from $endpointId (${info.endpointName})")
+                if (_connectedEndpoints.size + _pendingConnections.size >= maxConnections) {
+                    Log.w(TAG, "At max connections ($maxConnections), rejecting inbound $endpointId")
+                    connectionsClient.rejectConnection(endpointId)
+                    return
+                }
                 // Auto-accept: Reticulum handles authentication at the protocol layer
                 _pendingConnections[endpointId] = info.endpointName
                 connectionsClient.acceptConnection(endpointId, payloadCallback)
