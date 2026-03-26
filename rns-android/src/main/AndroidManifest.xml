@@ -13,10 +13,15 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+        android:maxSdkVersion="32" />
 
     <!-- BLE hardware feature (not required; graceful degradation if unavailable) -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- Nearby Connections — WiFi transport -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
 
     <!-- Network permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
