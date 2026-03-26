@@ -84,7 +84,10 @@ class _Subprocess:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
 
 class PythonSharedInstanceSession:
@@ -187,6 +190,7 @@ class PythonSharedInstanceSession:
             client_cmd = py_peer_cmd
 
         client_env = os.environ.copy()
+        client_env.pop("PIPE_PEER_SHARED_PORT", None)
         client_env["PIPE_PEER_ACTION"] = client_action
         client_env["PIPE_PEER_APP_NAME"] = app_name
         client_env["PIPE_PEER_ASPECTS"] = aspects

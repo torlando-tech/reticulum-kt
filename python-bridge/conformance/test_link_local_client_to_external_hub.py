@@ -55,7 +55,13 @@ def hub_dest(session):
     # Accept incoming links
     established_links = []
 
+    received_data = []
+
     def link_established(link):
+        def on_data(message, packet):
+            data = message if isinstance(message, bytes) else bytes(message)
+            received_data.append(data)
+        link.set_packet_callback(on_data)
         established_links.append(link)
 
     destination.set_link_established_callback(link_established)
@@ -66,6 +72,7 @@ def hub_dest(session):
         "destination": destination,
         "dest_hash_hex": destination.hash.hex(),
         "established_links": established_links,
+        "received_data": received_data,
     }
 
 
@@ -119,15 +126,11 @@ class TestLocalClientToExternalHub:
 
     def test_data_reaches_hub(self, session, hub_dest):
         """Data sent by the local client reaches the external hub."""
-        # The link_initiate action sends b"hello-from-initiator" after establishment
+        # The link_initiate action sends b"hello-from-initiator" after establishment.
+        # Packet callback is registered in hub_dest fixture at link establishment time
+        # to avoid a race where data arrives before the callback is set.
+        received_data = hub_dest["received_data"]
         deadline = time.time() + 15
-        received_data = []
-
-        for link in hub_dest["established_links"]:
-            def on_data(message, packet, _received=received_data):
-                data = message if isinstance(message, bytes) else bytes(message)
-                _received.append(data)
-            link.set_packet_callback(on_data)
 
         while time.time() < deadline:
             if received_data:
