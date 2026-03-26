@@ -44,8 +44,8 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Foreground Service | Complete | Persistent connection with Doze/battery awareness |
 | BLE Driver | Complete | GATT server/client, advertising, scanning (API 26+) |
 | Power Management | Complete | Doze handler, battery monitor, WorkManager integration |
-| Sample App | Moved | See [carina](https://github.com/torlando/carina) for the Compose UI sample app |
-| LXMF | Moved | See [LXMF-kt](https://github.com/torlando/LXMF-kt) for the LXMF messaging protocol |
+| Sample App | Moved | See [carina](https://github.com/torlando-tech/carina) for the Compose UI sample app |
+| LXMF | Moved | See [LXMF-kt](https://github.com/torlando-tech/LXMF-kt) for the LXMF messaging protocol |
 
 ### Remaining Work
 

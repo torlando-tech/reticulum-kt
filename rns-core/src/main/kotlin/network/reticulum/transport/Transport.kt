@@ -2394,6 +2394,34 @@ object Transport {
             packet.transportId = identity?.hash
         }
 
+        // Server-side defense: when a local client sends a HEADER_1 packet for a
+        // REMOTE destination (not forLocalClient), inject transport headers so the
+        // existing forwarding logic can handle it. Python clients always send HEADER_2
+        // for hops >= 1 (Transport.py:993-1011), but if a client omits transport
+        // headers, the shared instance must still be able to forward the packet.
+        if (fromLocalClient && packet.transportId == null && !forLocalClient &&
+            packet.packetType == PacketType.LINKREQUEST) {
+            val destPathEntry = pathTable[packet.destinationHash.toKey()]
+            if (destPathEntry != null) {
+                val myHash = identity?.hash
+                val packetRaw = packet.raw
+                if (myHash != null && packetRaw != null) {
+                    // Convert HEADER_1 raw to HEADER_2 by inserting transport_id
+                    val newFlags = (HeaderType.HEADER_2.value shl 6) or
+                                   (TransportType.TRANSPORT.value shl 4) or
+                                   (packetRaw[0].toInt() and 0x0F)
+                    val newRaw = ByteArray(packetRaw.size + RnsConstants.TRUNCATED_HASH_BYTES)
+                    newRaw[0] = newFlags.toByte()
+                    newRaw[1] = packetRaw[1]
+                    System.arraycopy(myHash, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
+                    System.arraycopy(packetRaw, 2, newRaw, 2 + RnsConstants.TRUNCATED_HASH_BYTES, packetRaw.size - 2)
+                    packet.raw = newRaw
+                    packet.transportId = myHash
+                    log("Injected transport headers for HEADER_1 packet from local client to remote dest ${packet.destinationHash.toHexString()}")
+                }
+            }
+        }
+
         // General transport handling (Python Transport.py:1404-1510)
         // This runs for ALL packet types (LINKREQUEST, DATA, PROOF) before type-specific handling.
         // It forwards packets where we are the designated next transport hop.
@@ -2592,6 +2620,13 @@ object Transport {
                 log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
                 if (pathEntry.hops > 1) {
                     // Insert into transport (HEADER_2)
+                    val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
+                    transmit(outboundInterface, transportRaw)
+                    sent = true
+                } else if (pathEntry.hops == 1 && outboundInterface.isConnectedToSharedInstance) {
+                    // When behind a shared instance, even 1-hop destinations need
+                    // transport headers so the shared instance can route them onto
+                    // the network. Python Transport.py:993-1011
                     val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                     transmit(outboundInterface, transportRaw)
                     sent = true

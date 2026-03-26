@@ -113,6 +113,10 @@ class AnnounceForwardingIntegrationTest {
         val announcePacket = destination.announce(send = false)
         assertNotNull(announcePacket, "Should create announce packet")
 
+        // Deregister the destination so Transport treats the announce as remote
+        // (processAnnounce skips announces for local destinations)
+        Transport.deregisterDestination(destination)
+
         // Inject it via the external interface (simulates receiving from network)
         val rawBytes = announcePacket.raw ?: announcePacket.pack()
         externalInterface!!.injectPacket(rawBytes)
@@ -176,6 +180,9 @@ class AnnounceForwardingIntegrationTest {
         val announcePacket = destination.announce(send = false)
         assertNotNull(announcePacket)
 
+        // Deregister the destination so Transport treats the announce as remote
+        Transport.deregisterDestination(destination)
+
         val rawBytes = announcePacket.raw ?: announcePacket.pack()
         externalInterface!!.injectPacket(rawBytes)
 
@@ -212,6 +219,9 @@ class AnnounceForwardingIntegrationTest {
 
         val announcePacket = destination.announce(send = false)
         assertNotNull(announcePacket)
+
+        // Deregister the destination so Transport treats the announce as remote
+        Transport.deregisterDestination(destination)
 
         val rawBytes = announcePacket.raw ?: announcePacket.pack()
         externalInterface!!.injectPacket(rawBytes)

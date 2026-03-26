@@ -39,7 +39,10 @@ def _find_project_root():
         if os.path.exists(os.path.join(d, "settings.gradle.kts")):
             return d
         d = os.path.dirname(d)
-    return os.path.dirname(os.path.abspath(__file__))
+    raise RuntimeError(
+        "Could not find project root (settings.gradle.kts not found). "
+        "Run tests from within the reticulum-kt project tree."
+    )
 
 
 @pytest.fixture(scope="session")
