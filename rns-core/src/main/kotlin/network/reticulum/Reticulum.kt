@@ -333,12 +333,14 @@ class Reticulum private constructor(
             // Set state only after all steps succeed (matches Python Reticulum.py:414-416)
             sharedInterface = clientInterface
             isConnectedToSharedInstance = true
+            Transport.isConnectedToSharedInstance = true
 
             log("Connected to shared instance")
             return true
         } catch (e: Exception) {
             log("Failed to connect to shared instance: ${e.message}")
             isConnectedToSharedInstance = false
+            Transport.isConnectedToSharedInstance = false
             return false
         }
     }
@@ -495,6 +497,7 @@ class Reticulum private constructor(
         sharedInterface = null
         isSharedInstance = false
         isConnectedToSharedInstance = false
+        Transport.isConnectedToSharedInstance = false
 
         // Detach interfaces
         interfaces.clear()
