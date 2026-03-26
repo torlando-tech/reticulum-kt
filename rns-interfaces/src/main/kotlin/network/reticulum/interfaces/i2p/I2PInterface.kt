@@ -119,7 +119,7 @@ class I2PInterface(
     private var tunnelJob: Job? = null
 
     init {
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.concurrent.CopyOnWriteArrayList()
     }
 
     override fun start() {

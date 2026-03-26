@@ -70,7 +70,7 @@ class BLEInterface(
     private val pendingConnections = ConcurrentHashMap.newKeySet<String>()
 
     init {
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.concurrent.CopyOnWriteArrayList()
     }
 
     // ---- Lifecycle ----

@@ -95,7 +95,7 @@ class TCPServerInterface(
     private var acceptJob: Job? = null
 
     init {
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.concurrent.CopyOnWriteArrayList()
     }
 
     override fun start() {
