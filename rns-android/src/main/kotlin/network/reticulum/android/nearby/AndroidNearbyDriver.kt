@@ -116,6 +116,7 @@ class AndroidNearbyDriver(
                     }
                     ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED -> {
                         Log.w(TAG, "Connection rejected by $endpointId")
+                        _connectionLost.tryEmit(endpointId)
                     }
                     ConnectionsStatusCodes.STATUS_ERROR -> {
                         Log.e(TAG, "Connection error with $endpointId: ${result.status.statusMessage}")
@@ -166,7 +167,7 @@ class AndroidNearbyDriver(
 
                 // Skip if already connected or at limit
                 if (_connectedEndpoints.containsKey(endpointId)) return
-                if (_connectedEndpoints.size >= maxConnections) {
+                if (_connectedEndpoints.size + _pendingConnections.size >= maxConnections) {
                     Log.d(TAG, "At max connections ($maxConnections), skipping $endpointId")
                     return
                 }
