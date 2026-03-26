@@ -169,9 +169,12 @@ class AndroidNearbyDriver(
 
                 _discoveredEndpoints.tryEmit(DiscoveredEndpoint(endpointId, info.endpointName))
 
-                // Deterministic tie-breaking: lower name initiates to prevent dual-connect
-                if (localEndpointName < info.endpointName) {
-                    Log.d(TAG, "Initiating connection to $endpointId (our name < theirs)")
+                // Deterministic tie-breaking: lower name initiates to prevent dual-connect.
+                // On equal names, use endpointId as secondary tie-breaker.
+                val weInitiate = localEndpointName < info.endpointName ||
+                    (localEndpointName == info.endpointName && localEndpointName < endpointId)
+                if (weInitiate) {
+                    Log.d(TAG, "Initiating connection to $endpointId (we initiate)")
                     _pendingConnections[endpointId] = info.endpointName
                     connectionsClient
                         .requestConnection(localEndpointName, endpointId, connectionLifecycleCallback)
@@ -268,12 +271,18 @@ class AndroidNearbyDriver(
             return
         }
         connectionsClient.sendPayload(endpointId, Payload.fromBytes(data))
+            .addOnFailureListener { e ->
+                Log.e(TAG, "sendPayload to $endpointId failed: ${e.message}")
+            }
     }
 
     override suspend fun broadcast(data: ByteArray) {
         val endpoints = _connectedEndpoints.keys().toList()
         if (endpoints.isEmpty()) return
         connectionsClient.sendPayload(endpoints, Payload.fromBytes(data))
+            .addOnFailureListener { e ->
+                Log.e(TAG, "broadcast sendPayload failed: ${e.message}")
+            }
     }
 
     override suspend fun disconnect(endpointId: String) {
