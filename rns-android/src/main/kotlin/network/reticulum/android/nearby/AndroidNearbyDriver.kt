@@ -174,8 +174,9 @@ class AndroidNearbyDriver(
                 if (_pendingConnections.containsKey(endpointId)) return
 
                 // Deterministic tie-breaking: lower name initiates to prevent dual-connect.
-                // On equal names, both sides initiate — Nearby Connections deduplicates
-                // the dual requestConnection and one side receives onConnectionInitiated.
+                // On equal names, both sides initiate — Nearby randomly fails one side's
+                // requestConnection (handled by addOnFailureListener), then the surviving
+                // request causes both devices to receive onConnectionInitiated.
                 val weInitiate = localEndpointName <= info.endpointName
                 _discoveredEndpoints.tryEmit(DiscoveredEndpoint(endpointId, info.endpointName, weInitiate))
 
@@ -274,6 +275,12 @@ class AndroidNearbyDriver(
         }
 
         connectionsClient.stopAllEndpoints()
+
+        // Emit connectionLost for pending connections so interface clears stale entries
+        for (endpointId in _pendingConnections.keys()) {
+            _connectionLost.tryEmit(endpointId)
+        }
+
         _connectedEndpoints.clear()
         _pendingConnections.clear()
     }
