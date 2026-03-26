@@ -55,8 +55,12 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
 
+    // Google Nearby Connections (WiFi Direct + BLE mesh)
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
+
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:$coroutinesVersion")
 
     // Unit testing
     testImplementation("junit:junit:4.13.2")
