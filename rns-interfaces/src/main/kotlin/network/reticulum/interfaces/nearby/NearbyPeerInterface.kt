@@ -1,7 +1,5 @@
 package network.reticulum.interfaces.nearby
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import network.reticulum.interfaces.Interface
 
 /**
@@ -36,15 +34,12 @@ class NearbyPeerInterface(
 
     /**
      * Send data to this specific endpoint.
-     * Transport calls this synchronously; bridge to suspend with runBlocking.
      */
     override fun processOutgoing(data: ByteArray) {
         if (!online.get() || detached.get()) return
 
         try {
-            runBlocking(Dispatchers.IO) {
-                driver.send(endpointId, data)
-            }
+            driver.send(endpointId, data)
             txBytes.addAndGet(data.size.toLong())
             parentNearbyInterface.txBytes.addAndGet(data.size.toLong())
         } catch (e: Exception) {
@@ -70,7 +65,7 @@ class NearbyPeerInterface(
         online.set(false)
 
         try {
-            runBlocking(Dispatchers.IO) { driver.disconnect(endpointId) }
+            driver.disconnect(endpointId)
         } catch (_: Exception) {
         }
 

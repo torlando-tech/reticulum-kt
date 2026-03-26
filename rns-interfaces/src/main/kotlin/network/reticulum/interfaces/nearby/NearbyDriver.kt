@@ -42,7 +42,7 @@ interface NearbyDriver {
      * @param endpointId Target endpoint identifier
      * @param data Bytes to send (max 32KB for BYTES payload)
      */
-    suspend fun send(
+    fun send(
         endpointId: String,
         data: ByteArray,
     )
@@ -52,12 +52,12 @@ interface NearbyDriver {
      *
      * @param data Bytes to broadcast
      */
-    suspend fun broadcast(data: ByteArray)
+    fun broadcast(data: ByteArray)
 
     /**
      * Disconnect a specific endpoint.
      */
-    suspend fun disconnect(endpointId: String)
+    fun disconnect(endpointId: String)
 
     /**
      * Full shutdown — stop and release all resources.

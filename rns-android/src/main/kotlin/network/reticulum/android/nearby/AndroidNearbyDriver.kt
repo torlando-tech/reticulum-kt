@@ -276,7 +276,7 @@ class AndroidNearbyDriver(
         connectionsClient.stopAllEndpoints()
     }
 
-    override suspend fun send(
+    override fun send(
         endpointId: String,
         data: ByteArray,
     ) {
@@ -290,7 +290,7 @@ class AndroidNearbyDriver(
             }
     }
 
-    override suspend fun broadcast(data: ByteArray) {
+    override fun broadcast(data: ByteArray) {
         val endpoints = _connectedEndpoints.keys().toList()
         if (endpoints.isEmpty()) return
         connectionsClient.sendPayload(endpoints, Payload.fromBytes(data))
@@ -299,7 +299,7 @@ class AndroidNearbyDriver(
             }
     }
 
-    override suspend fun disconnect(endpointId: String) {
+    override fun disconnect(endpointId: String) {
         connectionsClient.disconnectFromEndpoint(endpointId)
         // onDisconnected callback handles _connectedEndpoints removal and connectionLost emission
     }

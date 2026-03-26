@@ -159,7 +159,7 @@ class NearbyInterface(
                 // Enforce cap — disconnect surplus endpoints the driver accepted
                 if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) {
                     log("At max peers, disconnecting surplus endpoint ${endpoint.endpointId}")
-                    scope.launch { driver.disconnect(endpoint.endpointId) }
+                    driver.disconnect(endpoint.endpointId)
                     return@collect
                 }
 
