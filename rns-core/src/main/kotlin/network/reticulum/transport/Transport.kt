@@ -95,6 +95,9 @@ object Transport {
     var transportEnabled: Boolean = false
         private set
 
+    /** Whether this instance is connected to a local shared instance (Python: Transport.owner.is_connected_to_shared_instance). */
+    var isConnectedToSharedInstance: Boolean = false
+
     /** Optional network identity for discovery encryption. */
     var networkIdentity: Identity? = null
 
@@ -2400,7 +2403,8 @@ object Transport {
         // for hops >= 1 (Transport.py:993-1011), but if a client omits transport
         // headers, the shared instance must still be able to forward the packet.
         if (fromLocalClient && packet.transportId == null && !forLocalClient &&
-            packet.packetType == PacketType.LINKREQUEST) {
+            packet.packetType != PacketType.ANNOUNCE &&
+            packet.context != PacketContext.LRPROOF) {
             val destPathEntry = pathTable[packet.destinationHash.toKey()]
             if (destPathEntry != null) {
                 val myHash = identity?.hash
@@ -2623,7 +2627,7 @@ object Transport {
                     val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                     transmit(outboundInterface, transportRaw)
                     sent = true
-                } else if (pathEntry.hops == 1 && outboundInterface.isConnectedToSharedInstance) {
+                } else if (pathEntry.hops == 1 && isConnectedToSharedInstance) {
                     // When behind a shared instance, even 1-hop destinations need
                     // transport headers so the shared instance can route them onto
                     // the network. Python Transport.py:993-1011
@@ -2944,7 +2948,7 @@ object Transport {
         // Cache the announce packet for later path request responses
         // Python Transport.py:1867 — cache pre-increment raw announce to disk
         // Only cache if not connected to a shared instance (the server handles caching)
-        if (!interfaces.any { it.isConnectedToSharedInstance }) {
+        if (!isConnectedToSharedInstance) {
             cacheAnnouncePacket(packet, interfaceRef)
         }
 
@@ -3698,7 +3702,7 @@ object Transport {
     private fun packetFilter(packet: Packet, receivingInterface: InterfaceRef): Boolean {
         // Python RNS: Bypass local filtering if connected to shared instance
         // (Python Transport.py:1187-1190)
-        if (interfaces.any { it.isConnectedToSharedInstance }) {
+        if (isConnectedToSharedInstance) {
             return true
         }
 
