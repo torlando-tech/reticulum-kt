@@ -173,12 +173,13 @@ class AndroidNearbyDriver(
                 }
                 if (_pendingConnections.containsKey(endpointId)) return
 
-                _discoveredEndpoints.tryEmit(DiscoveredEndpoint(endpointId, info.endpointName))
-
                 // Deterministic tie-breaking: lower name initiates to prevent dual-connect.
                 // On equal names, both sides initiate — Nearby Connections deduplicates
                 // the dual requestConnection and one side receives onConnectionInitiated.
-                if (localEndpointName <= info.endpointName) {
+                val weInitiate = localEndpointName <= info.endpointName
+                _discoveredEndpoints.tryEmit(DiscoveredEndpoint(endpointId, info.endpointName, weInitiate))
+
+                if (weInitiate) {
                     Log.d(TAG, "Initiating connection to $endpointId (we initiate)")
                     _pendingConnections[endpointId] = info.endpointName
                     connectionsClient
@@ -237,7 +238,10 @@ class AndroidNearbyDriver(
         connectionsClient
             .startAdvertising(localEndpointName, SERVICE_ID, connectionLifecycleCallback, options)
             .addOnSuccessListener { Log.i(TAG, "Advertising started") }
-            .addOnFailureListener { e -> Log.e(TAG, "Failed to start advertising", e) }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to start advertising", e)
+                isRunning = false
+            }
     }
 
     private fun startDiscovery() {
@@ -250,7 +254,10 @@ class AndroidNearbyDriver(
         connectionsClient
             .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
             .addOnSuccessListener { Log.i(TAG, "Discovery started") }
-            .addOnFailureListener { e -> Log.e(TAG, "Failed to start discovery", e) }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to start discovery", e)
+                isRunning = false
+            }
     }
 
     override suspend fun stop() {
@@ -296,7 +303,7 @@ class AndroidNearbyDriver(
 
     override suspend fun disconnect(endpointId: String) {
         connectionsClient.disconnectFromEndpoint(endpointId)
-        _connectedEndpoints.remove(endpointId)
+        // Don't remove from _connectedEndpoints here — onDisconnected will handle it
     }
 
     override fun shutdown() {

@@ -136,9 +136,8 @@ class NearbyInterface(
                 if (pendingConnections.contains(endpoint.endpointId)) return@collect
                 if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
 
-                // Deterministic tie-breaking: lower name initiates.
-                // On equal names, both sides initiate — Nearby Connections deduplicates.
-                if (localEndpointName <= endpoint.endpointName) {
+                // Use the driver's tie-breaking decision to track pending state
+                if (endpoint.weInitiate) {
                     log(
                         "Initiating connection to ${endpoint.endpointId} " +
                             "(our name=$localEndpointName, theirs=${endpoint.endpointName})",

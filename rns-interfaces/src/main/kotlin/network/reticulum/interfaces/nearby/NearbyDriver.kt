@@ -103,6 +103,8 @@ interface NearbyDriver {
 data class DiscoveredEndpoint(
     val endpointId: String,
     val endpointName: String,
+    /** Whether the driver initiated a connection to this endpoint. */
+    val weInitiate: Boolean = false,
 )
 
 /** An endpoint that has successfully connected. */
