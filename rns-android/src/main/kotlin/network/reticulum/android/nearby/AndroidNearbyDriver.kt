@@ -242,6 +242,7 @@ class AndroidNearbyDriver(
             .addOnFailureListener { e ->
                 Log.e(TAG, "Failed to start advertising", e)
                 isRunning = false
+                connectionsClient.stopDiscovery()
             }
     }
 
@@ -258,14 +259,15 @@ class AndroidNearbyDriver(
             .addOnFailureListener { e ->
                 Log.e(TAG, "Failed to start discovery", e)
                 isRunning = false
+                connectionsClient.stopAdvertising()
             }
     }
 
     override suspend fun stop() {
-        if (!isRunning) return
+        val wasRunning = isRunning
         isRunning = false
 
-        Log.i(TAG, "Stopping Nearby Connections")
+        Log.i(TAG, "Stopping Nearby Connections (wasRunning=$wasRunning)")
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
 
@@ -314,12 +316,10 @@ class AndroidNearbyDriver(
     }
 
     override fun shutdown() {
-        if (isRunning) {
-            isRunning = false
-            connectionsClient.stopAdvertising()
-            connectionsClient.stopDiscovery()
-            connectionsClient.stopAllEndpoints()
-        }
+        isRunning = false
+        connectionsClient.stopAdvertising()
+        connectionsClient.stopDiscovery()
+        connectionsClient.stopAllEndpoints()
         _connectedEndpoints.clear()
         _pendingConnections.clear()
         scope.cancel()

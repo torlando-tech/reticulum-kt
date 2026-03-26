@@ -134,7 +134,7 @@ class NearbyInterface(
                 // Skip if already connected or pending
                 if (peers.containsKey(endpoint.endpointId)) return@collect
                 if (pendingConnections.contains(endpoint.endpointId)) return@collect
-                if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
+                if (peers.size + pendingConnections.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
 
                 // Use the driver's tie-breaking decision to track pending state
                 if (endpoint.weInitiate) {
