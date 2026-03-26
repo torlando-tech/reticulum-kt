@@ -65,14 +65,15 @@ class NearbyInterface(
     // ---- Lifecycle ----
 
     override fun start() {
-        online.set(true)
         log("start() called — launching Nearby Connections coroutines")
 
         scope.launch {
             try {
                 driver.start(localEndpointName, maxConnections)
+                online.set(true)
                 log("Advertising and discovery started (name=$localEndpointName)")
             } catch (e: Exception) {
+                online.set(false)
                 log("Failed to start: ${e.message}")
             }
         }
@@ -131,13 +132,16 @@ class NearbyInterface(
                 // Skip if already connected or pending
                 if (peers.containsKey(endpoint.endpointId)) return@collect
                 if (pendingConnections.contains(endpoint.endpointId)) return@collect
-                if (peers.size >= maxConnections) return@collect
+                if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
 
-                // Deterministic tie-breaking: lower name initiates
-                if (localEndpointName < endpoint.endpointName) {
+                // Deterministic tie-breaking: lower name initiates.
+                // On equal names, use endpointId as secondary tie-breaker.
+                val weInitiate = localEndpointName < endpoint.endpointName ||
+                    (localEndpointName == endpoint.endpointName && localEndpointName < endpoint.endpointId)
+                if (weInitiate) {
                     log(
                         "Initiating connection to ${endpoint.endpointId} " +
-                            "(our name < theirs: $localEndpointName < ${endpoint.endpointName})",
+                            "(our name=$localEndpointName, theirs=${endpoint.endpointName})",
                     )
                     pendingConnections.add(endpoint.endpointId)
                     // Driver handles the actual requestConnection call internally
@@ -145,7 +149,7 @@ class NearbyInterface(
                 } else {
                     log(
                         "Waiting for ${endpoint.endpointId} to initiate " +
-                            "(their name < ours: ${endpoint.endpointName} < $localEndpointName)",
+                            "(our name=$localEndpointName, theirs=${endpoint.endpointName})",
                     )
                 }
             }

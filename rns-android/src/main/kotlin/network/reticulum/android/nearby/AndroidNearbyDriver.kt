@@ -202,7 +202,11 @@ class AndroidNearbyDriver(
         }
 
         localEndpointName = endpointName
-        this.maxConnections = maxConnections.coerceIn(1, 10)
+        val clamped = maxConnections.coerceIn(1, 10)
+        if (clamped != maxConnections) {
+            Log.w(TAG, "maxConnections clamped from $maxConnections to $clamped (driver limit: 1..10)")
+        }
+        this.maxConnections = clamped
         isRunning = true
 
         Log.i(TAG, "Starting Nearby Connections (name=$localEndpointName, max=${this.maxConnections})")
@@ -244,6 +248,12 @@ class AndroidNearbyDriver(
         Log.i(TAG, "Stopping Nearby Connections")
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
+
+        // Emit connectionLost for all active peers before clearing state
+        for (endpointId in _connectedEndpoints.keys()) {
+            _connectionLost.tryEmit(endpointId)
+        }
+
         connectionsClient.stopAllEndpoints()
         _connectedEndpoints.clear()
         _pendingConnections.clear()

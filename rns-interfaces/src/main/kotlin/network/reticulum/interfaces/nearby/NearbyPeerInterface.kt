@@ -58,8 +58,6 @@ class NearbyPeerInterface(
      */
     fun deliverIncoming(data: ByteArray) {
         if (!online.get() || detached.get()) return
-        rxBytes.addAndGet(data.size.toLong())
-        parentNearbyInterface.rxBytes.addAndGet(data.size.toLong())
         processIncoming(data)
     }
 
