@@ -99,11 +99,13 @@ class NearbyInterface(
         online.set(false)
         log("Detaching — shutting down all peers and driver")
 
-        // Detach all peer interfaces
+        // Tear down all peer interfaces directly (don't call peer.detach() which
+        // would re-enter peerDisconnected and double-deregister from Transport)
         for ((_, peer) in peers) {
+            peer.online.set(false)
+            peer.detached.set(true)
             try {
                 Transport.deregisterInterface(peer.toRef())
-                peer.detach()
             } catch (_: Exception) {
             }
         }
@@ -135,10 +137,8 @@ class NearbyInterface(
                 if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
 
                 // Deterministic tie-breaking: lower name initiates.
-                // On equal names, use endpointId as secondary tie-breaker.
-                val weInitiate = localEndpointName < endpoint.endpointName ||
-                    (localEndpointName == endpoint.endpointName && localEndpointName < endpoint.endpointId)
-                if (weInitiate) {
+                // On equal names, both sides initiate — Nearby Connections deduplicates.
+                if (localEndpointName <= endpoint.endpointName) {
                     log(
                         "Initiating connection to ${endpoint.endpointId} " +
                             "(our name=$localEndpointName, theirs=${endpoint.endpointName})",
