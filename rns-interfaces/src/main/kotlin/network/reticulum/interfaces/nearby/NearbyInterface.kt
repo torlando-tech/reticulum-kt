@@ -15,9 +15,14 @@ import java.util.concurrent.ConcurrentHashMap
  * Nearby Connections mesh interface for Reticulum networking.
  *
  * Server-style parent interface (like [network.reticulum.interfaces.ble.BLEInterface])
- * that orchestrates discovery, connection, and peer management via Google Nearby
- * Connections (WiFi Direct + BLE). Spawns [NearbyPeerInterface] children for each
- * connected endpoint and registers them with Transport.
+ * that orchestrates peer management via Google Nearby Connections (WiFi Direct + BLE).
+ * Spawns [NearbyPeerInterface] children for each connected endpoint and registers them
+ * with Transport.
+ *
+ * The driver ([NearbyDriver]) is the single source of truth for connection state —
+ * tie-breaking, connection limits, and pending tracking all live in the driver. This
+ * interface only reacts to driver events: spawning peers on [NearbyDriver.connectedEndpoints],
+ * tearing them down on [NearbyDriver.connectionLost], and routing data.
  *
  * Key differences from BLEInterface:
  * - No fragmentation: Nearby BYTES payloads handle up to 32KB (Reticulum max ~16KB)
@@ -27,7 +32,6 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Architecture:
  * - Dual-role: advertises and discovers simultaneously via P2P_CLUSTER strategy
- * - Deterministic tie-breaking: lower endpoint name initiates connection (prevents dual-connect)
  * - processOutgoing() is a no-op — Transport calls each NearbyPeerInterface directly
  *
  * @param name Human-readable interface name
@@ -55,9 +59,6 @@ class NearbyInterface(
     // endpointId -> NearbyPeerInterface
     private val peers = ConcurrentHashMap<String, NearbyPeerInterface>()
 
-    // Endpoints we've already initiated connection to (prevents duplicate requests)
-    private val pendingConnections = ConcurrentHashMap.newKeySet<String>()
-
     init {
         spawnedInterfaces = mutableListOf()
     }
@@ -69,17 +70,11 @@ class NearbyInterface(
 
         scope.launch {
             try {
+                // driver.start() suspends until advertising + discovery are confirmed.
+                // It throws on failure, so online stays false.
                 driver.start(localEndpointName, maxConnections)
-                // driver.start() returns immediately; async Tasks may still fail.
-                // Brief delay then check driver.isRunning to catch early failures.
-                kotlinx.coroutines.delay(1000)
-                if (driver.isRunning) {
-                    online.set(true)
-                    log("Advertising and discovery started (name=$localEndpointName)")
-                } else {
-                    online.set(false)
-                    log("Driver failed to start (isRunning=false after start)")
-                }
+                online.set(true)
+                log("Advertising and discovery started (name=$localEndpointName)")
             } catch (e: Exception) {
                 online.set(false)
                 log("Failed to start: ${e.message}")
@@ -119,7 +114,6 @@ class NearbyInterface(
         }
         peers.clear()
         spawnedInterfaces?.clear()
-        pendingConnections.clear()
 
         // Shutdown driver and cancel scope
         driver.shutdown()
@@ -131,34 +125,13 @@ class NearbyInterface(
     // ---- Event Collection ----
 
     /**
-     * Handle discovered endpoints with deterministic tie-breaking.
-     * The peer with the lexicographically lower endpoint name initiates the connection.
+     * Log discovered endpoints. Connection decisions are made entirely by the driver.
      */
     private suspend fun collectDiscoveredEndpoints() {
         try {
             driver.discoveredEndpoints.collect { endpoint ->
-                if (!online.get() || detached.get()) return@collect
-
-                // Skip if already connected or pending
-                if (peers.containsKey(endpoint.endpointId)) return@collect
-                if (pendingConnections.contains(endpoint.endpointId)) return@collect
-                if (peers.size + pendingConnections.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) return@collect
-
-                // Use the driver's tie-breaking decision to track pending state
-                if (endpoint.weInitiate) {
-                    log(
-                        "Initiating connection to ${endpoint.endpointId} " +
-                            "(our name=$localEndpointName, theirs=${endpoint.endpointName})",
-                    )
-                    pendingConnections.add(endpoint.endpointId)
-                    // Driver handles the actual requestConnection call internally
-                    // The result comes via connectedEndpoints or connectionLost
-                } else {
-                    log(
-                        "Waiting for ${endpoint.endpointId} to initiate " +
-                            "(our name=$localEndpointName, theirs=${endpoint.endpointName})",
-                    )
-                }
+                val action = if (endpoint.weInitiate) "initiating" else "waiting"
+                log("Discovered ${endpoint.endpointId} (${endpoint.endpointName}), $action")
             }
         } catch (_: CancellationException) {
             // Normal shutdown
@@ -174,8 +147,6 @@ class NearbyInterface(
         try {
             driver.connectedEndpoints.collect { endpoint ->
                 if (!online.get() || detached.get()) return@collect
-
-                pendingConnections.remove(endpoint.endpointId)
 
                 // Skip if already have a peer for this endpoint
                 if (peers.containsKey(endpoint.endpointId)) return@collect
@@ -202,7 +173,6 @@ class NearbyInterface(
     private suspend fun collectConnectionLost() {
         try {
             driver.connectionLost.collect { endpointId ->
-                pendingConnections.remove(endpointId)
                 tearDownPeer(endpointId)
             }
         } catch (_: CancellationException) {
@@ -271,7 +241,6 @@ class NearbyInterface(
         } catch (_: Exception) {
         }
 
-        // Only detach if not already detached (avoids recursive peerDisconnected call)
         if (!peer.detached.get()) {
             peer.online.set(false)
             peer.detached.set(true)

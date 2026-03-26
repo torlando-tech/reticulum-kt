@@ -22,6 +22,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.tasks.await
 import network.reticulum.interfaces.nearby.ConnectedEndpoint
 import network.reticulum.interfaces.nearby.DiscoveredEndpoint
 import network.reticulum.interfaces.nearby.NearbyDriver
@@ -34,9 +35,8 @@ import java.util.concurrent.ConcurrentHashMap
  * Uses P2P_CLUSTER strategy for mesh-compatible topology (vs P2P_STAR which forces hub-spoke).
  * Auto-accepts all connections since Reticulum handles authentication at the protocol level.
  *
- * Deterministic tie-breaking on discovery: the NearbyInterface compares endpoint names and
- * decides which side initiates. This driver exposes discovered endpoints for the interface
- * to make that decision.
+ * The driver is the single source of truth for all connection state — tie-breaking, connection
+ * limits, and pending/connected tracking. The interface layer reacts to driver events only.
  *
  * @param context Android application context
  * @param scope CoroutineScope for the driver's internal operations
@@ -206,6 +206,10 @@ class AndroidNearbyDriver(
 
     // ---- NearbyDriver Implementation ----
 
+    /**
+     * Start advertising and discovery. Suspends until both are confirmed started.
+     * Throws on failure so the caller can set online=false.
+     */
     override suspend fun start(
         endpointName: String,
         maxConnections: Int,
@@ -221,53 +225,43 @@ class AndroidNearbyDriver(
             Log.w(TAG, "maxConnections clamped from $maxConnections to $clamped (driver limit: 1..10)")
         }
         this.maxConnections = clamped
-        isRunning = true
 
         Log.i(TAG, "Starting Nearby Connections (name=$localEndpointName, max=${this.maxConnections})")
 
-        startAdvertising()
-        startDiscovery()
-    }
-
-    private fun startAdvertising() {
-        val options =
-            AdvertisingOptions
-                .Builder()
+        try {
+            val advOptions = AdvertisingOptions.Builder()
                 .setStrategy(Strategy.P2P_CLUSTER)
                 .build()
+            connectionsClient
+                .startAdvertising(localEndpointName, SERVICE_ID, connectionLifecycleCallback, advOptions)
+                .await()
+            Log.i(TAG, "Advertising started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start advertising", e)
+            throw e
+        }
 
-        connectionsClient
-            .startAdvertising(localEndpointName, SERVICE_ID, connectionLifecycleCallback, options)
-            .addOnSuccessListener { Log.i(TAG, "Advertising started") }
-            .addOnFailureListener { e ->
-                Log.e(TAG, "Failed to start advertising", e)
-                isRunning = false
-                connectionsClient.stopDiscovery()
-            }
-    }
-
-    private fun startDiscovery() {
-        val options =
-            DiscoveryOptions
-                .Builder()
+        try {
+            val discOptions = DiscoveryOptions.Builder()
                 .setStrategy(Strategy.P2P_CLUSTER)
                 .build()
+            connectionsClient
+                .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discOptions)
+                .await()
+            Log.i(TAG, "Discovery started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start discovery, stopping advertising", e)
+            connectionsClient.stopAdvertising()
+            throw e
+        }
 
-        connectionsClient
-            .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
-            .addOnSuccessListener { Log.i(TAG, "Discovery started") }
-            .addOnFailureListener { e ->
-                Log.e(TAG, "Failed to start discovery", e)
-                isRunning = false
-                connectionsClient.stopAdvertising()
-            }
+        isRunning = true
     }
 
     override suspend fun stop() {
-        val wasRunning = isRunning
         isRunning = false
 
-        Log.i(TAG, "Stopping Nearby Connections (wasRunning=$wasRunning)")
+        Log.i(TAG, "Stopping Nearby Connections")
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
 
@@ -278,7 +272,7 @@ class AndroidNearbyDriver(
         _pendingConnections.clear()
 
         // stopAllEndpoints triggers onDisconnected for each connected endpoint,
-        // which emits connectionLost and clears _connectedEndpoints entries
+        // which emits connectionLost and removes from _connectedEndpoints
         connectionsClient.stopAllEndpoints()
     }
 
@@ -307,7 +301,7 @@ class AndroidNearbyDriver(
 
     override suspend fun disconnect(endpointId: String) {
         connectionsClient.disconnectFromEndpoint(endpointId)
-        // Don't remove from _connectedEndpoints here — onDisconnected will handle it
+        // onDisconnected callback handles _connectedEndpoints removal and connectionLost emission
     }
 
     override fun shutdown() {
