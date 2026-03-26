@@ -80,6 +80,8 @@ class NearbyInterface(
                 driver.start(localEndpointName, maxConnections)
                 online.set(true)
                 log("Advertising and discovery started (name=$localEndpointName)")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 online.set(false)
                 log("Failed to start: ${e.message}")
