@@ -195,6 +195,10 @@ class AndroidNearbyDriver(
 
             override fun onEndpointLost(endpointId: String) {
                 Log.d(TAG, "Endpoint lost: $endpointId")
+                if (_pendingConnections.remove(endpointId) != null) {
+                    Log.d(TAG, "Cleared pending connection for lost endpoint $endpointId")
+                    _connectionLost.tryEmit(endpointId)
+                }
             }
         }
 
