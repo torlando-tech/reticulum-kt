@@ -142,7 +142,7 @@ class LocalServerInterface : Interface {
             this.tcpPort = DEFAULT_TCP_PORT
         }
 
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.Collections.synchronizedList(mutableListOf())
     }
 
     /**
@@ -160,7 +160,7 @@ class LocalServerInterface : Interface {
         this.abstractSocketName = null
         this.socketPath = null
         this.tcpPort = tcpPort
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.Collections.synchronizedList(mutableListOf())
     }
 
     /**
@@ -193,7 +193,7 @@ class LocalServerInterface : Interface {
             this.socketPath = null
             this.tcpPort = DEFAULT_TCP_PORT
         }
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = java.util.Collections.synchronizedList(mutableListOf())
     }
 
     override fun start() {
