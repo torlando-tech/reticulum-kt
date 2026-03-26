@@ -75,7 +75,7 @@ class AutoInterface(
     private val multicastEchoes = ConcurrentHashMap<String, Long>()
 
     init {
-        spawnedInterfaces = java.util.Collections.synchronizedList(mutableListOf())
+        spawnedInterfaces = java.util.concurrent.CopyOnWriteArrayList()
     }
 
     override val bitrate: Int
