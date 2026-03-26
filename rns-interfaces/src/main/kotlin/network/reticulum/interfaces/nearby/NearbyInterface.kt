@@ -70,8 +70,16 @@ class NearbyInterface(
         scope.launch {
             try {
                 driver.start(localEndpointName, maxConnections)
-                online.set(true)
-                log("Advertising and discovery started (name=$localEndpointName)")
+                // driver.start() returns immediately; async Tasks may still fail.
+                // Brief delay then check driver.isRunning to catch early failures.
+                kotlinx.coroutines.delay(1000)
+                if (driver.isRunning) {
+                    online.set(true)
+                    log("Advertising and discovery started (name=$localEndpointName)")
+                } else {
+                    online.set(false)
+                    log("Driver failed to start (isRunning=false after start)")
+                }
             } catch (e: Exception) {
                 online.set(false)
                 log("Failed to start: ${e.message}")
@@ -171,6 +179,13 @@ class NearbyInterface(
 
                 // Skip if already have a peer for this endpoint
                 if (peers.containsKey(endpoint.endpointId)) return@collect
+
+                // Enforce cap — disconnect surplus endpoints the driver accepted
+                if (peers.size >= maxConnections.coerceAtMost(DEFAULT_MAX_CONNECTIONS)) {
+                    log("At max peers, disconnecting surplus endpoint ${endpoint.endpointId}")
+                    scope.launch { driver.disconnect(endpoint.endpointId) }
+                    return@collect
+                }
 
                 spawnPeerInterface(endpoint.endpointId, endpoint.endpointName)
             }

@@ -78,7 +78,7 @@ class AndroidNearbyDriver(
     private val _connectedEndpointsFlow = MutableSharedFlow<ConnectedEndpoint>(extraBufferCapacity = 16)
     override val connectedEndpoints: SharedFlow<ConnectedEndpoint> = _connectedEndpointsFlow.asSharedFlow()
 
-    private val _connectionLost = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    private val _connectionLost = MutableSharedFlow<String>(extraBufferCapacity = 64)
     override val connectionLost: SharedFlow<String> = _connectionLost.asSharedFlow()
 
     private val _dataReceived = MutableSharedFlow<ReceivedData>(extraBufferCapacity = 256)
@@ -271,20 +271,15 @@ class AndroidNearbyDriver(
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
 
-        // Emit connectionLost for all active peers before clearing state
-        for (endpointId in _connectedEndpoints.keys()) {
-            _connectionLost.tryEmit(endpointId)
-        }
-
-        connectionsClient.stopAllEndpoints()
-
-        // Emit connectionLost for pending connections so interface clears stale entries
+        // Emit connectionLost for pending connections (won't get onDisconnected callbacks)
         for (endpointId in _pendingConnections.keys()) {
             _connectionLost.tryEmit(endpointId)
         }
-
-        _connectedEndpoints.clear()
         _pendingConnections.clear()
+
+        // stopAllEndpoints triggers onDisconnected for each connected endpoint,
+        // which emits connectionLost and clears _connectedEndpoints entries
+        connectionsClient.stopAllEndpoints()
     }
 
     override suspend fun send(
