@@ -1410,6 +1410,83 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             result("valid" to boolVal(valid), "computed_ifac" to hexVal(computedIfac))
         }
 
+        "ifac_mask_packet" -> {
+            val ifacKey = p.hex("ifac_key")
+            val raw = p.hex("packet_data")
+            val ifacSize = p.intOpt("ifac_size") ?: 16
+
+            // 1. Compute IFAC
+            val ed25519Seed = ifacKey.copyOfRange(32, 64)
+            val signature = crypto.ed25519Sign(ed25519Seed, raw)
+            val ifac = signature.copyOfRange(signature.size - ifacSize, signature.size)
+
+            // 2. Set IFAC flag and insert IFAC bytes after 2-byte header
+            val newRaw = ByteArray(raw.size + ifacSize)
+            newRaw[0] = (raw[0].toInt() or 0x80).toByte()
+            newRaw[1] = raw[1]
+            System.arraycopy(ifac, 0, newRaw, 2, ifacSize)
+            System.arraycopy(raw, 2, newRaw, 2 + ifacSize, raw.size - 2)
+
+            // 3. Generate XOR mask
+            val mask = crypto.hkdf(newRaw.size, ifac, ifacKey, null)
+
+            // 4. Apply mask: XOR header and payload, leave IFAC bytes unmasked
+            val masked = ByteArray(newRaw.size)
+            for (i in newRaw.indices) {
+                masked[i] = when {
+                    i == 0 -> ((newRaw[i].toInt() xor mask[i].toInt()) or 0x80).toByte()
+                    i == 1 || i > ifacSize + 1 -> (newRaw[i].toInt() xor mask[i].toInt()).toByte()
+                    else -> newRaw[i] // IFAC bytes: no mask
+                }
+            }
+
+            result("masked_packet" to hexVal(masked), "ifac" to hexVal(ifac))
+        }
+
+        "ifac_unmask_packet" -> {
+            val ifacKey = p.hex("ifac_key")
+            val masked = p.hex("masked_packet")
+            val ifacSize = p.intOpt("ifac_size") ?: 16
+
+            // 1. Check IFAC flag
+            if (masked[0].toInt() and 0x80 != 0x80 || masked.size <= 2 + ifacSize) {
+                result("valid" to boolVal(false))
+            } else {
+                // 2. Extract IFAC (unmasked bytes 2..2+ifacSize)
+                val ifac = masked.copyOfRange(2, 2 + ifacSize)
+
+                // 3. Generate XOR mask
+                val mask = crypto.hkdf(masked.size, ifac, ifacKey, null)
+
+                // 4. Unmask header and payload
+                val unmasked = ByteArray(masked.size)
+                for (i in masked.indices) {
+                    unmasked[i] = when {
+                        i <= 1 || i > ifacSize + 1 -> (masked[i].toInt() xor mask[i].toInt()).toByte()
+                        else -> masked[i]
+                    }
+                }
+
+                // 5. Clear IFAC flag and remove IFAC bytes
+                val original = ByteArray(unmasked.size - ifacSize)
+                original[0] = (unmasked[0].toInt() and 0x7F).toByte()
+                original[1] = unmasked[1]
+                System.arraycopy(unmasked, 2 + ifacSize, original, 2, unmasked.size - 2 - ifacSize)
+
+                // 6. Validate: recompute IFAC over unmasked packet
+                val ed25519Seed = ifacKey.copyOfRange(32, 64)
+                val signature = crypto.ed25519Sign(ed25519Seed, original)
+                val expectedIfac = signature.copyOfRange(signature.size - ifacSize, signature.size)
+                val valid = ifac.contentEquals(expectedIfac)
+
+                if (valid) {
+                    result("valid" to boolVal(true), "packet_data" to hexVal(original), "ifac" to hexVal(ifac))
+                } else {
+                    result("valid" to boolVal(false), "ifac" to hexVal(ifac))
+                }
+            }
+        }
+
         // === 17. Compression ===
 
         "bz2_compress" -> {
