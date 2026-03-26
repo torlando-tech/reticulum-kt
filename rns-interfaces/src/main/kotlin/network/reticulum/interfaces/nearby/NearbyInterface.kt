@@ -9,7 +9,9 @@ import kotlinx.coroutines.launch
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Nearby Connections mesh interface for Reticulum networking.
@@ -59,13 +61,16 @@ class NearbyInterface(
     // endpointId -> NearbyPeerInterface
     private val peers = ConcurrentHashMap<String, NearbyPeerInterface>()
 
+    private val started = AtomicBoolean(false)
+
     init {
-        spawnedInterfaces = mutableListOf()
+        spawnedInterfaces = Collections.synchronizedList(mutableListOf())
     }
 
     // ---- Lifecycle ----
 
     override fun start() {
+        if (started.getAndSet(true)) return
         log("start() called — launching Nearby Connections coroutines")
 
         scope.launch {
