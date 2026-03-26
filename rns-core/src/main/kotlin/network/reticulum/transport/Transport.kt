@@ -2400,7 +2400,8 @@ object Transport {
         // for hops >= 1 (Transport.py:993-1011), but if a client omits transport
         // headers, the shared instance must still be able to forward the packet.
         if (fromLocalClient && packet.transportId == null && !forLocalClient &&
-            packet.packetType == PacketType.LINKREQUEST) {
+            packet.packetType != PacketType.ANNOUNCE &&
+            packet.context != PacketContext.LRPROOF) {
             val destPathEntry = pathTable[packet.destinationHash.toKey()]
             if (destPathEntry != null) {
                 val myHash = identity?.hash
@@ -2623,7 +2624,7 @@ object Transport {
                     val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                     transmit(outboundInterface, transportRaw)
                     sent = true
-                } else if (pathEntry.hops == 1 && outboundInterface.isConnectedToSharedInstance) {
+                } else if (pathEntry.hops == 1 && interfaces.any { it.isConnectedToSharedInstance }) {
                     // When behind a shared instance, even 1-hop destinations need
                     // transport headers so the shared instance can route them onto
                     // the network. Python Transport.py:993-1011
