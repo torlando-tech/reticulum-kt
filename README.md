@@ -15,11 +15,11 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Identity | Complete | X25519/Ed25519, ratchets, known destinations, persistent storage |
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs |
-| Transport | ~95% | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
+| Transport | Complete | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
 | Link | Complete | Establishment, encryption, channels, resources, request/response, MTU discovery |
-| Channel | ~90% | Windowed flow control, ordered delivery, retransmission, message type registry |
+| Channel | Complete | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels |
-| Resource | ~90% | Chunked transfer, BZ2 compression, progress tracking, metadata |
+| Resource | Complete | Chunked transfer, BZ2 compression, progress tracking, metadata |
 | Crypto | Complete | BouncyCastle: X25519, Ed25519, HKDF, AES-256-CBC, SHA-256/512 |
 
 ### Interfaces
@@ -53,8 +53,6 @@ Features that exist in the Python reference but are not yet implemented:
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| PHY stats on packets | Medium | Expose RSSI/SNR/Q from RNode through the Packet API |
-| Interface discovery | Medium | `InterfaceAnnouncer`/`InterfaceMonitor` for mDNS-based interface discovery |
 | Blackhole system | Medium | Identity blacklisting to block bad actors |
 | Remote management | Low | Control destinations for remote `/path` and `/status` queries |
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
