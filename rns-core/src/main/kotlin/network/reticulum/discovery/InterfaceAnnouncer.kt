@@ -13,7 +13,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
-import network.reticulum.transport.ByteArrayKey
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack

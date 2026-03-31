@@ -147,6 +147,10 @@ class Identity private constructor(
         private val ratchetPath: String
             get() = "$storagePath/ratchets"
 
+        /** Pluggable persistent storage for known destinations and ratchets.
+         *  When null, falls back to file-based persistence. */
+        var identityStore: network.reticulum.storage.IdentityStore? = null
+
         /**
          * Flag to prevent concurrent saves.
          */
@@ -360,6 +364,7 @@ class Identity private constructor(
                 appData = appData?.copyOf()
             )
             knownDestinations[destHash.toKey()] = data
+            identityStore?.upsertKnownDestination(destHash, data)
 
             // Index by identity hash for reverse lookups
             val identityHash = Hashes.truncatedHash(publicKey)
@@ -529,6 +534,9 @@ class Identity private constructor(
          * Thread-safe with a lock to prevent concurrent saves.
          */
         fun saveKnownDestinations() {
+            // When store is active, write-through handles persistence
+            if (identityStore != null) return
+
             try {
                 // Wait for any ongoing save to complete
                 val waitInterval = 200L // milliseconds
@@ -663,6 +671,19 @@ class Identity private constructor(
          * Called during Reticulum startup.
          */
         fun loadKnownDestinations() {
+            // When store is active, load from database
+            identityStore?.let { store ->
+                val loaded = store.loadAllKnownDestinations()
+                knownDestinations.putAll(loaded)
+                // Rebuild identity hash index
+                for ((destKey, data) in loaded) {
+                    val identityHash = Hashes.truncatedHash(data.publicKey)
+                    identityHashIndex[identityHash.toKey()] = destKey.bytes.copyOf()
+                }
+                println("Loaded ${loaded.size} known destinations from store")
+                return
+            }
+
             val destFile = java.io.File(storagePath, "known_destinations")
 
             if (!destFile.exists()) {
@@ -774,9 +795,9 @@ class Identity private constructor(
                 entries.removeIf { now - it.timestamp > RATCHET_EXPIRY }
             }
 
-            // Persist to disk
+            // Persist to storage
             if (shouldPersist) {
-                persistRatchet(destHash, ratchet, now)
+                identityStore?.upsertRatchet(destHash, ratchet, now) ?: persistRatchet(destHash, ratchet, now)
             }
         }
 
@@ -844,7 +865,20 @@ class Identity private constructor(
                 }
             }
 
-            // Try to load from disk
+            // Try to load from store or disk
+            identityStore?.let { store ->
+                val result = store.getRatchet(destHash) ?: return null
+                val (ratchet, timestamp) = result
+                if (System.currentTimeMillis() - timestamp > RATCHET_EXPIRY) return null
+                // Cache in memory
+                synchronized(destinationRatchets) {
+                    val entries = destinationRatchets.getOrPut(key) { mutableListOf() }
+                    if (!entries.any { it.ratchet.contentEquals(ratchet) }) {
+                        entries.add(0, RatchetEntry(ratchet.copyOf(), timestamp))
+                    }
+                }
+                return ratchet
+            }
             return loadRatchetFromDisk(destHash)
         }
 

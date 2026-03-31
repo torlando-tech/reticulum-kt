@@ -9,7 +9,7 @@ import kotlinx.coroutines.launch
 import kotlin.coroutines.coroutineContext
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
-import network.reticulum.transport.ByteArrayKey
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
@@ -35,6 +35,8 @@ class InterfaceDiscovery(
     private val autoConnectFactory: ((DiscoveredInterface) -> InterfaceRef?)? = null,
     private val maxAutoConnected: Int = 0,
     private val discoveryCallback: ((DiscoveredInterface) -> Unit)? = null,
+    /** Pluggable persistent storage. When null, falls back to file-based persistence. */
+    private val discoveryStore: network.reticulum.storage.DiscoveryStore? = null,
 ) {
     private var handler: InterfaceAnnounceHandler? = null
     private val monitoredInterfaces = mutableListOf<MonitoredInterface>()
@@ -83,12 +85,21 @@ class InterfaceDiscovery(
     fun listDiscovered(): List<Pair<DiscoveredInterface, String>> {
         val now = System.currentTimeMillis() / 1000L
         val results = mutableListOf<Pair<DiscoveredInterface, String>>()
-        val dir = discoveryDir
-        if (!dir.exists()) return results
 
-        for (file in dir.listFiles() ?: emptyArray()) {
+        // Load from store or file system
+        val allDiscovered: List<DiscoveredInterface> = discoveryStore?.let { store ->
+            store.removeOlderThan(now - DiscoveryConstants.THRESHOLD_REMOVE)
+            store.loadAllDiscovered()
+        } ?: run {
+            val dir = discoveryDir
+            if (!dir.exists()) return results
+            dir.listFiles()?.mapNotNull { file ->
+                try { loadDiscoveredInterface(file) } catch (_: Exception) { null }
+            } ?: emptyList()
+        }
+
+        for (info in allDiscovered) {
             try {
-                val info = loadDiscoveredInterface(file) ?: continue
                 val heardDelta = now - info.lastHeard
 
                 // Check removal thresholds
@@ -97,7 +108,11 @@ class InterfaceDiscovery(
                         ByteArrayKey(hexToBytes(info.networkId))))
 
                 if (shouldRemove) {
-                    file.delete()
+                    if (discoveryStore != null) {
+                        discoveryStore.removeDiscovered(info.discoveryHash)
+                    } else {
+                        File(discoveryDir, info.discoveryHash.toHexString()).delete()
+                    }
                     continue
                 }
 
@@ -109,7 +124,7 @@ class InterfaceDiscovery(
 
                 results.add(info to status)
             } catch (e: Exception) {
-                log("Error loading discovered interface data from ${file.name}: ${e.message}")
+                log("Error processing discovered interface: ${e.message}")
             }
         }
 
@@ -133,23 +148,39 @@ class InterfaceDiscovery(
     private fun onInterfaceDiscovered(info: DiscoveredInterface) {
         try {
             val filename = info.discoveryHash.toHexString()
-            val file = File(discoveryDir, filename)
 
-            val isNew = !file.exists()
-            if (isNew) {
-                info.discovered = info.received
-                info.lastHeard = info.received
-                info.heardCount = 0
+            if (discoveryStore != null) {
+                val existing = discoveryStore.getDiscovered(info.discoveryHash)
+                if (existing == null) {
+                    info.discovered = info.received
+                    info.lastHeard = info.received
+                    info.heardCount = 0
+                } else {
+                    info.discovered = existing.discovered
+                    info.heardCount = existing.heardCount + 1
+                    info.lastHeard = info.received
+                }
+                val isNew = existing == null
+                discoveryStore.upsertDiscovered(info)
+                log("${if (isNew) "New" else "Updated"} discovered interface: " +
+                    "${info.type} \"${info.name}\" (heard=${info.heardCount})")
             } else {
-                val existing = loadDiscoveredInterface(file)
-                info.discovered = existing?.discovered ?: info.received
-                info.heardCount = (existing?.heardCount ?: 0) + 1
-                info.lastHeard = info.received
+                val file = File(discoveryDir, filename)
+                val isNew = !file.exists()
+                if (isNew) {
+                    info.discovered = info.received
+                    info.lastHeard = info.received
+                    info.heardCount = 0
+                } else {
+                    val existing = loadDiscoveredInterface(file)
+                    info.discovered = existing?.discovered ?: info.received
+                    info.heardCount = (existing?.heardCount ?: 0) + 1
+                    info.lastHeard = info.received
+                }
+                saveDiscoveredInterface(file, info)
+                log("${if (isNew) "New" else "Updated"} discovered interface: " +
+                    "${info.type} \"${info.name}\" (heard=${info.heardCount}, file=$filename)")
             }
-
-            saveDiscoveredInterface(file, info)
-            log("${if (isNew) "New" else "Updated"} discovered interface: " +
-                "${info.type} \"${info.name}\" (heard=${info.heardCount}, file=$filename)")
         } catch (e: Exception) {
             log("Error persisting discovered interface: ${e.message}")
             return

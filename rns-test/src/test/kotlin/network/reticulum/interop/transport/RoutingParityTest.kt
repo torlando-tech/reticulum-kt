@@ -4,7 +4,7 @@ import network.reticulum.Reticulum
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.toHexString
-import network.reticulum.transport.toKey
+import network.reticulum.common.toKey
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.pipe.PipeInterface

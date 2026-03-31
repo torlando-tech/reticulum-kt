@@ -5,7 +5,7 @@ import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.transport.AnnounceHandler
-import network.reticulum.transport.ByteArrayKey
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
 

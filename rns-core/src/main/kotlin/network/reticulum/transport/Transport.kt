@@ -15,8 +15,10 @@ import network.reticulum.common.Platform
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.InterfaceMode
 import network.reticulum.common.TransportType
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.concatBytes
 import network.reticulum.common.toHexString
+import network.reticulum.common.toKey
 import network.reticulum.crypto.CryptoProvider
 import network.reticulum.crypto.Hashes
 import network.reticulum.crypto.defaultCryptoProvider
@@ -385,6 +387,12 @@ object Transport {
         // Cancel all link watchdog coroutines
         network.reticulum.link.Link.cancelAllWatchdogs()
 
+        // Persist data BEFORE clearing tables
+        if (transportEnabled) {
+            persistData()
+        }
+        persistDataToStorage()
+
         // Clear all tables
         pathTable.clear()
         linkTable.clear()
@@ -404,15 +412,6 @@ object Transport {
         announceHandlers.clear()
         pendingLinks.clear()
         activeLinks.clear()
-
-        // Persist data before clearing
-        if (transportEnabled) {
-            persistData()
-        }
-
-        // Save path table and packet hashlist to storage
-        persistDataToStorage()
-
         tunnels.clear()
         tunnelInterfaces.clear()
 
@@ -446,6 +445,20 @@ object Transport {
     internal fun setStoragePath(path: String) {
         storagePath = path
     }
+
+    // ===== Pluggable Storage Backends =====
+
+    /** Persistent path table storage. When null, falls back to file-based persistence. */
+    var pathStore: network.reticulum.storage.PathStore? = null
+
+    /** Persistent packet hashlist storage. When null, falls back to file-based persistence. */
+    var packetHashStore: network.reticulum.storage.PacketHashStore? = null
+
+    /** Persistent tunnel table storage. When null, falls back to file-based persistence. */
+    var tunnelStore: network.reticulum.storage.TunnelStore? = null
+
+    /** Persistent announce cache storage. When null, falls back to file-based persistence. */
+    var announceStore: network.reticulum.storage.AnnounceStore? = null
 
     // ===== Memory Management =====
 
@@ -912,6 +925,7 @@ object Transport {
             announcePacketHash = linkId  // Use linkId as placeholder
         )
         pathTable[linkId.toKey()] = entry
+        pathStore?.upsertPath(linkId, entry)
         log("Registered link path for ${linkId.toHexString()} via interface ${receivingInterfaceHash.toHexString()}")
     }
 
@@ -1011,6 +1025,7 @@ object Transport {
      */
     fun expirePath(destinationHash: ByteArray) {
         pathTable.remove(destinationHash.toKey())
+        pathStore?.removePath(destinationHash)
     }
 
     /**
@@ -2508,7 +2523,9 @@ object Transport {
                                 }
 
                                 transmit(outboundInterface, newRaw)
-                                pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
+                                val touched = pathEntry.touch()
+                                pathTable[packet.destinationHash.toKey()] = touched
+                                pathStore?.upsertPath(packet.destinationHash, touched)
                                 log("Transport forwarding ${packet.packetType} for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (remaining_hops=${pathEntry.hops})")
                             }
                         } else {
@@ -2641,7 +2658,9 @@ object Transport {
                 }
 
                 // Update path timestamp
-                pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
+                val touched = pathEntry.touch()
+                pathTable[packet.destinationHash.toKey()] = touched
+                pathStore?.upsertPath(packet.destinationHash, touched)
             } else {
                 log("Path exists for $destHex but interface not found")
             }
@@ -2908,6 +2927,7 @@ object Transport {
         )
 
         pathTable[destHash.toKey()] = pathEntry
+        pathStore?.upsertPath(destHash, pathEntry)
 
         // If receiving interface has a tunnel, also store path in tunnel for persistence
         addPathToTunnel(
@@ -3538,7 +3558,9 @@ object Transport {
         reverseTable[packet.truncatedHash.toKey()] = reverseEntry
 
         // Update path timestamp
-        pathTable[packet.destinationHash.toKey()] = pathEntry.touch()
+        val touched = pathEntry.touch()
+        pathTable[packet.destinationHash.toKey()] = touched
+        pathStore?.upsertPath(packet.destinationHash, touched)
     }
 
     private fun deliverPacket(destination: Destination, packet: Packet) {
@@ -3991,6 +4013,7 @@ object Transport {
 
         // Remove expired path entries and entries whose interface no longer exists
         // (matches Python Transport.py:707-720)
+        pathStore?.removeExpiredBefore(now)
         pathTable.entries.removeIf { entry ->
             val pathEntry = entry.value
             if (pathEntry.isExpired()) {
@@ -4204,6 +4227,7 @@ object Transport {
             interface_.tunnelId = tunnelId
             tunnels[key] = tunnel
             tunnelInterfaces[key] = interface_
+            tunnelStore?.upsertTunnel(tunnelId, interface_.hash, tunnel.expires)
         } else {
             // Existing tunnel reappeared - restore paths
             log("Tunnel endpoint ${tunnelId.toHexString()} reappeared. Restoring paths...")
@@ -4254,6 +4278,7 @@ object Transport {
                 announcePacketHash = pathEntry.packetHash
             )
             pathTable[destKey] = restoredPath
+            pathStore?.upsertPath(destKey.bytes, restoredPath)
             log("Restored path to ${destKey} (${pathEntry.hops} hops) via tunnel ${tunnel.tunnelId.toHexString()}")
         }
 
@@ -4294,6 +4319,7 @@ object Transport {
         tunnel.paths[destHash.toKey()] = tunnelPath
         tunnel.expires = System.currentTimeMillis() + TransportConstants.DESTINATION_TIMEOUT
         tunnel.lastActivity = System.currentTimeMillis()
+        tunnelStore?.upsertTunnelPath(tunnelId, destHash, tunnelPath)
 
         log("Path to ${destHash.toHexString()} associated with tunnel ${tunnelId.toHexString()}")
 
@@ -4312,6 +4338,14 @@ object Transport {
      * @param interface_ The receiving interface
      */
     private fun cacheAnnouncePacket(packet: Packet, interface_: InterfaceRef) {
+        // Use store if available (Room on Android)
+        announceStore?.let { store ->
+            val raw = packet.raw ?: return
+            store.cacheAnnounce(packet.packetHash, raw, interface_.name)
+            log("Cached announce packet ${packet.packetHash.toHexString().take(12)}")
+            return
+        }
+
         try {
             // Create announces cache directory if needed
             val announcesDir = File("$cachePath/announces")
@@ -4355,6 +4389,9 @@ object Transport {
      * @return The raw packet bytes and interface name, or null if not found
      */
     fun getCachedAnnouncePacket(packetHash: ByteArray): Pair<ByteArray, String?>? {
+        // Use store if available (Room on Android)
+        announceStore?.let { return it.getAnnounce(packetHash) }
+
         try {
             val packetHashHex = packetHash.toHexString()
             val cacheFile = File("$cachePath/announces", packetHashHex)
@@ -4394,6 +4431,21 @@ object Transport {
      * Removes cached announces that are no longer referenced by path table or tunnels.
      */
     private fun cleanAnnounceCache() {
+        // Use store if available (Room on Android)
+        announceStore?.let { store ->
+            val activeHashes = mutableSetOf<ByteArrayKey>()
+            for ((_, pathEntry) in pathTable) {
+                activeHashes.add(pathEntry.announcePacketHash.toKey())
+            }
+            for ((_, tunnel) in tunnels) {
+                for ((_, tunnelPath) in tunnel.paths) {
+                    activeHashes.add(tunnelPath.packetHash.toKey())
+                }
+            }
+            store.removeAllExcept(activeHashes)
+            return
+        }
+
         try {
             val announcesDir = File("$cachePath/announces")
             if (!announcesDir.exists()) return
@@ -4440,6 +4492,9 @@ object Transport {
      * Each path: [dest_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
      */
     fun saveTunnelTable() {
+        // When Room store is active, write-through handles persistence
+        if (tunnelStore != null) return
+
         try {
             val startTime = System.currentTimeMillis()
             log("Saving tunnel table to storage...")
@@ -4533,6 +4588,14 @@ object Transport {
      * Load tunnel table from persistent storage.
      */
     fun loadTunnelTable() {
+        // When Room store is active, load from database
+        tunnelStore?.let { store ->
+            val loaded = store.loadAllTunnels()
+            tunnels.putAll(loaded)
+            log("Loaded ${loaded.size} tunnels from store")
+            return
+        }
+
         try {
             val tunnelsFile = File("$storagePath/tunnels")
             if (!tunnelsFile.exists()) {
@@ -4678,6 +4741,15 @@ object Transport {
      * Uses filenames matching Python reference: "destination_table" and "packet_hashlist".
      */
     private fun persistDataToStorage() {
+        // When Room stores are active, write-through handles persistence
+        if (pathStore != null) {
+            // Batch-persist packet hashlist (not write-through)
+            packetHashStore?.let { store ->
+                store.saveAll(packetHashlist.toSet(), 0)
+                store.saveAll(packetHashlistPrev.toSet(), 1)
+            }
+            return
+        }
         if (storagePath.isBlank()) return
         val dir = java.io.File(storagePath)
         dir.mkdirs()
@@ -4690,6 +4762,20 @@ object Transport {
      * Uses filenames matching Python reference: "destination_table" and "packet_hashlist".
      */
     private fun loadPersistedDataFromStorage() {
+        // When Room stores are active, load from database
+        pathStore?.let { store ->
+            val paths = store.loadAllPaths()
+            pathTable.putAll(paths)
+            log("Loaded ${paths.size} path entries from store")
+
+            packetHashStore?.let { hashStore ->
+                val (current, prev) = hashStore.loadAll()
+                packetHashlist.addAll(current)
+                packetHashlistPrev.addAll(prev)
+                log("Loaded ${current.size + prev.size} packet hashes from store")
+            }
+            return
+        }
         if (storagePath.isBlank()) return
         val dir = java.io.File(storagePath)
         if (!dir.exists()) return
@@ -4708,6 +4794,7 @@ object Transport {
 
         val removed = tunnels.remove(key)
         tunnelInterfaces.remove(key)
+        tunnelStore?.removeTunnel(tunnelId)
 
         if (removed != null) {
             log("Voided tunnel ${tunnelId.toHexString()}")
@@ -4793,6 +4880,7 @@ object Transport {
         for ((key, tunnel) in expired) {
             tunnels.remove(key)
             tunnelInterfaces.remove(key)
+            tunnelStore?.removeTunnel(tunnel.tunnelId)
             log("Cleaned expired tunnel ${tunnel.tunnelId.toHexString()}")
         }
     }
@@ -4975,22 +5063,3 @@ data class HeldAnnounce(
     val receivingInterface: InterfaceRef
 )
 
-/**
- * Wrapper for ByteArray to use as map key.
- */
-class ByteArrayKey(val bytes: ByteArray) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is ByteArrayKey) return false
-        return bytes.contentEquals(other.bytes)
-    }
-
-    override fun hashCode(): Int = bytes.contentHashCode()
-
-    override fun toString(): String = bytes.toHexString()
-}
-
-/**
- * Convert ByteArray to ByteArrayKey for use in maps.
- */
-fun ByteArray.toKey(): ByteArrayKey = ByteArrayKey(this)
