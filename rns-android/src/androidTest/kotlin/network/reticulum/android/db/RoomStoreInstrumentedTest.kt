@@ -34,6 +34,13 @@ class RoomStoreInstrumentedTest {
     private lateinit var db: ReticulumDatabase
     private val executor = Executors.newSingleThreadExecutor()
 
+    /** Drain the write executor by submitting a barrier task and waiting for it. */
+    private fun drainExecutor() {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        executor.execute { latch.countDown() }
+        latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+    }
+
     @Before
     fun createDb() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -125,7 +132,7 @@ class RoomStoreInstrumentedTest {
 
         // Write through executor — need to wait for it to complete
         store.upsertPath(destHash, entry)
-        Thread.sleep(100) // Wait for executor
+        drainExecutor()
 
         val loaded = store.loadAllPaths()
         assertEquals(1, loaded.size)
@@ -225,7 +232,7 @@ class RoomStoreInstrumentedTest {
         val ratchet = ByteArray(32) { 0xAA.toByte() }
 
         store.upsertRatchet(destHash, ratchet, System.currentTimeMillis())
-        Thread.sleep(100) // Wait for executor
+        drainExecutor()
 
         val result = store.getRatchet(destHash)
         assertNotNull(result)

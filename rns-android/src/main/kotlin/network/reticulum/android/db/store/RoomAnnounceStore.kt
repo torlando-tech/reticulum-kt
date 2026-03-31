@@ -31,15 +31,16 @@ class RoomAnnounceStore(
     }
 
     override fun removeAllExcept(activeHashes: Set<ByteArrayKey>) {
-        val activeList = activeHashes.map { it.bytes }
         writeExecutor.execute {
-            // SQLite has a limit on IN clause parameters; chunk if needed
-            if (activeList.isEmpty()) {
-                // No active hashes means delete everything — but getAllHashes + deleteByHash
-                // is simpler than a raw "DELETE FROM announce_cache"
-                dao.deleteAllExcept(emptyList())
-            } else {
-                dao.deleteAllExcept(activeList)
+            // Fetch all hashes from DB, compute which to delete, then delete in chunks.
+            // This avoids the SQLite 999-variable limit on NOT IN clauses.
+            val allHashes = dao.getAllHashes()
+            val activeSet = activeHashes.map { it.bytes.toList() }.toSet()
+            val toDelete = allHashes.filter { it.toList() !in activeSet }
+            toDelete.chunked(900).forEach { chunk ->
+                for (hash in chunk) {
+                    dao.deleteByHash(hash)
+                }
             }
         }
     }

@@ -267,6 +267,7 @@ class ReticulumService : LifecycleService() {
         network.reticulum.transport.Transport.packetHashStore = null
         network.reticulum.transport.Transport.tunnelStore = null
         network.reticulum.transport.Transport.announceStore = null
+        network.reticulum.transport.Transport.discoveryStore = null
         network.reticulum.identity.Identity.identityStore = null
 
         database?.close()
@@ -329,6 +330,8 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.store.RoomTunnelStore(db.tunnelDao(), db.tunnelPathDao(), executor)
             network.reticulum.transport.Transport.announceStore =
                 network.reticulum.android.db.store.RoomAnnounceStore(db.announceCacheDao(), executor)
+            network.reticulum.transport.Transport.discoveryStore =
+                network.reticulum.android.db.store.RoomDiscoveryStore(db.discoveredInterfaceDao(), executor)
             network.reticulum.identity.Identity.identityStore =
                 network.reticulum.android.db.store.RoomIdentityStore(db.knownDestinationDao(), db.identityRatchetDao(), executor)
 

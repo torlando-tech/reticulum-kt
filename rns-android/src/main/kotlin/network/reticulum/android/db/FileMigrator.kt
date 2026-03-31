@@ -166,8 +166,9 @@ class FileMigrator(
                     }
 
                     val pathCount = unpacker.unpackArrayHeader()
-                    val expires: Long
 
+                    // Collect paths first — we need to read expires (after paths) before inserting
+                    val pendingPaths = mutableListOf<TunnelPathEntity>()
                     for (j in 0 until pathCount) {
                         unpacker.unpackArrayHeader() // 8 fields
 
@@ -196,7 +197,7 @@ class FileMigrator(
                         unpacker.readPayload(packetHash)
 
                         if (System.currentTimeMillis() <= pathExpires) {
-                            db.tunnelPathDao().upsert(TunnelPathEntity(
+                            pendingPaths.add(TunnelPathEntity(
                                 tunnelId = tunnelId,
                                 destHash = destHash,
                                 timestamp = timestamp,
@@ -208,14 +209,18 @@ class FileMigrator(
                         }
                     }
 
-                    expires = unpacker.unpackLong()
+                    val expires = unpacker.unpackLong()
 
                     if (System.currentTimeMillis() <= expires) {
+                        // Insert parent BEFORE children to satisfy FK constraint
                         db.tunnelDao().upsert(TunnelEntity(
                             tunnelId = tunnelId,
                             interfaceHash = interfaceHash,
                             expires = expires
                         ))
+                        for (path in pendingPaths) {
+                            db.tunnelPathDao().upsert(path)
+                        }
                         count++
                     }
                 } catch (_: Exception) { }
@@ -368,9 +373,7 @@ class FileMigrator(
         return when (format.valueType) {
             org.msgpack.value.ValueType.NIL -> { unpacker.unpackNil(); null }
             org.msgpack.value.ValueType.BOOLEAN -> unpacker.unpackBoolean()
-            org.msgpack.value.ValueType.INTEGER -> {
-                try { unpacker.unpackInt() } catch (_: Exception) { unpacker.unpackLong() }
-            }
+            org.msgpack.value.ValueType.INTEGER -> unpacker.unpackLong()
             org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble()
             org.msgpack.value.ValueType.STRING -> unpacker.unpackString()
             org.msgpack.value.ValueType.BINARY -> {

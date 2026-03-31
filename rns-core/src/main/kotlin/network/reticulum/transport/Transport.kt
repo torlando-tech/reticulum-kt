@@ -460,6 +460,9 @@ object Transport {
     /** Persistent announce cache storage. When null, falls back to file-based persistence. */
     var announceStore: network.reticulum.storage.AnnounceStore? = null
 
+    /** Persistent discovery storage. When null, falls back to file-based persistence. */
+    var discoveryStore: network.reticulum.storage.DiscoveryStore? = null
+
     // ===== Memory Management =====
 
     /**
@@ -862,6 +865,7 @@ object Transport {
                 autoConnectFactory = autoConnectFactory,
                 maxAutoConnected = maxAutoConnected,
                 discoveryCallback = callback,
+                discoveryStore = discoveryStore,
             )
             discoveryHandler?.start()
             log("Interface discovery listening enabled")
