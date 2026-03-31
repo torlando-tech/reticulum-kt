@@ -63,6 +63,10 @@ class ReticulumService : LifecycleService() {
     private lateinit var batteryStatsTracker: BatteryStatsTracker
     private lateinit var eventTracker: ServiceEventTracker
 
+    // Room database for persistent storage
+    private var database: network.reticulum.android.db.ReticulumDatabase? = null
+    private var dbWriteExecutor: java.util.concurrent.ExecutorService? = null
+
     // Pause/resume state tracking
     private var _isPaused = false
 
@@ -248,6 +252,27 @@ class ReticulumService : LifecycleService() {
 
         serviceScope.cancel()
         shutdownReticulum()
+
+        // Shut down Room write executor and close database
+        dbWriteExecutor?.let { executor ->
+            executor.shutdown()
+            try {
+                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (_: InterruptedException) { }
+        }
+        dbWriteExecutor = null
+
+        // Null out store references before closing DB to prevent use-after-close
+        network.reticulum.transport.Transport.pathStore = null
+        network.reticulum.transport.Transport.packetHashStore = null
+        network.reticulum.transport.Transport.tunnelStore = null
+        network.reticulum.transport.Transport.announceStore = null
+        network.reticulum.transport.Transport.discoveryStore = null
+        network.reticulum.identity.Identity.identityStore = null
+
+        database?.close()
+        database = null
+
         super.onDestroy()
     }
 
@@ -280,32 +305,68 @@ class ReticulumService : LifecycleService() {
             // Ensure config directory exists
             File(configDir).mkdirs()
 
-            // Configure Transport for coroutine-based job loop on Android
-            // Use 250ms loop (matches Python) with battery-adjusted intervals for expensive operations
-            network.reticulum.transport.Transport.configureCoroutineJobLoop(
-                scope = serviceScope,
-                intervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL, // 250ms
-                tablesCullIntervalMs = config.getEffectiveTablesCullInterval(),
-                announcesCheckIntervalMs = config.getEffectiveAnnouncesCheckInterval()
-            )
+            // Initialize Room database and inject persistent stores
+            val db = androidx.room.Room.databaseBuilder(
+                applicationContext,
+                network.reticulum.android.db.ReticulumDatabase::class.java,
+                "reticulum.db"
+            ).build()
+            database = db
 
-            // Check if another shared instance is already running
-            val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "ReticulumDB-write").apply { isDaemon = true }
+            }
+            dbWriteExecutor = executor
 
-            reticulum = Reticulum.start(
-                configDir = configDir,
-                enableTransport = config.enableTransport,
-                shareInstance = config.shareInstance && !sharedInstanceExists,
-                sharedInstancePort = config.sharedInstancePort,
-                connectToSharedInstance = sharedInstanceExists
-            )
+            network.reticulum.transport.Transport.pathStore =
+                network.reticulum.android.db.store.RoomPathStore(db.pathDao(), executor)
+            network.reticulum.transport.Transport.packetHashStore =
+                network.reticulum.android.db.store.RoomPacketHashStore(db.packetHashDao(), executor)
+            network.reticulum.transport.Transport.tunnelStore =
+                network.reticulum.android.db.store.RoomTunnelStore(db.tunnelDao(), db.tunnelPathDao(), executor)
+            network.reticulum.transport.Transport.announceStore =
+                network.reticulum.android.db.store.RoomAnnounceStore(db.announceCacheDao(), executor)
+            network.reticulum.transport.Transport.discoveryStore =
+                network.reticulum.android.db.store.RoomDiscoveryStore(db.discoveredInterfaceDao(), executor)
+            network.reticulum.identity.Identity.identityStore =
+                network.reticulum.android.db.store.RoomIdentityStore(db.knownDestinationDao(), db.identityRatchetDao(), executor)
 
-            // If shareInstance is enabled but server hasn't started yet,
-            // set up factories and start the local server now
-            reticulum?.let { rns ->
-                if (config.shareInstance && !sharedInstanceExists && !rns.isSharedInstance) {
-                    // Start the local server manually
-                    startLocalServer(rns, config.sharedInstancePort)
+            Log.i(TAG, "Room database initialized with persistent stores")
+
+            // Run migration and Reticulum startup on IO thread to avoid
+            // Room's main-thread query check during initial DB reads.
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                // Migrate existing file-based data to Room (one-time, idempotent)
+                network.reticulum.android.db.FileMigrator(
+                    db, "$configDir/storage", "$configDir/cache"
+                ).migrateIfNeeded()
+
+                // Configure Transport for coroutine-based job loop on Android
+                // Use 250ms loop (matches Python) with battery-adjusted intervals for expensive operations
+                network.reticulum.transport.Transport.configureCoroutineJobLoop(
+                    scope = serviceScope,
+                    intervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL, // 250ms
+                    tablesCullIntervalMs = config.getEffectiveTablesCullInterval(),
+                    announcesCheckIntervalMs = config.getEffectiveAnnouncesCheckInterval()
+                )
+
+                // Check if another shared instance is already running
+                val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
+
+                reticulum = Reticulum.start(
+                    configDir = configDir,
+                    enableTransport = config.enableTransport,
+                    shareInstance = config.shareInstance && !sharedInstanceExists,
+                    sharedInstancePort = config.sharedInstancePort,
+                    connectToSharedInstance = sharedInstanceExists
+                )
+
+                // If shareInstance is enabled but server hasn't started yet,
+                // set up factories and start the local server now
+                reticulum?.let { rns ->
+                    if (config.shareInstance && !sharedInstanceExists && !rns.isSharedInstance) {
+                        startLocalServer(rns, config.sharedInstancePort)
+                    }
                 }
             }
 

@@ -1,0 +1,28 @@
+coverage:
+  status:
+    project:
+      default:
+        # Don't regress overall project coverage
+        target: auto
+        threshold: 5%
+    patch:
+      default:
+        # Report coverage on new/changed lines but don't block PRs.
+        # The project-level auto target prevents regressions.
+        informational: true
+        target: 70%
+
+ignore:
+  # Android module can only be tested via instrumented tests (not Kover JVM coverage)
+  - "rns-android/**"
+  # Test code and build infrastructure
+  - "rns-test/**"
+  - "rns-cli/**"
+  - "conformance-bridge/**"
+  - "python-bridge/**"
+  - "test-scripts/**"
+
+comment:
+  layout: "condensed_header, condensed_files, condensed_footer"
+  behavior: default
+  require_changes: true

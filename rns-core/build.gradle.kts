@@ -1,5 +1,6 @@
 plugins {
     kotlin("jvm")
+    id("org.jetbrains.kotlinx.kover")
 }
 
 val coroutinesVersion: String by project
@@ -14,8 +15,8 @@ dependencies {
     // Cryptography - BouncyCastle for JVM
     implementation("org.bouncycastle:bcprov-jdk18on:$bouncycastleVersion")
 
-    // MessagePack for serialization
-    implementation("org.msgpack:msgpack-core:0.9.8")
+    // MessagePack for serialization (api: exposed via Transport/Identity persistence methods)
+    api("org.msgpack:msgpack-core:0.9.8")
 
     // Compression - Apache Commons Compress for BZ2
     implementation("org.apache.commons:commons-compress:1.26.0")

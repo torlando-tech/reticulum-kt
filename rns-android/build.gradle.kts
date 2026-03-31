@@ -2,6 +2,7 @@ plugins {
     id("com.android.library")
     kotlin("android")
     id("kotlin-parcelize")
+    id("com.google.devtools.ksp")
 }
 
 val coroutinesVersion: String by project
@@ -37,6 +38,10 @@ android {
         jvmTarget = "17"
     }
 
+    ksp {
+        arg("room.schemaLocation", "$projectDir/schemas")
+    }
+
     testOptions {
         unitTests.all {
             it.useJUnit()
@@ -61,6 +66,11 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:$coroutinesVersion")
+
+    // Room database
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
 
     // Unit testing
     testImplementation("junit:junit:4.13.2")

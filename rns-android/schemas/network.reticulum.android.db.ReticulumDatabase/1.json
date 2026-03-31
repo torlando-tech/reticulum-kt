@@ -1,0 +1,531 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "a93f99c4ed77ba7550e210a53805e198",
+    "entities": [
+      {
+        "tableName": "paths",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`dest_hash` BLOB NOT NULL, `next_hop` BLOB NOT NULL, `hops` INTEGER NOT NULL, `expires` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL, `interface_hash` BLOB NOT NULL, `announce_hash` BLOB NOT NULL, `state` INTEGER NOT NULL, `failure_count` INTEGER NOT NULL, PRIMARY KEY(`dest_hash`))",
+        "fields": [
+          {
+            "fieldPath": "destHash",
+            "columnName": "dest_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextHop",
+            "columnName": "next_hop",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hops",
+            "columnName": "hops",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expires",
+            "columnName": "expires",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "interfaceHash",
+            "columnName": "interface_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "announceHash",
+            "columnName": "announce_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "failureCount",
+            "columnName": "failure_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "dest_hash"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_paths_expires",
+            "unique": false,
+            "columnNames": [
+              "expires"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_paths_expires` ON `${TABLE_NAME}` (`expires`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "packet_hashes",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`hash` BLOB NOT NULL, `generation` INTEGER NOT NULL, PRIMARY KEY(`hash`))",
+        "fields": [
+          {
+            "fieldPath": "hash",
+            "columnName": "hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "generation",
+            "columnName": "generation",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "hash"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_packet_hashes_generation",
+            "unique": false,
+            "columnNames": [
+              "generation"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_packet_hashes_generation` ON `${TABLE_NAME}` (`generation`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "known_destinations",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`dest_hash` BLOB NOT NULL, `timestamp` INTEGER NOT NULL, `packet_hash` BLOB NOT NULL, `public_key` BLOB NOT NULL, `app_data` BLOB, PRIMARY KEY(`dest_hash`))",
+        "fields": [
+          {
+            "fieldPath": "destHash",
+            "columnName": "dest_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packetHash",
+            "columnName": "packet_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicKey",
+            "columnName": "public_key",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appData",
+            "columnName": "app_data",
+            "affinity": "BLOB",
+            "notNull": false
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "dest_hash"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "tunnels",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`tunnel_id` BLOB NOT NULL, `interface_hash` BLOB, `expires` INTEGER NOT NULL, PRIMARY KEY(`tunnel_id`))",
+        "fields": [
+          {
+            "fieldPath": "tunnelId",
+            "columnName": "tunnel_id",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "interfaceHash",
+            "columnName": "interface_hash",
+            "affinity": "BLOB",
+            "notNull": false
+          },
+          {
+            "fieldPath": "expires",
+            "columnName": "expires",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "tunnel_id"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "tunnel_paths",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`tunnel_id` BLOB NOT NULL, `dest_hash` BLOB NOT NULL, `timestamp` INTEGER NOT NULL, `received_from` BLOB NOT NULL, `hops` INTEGER NOT NULL, `expires` INTEGER NOT NULL, `packet_hash` BLOB NOT NULL, PRIMARY KEY(`tunnel_id`, `dest_hash`), FOREIGN KEY(`tunnel_id`) REFERENCES `tunnels`(`tunnel_id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "tunnelId",
+            "columnName": "tunnel_id",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "destHash",
+            "columnName": "dest_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedFrom",
+            "columnName": "received_from",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hops",
+            "columnName": "hops",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expires",
+            "columnName": "expires",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packetHash",
+            "columnName": "packet_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "tunnel_id",
+            "dest_hash"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_tunnel_paths_tunnel_id",
+            "unique": false,
+            "columnNames": [
+              "tunnel_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tunnel_paths_tunnel_id` ON `${TABLE_NAME}` (`tunnel_id`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "tunnels",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "tunnel_id"
+            ],
+            "referencedColumns": [
+              "tunnel_id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "announce_cache",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packet_hash` BLOB NOT NULL, `raw` BLOB NOT NULL, `interface_name` TEXT NOT NULL, PRIMARY KEY(`packet_hash`))",
+        "fields": [
+          {
+            "fieldPath": "packetHash",
+            "columnName": "packet_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "raw",
+            "columnName": "raw",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "interfaceName",
+            "columnName": "interface_name",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packet_hash"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "identity_ratchets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`dest_hash` BLOB NOT NULL, `ratchet` BLOB NOT NULL, `timestamp` INTEGER NOT NULL, PRIMARY KEY(`dest_hash`))",
+        "fields": [
+          {
+            "fieldPath": "destHash",
+            "columnName": "dest_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ratchet",
+            "columnName": "ratchet",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "dest_hash"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_identity_ratchets_timestamp",
+            "unique": false,
+            "columnNames": [
+              "timestamp"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_identity_ratchets_timestamp` ON `${TABLE_NAME}` (`timestamp`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "discovered_interfaces",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`discovery_hash` BLOB NOT NULL, `type` TEXT NOT NULL, `transport` INTEGER NOT NULL, `name` TEXT NOT NULL, `received` INTEGER NOT NULL, `stamp_value` INTEGER NOT NULL, `transport_id` TEXT NOT NULL, `network_id` TEXT NOT NULL, `hops` INTEGER NOT NULL, `latitude` REAL, `longitude` REAL, `height` REAL, `reachable_on` TEXT, `port` INTEGER, `frequency` INTEGER, `bandwidth` INTEGER, `spreading_factor` INTEGER, `coding_rate` INTEGER, `modulation` TEXT, `channel` INTEGER, `ifac_netname` TEXT, `ifac_netkey` TEXT, `discovered` INTEGER NOT NULL, `last_heard` INTEGER NOT NULL, `heard_count` INTEGER NOT NULL, PRIMARY KEY(`discovery_hash`))",
+        "fields": [
+          {
+            "fieldPath": "discoveryHash",
+            "columnName": "discovery_hash",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transport",
+            "columnName": "transport",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "received",
+            "columnName": "received",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stampValue",
+            "columnName": "stamp_value",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportId",
+            "columnName": "transport_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "networkId",
+            "columnName": "network_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hops",
+            "columnName": "hops",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "latitude",
+            "columnName": "latitude",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "longitude",
+            "columnName": "longitude",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "height",
+            "columnName": "height",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "reachableOn",
+            "columnName": "reachable_on",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "port",
+            "columnName": "port",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "frequency",
+            "columnName": "frequency",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "bandwidth",
+            "columnName": "bandwidth",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "spreadingFactor",
+            "columnName": "spreading_factor",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "codingRate",
+            "columnName": "coding_rate",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "modulation",
+            "columnName": "modulation",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "channel",
+            "columnName": "channel",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "ifacNetname",
+            "columnName": "ifac_netname",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "ifacNetkey",
+            "columnName": "ifac_netkey",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "discovered",
+            "columnName": "discovered",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastHeard",
+            "columnName": "last_heard",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "heardCount",
+            "columnName": "heard_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "discovery_hash"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_discovered_interfaces_last_heard",
+            "unique": false,
+            "columnNames": [
+              "last_heard"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_discovered_interfaces_last_heard` ON `${TABLE_NAME}` (`last_heard`)"
+          }
+        ],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'a93f99c4ed77ba7550e210a53805e198')"
+    ]
+  }
+}

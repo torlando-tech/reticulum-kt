@@ -1,5 +1,6 @@
 package network.reticulum.transport
 
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.toHexString
 
 /**
