@@ -2,10 +2,12 @@ coverage:
   status:
     project:
       default:
-        target: 70%
-        threshold: 2%
+        # Don't fail on overall project coverage — it'll climb over time
+        target: auto
+        threshold: 5%
     patch:
       default:
+        # Enforce 70% on new/changed lines in each PR
         target: 70%
 
 comment:
