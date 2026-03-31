@@ -310,11 +310,7 @@ class ReticulumService : LifecycleService() {
                 applicationContext,
                 network.reticulum.android.db.ReticulumDatabase::class.java,
                 "reticulum.db"
-            )
-                // Allow main-thread reads during startup (migration + initial load).
-                // Runtime writes use the single-thread write executor and never block.
-                .allowMainThreadQueries()
-                .build()
+            ).build()
             database = db
 
             val executor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
@@ -337,37 +333,40 @@ class ReticulumService : LifecycleService() {
 
             Log.i(TAG, "Room database initialized with persistent stores")
 
-            // Migrate existing file-based data to Room (one-time, idempotent)
-            network.reticulum.android.db.FileMigrator(
-                db, "$configDir/storage", "$configDir/cache"
-            ).migrateIfNeeded()
+            // Run migration and Reticulum startup on IO thread to avoid
+            // Room's main-thread query check during initial DB reads.
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                // Migrate existing file-based data to Room (one-time, idempotent)
+                network.reticulum.android.db.FileMigrator(
+                    db, "$configDir/storage", "$configDir/cache"
+                ).migrateIfNeeded()
 
-            // Configure Transport for coroutine-based job loop on Android
-            // Use 250ms loop (matches Python) with battery-adjusted intervals for expensive operations
-            network.reticulum.transport.Transport.configureCoroutineJobLoop(
-                scope = serviceScope,
-                intervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL, // 250ms
-                tablesCullIntervalMs = config.getEffectiveTablesCullInterval(),
-                announcesCheckIntervalMs = config.getEffectiveAnnouncesCheckInterval()
-            )
+                // Configure Transport for coroutine-based job loop on Android
+                // Use 250ms loop (matches Python) with battery-adjusted intervals for expensive operations
+                network.reticulum.transport.Transport.configureCoroutineJobLoop(
+                    scope = serviceScope,
+                    intervalMs = network.reticulum.transport.TransportConstants.JOB_INTERVAL, // 250ms
+                    tablesCullIntervalMs = config.getEffectiveTablesCullInterval(),
+                    announcesCheckIntervalMs = config.getEffectiveAnnouncesCheckInterval()
+                )
 
-            // Check if another shared instance is already running
-            val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
+                // Check if another shared instance is already running
+                val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
 
-            reticulum = Reticulum.start(
-                configDir = configDir,
-                enableTransport = config.enableTransport,
-                shareInstance = config.shareInstance && !sharedInstanceExists,
-                sharedInstancePort = config.sharedInstancePort,
-                connectToSharedInstance = sharedInstanceExists
-            )
+                reticulum = Reticulum.start(
+                    configDir = configDir,
+                    enableTransport = config.enableTransport,
+                    shareInstance = config.shareInstance && !sharedInstanceExists,
+                    sharedInstancePort = config.sharedInstancePort,
+                    connectToSharedInstance = sharedInstanceExists
+                )
 
-            // If shareInstance is enabled but server hasn't started yet,
-            // set up factories and start the local server now
-            reticulum?.let { rns ->
-                if (config.shareInstance && !sharedInstanceExists && !rns.isSharedInstance) {
-                    // Start the local server manually
-                    startLocalServer(rns, config.sharedInstancePort)
+                // If shareInstance is enabled but server hasn't started yet,
+                // set up factories and start the local server now
+                reticulum?.let { rns ->
+                    if (config.shareInstance && !sharedInstanceExists && !rns.isSharedInstance) {
+                        startLocalServer(rns, config.sharedInstancePort)
+                    }
                 }
             }
 
