@@ -24,11 +24,18 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run rns-core tests
-        run: ./gradlew :rns-core:test
+      - name: Run tests with coverage
+        run: ./gradlew :rns-core:test :rns-core:koverXmlReport :rns-interfaces:test :rns-interfaces:koverXmlReport --continue
 
-      - name: Run rns-interfaces tests
-        run: ./gradlew :rns-interfaces:test
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: |
+            rns-core/build/reports/kover/report.xml
+            rns-interfaces/build/reports/kover/report.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload test reports
         if: always()

@@ -4,11 +4,17 @@ plugins {
     kotlin("plugin.serialization") version "1.9.22" apply false
     id("com.android.library") version "8.2.2" apply false
     id("com.google.devtools.ksp") version "1.9.22-1.0.17" apply false
+    id("org.jetbrains.kotlinx.kover") version "0.7.6"
 }
 
 allprojects {
     group = "network.reticulum"
     version = "0.1.0-SNAPSHOT"
+}
+
+dependencies {
+    kover(project(":rns-core"))
+    kover(project(":rns-interfaces"))
 }
 
 subprojects {

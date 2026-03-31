@@ -1,5 +1,6 @@
 plugins {
     kotlin("jvm")
+    id("org.jetbrains.kotlinx.kover")
 }
 
 val coroutinesVersion: String by project
