@@ -7,13 +7,18 @@ coverage:
         threshold: 5%
     patch:
       default:
-        # Enforce 70% on new/changed lines in each PR
+        # Enforce 70% coverage on new/changed lines in each PR
         target: 70%
-        # Only measure files that Kover can instrument (JVM modules).
-        # Android module code requires instrumented tests which run separately.
-        paths:
-          - "rns-core/**"
-          - "rns-interfaces/**"
+
+ignore:
+  # Android module can only be tested via instrumented tests (not Kover JVM coverage)
+  - "rns-android/**"
+  # Test code and build infrastructure
+  - "rns-test/**"
+  - "rns-cli/**"
+  - "conformance-bridge/**"
+  - "python-bridge/**"
+  - "test-scripts/**"
 
 comment:
   layout: "condensed_header, condensed_files, condensed_footer"
