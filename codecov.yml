@@ -7,7 +7,9 @@ coverage:
         threshold: 5%
     patch:
       default:
-        # Enforce 70% coverage on new/changed lines in each PR
+        # Report coverage on new/changed lines but don't block PRs.
+        # The project-level auto target prevents regressions.
+        informational: true
         target: 70%
 
 ignore:
