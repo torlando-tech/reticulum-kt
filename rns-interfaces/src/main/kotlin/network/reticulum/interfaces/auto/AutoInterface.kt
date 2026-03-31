@@ -6,7 +6,6 @@ import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
 import java.net.*
-import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -40,13 +39,12 @@ class AutoInterface(
     /** Network interfaces to ignore. */
     private val ignoredDevices: List<String> = emptyList(),
     /** Configured bitrate override. */
-    val configuredBitrate: Int? = null
+    val configuredBitrate: Int? = null,
 ) : Interface(name) {
-
     // Peer tracking
     private data class PeerInfo(
         val interfaceName: String,
-        var lastHeard: Long = System.currentTimeMillis()
+        var lastHeard: Long = System.currentTimeMillis(),
     )
 
     private val peers = ConcurrentHashMap<String, PeerInfo>()
@@ -64,7 +62,11 @@ class AutoInterface(
     private val linkLocalAddresses = ConcurrentHashMap<String, Inet6Address>()
 
     // Recent packets for duplicate detection (multi-interface)
-    private data class RecentPacket(val hash: Int, val timestamp: Long)
+    private data class RecentPacket(
+        val hash: Int,
+        val timestamp: Long,
+    )
+
     private val recentPackets = ConcurrentHashMap.newKeySet<RecentPacket>()
 
     // Coroutine management
@@ -115,7 +117,6 @@ class AutoInterface(
 
             online.set(true)
             log("AutoInterface started on ${linkLocalAddresses.size} interface(s)")
-
         } catch (e: Exception) {
             log("Failed to start AutoInterface: ${e.message}")
             e.printStackTrace()
@@ -206,9 +207,11 @@ class AutoInterface(
             }
 
             // Find link-local IPv6 address
-            val linkLocal = netIf.inetAddresses.asSequence()
-                .filterIsInstance<Inet6Address>()
-                .firstOrNull { it.isLinkLocalAddress }
+            val linkLocal =
+                netIf.inetAddresses
+                    .asSequence()
+                    .filterIsInstance<Inet6Address>()
+                    .firstOrNull { it.isLinkLocalAddress }
 
             if (linkLocal == null) {
                 log("Skipping $ifName: no IPv6 link-local address")
@@ -220,33 +223,39 @@ class AutoInterface(
 
             try {
                 // Create discovery input socket (multicast receiver)
-                val discoveryIn = MulticastSocket(discoveryPort).apply {
-                    reuseAddress = true
-                    networkInterface = netIf
-                    joinGroup(multicastGroup, netIf)
-                }
+                val discoveryIn =
+                    MulticastSocket(discoveryPort).apply {
+                        reuseAddress = true
+                        networkInterface = netIf
+                        joinGroup(multicastGroup, netIf)
+                    }
                 discoverySocketsIn[ifName] = discoveryIn
                 log("Successfully joined multicast group ${multicastGroup.address.hostAddress} on $ifName")
 
                 // Create discovery output socket (for sending announcements)
                 // Must use MulticastSocket and set the outgoing interface
-                val discoveryOut = MulticastSocket().apply {
-                    reuseAddress = true
-                    networkInterface = netIf
-                }
+                val discoveryOut =
+                    MulticastSocket().apply {
+                        reuseAddress = true
+                        networkInterface = netIf
+                    }
                 discoverySocketsOut[ifName] = discoveryOut
 
                 // Create data socket (for receiving unicast data)
                 // Use DatagramChannel for potential SO_REUSEPORT support
-                val dataChannel = DatagramChannel.open(StandardProtocolFamily.INET6).apply {
-                    setOption(StandardSocketOptions.SO_REUSEADDR, true)
-                    // Try to set SO_REUSEPORT via reflection (JDK 14+)
-                    trySetReusePort(this)
-                    bind(InetSocketAddress(linkLocal, dataPort))
-                    configureBlocking(true)
+                try {
+                    val dataChannel =
+                        DatagramChannel.open(StandardProtocolFamily.INET6).apply {
+                            setOption(StandardSocketOptions.SO_REUSEADDR, true)
+                            // Try to set SO_REUSEPORT via reflection (JDK 14+)
+                            trySetReusePort(this)
+                            bind(InetSocketAddress(linkLocal, dataPort))
+                            configureBlocking(true)
+                        }
+                    dataSockets[ifName] = dataChannel.socket()
+                } catch (e: java.net.BindException) {
+                    log("Data port $dataPort already in use on $ifName (another RNS instance running?) — peer connections will still work", "WARNING")
                 }
-                dataSockets[ifName] = dataChannel.socket()
-
             } catch (e: java.io.IOException) {
                 log("I/O error setting up sockets for $ifName: ${e.message}", "ERROR")
                 e.printStackTrace()
@@ -308,7 +317,10 @@ class AutoInterface(
     /**
      * Handle discovery packets on a specific interface.
      */
-    private suspend fun discoveryHandler(ifName: String, socket: MulticastSocket) {
+    private suspend fun discoveryHandler(
+        ifName: String,
+        socket: MulticastSocket,
+    ) {
         // SHA-256 produces 32 bytes
         val buffer = ByteArray(32)
 
@@ -353,7 +365,6 @@ class AutoInterface(
 
                 // Valid peer discovered
                 addPeer(senderAddrStr, ifName)
-
             } catch (e: SocketException) {
                 if (running.get()) {
                     log("Discovery socket error on $ifName: ${e.message}")
@@ -383,7 +394,10 @@ class AutoInterface(
     /**
      * Handle incoming data packets on a specific interface.
      */
-    private suspend fun dataHandler(ifName: String, socket: DatagramSocket) {
+    private suspend fun dataHandler(
+        ifName: String,
+        socket: DatagramSocket,
+    ) {
         val buffer = ByteArray(AutoInterfaceConstants.HW_MTU + 64)
 
         log("Data handler started for $ifName")
@@ -421,7 +435,6 @@ class AutoInterface(
                     // Unknown peer - might be a new discovery
                     log("Data from unknown peer: $senderAddrStr")
                 }
-
             } catch (e: SocketException) {
                 if (running.get()) {
                     log("Data socket error on $ifName: ${e.message}")
@@ -480,7 +493,6 @@ class AutoInterface(
                 // Send to multicast group
                 val packet = DatagramPacket(token, token.size, multicastGroup)
                 socket.send(packet)
-
             } catch (e: Exception) {
                 log("Failed to send announcement on $ifName: ${e.message}")
             }
@@ -601,7 +613,10 @@ class AutoInterface(
     /**
      * Add a newly discovered peer.
      */
-    private fun addPeer(address: String, interfaceName: String) {
+    private fun addPeer(
+        address: String,
+        interfaceName: String,
+    ) {
         val cleanAddr = address.substringBefore('%')
 
         // Atomic check-and-insert to prevent race condition when peer is
@@ -620,19 +635,21 @@ class AutoInterface(
         // For IPv6 link-local addresses, we need to include the scope ID (interface)
         // to ensure proper routing
         val networkInterface = NetworkInterface.getByName(interfaceName)
-        val peerInet6Addr = Inet6Address.getByAddress(
-            null,
-            InetAddress.getByName(cleanAddr).address,
-            networkInterface
-        )
+        val peerInet6Addr =
+            Inet6Address.getByAddress(
+                null,
+                InetAddress.getByName(cleanAddr).address,
+                networkInterface,
+            )
         val targetAddr = InetSocketAddress(peerInet6Addr, dataPort)
 
-        val peer = AutoInterfacePeer(
-            name = "$name[$cleanAddr]",
-            parent = this,
-            targetAddress = targetAddr,
-            interfaceName = interfaceName
-        )
+        val peer =
+            AutoInterfacePeer(
+                name = "$name[$cleanAddr]",
+                parent = this,
+                targetAddress = targetAddr,
+                interfaceName = interfaceName,
+            )
 
         peer.start()
 
@@ -693,6 +710,7 @@ class AutoInterface(
             // Try to access jdk.net.ExtendedSocketOptions.SO_REUSEPORT via reflection
             val extOptClass = Class.forName("jdk.net.ExtendedSocketOptions")
             val reusePortField = extOptClass.getField("SO_REUSEPORT")
+
             @Suppress("UNCHECKED_CAST")
             val reusePortOption = reusePortField.get(null) as SocketOption<Boolean>
             channel.setOption(reusePortOption, true)
@@ -701,22 +719,37 @@ class AutoInterface(
         }
     }
 
-    private fun log(message: String, level: String = "INFO") {
-        val timestamp = java.time.LocalTime.now().toString().take(12)
+    private fun log(
+        message: String,
+        level: String = "INFO",
+    ) {
+        val timestamp =
+            java.time.LocalTime
+                .now()
+                .toString()
+                .take(12)
         val logMessage = "[$timestamp] [$name] $message"
 
         // Try Android logging first
         try {
             val logClass = Class.forName("android.util.Log")
             when (level) {
-                "ERROR" -> logClass.getMethod("e", String::class.java, String::class.java)
-                    .invoke(null, "AutoInterface", logMessage)
-                "WARNING", "WARN" -> logClass.getMethod("w", String::class.java, String::class.java)
-                    .invoke(null, "AutoInterface", logMessage)
-                "DEBUG" -> logClass.getMethod("d", String::class.java, String::class.java)
-                    .invoke(null, "AutoInterface", logMessage)
-                else -> logClass.getMethod("i", String::class.java, String::class.java)
-                    .invoke(null, "AutoInterface", logMessage)
+                "ERROR" ->
+                    logClass
+                        .getMethod("e", String::class.java, String::class.java)
+                        .invoke(null, "AutoInterface", logMessage)
+                "WARNING", "WARN" ->
+                    logClass
+                        .getMethod("w", String::class.java, String::class.java)
+                        .invoke(null, "AutoInterface", logMessage)
+                "DEBUG" ->
+                    logClass
+                        .getMethod("d", String::class.java, String::class.java)
+                        .invoke(null, "AutoInterface", logMessage)
+                else ->
+                    logClass
+                        .getMethod("i", String::class.java, String::class.java)
+                        .invoke(null, "AutoInterface", logMessage)
             }
         } catch (e: Exception) {
             // Fall back to println for non-Android platforms

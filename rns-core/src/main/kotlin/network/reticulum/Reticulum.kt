@@ -51,7 +51,7 @@ class Reticulum private constructor(
     val enableTransport: Boolean,
     val shareInstance: Boolean,
     val sharedInstancePort: Int,
-    val connectToSharedInstance: Boolean
+    val connectToSharedInstance: Boolean,
 ) {
     companion object {
         /**
@@ -132,9 +132,7 @@ class Reticulum private constructor(
          * Get the current Reticulum instance.
          * @throws IllegalStateException if not started
          */
-        fun getInstance(): Reticulum {
-            return instance ?: throw IllegalStateException("Reticulum not started")
-        }
+        fun getInstance(): Reticulum = instance ?: throw IllegalStateException("Reticulum not started")
 
         /**
          * Check if Reticulum is currently running.
@@ -156,7 +154,7 @@ class Reticulum private constructor(
             enableTransport: Boolean = false,
             shareInstance: Boolean = false,
             sharedInstancePort: Int = DEFAULT_SHARED_INSTANCE_PORT,
-            connectToSharedInstance: Boolean = false
+            connectToSharedInstance: Boolean = false,
         ): Reticulum {
             if (started.compareAndSet(false, true)) {
                 val dir = configDir ?: getDefaultConfigDir()
@@ -183,9 +181,9 @@ class Reticulum private constructor(
          */
         fun isSharedInstanceRunning(
             port: Int = DEFAULT_SHARED_INSTANCE_PORT,
-            host: String = "127.0.0.1"
-        ): Boolean {
-            return try {
+            host: String = "127.0.0.1",
+        ): Boolean =
+            try {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(host, port), 1000)
                     true
@@ -193,7 +191,6 @@ class Reticulum private constructor(
             } catch (e: Exception) {
                 false
             }
-        }
 
         /**
          * Stop Reticulum and clean up resources.
@@ -224,9 +221,11 @@ class Reticulum private constructor(
         fun linkMtuDiscovery(): Boolean = LINK_MTU_DISCOVERY
 
         private fun log(message: String) {
-            val timestamp = java.time.LocalDateTime.now().format(
-                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-            )
+            val timestamp =
+                java.time.LocalDateTime.now().format(
+                    java.time.format.DateTimeFormatter
+                        .ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
+                )
             println("[$timestamp] [Reticulum] $message")
         }
     }
@@ -272,9 +271,10 @@ class Reticulum private constructor(
         // Load or create transport identity
         val transportIdentity = loadOrCreateTransportIdentity()
 
-        // Configure Transport paths
+        // Configure Transport and Identity storage paths
         Transport.setCachePath(cachePath)
         Transport.setStoragePath(storagePath)
+        Identity.setStoragePath(storagePath)
 
         // Check if we should connect to an existing shared instance
         if (connectToSharedInstance) {
@@ -443,10 +443,10 @@ class Reticulum private constructor(
     /**
      * Get the path table as a map of destination hash (hex) to hop count.
      */
-    fun getPathTable(): Map<String, Int> {
-        return Transport.pathTable.mapKeys { it.key.toString() }
+    fun getPathTable(): Map<String, Int> =
+        Transport.pathTable
+            .mapKeys { it.key.toString() }
             .mapValues { it.value.hops }
-    }
 
     /**
      * Register a destination with Transport.
