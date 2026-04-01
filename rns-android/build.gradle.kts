@@ -1,6 +1,5 @@
 plugins {
     id("com.android.library")
-    kotlin("android")
     id("kotlin-parcelize")
     id("com.google.devtools.ksp")
 }
@@ -9,12 +8,10 @@ val coroutinesVersion: String by project
 
 android {
     namespace = "network.reticulum.android"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26  // Android 8.0
-        targetSdk = 34
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }
@@ -34,8 +31,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
     }
 
     ksp {

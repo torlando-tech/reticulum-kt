@@ -1,9 +1,8 @@
 plugins {
-    kotlin("jvm") version "1.9.22" apply false
-    kotlin("android") version "1.9.22" apply false
-    kotlin("plugin.serialization") version "1.9.22" apply false
-    id("com.android.library") version "8.13.0" apply false
-    id("com.google.devtools.ksp") version "1.9.22-1.0.17" apply false
+    kotlin("jvm") version "2.3.0" apply false
+    kotlin("plugin.serialization") version "2.3.0" apply false
+    id("com.android.library") version "9.1.0" apply false
+    id("com.google.devtools.ksp") version "2.3.6" apply false
     id("org.jetbrains.kotlinx.kover") version "0.7.6"
 }
 
@@ -23,9 +22,9 @@ subprojects {
     afterEvaluate {
         if (!plugins.hasPlugin("com.android.library") && !plugins.hasPlugin("com.android.application")) {
             tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
-                kotlinOptions {
-                    jvmTarget = "21"
-                    freeCompilerArgs = listOf("-Xjsr305=strict")
+                compilerOptions {
+                    jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+                    freeCompilerArgs.add("-Xjsr305=strict")
                 }
             }
 
