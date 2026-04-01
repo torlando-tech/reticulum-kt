@@ -58,8 +58,13 @@ fun interface AnnounceHandler {
 }
 
 /**
- * Extended announce handler that receives hop count and receiving interface name.
- * Implement this instead of [AnnounceHandler] to get full announce context.
+ * Extended announce handler that receives full announce context including
+ * the matched aspect, hop count, and receiving interface name.
+ *
+ * Transport determines the aspect by computing
+ * `Destination.hashFromNameAndIdentity(aspectFilter, identity)` for each
+ * registered handler and comparing against the packet's destination hash
+ * — the same approach Python uses (Transport.py:1895-1896).
  */
 interface RichAnnounceHandler : AnnounceHandler {
     fun handleAnnounceWithContext(
@@ -68,14 +73,28 @@ interface RichAnnounceHandler : AnnounceHandler {
         appData: ByteArray?,
         hops: Int,
         receivingInterfaceName: String?,
+        matchedAspect: String?,
     ): Boolean
 
     override fun handleAnnounce(
         destinationHash: ByteArray,
         announcedIdentity: Identity,
         appData: ByteArray?,
-    ): Boolean = handleAnnounceWithContext(destinationHash, announcedIdentity, appData, 0, null)
+    ): Boolean = handleAnnounceWithContext(destinationHash, announcedIdentity, appData, 0, null, null)
 }
+
+/**
+ * A handler paired with its optional aspect filter, mirroring Python's
+ * `handler.aspect_filter` attribute (Transport.py:1890).
+ *
+ * When [aspectFilter] is non-null, Transport only calls the handler for
+ * announces whose destination hash matches `Destination.hashFromNameAndIdentity(aspectFilter, identity)`.
+ * When null, the handler receives all announces.
+ */
+internal data class RegisteredHandler(
+    val handler: AnnounceHandler,
+    val aspectFilter: String?,
+)
 
 /**
  * Callback for packet delivery.
@@ -248,8 +267,11 @@ object Transport {
     /** Registered destinations. */
     private val destinations = CopyOnWriteArrayList<Destination>()
 
-    /** Registered announce handlers. */
-    private val announceHandlers = CopyOnWriteArrayList<AnnounceHandler>()
+    /** Registered announce handlers with their aspect filters. */
+    private val announceHandlers = CopyOnWriteArrayList<RegisteredHandler>()
+
+    /** Known aspects for resolving destination hashes in null-filter handlers. */
+    private val knownAspects = ConcurrentHashMap.newKeySet<String>()
 
     /** Control destination hashes (path requests, etc.). */
     private val controlHashes = ConcurrentHashMap.newKeySet<ByteArrayKey>()
@@ -439,6 +461,7 @@ object Transport {
         discoveryPathRequests.clear()
         pendingReceipts.clear()
         announceHandlers.clear()
+        knownAspects.clear()
         pendingLinks.clear()
         activeLinks.clear()
         tunnels.clear()
@@ -839,16 +862,22 @@ object Transport {
 
     /**
      * Register an announce handler.
+     *
+     * @param handler The handler to call when announces arrive
+     * @param aspectFilter If non-null, only call this handler for announces whose
+     *   destination hash matches `Destination.hashFromNameAndIdentity(aspectFilter, identity)`.
+     *   If null, the handler receives all announces. Matches Python's `handler.aspect_filter`.
      */
-    fun registerAnnounceHandler(handler: AnnounceHandler) {
-        announceHandlers.add(handler)
+    fun registerAnnounceHandler(handler: AnnounceHandler, aspectFilter: String? = null) {
+        announceHandlers.add(RegisteredHandler(handler, aspectFilter))
+        if (aspectFilter != null) knownAspects.add(aspectFilter)
     }
 
     /**
      * Deregister an announce handler.
      */
     fun deregisterAnnounceHandler(handler: AnnounceHandler) {
-        announceHandlers.remove(handler)
+        announceHandlers.removeIf { it.handler === handler }
     }
 
     // ===== Interface Discovery =====
@@ -3125,6 +3154,14 @@ object Transport {
         }
     }
 
+    /**
+     * Notify registered announce handlers, applying aspect filtering.
+     *
+     * Mirrors Python Transport.py:1884-1896:
+     * - If handler.aspect_filter is None → execute callback
+     * - Otherwise, compute hash_from_name_and_identity(aspect_filter, identity)
+     *   and only execute if it matches the packet's destination hash.
+     */
     private fun notifyAnnounceHandlers(
         destHash: ByteArray,
         identity: Identity,
@@ -3132,14 +3169,34 @@ object Transport {
         hops: Int,
         interfaceName: String?,
     ) {
-        for (handler in announceHandlers) {
+        var resolvedAspect: String? = null // cached for multiple null-filter handlers
+        for (registered in announceHandlers) {
             try {
-                val handled =
-                    if (handler is RichAnnounceHandler) {
-                        handler.handleAnnounceWithContext(destHash, identity, appData, hops, interfaceName)
+                val handler = registered.handler
+
+                // Aspect filtering (Python Transport.py:1890-1896)
+                val matchedAspect: String?
+                if (registered.aspectFilter != null) {
+                    val expectedHash = Destination.hashFromNameAndIdentity(
+                        registered.aspectFilter, identity,
+                    )
+                    if (!expectedHash.contentEquals(destHash)) continue
+                    matchedAspect = registered.aspectFilter
+                } else {
+                    // No filter — resolve aspect for RichAnnounceHandler callers
+                    matchedAspect = if (handler is RichAnnounceHandler) {
+                        resolvedAspect ?: resolveAspect(destHash, identity).also { resolvedAspect = it }
                     } else {
-                        handler.handleAnnounce(destHash, identity, appData)
+                        null
                     }
+                }
+                val handled = if (handler is RichAnnounceHandler) {
+                    handler.handleAnnounceWithContext(
+                        destHash, identity, appData, hops, interfaceName, matchedAspect,
+                    )
+                } else {
+                    handler.handleAnnounce(destHash, identity, appData)
+                }
                 if (handled) break
             } catch (e: Exception) {
                 log("Announce handler error: ${e.message}")
@@ -3147,7 +3204,28 @@ object Transport {
         }
     }
 
-    // (retransmit logic moved into processAnnounce above via retransmitAnnounce)
+    /**
+     * Resolve which aspect a destination hash belongs to by trying all
+     * known aspects. Used when a null-filter RichAnnounceHandler needs
+     * to know the aspect.
+     */
+    private fun resolveAspect(destHash: ByteArray, identity: Identity): String? {
+        for (aspect in knownAspects) {
+            try {
+                val expectedHash = Destination.hashFromNameAndIdentity(aspect, identity)
+                if (expectedHash.contentEquals(destHash)) return aspect
+            } catch (_: Exception) {}
+        }
+        return null
+    }
+
+    /**
+     * Register an aspect for resolution by null-filter RichAnnounceHandlers.
+     * Aspects from filtered handlers are automatically included.
+     */
+    fun registerKnownAspect(aspect: String) {
+        knownAspects.add(aspect)
+    }
 
     /**
      * Immediately retransmit an announce to all local client interfaces.
