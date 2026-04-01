@@ -868,7 +868,10 @@ object Transport {
      *   destination hash matches `Destination.hashFromNameAndIdentity(aspectFilter, identity)`.
      *   If null, the handler receives all announces. Matches Python's `handler.aspect_filter`.
      */
-    fun registerAnnounceHandler(handler: AnnounceHandler, aspectFilter: String? = null) {
+    fun registerAnnounceHandler(
+        handler: AnnounceHandler,
+        aspectFilter: String? = null,
+    ) {
         announceHandlers.add(RegisteredHandler(handler, aspectFilter))
         if (aspectFilter != null) knownAspects.add(aspectFilter)
     }
@@ -946,6 +949,11 @@ object Transport {
      * Returns list of (DiscoveredInterface, status) pairs.
      */
     fun listDiscoveredInterfaces(): List<Pair<network.reticulum.discovery.DiscoveredInterface, String>> = discoveryHandler?.listDiscovered() ?: emptyList()
+
+    /**
+     * Get the set of currently auto-connected endpoint strings ("host:port").
+     */
+    fun getAutoconnectedEndpoints(): Set<String> = discoveryHandler?.getAutoconnectedEndpoints() ?: emptySet()
 
     // ===== Link Management =====
 
@@ -3177,26 +3185,38 @@ object Transport {
                 // Aspect filtering (Python Transport.py:1890-1896)
                 val matchedAspect: String?
                 if (registered.aspectFilter != null) {
-                    val expectedHash = Destination.hashFromNameAndIdentity(
-                        registered.aspectFilter, identity,
-                    )
+                    val expectedHash =
+                        Destination.hashFromNameAndIdentity(
+                            registered.aspectFilter,
+                            identity,
+                        )
                     if (!expectedHash.contentEquals(destHash)) continue
                     matchedAspect = registered.aspectFilter
                 } else {
                     // No filter — resolve aspect for RichAnnounceHandler callers
-                    matchedAspect = if (handler is RichAnnounceHandler) {
-                        resolvedAspect ?: resolveAspect(destHash, identity).also { resolvedAspect = it }
+                    matchedAspect =
+                        if (handler is RichAnnounceHandler) {
+                            resolvedAspect ?: resolveAspect(destHash, identity).also { resolvedAspect = it }
+                        } else {
+                            null
+                        }
+                }
+                if (handler is RichAnnounceHandler) {
+                    log("notifyAnnounceHandlers: RichHandler matchedAspect=$matchedAspect dest=${destHash.toHexString().take(12)}")
+                }
+                val handled =
+                    if (handler is RichAnnounceHandler) {
+                        handler.handleAnnounceWithContext(
+                            destHash,
+                            identity,
+                            appData,
+                            hops,
+                            interfaceName,
+                            matchedAspect,
+                        )
                     } else {
-                        null
+                        handler.handleAnnounce(destHash, identity, appData)
                     }
-                }
-                val handled = if (handler is RichAnnounceHandler) {
-                    handler.handleAnnounceWithContext(
-                        destHash, identity, appData, hops, interfaceName, matchedAspect,
-                    )
-                } else {
-                    handler.handleAnnounce(destHash, identity, appData)
-                }
                 if (handled) break
             } catch (e: Exception) {
                 log("Announce handler error: ${e.message}")
@@ -3209,13 +3229,19 @@ object Transport {
      * known aspects. Used when a null-filter RichAnnounceHandler needs
      * to know the aspect.
      */
-    private fun resolveAspect(destHash: ByteArray, identity: Identity): String? {
+    private fun resolveAspect(
+        destHash: ByteArray,
+        identity: Identity,
+    ): String? {
         for (aspect in knownAspects) {
             try {
                 val expectedHash = Destination.hashFromNameAndIdentity(aspect, identity)
                 if (expectedHash.contentEquals(destHash)) return aspect
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                log("resolveAspect: exception for $aspect: ${e.message}")
+            }
         }
+        log("resolveAspect: no match for ${destHash.toHexString()} among ${knownAspects.size} aspects (id=${identity.hexHash.take(12)})")
         return null
     }
 
