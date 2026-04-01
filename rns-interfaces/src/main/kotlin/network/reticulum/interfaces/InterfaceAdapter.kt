@@ -10,12 +10,16 @@ import java.util.concurrent.ConcurrentHashMap
  * Adapter to bridge Interface to InterfaceRef for Transport integration.
  * Also sets up the receive callback to deliver packets to Transport.
  */
-class InterfaceAdapter private constructor(private val iface: Interface) : InterfaceRef {
+class InterfaceAdapter private constructor(
+    private val iface: Interface,
+) : InterfaceRef {
     override val name: String = iface.name
     override val hash: ByteArray = iface.getHash()
     override val canSend: Boolean = iface.canSend
     override val canReceive: Boolean = iface.canReceive
     override val online: Boolean get() = iface.online.get()
+    override val rxBytes: Long get() = iface.rxBytes.get()
+    override val txBytes: Long get() = iface.txBytes.get()
     override val mode: InterfaceMode get() = iface.mode
     override val announceCap: Double get() = iface.announceCap
     override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
@@ -24,11 +28,15 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     // Tunnel properties - delegate to underlying interface
     override var tunnelId: ByteArray?
         get() = iface.tunnelId
-        set(value) { iface.tunnelId = value }
+        set(value) {
+            iface.tunnelId = value
+        }
 
     override var wantsTunnel: Boolean
         get() = iface.wantsTunnel
-        set(value) { iface.wantsTunnel = value }
+        set(value) {
+            iface.wantsTunnel = value
+        }
 
     // Shared instance properties (Python RNS compatibility)
     override val isLocalSharedInstance: Boolean
@@ -53,7 +61,9 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val discoverable: Boolean get() = iface.discoverable
     override var lastDiscoveryAnnounce: Long
         get() = iface.lastDiscoveryAnnounce
-        set(value) { iface.lastDiscoveryAnnounce = value }
+        set(value) {
+            iface.lastDiscoveryAnnounce = value
+        }
     override val discoveryAnnounceInterval: Long get() = iface.discoveryAnnounceInterval
     override val discoveryName: String? get() = iface.discoveryName
     override val discoveryEncrypt: Boolean get() = iface.discoveryEncrypt
@@ -65,6 +75,7 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
     override val discoveryInterfaceType: String get() = iface.discoveryInterfaceType
     override val ifacNetname: String? get() = iface.ifacNetname
     override val ifacNetkey: String? get() = iface.ifacNetkey
+
     override fun getDiscoveryData(): Map<Int, Any>? = iface.getDiscoveryData()
 
     // IFAC properties - delegate to underlying interface
@@ -83,11 +94,12 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
         if (iface.onPacketReceived == null) {
             iface.onPacketReceived = { data, fromInterface ->
                 // Get or create InterfaceRef for the source interface
-                val sourceRef = if (fromInterface === iface) {
-                    this
-                } else {
-                    fromInterface.toRef()
-                }
+                val sourceRef =
+                    if (fromInterface === iface) {
+                        this
+                    } else {
+                        fromInterface.toRef()
+                    }
                 Transport.inbound(data, sourceRef)
             }
         }
@@ -95,12 +107,19 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
 
     // Ingress control delegation
     override fun shouldIngressLimit(): Boolean = iface.shouldIngressLimit()
+
     override fun recordIncomingAnnounce() = iface.recordIncomingAnnounce()
 
     // Held announce delegation
-    override fun holdAnnounce(destinationHash: ByteArray, raw: ByteArray, hops: Int, receivingInterface: InterfaceRef) =
-        iface.holdAnnounce(destinationHash, raw, hops, receivingInterface)
+    override fun holdAnnounce(
+        destinationHash: ByteArray,
+        raw: ByteArray,
+        hops: Int,
+        receivingInterface: InterfaceRef,
+    ) = iface.holdAnnounce(destinationHash, raw, hops, receivingInterface)
+
     override fun processHeldAnnounces() = iface.processHeldAnnounces()
+
     override fun heldAnnounceCount(): Int = iface.heldAnnounceCount()
 
     override fun send(data: ByteArray) {
@@ -111,9 +130,7 @@ class InterfaceAdapter private constructor(private val iface: Interface) : Inter
         // Cache adapters to avoid creating duplicates
         private val adapterCache = ConcurrentHashMap<Interface, InterfaceAdapter>()
 
-        fun getOrCreate(iface: Interface): InterfaceAdapter {
-            return adapterCache.computeIfAbsent(iface) { InterfaceAdapter(iface) }
-        }
+        fun getOrCreate(iface: Interface): InterfaceAdapter = adapterCache.computeIfAbsent(iface) { InterfaceAdapter(iface) }
     }
 }
 
