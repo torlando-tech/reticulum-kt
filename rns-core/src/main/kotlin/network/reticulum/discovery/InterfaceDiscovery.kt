@@ -33,7 +33,7 @@ class InterfaceDiscovery(
     private val requiredValue: Int = DiscoveryConstants.DEFAULT_STAMP_VALUE,
     private val discoverySources: Set<ByteArrayKey>? = null,
     private val autoConnectFactory: ((DiscoveredInterface) -> InterfaceRef?)? = null,
-    private val maxAutoConnected: Int = 0,
+    private var maxAutoConnected: Int = 0,
     private val discoveryCallback: ((DiscoveredInterface) -> Unit)? = null,
     /** Pluggable persistent storage. When null, falls back to file-based persistence. */
     private val discoveryStore: network.reticulum.storage.DiscoveryStore? = null,
@@ -80,6 +80,20 @@ class InterfaceDiscovery(
         monitorJob?.cancel()
         monitorJob = null
         log("Stopped discovery listener")
+    }
+
+    /**
+     * Update the auto-connect limit at runtime (no restart needed).
+     * If the new limit is higher than the current count, triggers reconnect
+     * of available discovered interfaces to fill the new slots.
+     */
+    fun setMaxAutoConnected(count: Int) {
+        val old = maxAutoConnected
+        maxAutoConnected = count
+        log("Auto-connect limit updated: $old → $count")
+        if (count > old && autoConnectFactory != null) {
+            scope.launch { connectDiscovered() }
+        }
     }
 
     /**

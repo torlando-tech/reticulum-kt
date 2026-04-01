@@ -955,6 +955,13 @@ object Transport {
      */
     fun getAutoconnectedEndpoints(): Set<String> = discoveryHandler?.getAutoconnectedEndpoints() ?: emptySet()
 
+    /**
+     * Update the auto-connect limit at runtime without restarting.
+     */
+    fun setMaxAutoConnected(count: Int) {
+        discoveryHandler?.setMaxAutoConnected(count)
+    }
+
     // ===== Link Management =====
 
     /**
