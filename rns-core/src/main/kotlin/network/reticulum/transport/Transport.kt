@@ -842,12 +842,13 @@ object Transport {
      */
     fun registerReceipt(receipt: PacketReceipt) {
         receipts.add(receipt)
-        // Also register for proof handling
-        pendingReceipts[receipt.hash.toKey()] =
+        // Register by TRUNCATED hash — proof packets carry the original packet's
+        // truncated hash as their destination, matching Python's get_hash() usage.
+        pendingReceipts[receipt.truncatedHash.toKey()] =
             object : ProofCallback {
                 override fun onProofReceived(proofPacket: Packet): Boolean = receipt.validateProofPacket(proofPacket)
             }
-        log("Registered receipt for ${receipt.hash.toHexString()}")
+        log("Registered receipt for ${receipt.truncatedHash.toHexString()}")
     }
 
     /**
