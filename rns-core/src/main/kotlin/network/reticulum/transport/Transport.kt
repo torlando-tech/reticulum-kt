@@ -2980,6 +2980,15 @@ object Transport {
         if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
             log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
             interfaceRef.holdAnnounce(destHash, packet.raw ?: packet.pack(), packet.hops, interfaceRef)
+            // Still notify local handlers so display names are captured.
+            // Python processes the announce locally even when ingress-limited;
+            // it only holds the *retransmission*.
+            for (handler in announceHandlers) {
+                try {
+                    if (handler.handleAnnounce(destHash, identity, appData)) break
+                } catch (_: Exception) {
+                }
+            }
             return
         }
 
