@@ -3047,7 +3047,7 @@ object Transport {
             // Still notify local handlers so display names are captured.
             // Python processes the announce locally even when ingress-limited;
             // it only holds the *retransmission*.
-            notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.name)
+            notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.qualifiedName)
             return
         }
 
@@ -3151,7 +3151,7 @@ object Transport {
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
         // Notify announce handlers
-        notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.name)
+        notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.qualifiedName)
 
         // Cache the announce packet for later path request responses
         // Python Transport.py:1867 — cache pre-increment raw announce to disk
@@ -5371,6 +5371,9 @@ interface InterfaceRef {
 
     /** The interface type name as it appears in discovery announces. */
     val discoveryInterfaceType: String get() = "Interface"
+
+    /** Python-style qualified name: "TCPClientInterface[homelab]". Used for interface type detection. */
+    val qualifiedName: String get() = "$discoveryInterfaceType[$name]"
 
     /** Type-specific discovery data (TCP: reachable_on/port, RNode: freq/bw/sf/cr, etc.). */
     fun getDiscoveryData(): Map<Int, Any>? = null
