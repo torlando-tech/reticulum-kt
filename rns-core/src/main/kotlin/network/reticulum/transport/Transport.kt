@@ -3209,9 +3209,6 @@ object Transport {
                             null
                         }
                 }
-                if (handler is RichAnnounceHandler) {
-                    log("notifyAnnounceHandlers: RichHandler matchedAspect=$matchedAspect dest=${destHash.toHexString().take(12)}")
-                }
                 val handled =
                     if (handler is RichAnnounceHandler) {
                         handler.handleAnnounceWithContext(
@@ -3245,11 +3242,9 @@ object Transport {
             try {
                 val expectedHash = Destination.hashFromNameAndIdentity(aspect, identity)
                 if (expectedHash.contentEquals(destHash)) return aspect
-            } catch (e: Exception) {
-                log("resolveAspect: exception for $aspect: ${e.message}")
+            } catch (_: Exception) {
             }
         }
-        log("resolveAspect: no match for ${destHash.toHexString()} among ${knownAspects.size} aspects (id=${identity.hexHash.take(12)})")
         return null
     }
 
