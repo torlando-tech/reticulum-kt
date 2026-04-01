@@ -275,6 +275,7 @@ class Reticulum private constructor(
         Transport.setCachePath(cachePath)
         Transport.setStoragePath(storagePath)
         Identity.setStoragePath(storagePath)
+        Identity.loadKnownDestinations()
 
         // Check if we should connect to an existing shared instance
         if (connectToSharedInstance) {
