@@ -850,6 +850,16 @@ object Transport {
         }
     }
 
+    fun disableDiscovery() {
+        interfaceAnnouncer?.stop()
+        interfaceAnnouncer = null
+        discoveryHandler?.stop()
+        discoveryHandler = null
+        log("Interface discovery disabled")
+    }
+
+    fun isDiscoveryEnabled(): Boolean = interfaceAnnouncer != null
+
     /**
      * Start listening for interface discovery announces.
      *
