@@ -58,6 +58,26 @@ fun interface AnnounceHandler {
 }
 
 /**
+ * Extended announce handler that receives hop count and receiving interface name.
+ * Implement this instead of [AnnounceHandler] to get full announce context.
+ */
+interface RichAnnounceHandler : AnnounceHandler {
+    fun handleAnnounceWithContext(
+        destinationHash: ByteArray,
+        announcedIdentity: Identity,
+        appData: ByteArray?,
+        hops: Int,
+        receivingInterfaceName: String?,
+    ): Boolean
+
+    override fun handleAnnounce(
+        destinationHash: ByteArray,
+        announcedIdentity: Identity,
+        appData: ByteArray?,
+    ): Boolean = handleAnnounceWithContext(destinationHash, announcedIdentity, appData, 0, null)
+}
+
+/**
  * Callback for packet delivery.
  */
 fun interface PacketCallback {
@@ -2983,12 +3003,7 @@ object Transport {
             // Still notify local handlers so display names are captured.
             // Python processes the announce locally even when ingress-limited;
             // it only holds the *retransmission*.
-            for (handler in announceHandlers) {
-                try {
-                    if (handler.handleAnnounce(destHash, identity, appData)) break
-                } catch (_: Exception) {
-                }
-            }
+            notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.name)
             return
         }
 
@@ -3092,15 +3107,7 @@ object Transport {
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
         // Notify announce handlers
-        for (handler in announceHandlers) {
-            try {
-                if (handler.handleAnnounce(destHash, identity, appData)) {
-                    break
-                }
-            } catch (e: Exception) {
-                log("Announce handler error: ${e.message}")
-            }
-        }
+        notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.name)
 
         // Cache the announce packet for later path request responses
         // Python Transport.py:1867 — cache pre-increment raw announce to disk
@@ -3112,13 +3119,35 @@ object Transport {
         retransmitAnnounceToLocalClients(packet, interfaceRef)
 
         // Retransmit if transport is enabled OR announce came from a local client
-        // Python Transport.py:1741 — local client announces are always retransmitted
-        // to external interfaces, even when transport routing is disabled
         val fromLocal = fromLocalClient(interfaceRef)
         if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
             queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
         }
     }
+
+    private fun notifyAnnounceHandlers(
+        destHash: ByteArray,
+        identity: Identity,
+        appData: ByteArray?,
+        hops: Int,
+        interfaceName: String?,
+    ) {
+        for (handler in announceHandlers) {
+            try {
+                val handled =
+                    if (handler is RichAnnounceHandler) {
+                        handler.handleAnnounceWithContext(destHash, identity, appData, hops, interfaceName)
+                    } else {
+                        handler.handleAnnounce(destHash, identity, appData)
+                    }
+                if (handled) break
+            } catch (e: Exception) {
+                log("Announce handler error: ${e.message}")
+            }
+        }
+    }
+
+    // (retransmit logic moved into processAnnounce above via retransmitAnnounce)
 
     /**
      * Immediately retransmit an announce to all local client interfaces.
