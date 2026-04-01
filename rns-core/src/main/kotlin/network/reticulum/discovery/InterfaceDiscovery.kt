@@ -84,14 +84,31 @@ class InterfaceDiscovery(
 
     /**
      * Update the auto-connect limit at runtime (no restart needed).
-     * If the new limit is higher than the current count, triggers reconnect
-     * of available discovered interfaces to fill the new slots.
+     * - If increased: connects more discovered interfaces to fill new slots.
+     * - If reduced: detaches excess auto-connected interfaces (LIFO order).
+     * - If set to 0: detaches all auto-connected interfaces.
      */
     fun setMaxAutoConnected(count: Int) {
         val old = maxAutoConnected
         maxAutoConnected = count
         log("Auto-connect limit updated: $old → $count")
-        if (count > old && autoConnectFactory != null) {
+
+        // Detach excess interfaces when limit is reduced
+        val excess = monitoredInterfaces.size - count
+        if (excess > 0) {
+            // Remove from the end (most recently added first)
+            val toDetach = monitoredInterfaces.takeLast(excess)
+            for (m in toDetach) {
+                monitoredInterfaces.remove(m)
+                try {
+                    Transport.deregisterInterface(m.ref)
+                    log("Detached auto-connected interface: ${m.ref.name}")
+                } catch (e: Exception) {
+                    log("Error detaching interface ${m.ref.name}: ${e.message}")
+                }
+            }
+        } else if (count > old && autoConnectFactory != null) {
+            // Fill new slots from known discovered interfaces
             scope.launch { connectDiscovered() }
         }
     }
