@@ -1,5 +1,16 @@
 package network.reticulum.link
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import network.reticulum.Reticulum
+import network.reticulum.channel.Channel
+import network.reticulum.channel.ChannelOutlet
+import network.reticulum.channel.MessageState
 import network.reticulum.common.DestinationType
 import network.reticulum.common.PacketContext
 import network.reticulum.common.PacketType
@@ -14,20 +25,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
-import network.reticulum.Reticulum
 import network.reticulum.transport.Transport
-import network.reticulum.channel.Channel
-import network.reticulum.channel.ChannelOutlet
-import network.reticulum.channel.MessageState
-import network.reticulum.common.ByteArrayKey
-import network.reticulum.common.toKey
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -79,7 +77,7 @@ class Link private constructor(
     /** The owner destination for incoming links. */
     private val owner: Destination?,
     /** Encryption mode for this link. */
-    val mode: Int = LinkConstants.MODE_DEFAULT
+    val mode: Int = LinkConstants.MODE_DEFAULT,
 ) {
     companion object {
         private val linkCounter = AtomicInteger(0)
@@ -114,19 +112,20 @@ class Link private constructor(
             destination: Destination,
             establishedCallback: ((Link) -> Unit)? = null,
             closedCallback: ((Link) -> Unit)? = null,
-            mode: Int = LinkConstants.MODE_DEFAULT
+            mode: Int = LinkConstants.MODE_DEFAULT,
         ): Link {
             require(destination.type == DestinationType.SINGLE) {
                 "Links can only be established to SINGLE destination type"
             }
 
-            val link = Link(
-                crypto = defaultCryptoProvider(),
-                destination = destination,
-                initiator = true,
-                owner = null,
-                mode = mode
-            )
+            val link =
+                Link(
+                    crypto = defaultCryptoProvider(),
+                    destination = destination,
+                    initiator = true,
+                    owner = null,
+                    mode = mode,
+                )
 
             establishedCallback?.let { link.callbacks.linkEstablished = it }
             closedCallback?.let { link.callbacks.linkClosed = it }
@@ -143,9 +142,14 @@ class Link private constructor(
          * @param packet The link request packet
          * @return The new Link if valid, null otherwise
          */
-        fun validateRequest(owner: Destination, data: ByteArray, packet: Packet): Link? {
+        fun validateRequest(
+            owner: Destination,
+            data: ByteArray,
+            packet: Packet,
+        ): Link? {
             if (data.size != LinkConstants.ECPUBSIZE &&
-                data.size != LinkConstants.ECPUBSIZE + LinkConstants.LINK_MTU_SIZE) {
+                data.size != LinkConstants.ECPUBSIZE + LinkConstants.LINK_MTU_SIZE
+            ) {
                 log("Invalid link request payload size: ${data.size}")
                 return null
             }
@@ -154,13 +158,14 @@ class Link private constructor(
                 val peerPubBytes = data.copyOfRange(0, LinkConstants.KEYSIZE)
                 val peerSigPubBytes = data.copyOfRange(LinkConstants.KEYSIZE, LinkConstants.ECPUBSIZE)
 
-                val link = Link(
-                    crypto = defaultCryptoProvider(),
-                    destination = null,
-                    initiator = false,
-                    owner = owner,
-                    mode = modeFromLrPacket(packet)
-                )
+                val link =
+                    Link(
+                        crypto = defaultCryptoProvider(),
+                        destination = null,
+                        initiator = false,
+                        owner = owner,
+                        mode = modeFromLrPacket(packet),
+                    )
 
                 link.loadPeer(peerPubBytes, peerSigPubBytes)
                 link.initializeAsReceiver()
@@ -202,7 +207,6 @@ class Link private constructor(
 
                 log("Link request ${link.linkId.toHexString()} accepted")
                 link
-
             } catch (e: Exception) {
                 log("Validating link request failed: ${e.message}")
                 null
@@ -230,8 +234,8 @@ class Link private constructor(
             }
             val offset = LinkConstants.ECPUBSIZE
             return ((packet.data[offset].toInt() and 0xFF) shl 16) or
-                   ((packet.data[offset + 1].toInt() and 0xFF) shl 8) or
-                   (packet.data[offset + 2].toInt() and 0xFF) and LinkConstants.MTU_BYTEMASK
+                ((packet.data[offset + 1].toInt() and 0xFF) shl 8) or
+                (packet.data[offset + 2].toInt() and 0xFF) and LinkConstants.MTU_BYTEMASK
         }
 
         /**
@@ -247,23 +251,29 @@ class Link private constructor(
         /**
          * Create signalling bytes for MTU and mode.
          */
-        fun signallingBytes(mtu: Int, mode: Int): ByteArray {
+        fun signallingBytes(
+            mtu: Int,
+            mode: Int,
+        ): ByteArray {
             require(mode in LinkConstants.ENABLED_MODES) {
                 "Requested link mode ${LinkConstants.modeDescription(mode)} not enabled"
             }
-            val value = (mtu and LinkConstants.MTU_BYTEMASK) +
-                        (((mode shl 5) and LinkConstants.MODE_BYTEMASK) shl 16)
+            val value =
+                (mtu and LinkConstants.MTU_BYTEMASK) +
+                    (((mode shl 5) and LinkConstants.MODE_BYTEMASK) shl 16)
             return byteArrayOf(
                 ((value shr 16) and 0xFF).toByte(),
                 ((value shr 8) and 0xFF).toByte(),
-                (value and 0xFF).toByte()
+                (value and 0xFF).toByte(),
             )
         }
 
         private fun log(message: String) {
-            val timestamp = java.time.LocalDateTime.now().format(
-                java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-            )
+            val timestamp =
+                java.time.LocalDateTime.now().format(
+                    java.time.format.DateTimeFormatter
+                        .ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
+                )
             println("[$timestamp] [Link] $message")
         }
     }
@@ -345,17 +355,18 @@ class Link private constructor(
     // Attached interface/destination (public to allow initiator links to attach a destination
     // for request handling — matches Python's Link.attached_interface which is also public)
     var attachedDestination: Destination? = null
+
     // Hash of the interface this link is attached to (Python: link.attached_interface)
     var attachedInterfaceHash: ByteArray? = null
     private var remoteIdentity: Identity? = null
 
     // Cryptographic state
-    private var prv: ByteArray? = null  // X25519 private key
-    private var pub: ByteArray? = null  // X25519 public key
-    private var sigPrv: ByteArray? = null  // Ed25519 private key
-    private var sigPub: ByteArray? = null  // Ed25519 public key
-    private var peerPub: ByteArray? = null  // Peer's X25519 public key
-    private var peerSigPub: ByteArray? = null  // Peer's Ed25519 public key
+    private var prv: ByteArray? = null // X25519 private key
+    private var pub: ByteArray? = null // X25519 public key
+    private var sigPrv: ByteArray? = null // Ed25519 private key
+    private var sigPub: ByteArray? = null // Ed25519 public key
+    private var peerPub: ByteArray? = null // Peer's X25519 public key
+    private var peerSigPub: ByteArray? = null // Peer's Ed25519 public key
     private var sharedKey: ByteArray? = null
     private var derivedKey: ByteArray? = null
     private var token: Token? = null
@@ -401,23 +412,25 @@ class Link private constructor(
 
         // Query next-hop interface MTU for link MTU discovery (Python Link.py:308-314)
         val nhHwMtu = Transport.nextHopInterfaceHwMtu(destination!!.hash)
-        val signalledMtu = if (Reticulum.LINK_MTU_DISCOVERY && nhHwMtu != null) {
-            log("Signalling link MTU of $nhHwMtu for link")
-            nhHwMtu
-        } else {
-            mtu  // default RnsConstants.MTU (500)
-        }
+        val signalledMtu =
+            if (Reticulum.LINK_MTU_DISCOVERY && nhHwMtu != null) {
+                log("Signalling link MTU of $nhHwMtu for link")
+                nhHwMtu
+            } else {
+                mtu // default RnsConstants.MTU (500)
+            }
         val signallingBytes = signallingBytes(signalledMtu, mode)
         val requestData = pub!! + sigPub!! + signallingBytes
 
         // Create and send link request
-        val packet = Packet.createRaw(
-            destinationHash = destination.hash,
-            data = requestData,
-            packetType = PacketType.LINKREQUEST,
-            destinationType = destination.type,
-            transportType = TransportType.BROADCAST
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = destination.hash,
+                data = requestData,
+                packetType = PacketType.LINKREQUEST,
+                destinationType = destination.type,
+                transportType = TransportType.BROADCAST,
+            )
         packet.pack()
 
         establishmentCost += packet.raw?.size ?: 0
@@ -436,7 +449,10 @@ class Link private constructor(
     /**
      * Load peer public keys.
      */
-    private fun loadPeer(peerPubBytes: ByteArray, peerSigPubBytes: ByteArray) {
+    private fun loadPeer(
+        peerPubBytes: ByteArray,
+        peerSigPubBytes: ByteArray,
+    ) {
         this.peerPub = peerPubBytes.copyOf()
         this.peerSigPub = peerSigPubBytes.copyOf()
     }
@@ -452,8 +468,9 @@ class Link private constructor(
         pub = x25519KeyPair.publicKey
 
         // Use owner's Ed25519 signing key
-        val ownerIdentity = owner?.identity
-            ?: throw IllegalStateException("Cannot initialize receiver link: owner has no identity")
+        val ownerIdentity =
+            owner?.identity
+                ?: throw IllegalStateException("Cannot initialize receiver link: owner has no identity")
         sigPrv = ownerIdentity.sigPrv
         sigPub = ownerIdentity.sigPub
     }
@@ -481,12 +498,13 @@ class Link private constructor(
 
         // Derive encryption keys using HKDF
         val derivedKeyLength = LinkConstants.derivedKeyLength(mode)
-        derivedKey = crypto.hkdf(
-            length = derivedKeyLength,
-            ikm = sharedKey!!,
-            salt = getSalt(),
-            info = getContext()
-        )
+        derivedKey =
+            crypto.hkdf(
+                length = derivedKeyLength,
+                ikm = sharedKey!!,
+                salt = getSalt(),
+                info = getContext(),
+            )
     }
 
     /**
@@ -497,18 +515,20 @@ class Link private constructor(
         val signedData = linkId + pub!! + sigPub!! + signallingBytes
 
         // Sign with owner's identity
-        val signature = owner!!.identity!!.sign(signedData)
-            ?: throw IllegalStateException("Cannot sign link proof")
+        val signature =
+            owner!!.identity!!.sign(signedData)
+                ?: throw IllegalStateException("Cannot sign link proof")
 
         val proofData = signature + pub!! + signallingBytes
 
-        val proof = Packet.createRaw(
-            destinationHash = linkId,
-            data = proofData,
-            packetType = PacketType.PROOF,
-            context = PacketContext.LRPROOF,
-            destinationType = DestinationType.LINK
-        )
+        val proof =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = proofData,
+                packetType = PacketType.PROOF,
+                context = PacketContext.LRPROOF,
+                destinationType = DestinationType.LINK,
+            )
         proof.link = this
 
         Transport.outbound(proof)
@@ -546,8 +566,11 @@ class Link private constructor(
             val peerPubBytes = packet.data.copyOfRange(sigLength, sigLength + pubSize)
 
             // Get peer's Ed25519 public key from destination's identity
-            val peerSigPubBytes = destination!!.identity!!.getPublicKey()
-                .copyOfRange(LinkConstants.KEYSIZE, LinkConstants.ECPUBSIZE)
+            val peerSigPubBytes =
+                destination!!
+                    .identity!!
+                    .getPublicKey()
+                    .copyOfRange(LinkConstants.KEYSIZE, LinkConstants.ECPUBSIZE)
 
             loadPeer(peerPubBytes, peerSigPubBytes)
             handshake()
@@ -615,7 +638,6 @@ class Link private constructor(
             }
 
             return true
-
         } catch (e: Exception) {
             log("Error validating proof: ${e.message}")
             status = LinkConstants.CLOSED
@@ -638,8 +660,8 @@ class Link private constructor(
         val mtuOffset = sigLength + pubSize
         if (packet.data.size >= mtuOffset + LinkConstants.LINK_MTU_SIZE) {
             return ((packet.data[mtuOffset].toInt() and 0xFF) shl 16) or
-                   ((packet.data[mtuOffset + 1].toInt() and 0xFF) shl 8) or
-                   (packet.data[mtuOffset + 2].toInt() and 0xFF) and LinkConstants.MTU_BYTEMASK
+                ((packet.data[mtuOffset + 1].toInt() and 0xFF) shl 8) or
+                (packet.data[mtuOffset + 2].toInt() and 0xFF) and LinkConstants.MTU_BYTEMASK
         }
         return null
     }
@@ -677,21 +699,21 @@ class Link private constructor(
     /**
      * Sign a message using this link's signing key.
      */
-    fun sign(message: ByteArray): ByteArray {
-        return crypto.ed25519Sign(sigPrv!!, message)
-    }
+    fun sign(message: ByteArray): ByteArray = crypto.ed25519Sign(sigPrv!!, message)
 
     /**
      * Validate a signature from the peer.
      */
-    fun validate(signature: ByteArray, message: ByteArray): Boolean {
-        return try {
+    fun validate(
+        signature: ByteArray,
+        message: ByteArray,
+    ): Boolean =
+        try {
             crypto.ed25519Verify(peerSigPub!!, message, signature)
             true
         } catch (e: Exception) {
             false
         }
-    }
 
     /**
      * Generate and send a proof for a packet over this link.
@@ -706,12 +728,13 @@ class Link private constructor(
         val proofData = packet.packetHash + signature
 
         // Create proof packet addressed to this link
-        val proof = Packet.createRaw(
-            destinationHash = linkId,
-            data = proofData,
-            packetType = PacketType.PROOF,
-            destinationType = DestinationType.LINK
-        )
+        val proof =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = proofData,
+                packetType = PacketType.PROOF,
+                destinationType = DestinationType.LINK,
+            )
 
         proof.send()
         hadOutbound(isData = false)
@@ -720,9 +743,7 @@ class Link private constructor(
     /**
      * Send data over the link.
      */
-    fun send(data: ByteArray): Boolean {
-        return sendWithReceipt(data) != null
-    }
+    fun send(data: ByteArray): Boolean = sendWithReceipt(data) != null
 
     /**
      * Send data over the link and return a receipt for delivery tracking.
@@ -736,14 +757,15 @@ class Link private constructor(
         }
 
         val encrypted = encrypt(data)
-        val packet = Packet.createRaw(
-            destinationHash = linkId,
-            data = encrypted,
-            packetType = PacketType.DATA,
-            destinationType = DestinationType.LINK,
-            createReceipt = true,
-            mtu = mtu
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
+                createReceipt = true,
+                mtu = mtu,
+            )
         packet.link = this
 
         val receipt = packet.send()
@@ -765,14 +787,15 @@ class Link private constructor(
         }
 
         log("sendResourceData: sending ${data.size} bytes (already resource-encrypted, no link encryption)")
-        val packet = Packet.createRaw(
-            destinationHash = linkId,
-            data = data,  // Send directly - already resource-level encrypted
-            packetType = PacketType.DATA,
-            destinationType = DestinationType.LINK,
-            context = PacketContext.RESOURCE,
-            mtu = mtu
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = data, // Send directly - already resource-level encrypted
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
+                context = PacketContext.RESOURCE,
+                mtu = mtu,
+            )
         packet.link = this
 
         packet.send()
@@ -796,7 +819,9 @@ class Link private constructor(
      * ChannelOutlet implementation that wraps a Link.
      * Provides the transport layer for Channel message delivery.
      */
-    private class LinkChannelOutlet(private val link: Link) : ChannelOutlet {
+    private class LinkChannelOutlet(
+        private val link: Link,
+    ) : ChannelOutlet {
         override val mdu: Int
             get() = link.mdu
 
@@ -807,21 +832,23 @@ class Link private constructor(
             get() = link.status == LinkConstants.ACTIVE
 
         override val timedOut: Boolean
-            get() = link.status == LinkConstants.CLOSED &&
+            get() =
+                link.status == LinkConstants.CLOSED &&
                     link.teardownReason == LinkConstants.TEARDOWN_REASON_TIMEOUT
 
         override fun send(raw: ByteArray): Any? {
             if (!isUsable) return null
 
             val encrypted = link.encrypt(raw)
-            val packet = Packet.createRaw(
-                destinationHash = link.linkId,
-                data = encrypted,
-                packetType = PacketType.DATA,
-                context = PacketContext.CHANNEL,
-                destinationType = DestinationType.LINK,
-                mtu = link.mtu
-            )
+            val packet =
+                Packet.createRaw(
+                    destinationHash = link.linkId,
+                    data = encrypted,
+                    packetType = PacketType.DATA,
+                    context = PacketContext.CHANNEL,
+                    destinationType = DestinationType.LINK,
+                    mtu = link.mtu,
+                )
 
             // Use packet.send() so a PacketReceipt is created, enabling
             // delivery confirmation and timeout callbacks for Channel retry logic
@@ -852,12 +879,16 @@ class Link private constructor(
             }
         }
 
-        override fun setPacketTimeoutCallback(packet: Any, callback: ((Any) -> Unit)?, timeout: Long?) {
+        override fun setPacketTimeoutCallback(
+            packet: Any,
+            callback: ((Any) -> Unit)?,
+            timeout: Long?,
+        ) {
             if (packet !is Packet) return
             val receipt = packet.receipt ?: return
 
             if (timeout != null) {
-                receipt.setTimeout(timeout / 1000.0)  // Convert ms to seconds
+                receipt.setTimeout(timeout / 1000.0) // Convert ms to seconds
             }
 
             if (callback != null) {
@@ -867,7 +898,10 @@ class Link private constructor(
             }
         }
 
-        override fun setPacketDeliveredCallback(packet: Any, callback: ((Any) -> Unit)?) {
+        override fun setPacketDeliveredCallback(
+            packet: Any,
+            callback: ((Any) -> Unit)?,
+        ) {
             if (packet !is Packet) return
             val receipt = packet.receipt ?: return
 
@@ -878,9 +912,7 @@ class Link private constructor(
             }
         }
 
-        override fun getPacketId(packet: Any): Any {
-            return if (packet is Packet) packet.packetHash else packet
-        }
+        override fun getPacketId(packet: Any): Any = if (packet is Packet) packet.packetHash else packet
     }
 
     /**
@@ -906,7 +938,7 @@ class Link private constructor(
         responseCallback: ((RequestReceipt) -> Unit)? = null,
         failedCallback: ((RequestReceipt) -> Unit)? = null,
         progressCallback: ((RequestReceipt) -> Unit)? = null,
-        timeout: Long? = null
+        timeout: Long? = null,
     ): RequestReceipt? {
         if (status != LinkConstants.ACTIVE) {
             log("Cannot send request: link not active")
@@ -918,12 +950,13 @@ class Link private constructor(
 
         // Pack the request: [timestamp, path_hash, data]
         val timestamp = System.currentTimeMillis()
-        val packedRequest = try {
-            packRequest(timestamp, pathHash, data)
-        } catch (e: Exception) {
-            log("Error packing request: ${e.message}")
-            return null
-        }
+        val packedRequest =
+            try {
+                packRequest(timestamp, pathHash, data)
+            } catch (e: Exception) {
+                log("Error packing request: ${e.message}")
+                return null
+            }
 
         // Calculate timeout if not provided
         val actualTimeout = timeout ?: calculateRequestTimeout()
@@ -932,14 +965,15 @@ class Link private constructor(
         if (packedRequest.size <= mdu) {
             // Send as packet
             val encrypted = encrypt(packedRequest)
-            val packet = Packet.createRaw(
-                destinationHash = linkId,
-                data = encrypted,
-                packetType = PacketType.DATA,
-                context = PacketContext.REQUEST,
-                destinationType = DestinationType.LINK,
-                mtu = mtu
-            )
+            val packet =
+                Packet.createRaw(
+                    destinationHash = linkId,
+                    data = encrypted,
+                    packetType = PacketType.DATA,
+                    context = PacketContext.REQUEST,
+                    destinationType = DestinationType.LINK,
+                    mtu = mtu,
+                )
 
             packet.link = this
 
@@ -948,15 +982,16 @@ class Link private constructor(
             val requestId = packet.truncatedHash
 
             // Create the RequestReceipt
-            val receipt = RequestReceipt(
-                link = this,
-                requestId = requestId,
-                requestSize = packedRequest.size,
-                responseCallback = responseCallback,
-                failedCallback = failedCallback,
-                progressCallback = progressCallback,
-                timeout = actualTimeout
-            )
+            val receipt =
+                RequestReceipt(
+                    link = this,
+                    requestId = requestId,
+                    requestSize = packedRequest.size,
+                    responseCallback = responseCallback,
+                    failedCallback = failedCallback,
+                    progressCallback = progressCallback,
+                    timeout = actualTimeout,
+                )
 
             // Add to pending requests
             synchronized(pendingRequests) {
@@ -976,29 +1011,30 @@ class Link private constructor(
 
             // Timeout monitoring handled by watchdog checkRequestTimeouts()
             return receipt
-
         } else {
             // Send as resource (Python: Link.py:514-527)
             val requestId = Hashes.truncatedHash(packedRequest)
             log("Sending request ${requestId.toHexString()} as resource")
 
-            val requestResource = network.reticulum.resource.Resource.create(
-                data = packedRequest,
-                link = this,
-                requestId = requestId,
-                isResponse = false,
-                timeout = actualTimeout
-            )
+            val requestResource =
+                network.reticulum.resource.Resource.create(
+                    data = packedRequest,
+                    link = this,
+                    requestId = requestId,
+                    isResponse = false,
+                    timeout = actualTimeout,
+                )
 
-            val receipt = RequestReceipt(
-                link = this,
-                requestId = requestId,
-                requestSize = packedRequest.size,
-                responseCallback = responseCallback,
-                failedCallback = failedCallback,
-                progressCallback = progressCallback,
-                timeout = actualTimeout
-            )
+            val receipt =
+                RequestReceipt(
+                    link = this,
+                    requestId = requestId,
+                    requestSize = packedRequest.size,
+                    responseCallback = responseCallback,
+                    failedCallback = failedCallback,
+                    progressCallback = progressCallback,
+                    timeout = actualTimeout,
+                )
 
             synchronized(pendingRequests) {
                 pendingRequests.add(receipt)
@@ -1038,21 +1074,23 @@ class Link private constructor(
         val signedData = linkId + publicKey
 
         // Sign the data
-        val signature = identity.sign(signedData)
-            ?: return false.also { log("Failed to sign identity data") }
+        val signature =
+            identity.sign(signedData)
+                ?: return false.also { log("Failed to sign identity data") }
 
         // Build proof data: public_key + signature
         val proofData = publicKey + signature
 
         // Encrypt and send
         val encrypted = encrypt(proofData)
-        val packet = Packet.createRaw(
-            destinationHash = linkId,
-            data = encrypted,
-            packetType = PacketType.DATA,
-            context = PacketContext.LINKIDENTIFY,
-            destinationType = DestinationType.LINK
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                context = PacketContext.LINKIDENTIFY,
+                destinationType = DestinationType.LINK,
+            )
         packet.link = this
 
         return Transport.outbound(packet).also { sent ->
@@ -1069,8 +1107,8 @@ class Link private constructor(
      * @param strategy One of ACCEPT_NONE, ACCEPT_ALL, or ACCEPT_APP
      * @return true if strategy was set successfully, false otherwise
      */
-    fun setResourceStrategy(strategy: Int): Boolean {
-        return when (strategy) {
+    fun setResourceStrategy(strategy: Int): Boolean =
+        when (strategy) {
             ACCEPT_NONE, ACCEPT_ALL, ACCEPT_APP -> {
                 resourceStrategy = strategy
                 true
@@ -1080,7 +1118,6 @@ class Link private constructor(
                 false
             }
         }
-    }
 
     /**
      * Get the current resource strategy for this link.
@@ -1103,7 +1140,11 @@ class Link private constructor(
      *
      * Format: [timestamp, path_hash, data]
      */
-    private fun packRequest(timestamp: Long, pathHash: ByteArray, data: Any?): ByteArray {
+    private fun packRequest(
+        timestamp: Long,
+        pathHash: ByteArray,
+        data: Any?,
+    ): ByteArray {
         val output = ByteArrayOutputStream()
         val packer = MessagePack.newDefaultPacker(output)
 
@@ -1122,7 +1163,10 @@ class Link private constructor(
     /**
      * Pack a generic value using msgpack.
      */
-    private fun packValue(packer: org.msgpack.core.MessagePacker, value: Any?) {
+    private fun packValue(
+        packer: org.msgpack.core.MessagePacker,
+        value: Any?,
+    ) {
         when (value) {
             null -> packer.packNil()
             is ByteArray -> {
@@ -1147,7 +1191,10 @@ class Link private constructor(
     /**
      * Pack a map using msgpack.
      */
-    private fun packMap(packer: org.msgpack.core.MessagePacker, map: Map<*, *>) {
+    private fun packMap(
+        packer: org.msgpack.core.MessagePacker,
+        map: Map<*, *>,
+    ) {
         packer.packMapHeader(map.size)
         for ((key, value) in map) {
             // Pack key
@@ -1160,7 +1207,10 @@ class Link private constructor(
     /**
      * Pack a list using msgpack.
      */
-    private fun packList(packer: org.msgpack.core.MessagePacker, list: List<*>) {
+    private fun packList(
+        packer: org.msgpack.core.MessagePacker,
+        list: List<*>,
+    ) {
         packer.packArrayHeader(list.size)
         for (item in list) {
             packValue(packer, item)
@@ -1189,12 +1239,16 @@ class Link private constructor(
         status = LinkConstants.CLOSED
 
         // Set teardown reason
-        teardownReason = if (reason == LinkConstants.TEARDOWN_REASON_UNKNOWN) {
-            if (initiator) LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
-            else LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
-        } else {
-            reason
-        }
+        teardownReason =
+            if (reason == LinkConstants.TEARDOWN_REASON_UNKNOWN) {
+                if (initiator) {
+                    LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
+                } else {
+                    LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
+                }
+            } else {
+                reason
+            }
 
         stopWatchdog()
 
@@ -1220,7 +1274,10 @@ class Link private constructor(
     /**
      * Record outbound activity.
      */
-    fun hadOutbound(isKeepalive: Boolean = false, isData: Boolean = false) {
+    fun hadOutbound(
+        isKeepalive: Boolean = false,
+        isData: Boolean = false,
+    ) {
         lastOutbound = System.currentTimeMillis()
         if (isKeepalive) {
             lastKeepalive = lastOutbound
@@ -1243,11 +1300,12 @@ class Link private constructor(
     /**
      * Get link age in milliseconds.
      */
-    fun getAge(): Long? {
-        return if (activatedAt > 0) {
+    fun getAge(): Long? =
+        if (activatedAt > 0) {
             System.currentTimeMillis() - activatedAt
-        } else null
-    }
+        } else {
+            null
+        }
 
     /**
      * Time since last inbound packet.
@@ -1261,23 +1319,17 @@ class Link private constructor(
     /**
      * Time since last outbound packet.
      */
-    fun noOutboundFor(): Long {
-        return System.currentTimeMillis() - lastOutbound
-    }
+    fun noOutboundFor(): Long = System.currentTimeMillis() - lastOutbound
 
     /**
      * Time since last data packet (excludes keepalives).
      */
-    fun noDataFor(): Long {
-        return System.currentTimeMillis() - lastData
-    }
+    fun noDataFor(): Long = System.currentTimeMillis() - lastData
 
     /**
      * Time since any activity.
      */
-    fun inactiveFor(): Long {
-        return minOf(noInboundFor(), noOutboundFor())
-    }
+    fun inactiveFor(): Long = minOf(noInboundFor(), noOutboundFor())
 
     /**
      * Get the remote peer's identity if known.
@@ -1306,19 +1358,20 @@ class Link private constructor(
         activeWatchdogs[instanceId]?.cancel()
 
         // Start new watchdog coroutine in shared scope
-        val job = watchdogScope.launch {
-            while (isActive && status != LinkConstants.CLOSED) {
-                try {
-                    delay(minOf(keepalive / 4, LinkConstants.WATCHDOG_MAX_SLEEP))
-                    checkTimeout()
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    // Normal cancellation, exit loop
-                    break
-                } catch (e: Exception) {
-                    log("Watchdog error: ${e.message}")
+        val job =
+            watchdogScope.launch {
+                while (isActive && status != LinkConstants.CLOSED) {
+                    try {
+                        delay(minOf(keepalive / 4, LinkConstants.WATCHDOG_MAX_SLEEP))
+                        checkTimeout()
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // Normal cancellation, exit loop
+                        break
+                    } catch (e: Exception) {
+                        log("Watchdog error: ${e.message}")
+                    }
                 }
             }
-        }
 
         activeWatchdogs[instanceId] = job
     }
@@ -1416,14 +1469,15 @@ class Link private constructor(
      */
     private fun sendTeardownPacket() {
         try {
-            val teardownData = linkId  // Send link ID as teardown data
-            val packet = Packet.createRaw(
-                destinationHash = linkId,
-                data = encrypt(teardownData),
-                packetType = PacketType.DATA,
-                context = PacketContext.LINKCLOSE,
-                destinationType = DestinationType.LINK
-            )
+            val teardownData = linkId // Send link ID as teardown data
+            val packet =
+                Packet.createRaw(
+                    destinationHash = linkId,
+                    data = encrypt(teardownData),
+                    packetType = PacketType.DATA,
+                    context = PacketContext.LINKCLOSE,
+                    destinationType = DestinationType.LINK,
+                )
             packet.link = this
             Transport.outbound(packet)
         } catch (e: Exception) {
@@ -1448,13 +1502,14 @@ class Link private constructor(
 
         // Encrypt and send
         val encrypted = encrypt(rttData)
-        val packet = Packet.createRaw(
-            destinationHash = linkId,
-            data = encrypted,
-            packetType = PacketType.DATA,
-            context = PacketContext.LRRTT,
-            destinationType = DestinationType.LINK
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                context = PacketContext.LRRTT,
+                destinationType = DestinationType.LINK,
+            )
         packet.link = this
 
         Transport.outbound(packet)
@@ -1468,13 +1523,14 @@ class Link private constructor(
     private fun sendKeepalive() {
         if (status != LinkConstants.ACTIVE && status != LinkConstants.STALE) return
 
-        val packet = Packet.createRaw(
-            destinationHash = linkId,
-            data = byteArrayOf(0xFF.toByte()),
-            packetType = PacketType.DATA,
-            context = PacketContext.KEEPALIVE,
-            destinationType = DestinationType.LINK
-        )
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = byteArrayOf(0xFF.toByte()),
+                packetType = PacketType.DATA,
+                context = PacketContext.KEEPALIVE,
+                destinationType = DestinationType.LINK,
+            )
         packet.link = this
 
         Transport.outbound(packet)
@@ -1499,16 +1555,20 @@ class Link private constructor(
     fun receive(packet: Packet) {
         // Skip closed links, and skip initiator keepalive responses
         if (status == LinkConstants.CLOSED) return
-        if (initiator && packet.context == PacketContext.KEEPALIVE &&
-            packet.data.contentEquals(byteArrayOf(0xFF.toByte()))) {
+        if (initiator &&
+            packet.context == PacketContext.KEEPALIVE &&
+            packet.data.contentEquals(byteArrayOf(0xFF.toByte()))
+        ) {
             return
         }
 
         // Verify packet arrived on expected interface (Python: Link.py:982-983)
         val expectedIface = attachedInterfaceHash
         val receivedIface = packet.receivingInterfaceHash
-        if (expectedIface != null && receivedIface != null &&
-            !expectedIface.contentEquals(receivedIface)) {
+        if (expectedIface != null &&
+            receivedIface != null &&
+            !expectedIface.contentEquals(receivedIface)
+        ) {
             log("Link packet received on unexpected interface, ignoring")
             return
         }
@@ -1611,10 +1671,11 @@ class Link private constructor(
             try {
                 val publicKey = plaintext.copyOfRange(0, RnsConstants.IDENTITY_PUBLIC_KEY_SIZE)
                 val signedData = linkId + publicKey
-                val signature = plaintext.copyOfRange(
-                    RnsConstants.IDENTITY_PUBLIC_KEY_SIZE,
-                    RnsConstants.IDENTITY_PUBLIC_KEY_SIZE + RnsConstants.SIGNATURE_SIZE
-                )
+                val signature =
+                    plaintext.copyOfRange(
+                        RnsConstants.IDENTITY_PUBLIC_KEY_SIZE,
+                        RnsConstants.IDENTITY_PUBLIC_KEY_SIZE + RnsConstants.SIGNATURE_SIZE,
+                    )
 
                 // Load and validate the identity
                 val identity = Identity.fromPublicKey(publicKey)
@@ -1652,7 +1713,9 @@ class Link private constructor(
             val packedRequest = decrypt(packet.data) ?: return
 
             // Unpack msgpack request: [timestamp, pathHash, data]
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedRequest)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(packedRequest)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 3) {
                 log("Invalid request format: expected 3 elements, got $arraySize")
@@ -1662,29 +1725,30 @@ class Link private constructor(
             // Python sends time.time() which is a float; Kotlin uses millis (Long).
             // Accept both integer and float timestamps from msgpack.
             val nextFormat = unpacker.nextFormat
-            val timestamp = if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
-                unpacker.unpackDouble().toLong()
-            } else {
-                unpacker.unpackLong()
-            }
+            val timestamp =
+                if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
+                    unpacker.unpackDouble().toLong()
+                } else {
+                    unpacker.unpackLong()
+                }
             val pathHashSize = unpacker.unpackBinaryHeader()
             val pathHash = ByteArray(pathHashSize)
             unpacker.readPayload(pathHash)
 
-            val requestData = if (unpacker.tryUnpackNil()) {
-                null
-            } else {
-                val dataSize = unpacker.unpackBinaryHeader()
-                val data = ByteArray(dataSize)
-                unpacker.readPayload(data)
-                data
-            }
+            val requestData =
+                if (unpacker.tryUnpackNil()) {
+                    null
+                } else {
+                    val dataSize = unpacker.unpackBinaryHeader()
+                    val data = ByteArray(dataSize)
+                    unpacker.readPayload(data)
+                    data
+                }
             unpacker.close()
 
             // Pass to handleRequest
             val unpackedRequest = listOf(timestamp, pathHash, requestData)
             handleRequest(requestId, unpackedRequest)
-
         } catch (e: Exception) {
             log("Error processing request: ${e.message}")
         }
@@ -1695,11 +1759,18 @@ class Link private constructor(
      */
     private fun processResponse(packet: Packet) {
         try {
-            val packedResponse = decrypt(packet.data) ?: return
+            System.err.println("[Link] processResponse: decrypting ${packet.data.size} bytes")
+            val packedResponse = decrypt(packet.data)
+            if (packedResponse == null) {
+                System.err.println("[Link] processResponse: decrypt returned null!")
+                return
+            }
 
             // Unpack msgpack response: [requestId, responseData]
             // The responseData can be any msgpack type (binary, array, map, etc.)
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedResponse)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(packedResponse)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 2) {
                 log("Invalid response format: expected 2 elements, got $arraySize")
@@ -1716,29 +1787,33 @@ class Link private constructor(
             val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            val responseData: ByteArray? = when {
-                responseValue.isNilValue -> null
-                responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
-                responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
-                else -> {
-                    // For complex types (arrays, maps), re-serialize to msgpack bytes
-                    val responseBuffer = ByteArrayOutputStream()
-                    val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
-                    responseValue.writeTo(responsePacker)
-                    responsePacker.close()
-                    responseBuffer.toByteArray()
+            val responseData: ByteArray? =
+                when {
+                    responseValue.isNilValue -> null
+                    responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
+                    responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
+                    else -> {
+                        // For complex types (arrays, maps), re-serialize to msgpack bytes
+                        val responseBuffer = ByteArrayOutputStream()
+                        val responsePacker =
+                            org.msgpack.core.MessagePack
+                                .newDefaultPacker(responseBuffer)
+                        responseValue.writeTo(responsePacker)
+                        responsePacker.close()
+                        responseBuffer.toByteArray()
+                    }
                 }
-            }
 
             // Calculate transfer size
             val responseDataSize = responseData?.size ?: 0
             val transferSize = responseDataSize
 
             // Pass to handleResponse
+            System.err.println("[Link] processResponse: requestId=${requestId.joinToString("") { "%02x".format(it) }}, dataSize=$responseDataSize")
             handleResponse(requestId, responseData, responseDataSize, transferSize)
-
         } catch (e: Exception) {
-            log("Error processing response: ${e.message}")
+            System.err.println("[Link] processResponse EXCEPTION: ${e.message}")
+            e.printStackTrace()
         }
     }
 
@@ -1762,22 +1837,23 @@ class Link private constructor(
 
             // Unpack msgpack RTT value from plaintext
             // Python sends RTT as a float in seconds
-            val remoteRtt = try {
-                val unpacker = MessagePack.newDefaultUnpacker(plaintext)
-                val rttSeconds = unpacker.unpackDouble()
-                unpacker.close()
-                (rttSeconds * 1000).toLong()  // Convert seconds to ms
-            } catch (e: Exception) {
-                // Fallback: try as float
+            val remoteRtt =
                 try {
                     val unpacker = MessagePack.newDefaultUnpacker(plaintext)
-                    val rttSeconds = unpacker.unpackFloat()
+                    val rttSeconds = unpacker.unpackDouble()
                     unpacker.close()
-                    (rttSeconds * 1000).toLong()
-                } catch (e2: Exception) {
-                    measuredRtt  // Use measured if unpacking fails
+                    (rttSeconds * 1000).toLong() // Convert seconds to ms
+                } catch (e: Exception) {
+                    // Fallback: try as float
+                    try {
+                        val unpacker = MessagePack.newDefaultUnpacker(plaintext)
+                        val rttSeconds = unpacker.unpackFloat()
+                        unpacker.close()
+                        (rttSeconds * 1000).toLong()
+                    } catch (e2: Exception) {
+                        measuredRtt // Use measured if unpacking fails
+                    }
                 }
-            }
 
             // Use max of measured and remote RTT
             rtt = maxOf(measuredRtt, remoteRtt)
@@ -1819,11 +1895,12 @@ class Link private constructor(
             // Verify the close is for this link
             if (plaintext.contentEquals(linkId)) {
                 log("Received link close packet")
-                val closeReason = if (initiator) {
-                    LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
-                } else {
-                    LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
-                }
+                val closeReason =
+                    if (initiator) {
+                        LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED
+                    } else {
+                        LinkConstants.TEARDOWN_REASON_INITIATOR_CLOSED
+                    }
                 teardown(closeReason)
             }
         } catch (e: Exception) {
@@ -1840,20 +1917,25 @@ class Link private constructor(
             val plaintext = decrypt(packet.data) ?: return
 
             // Parse the advertisement
-            val advertisement = network.reticulum.resource.ResourceAdvertisement.unpack(plaintext)
+            val advertisement =
+                network.reticulum.resource.ResourceAdvertisement
+                    .unpack(plaintext)
             if (advertisement == null) {
                 log("Failed to unpack resource advertisement")
                 return
             }
 
             // Check if this is a request response
-            if (network.reticulum.resource.ResourceAdvertisement.isRequest(plaintext)) {
+            if (network.reticulum.resource.ResourceAdvertisement
+                    .isRequest(plaintext)
+            ) {
                 // This is a request being sent as a resource
-                val resource = network.reticulum.resource.Resource.accept(
-                    advertisement = advertisement,
-                    link = this,
-                    callback = { res -> requestResourceConcluded(res) }
-                )
+                val resource =
+                    network.reticulum.resource.Resource.accept(
+                        advertisement = advertisement,
+                        link = this,
+                        callback = { res -> requestResourceConcluded(res) },
+                    )
                 if (resource != null) {
                     registerIncomingResource(resource)
                 }
@@ -1861,24 +1943,34 @@ class Link private constructor(
             }
 
             // Check if this is a response to a pending request
-            if (network.reticulum.resource.ResourceAdvertisement.isResponse(plaintext)) {
-                val requestId = network.reticulum.resource.ResourceAdvertisement.readRequestId(plaintext)
+            if (network.reticulum.resource.ResourceAdvertisement
+                    .isResponse(plaintext)
+            ) {
+                val requestId =
+                    network.reticulum.resource.ResourceAdvertisement
+                        .readRequestId(plaintext)
                 if (requestId != null) {
                     // Find matching pending request
-                    val pendingRequest = synchronized(pendingRequests) {
-                        pendingRequests.find { it.requestId.contentEquals(requestId) }
-                    }
+                    val pendingRequest =
+                        synchronized(pendingRequests) {
+                            pendingRequests.find { it.requestId.contentEquals(requestId) }
+                        }
 
                     if (pendingRequest != null) {
-                        val resource = network.reticulum.resource.Resource.accept(
-                            advertisement = advertisement,
-                            link = this,
-                            callback = { res -> responseResourceConcluded(res) },
-                            progressCallback = { res -> pendingRequest.updateProgress(res.progress) }
-                        )
+                        val resource =
+                            network.reticulum.resource.Resource.accept(
+                                advertisement = advertisement,
+                                link = this,
+                                callback = { res -> responseResourceConcluded(res) },
+                                progressCallback = { res -> pendingRequest.updateProgress(res.progress) },
+                            )
                         if (resource != null) {
-                            val responseSize = network.reticulum.resource.ResourceAdvertisement.readSize(plaintext)
-                            val transferSize = network.reticulum.resource.ResourceAdvertisement.readTransferSize(plaintext)
+                            val responseSize =
+                                network.reticulum.resource.ResourceAdvertisement
+                                    .readSize(plaintext)
+                            val transferSize =
+                                network.reticulum.resource.ResourceAdvertisement
+                                    .readTransferSize(plaintext)
                             if (responseSize != null) {
                                 pendingRequest.responseSize = responseSize
                             }
@@ -1902,15 +1994,17 @@ class Link private constructor(
             when (resourceStrategy) {
                 ACCEPT_NONE -> {
                     log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_NONE)")
-                    network.reticulum.resource.Resource.reject(advertisement, this)
+                    network.reticulum.resource.Resource
+                        .reject(advertisement, this)
                 }
                 ACCEPT_ALL -> {
                     log("Accepting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_ALL)")
-                    val resource = network.reticulum.resource.Resource.accept(
-                        advertisement = advertisement,
-                        link = this,
-                        callback = { res -> resourceConcluded(res) }
-                    )
+                    val resource =
+                        network.reticulum.resource.Resource.accept(
+                            advertisement = advertisement,
+                            link = this,
+                            callback = { res -> resourceConcluded(res) },
+                        )
                     if (resource != null) {
                         registerIncomingResource(resource)
                         callbacks.resourceStarted?.let { callback ->
@@ -1930,11 +2024,12 @@ class Link private constructor(
                         try {
                             if (callback(advertisement)) {
                                 log("Accepting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, callback returned true)")
-                                val resource = network.reticulum.resource.Resource.accept(
-                                    advertisement = advertisement,
-                                    link = this,
-                                    callback = { res -> resourceConcluded(res) }
-                                )
+                                val resource =
+                                    network.reticulum.resource.Resource.accept(
+                                        advertisement = advertisement,
+                                        link = this,
+                                        callback = { res -> resourceConcluded(res) },
+                                    )
                                 if (resource != null) {
                                     registerIncomingResource(resource)
                                     callbacks.resourceStarted?.let { startCallback ->
@@ -1949,19 +2044,21 @@ class Link private constructor(
                                 }
                             } else {
                                 log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, callback returned false)")
-                                network.reticulum.resource.Resource.reject(advertisement, this)
+                                network.reticulum.resource.Resource
+                                    .reject(advertisement, this)
                             }
                         } catch (e: Exception) {
                             log("Error in resource callback: ${e.message}")
-                            network.reticulum.resource.Resource.reject(advertisement, this)
+                            network.reticulum.resource.Resource
+                                .reject(advertisement, this)
                         }
                     } else {
                         log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, no callback set)")
-                        network.reticulum.resource.Resource.reject(advertisement, this)
+                        network.reticulum.resource.Resource
+                            .reject(advertisement, this)
                     }
                 }
             }
-
         } catch (e: Exception) {
             log("Error processing resource advertisement: ${e.message}")
         }
@@ -1978,32 +2075,35 @@ class Link private constructor(
             // Format is either:
             // - [flags][hash] for normal requests
             // - [HASHMAP_IS_EXHAUSTED][maphash][hash] for exhausted hashmap requests
-            val resourceHash = if (plaintext.isNotEmpty() &&
-                plaintext[0].toInt() and 0xFF == network.reticulum.resource.ResourceConstants.HASHMAP_IS_EXHAUSTED) {
-                // Exhausted hashmap format: skip first byte + MAPHASH_LEN
-                val offset = 1 + network.reticulum.resource.ResourceConstants.MAPHASH_LEN
-                if (plaintext.size >= offset + RnsConstants.TRUNCATED_HASH_BYTES) {
-                    plaintext.copyOfRange(offset, offset + RnsConstants.TRUNCATED_HASH_BYTES)
+            val resourceHash =
+                if (plaintext.isNotEmpty() &&
+                    plaintext[0].toInt() and 0xFF == network.reticulum.resource.ResourceConstants.HASHMAP_IS_EXHAUSTED
+                ) {
+                    // Exhausted hashmap format: skip first byte + MAPHASH_LEN
+                    val offset = 1 + network.reticulum.resource.ResourceConstants.MAPHASH_LEN
+                    if (plaintext.size >= offset + RnsConstants.TRUNCATED_HASH_BYTES) {
+                        plaintext.copyOfRange(offset, offset + RnsConstants.TRUNCATED_HASH_BYTES)
+                    } else {
+                        log("Invalid exhausted hashmap request size: ${plaintext.size}")
+                        return
+                    }
                 } else {
-                    log("Invalid exhausted hashmap request size: ${plaintext.size}")
-                    return
+                    // Normal format: skip first byte (flags)
+                    if (plaintext.size >= 1 + RnsConstants.TRUNCATED_HASH_BYTES) {
+                        plaintext.copyOfRange(1, 1 + RnsConstants.TRUNCATED_HASH_BYTES)
+                    } else {
+                        log("Invalid resource request size: ${plaintext.size}")
+                        return
+                    }
                 }
-            } else {
-                // Normal format: skip first byte (flags)
-                if (plaintext.size >= 1 + RnsConstants.TRUNCATED_HASH_BYTES) {
-                    plaintext.copyOfRange(1, 1 + RnsConstants.TRUNCATED_HASH_BYTES)
-                } else {
-                    log("Invalid resource request size: ${plaintext.size}")
-                    return
-                }
-            }
 
             // Find matching outgoing resource - compare truncated hash (first 16 bytes)
-            val resource = synchronized(outgoingResources) {
-                outgoingResources.find {
-                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+            val resource =
+                synchronized(outgoingResources) {
+                    outgoingResources.find {
+                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                    }
                 }
-            }
 
             if (resource == null) {
                 log("Received request for unknown resource: ${resourceHash.toHexString()}")
@@ -2013,7 +2113,6 @@ class Link private constructor(
             // Process the request - send requested parts
             log("Processing request for resource ${resourceHash.toHexString()}")
             resource.handleRequest(plaintext)
-
         } catch (e: Exception) {
             log("Error processing resource request: ${e.message}")
         }
@@ -2035,11 +2134,12 @@ class Link private constructor(
             val resourceHash = plaintext.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
             // Find matching incoming resource - compare truncated hash (first 16 bytes)
-            val resource = synchronized(incomingResources) {
-                incomingResources.find {
-                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+            val resource =
+                synchronized(incomingResources) {
+                    incomingResources.find {
+                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                    }
                 }
-            }
 
             if (resource == null) {
                 log("Received HMU for unknown resource: ${resourceHash.toHexString()}")
@@ -2049,7 +2149,6 @@ class Link private constructor(
             // Process hashmap update - update received parts and request next
             log("Processing HMU for resource ${resourceHash.toHexString()}")
             resource.handleHashmapUpdate(plaintext)
-
         } catch (e: Exception) {
             log("Error processing resource HMU: ${e.message}")
         }
@@ -2072,11 +2171,12 @@ class Link private constructor(
 
             // Find matching incoming resource (we're receiving, initiator is cancelling)
             // Compare truncated hash (first 16 bytes)
-            val resource = synchronized(incomingResources) {
-                incomingResources.find {
-                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+            val resource =
+                synchronized(incomingResources) {
+                    incomingResources.find {
+                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                    }
                 }
-            }
 
             if (resource == null) {
                 log("Received ICL for unknown resource: ${resourceHash.toHexString()}")
@@ -2085,7 +2185,6 @@ class Link private constructor(
 
             log("Initiator cancelled resource ${resourceHash.toHexString()}")
             resource.cancel()
-
         } catch (e: Exception) {
             log("Error processing resource ICL: ${e.message}")
         }
@@ -2108,11 +2207,12 @@ class Link private constructor(
 
             // Find matching outgoing resource (we're sending, receiver is rejecting)
             // Compare truncated hash (first 16 bytes)
-            val resource = synchronized(outgoingResources) {
-                outgoingResources.find {
-                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+            val resource =
+                synchronized(outgoingResources) {
+                    outgoingResources.find {
+                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                    }
                 }
-            }
 
             if (resource == null) {
                 log("Received RCL for unknown resource: ${resourceHash.toHexString()}")
@@ -2122,7 +2222,6 @@ class Link private constructor(
             log("Receiver rejected resource ${resourceHash.toHexString()}")
             // TODO: Call resource.rejected() when method is available
             resource.cancel()
-
         } catch (e: Exception) {
             log("Error processing resource RCL: ${e.message}")
         }
@@ -2140,11 +2239,12 @@ class Link private constructor(
 
             // Find matching incoming resource by trying each one
             // Resource parts are identified by their map hash, not by an explicit resource hash in the packet
-            val resource = synchronized(incomingResources) {
-                incomingResources.toList()
-            }.firstOrNull { res ->
-                res.status == network.reticulum.resource.ResourceConstants.TRANSFERRING
-            }
+            val resource =
+                synchronized(incomingResources) {
+                    incomingResources.toList()
+                }.firstOrNull { res ->
+                    res.status == network.reticulum.resource.ResourceConstants.TRANSFERRING
+                }
 
             if (resource == null) {
                 log("Received resource data but no active incoming resource")
@@ -2153,7 +2253,6 @@ class Link private constructor(
 
             // Pass the data directly - it's already resource-level encrypted, NOT link-encrypted
             resource.receivePart(packet.data)
-
         } catch (e: Exception) {
             log("Error processing resource data: ${e.message}")
         }
@@ -2165,13 +2264,14 @@ class Link private constructor(
     private fun processKeepalive(packet: Packet) {
         // Receivers respond to keepalive requests
         if (!initiator && packet.data.contentEquals(byteArrayOf(0xFF.toByte()))) {
-            val keepaliveResponse = Packet.createRaw(
-                destinationHash = linkId,
-                data = byteArrayOf(0xFE.toByte()),
-                packetType = PacketType.DATA,
-                context = PacketContext.KEEPALIVE,
-                destinationType = DestinationType.LINK
-            )
+            val keepaliveResponse =
+                Packet.createRaw(
+                    destinationHash = linkId,
+                    data = byteArrayOf(0xFE.toByte()),
+                    packetType = PacketType.DATA,
+                    context = PacketContext.KEEPALIVE,
+                    destinationType = DestinationType.LINK,
+                )
             keepaliveResponse.link = this
             Transport.outbound(keepaliveResponse)
             hadOutbound(isKeepalive = true)
@@ -2251,11 +2351,12 @@ class Link private constructor(
             val resourceHash = resourceHashFull.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
 
             // Find matching outgoing resource - compare truncated hash (first 16 bytes)
-            val resource = synchronized(outgoingResources) {
-                outgoingResources.find {
-                    it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+            val resource =
+                synchronized(outgoingResources) {
+                    outgoingResources.find {
+                        it.hash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES).contentEquals(resourceHash)
+                    }
                 }
-            }
 
             if (resource == null) {
                 log("Received proof for unknown resource: ${resourceHash.toHexString()}")
@@ -2270,7 +2371,6 @@ class Link private constructor(
             } else {
                 log("Proof validation failed for resource ${resourceHash.toHexString()}")
             }
-
         } catch (e: Exception) {
             log("Error processing resource proof: ${e.message}")
         }
@@ -2308,12 +2408,14 @@ class Link private constructor(
      */
     fun resourceConcluded(resource: network.reticulum.resource.Resource) {
         val concludedAt = System.currentTimeMillis()
-        val wasIncoming = synchronized(incomingResources) {
-            incomingResources.contains(resource)
-        }
-        val wasOutgoing = synchronized(outgoingResources) {
-            outgoingResources.contains(resource)
-        }
+        val wasIncoming =
+            synchronized(incomingResources) {
+                incomingResources.contains(resource)
+            }
+        val wasOutgoing =
+            synchronized(outgoingResources) {
+                outgoingResources.contains(resource)
+            }
 
         // Update statistics based on resource performance
         if (wasIncoming) {
@@ -2369,7 +2471,10 @@ class Link private constructor(
      * @param requestId The unique request identifier
      * @param unpackedRequest Array of [timestamp, pathHash, data]
      */
-    fun handleRequest(requestId: ByteArray, unpackedRequest: List<Any?>) {
+    fun handleRequest(
+        requestId: ByteArray,
+        unpackedRequest: List<Any?>,
+    ) {
         if (status != LinkConstants.ACTIVE) return
 
         try {
@@ -2382,21 +2487,23 @@ class Link private constructor(
             val targetDestination = owner ?: attachedDestination ?: return
 
             // Look up the request handler
-            val handler = targetDestination.getRequestHandler(pathHash) ?: run {
-                log("No handler found for path hash ${pathHash.toHexString()}")
-                return
-            }
+            val handler =
+                targetDestination.getRequestHandler(pathHash) ?: run {
+                    log("No handler found for path hash ${pathHash.toHexString()}")
+                    return
+                }
 
             // Check access control
-            val allowed = when (handler.allow) {
-                network.reticulum.destination.RequestPolicy.ALLOW_NONE -> false
-                network.reticulum.destination.RequestPolicy.ALLOW_ALL -> true
-                network.reticulum.destination.RequestPolicy.ALLOW_LIST -> {
-                    val remoteId = remoteIdentity
-                    remoteId != null && handler.allowedList?.any { it.contentEquals(remoteId.hash) } == true
+            val allowed =
+                when (handler.allow) {
+                    network.reticulum.destination.RequestPolicy.ALLOW_NONE -> false
+                    network.reticulum.destination.RequestPolicy.ALLOW_ALL -> true
+                    network.reticulum.destination.RequestPolicy.ALLOW_LIST -> {
+                        val remoteId = remoteIdentity
+                        remoteId != null && handler.allowedList?.any { it.contentEquals(remoteId.hash) } == true
+                    }
+                    else -> false
                 }
-                else -> false
-            }
 
             if (!allowed) {
                 val identityStr = remoteIdentity?.hexHash ?: "<Unknown>"
@@ -2407,25 +2514,25 @@ class Link private constructor(
             log("Handling request ${requestId.toHexString()} for: ${handler.path}")
 
             // Generate response
-            val response = try {
-                handler.responseGenerator(
-                    handler.path,
-                    requestData,
-                    requestId,
-                    linkId,
-                    remoteIdentity,
-                    requestedAt
-                )
-            } catch (e: Exception) {
-                log("Error in response generator: ${e.message}")
-                null
-            }
+            val response =
+                try {
+                    handler.responseGenerator(
+                        handler.path,
+                        requestData,
+                        requestId,
+                        linkId,
+                        remoteIdentity,
+                        requestedAt,
+                    )
+                } catch (e: Exception) {
+                    log("Error in response generator: ${e.message}")
+                    null
+                }
 
             // Send response if not null
             if (response != null) {
                 sendResponse(requestId, response, handler.autoCompress)
             }
-
         } catch (e: Exception) {
             log("Error handling request: ${e.message}")
         }
@@ -2438,11 +2545,17 @@ class Link private constructor(
      * @param response The response data
      * @param autoCompress Whether to auto-compress (if large enough)
      */
-    private fun sendResponse(requestId: ByteArray, response: ByteArray, autoCompress: Boolean) {
+    private fun sendResponse(
+        requestId: ByteArray,
+        response: ByteArray,
+        autoCompress: Boolean,
+    ) {
         try {
             // Pack response as msgpack: [requestId, response]
             val output = java.io.ByteArrayOutputStream()
-            val packer = org.msgpack.core.MessagePack.newDefaultPacker(output)
+            val packer =
+                org.msgpack.core.MessagePack
+                    .newDefaultPacker(output)
             packer.packArrayHeader(2)
             packer.packBinaryHeader(requestId.size)
             packer.writePayload(requestId)
@@ -2454,14 +2567,15 @@ class Link private constructor(
 
             // Send as packet if small enough, otherwise as resource
             if (packedResponse.size <= mdu) {
-                val packet = Packet.createRaw(
-                    destinationHash = linkId,
-                    data = encrypt(packedResponse),
-                    packetType = PacketType.DATA,
-                    context = PacketContext.RESPONSE,
-                    destinationType = DestinationType.LINK,
-                    mtu = mtu
-                )
+                val packet =
+                    Packet.createRaw(
+                        destinationHash = linkId,
+                        data = encrypt(packedResponse),
+                        packetType = PacketType.DATA,
+                        context = PacketContext.RESPONSE,
+                        destinationType = DestinationType.LINK,
+                        mtu = mtu,
+                    )
                 packet.link = this
                 Transport.outbound(packet)
                 hadOutbound(isData = true)
@@ -2472,7 +2586,7 @@ class Link private constructor(
                     link = this,
                     requestId = requestId,
                     isResponse = true,
-                    autoCompress = autoCompress
+                    autoCompress = autoCompress,
                 )
             }
         } catch (e: Exception) {
@@ -2494,15 +2608,16 @@ class Link private constructor(
         responseData: ByteArray?,
         responseSize: Int,
         transferSize: Int,
-        metadata: ByteArray? = null
+        metadata: ByteArray? = null,
     ) {
         if (status != LinkConstants.ACTIVE) return
 
         try {
             // Find matching pending request
-            val receipt = synchronized(pendingRequests) {
-                pendingRequests.find { it.requestId.contentEquals(requestId) }
-            }
+            val receipt =
+                synchronized(pendingRequests) {
+                    pendingRequests.find { it.requestId.contentEquals(requestId) }
+                }
 
             if (receipt == null) {
                 log("Received response for unknown request: ${requestId.toHexString()}")
@@ -2523,7 +2638,6 @@ class Link private constructor(
             synchronized(pendingRequests) {
                 pendingRequests.remove(receipt)
             }
-
         } catch (e: Exception) {
             log("Error handling response: ${e.message}")
         }
@@ -2536,15 +2650,18 @@ class Link private constructor(
      */
     fun requestResourceConcluded(resource: network.reticulum.resource.Resource) {
         if (resource.status == network.reticulum.resource.ResourceConstants.COMPLETE) {
-            val packedRequest = resource.data ?: run {
-                log("Request resource completed but has no data")
-                return
-            }
+            val packedRequest =
+                resource.data ?: run {
+                    log("Request resource completed but has no data")
+                    return
+                }
 
             // Unpack the request and compute requestId from the packed data
             // (Python: Link.py:931-940)
             val requestId = Hashes.truncatedHash(packedRequest)
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedRequest)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(packedRequest)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 3) {
                 log("Invalid resource request format: expected 3 elements, got $arraySize")
@@ -2553,23 +2670,25 @@ class Link private constructor(
 
             // Python sends time.time() which is a float; accept both types
             val nextFormat = unpacker.nextFormat
-            val timestamp = if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
-                unpacker.unpackDouble().toLong()
-            } else {
-                unpacker.unpackLong()
-            }
+            val timestamp =
+                if (nextFormat.valueType == org.msgpack.value.ValueType.FLOAT) {
+                    unpacker.unpackDouble().toLong()
+                } else {
+                    unpacker.unpackLong()
+                }
             val pathHashSize = unpacker.unpackBinaryHeader()
             val pathHash = ByteArray(pathHashSize)
             unpacker.readPayload(pathHash)
 
-            val requestData = if (unpacker.tryUnpackNil()) {
-                null
-            } else {
-                val dataSize = unpacker.unpackBinaryHeader()
-                val data = ByteArray(dataSize)
-                unpacker.readPayload(data)
-                data
-            }
+            val requestData =
+                if (unpacker.tryUnpackNil()) {
+                    null
+                } else {
+                    val dataSize = unpacker.unpackBinaryHeader()
+                    val data = ByteArray(dataSize)
+                    unpacker.readPayload(data)
+                    data
+                }
             unpacker.close()
 
             val unpackedRequest = listOf(timestamp, pathHash, requestData)
@@ -2612,7 +2731,9 @@ class Link private constructor(
 
         try {
             // Unpack response: [request_id, response_data]
-            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(packedResponse)
+            val unpacker =
+                org.msgpack.core.MessagePack
+                    .newDefaultUnpacker(packedResponse)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 2) {
                 log("Invalid response format: expected 2 elements, got $arraySize")
@@ -2627,22 +2748,24 @@ class Link private constructor(
             val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            val responseData: ByteArray? = when {
-                responseValue.isNilValue -> null
-                responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
-                responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
-                else -> {
-                    val responseBuffer = ByteArrayOutputStream()
-                    val responsePacker = org.msgpack.core.MessagePack.newDefaultPacker(responseBuffer)
-                    responseValue.writeTo(responsePacker)
-                    responsePacker.close()
-                    responseBuffer.toByteArray()
+            val responseData: ByteArray? =
+                when {
+                    responseValue.isNilValue -> null
+                    responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
+                    responseValue.isStringValue -> responseValue.asStringValue().asByteArray()
+                    else -> {
+                        val responseBuffer = ByteArrayOutputStream()
+                        val responsePacker =
+                            org.msgpack.core.MessagePack
+                                .newDefaultPacker(responseBuffer)
+                        responseValue.writeTo(responsePacker)
+                        responsePacker.close()
+                        responseBuffer.toByteArray()
+                    }
                 }
-            }
 
             // Pass to handleResponse
             handleResponse(requestId, responseData, packedResponse.size, resource.totalSize)
-
         } catch (e: Exception) {
             log("Error processing response resource: ${e.message}")
         }
@@ -2662,27 +2785,21 @@ class Link private constructor(
      *
      * @return RSSI value if tracking is enabled and available, null otherwise
      */
-    fun getRssi(): Int? {
-        return if (trackPhyStats) phyRssi else null
-    }
+    fun getRssi(): Int? = if (trackPhyStats) phyRssi else null
 
     /**
      * Get the SNR (Signal-to-Noise Ratio) value.
      *
      * @return SNR value if tracking is enabled and available, null otherwise
      */
-    fun getSnr(): Float? {
-        return if (trackPhyStats) phySnr else null
-    }
+    fun getSnr(): Float? = if (trackPhyStats) phySnr else null
 
     /**
      * Get the Q (link quality) value.
      *
      * @return Q value if tracking is enabled and available, null otherwise
      */
-    fun getQ(): Float? {
-        return if (trackPhyStats) phyQ else null
-    }
+    fun getQ(): Float? = if (trackPhyStats) phyQ else null
 
     /**
      * Update physical layer statistics from interface.
@@ -2692,7 +2809,11 @@ class Link private constructor(
      * @param snr SNR value
      * @param q Link quality value
      */
-    fun updatePhyStats(rssi: Int? = null, snr: Float? = null, q: Float? = null) {
+    fun updatePhyStats(
+        rssi: Int? = null,
+        snr: Float? = null,
+        q: Float? = null,
+    ) {
         if (trackPhyStats) {
             rssi?.let { phyRssi = it }
             snr?.let { phySnr = it }
@@ -2705,18 +2826,14 @@ class Link private constructor(
      *
      * @return MTU if link is active, null otherwise
      */
-    fun getMtu(): Int? {
-        return if (status == LinkConstants.ACTIVE) mtu else null
-    }
+    fun getMtu(): Int? = if (status == LinkConstants.ACTIVE) mtu else null
 
     /**
      * Get the MDU (Maximum Data Unit) for this link.
      *
      * @return MDU if link is active, null otherwise
      */
-    fun getMdu(): Int? {
-        return if (status == LinkConstants.ACTIVE) mdu else null
-    }
+    fun getMdu(): Int? = if (status == LinkConstants.ACTIVE) mdu else null
 
     /**
      * Check if a resource is in the incoming resources list.
@@ -2859,7 +2976,7 @@ class Link private constructor(
      * @return Establishment rate in bits per second if available, null otherwise
      */
     fun getEstablishmentRate(): Float? {
-        return establishmentRate?.let { it * 8 }  // Convert bytes/ms to bits/second
+        return establishmentRate?.let { it * 8 } // Convert bytes/ms to bits/second
     }
 
     /**
@@ -2867,9 +2984,7 @@ class Link private constructor(
      *
      * @return Expected rate in bits per second if available, null otherwise
      */
-    fun getExpectedRate(): Float? {
-        return if (status == LinkConstants.ACTIVE) expectedRate else null
-    }
+    fun getExpectedRate(): Float? = if (status == LinkConstants.ACTIVE) expectedRate else null
 
     override fun toString(): String = "Link[${linkId.toHexString().take(12)}]"
 }
@@ -2885,7 +3000,7 @@ class RequestReceipt(
     private val responseCallback: ((RequestReceipt) -> Unit)? = null,
     private val failedCallback: ((RequestReceipt) -> Unit)? = null,
     private val progressCallback: ((RequestReceipt) -> Unit)? = null,
-    val timeout: Long
+    val timeout: Long,
 ) {
     companion object {
         const val FAILED = 0x00
@@ -2922,7 +3037,10 @@ class RequestReceipt(
     /**
      * Called when the response is received.
      */
-    internal fun responseReceived(responseData: ByteArray?, metadata: ByteArray? = null) {
+    internal fun responseReceived(
+        responseData: ByteArray?,
+        metadata: ByteArray? = null,
+    ) {
         if (status == FAILED) return
 
         this.progress = 1.0f
