@@ -2825,6 +2825,15 @@ object Transport {
         if (effectiveUsePathRouting) {
             // We have a path - use it
             val outboundInterface = findInterfaceByHash(pathEntry!!.receivingInterfaceHash)
+            if (outboundInterface == null) {
+                // Interface no longer available (e.g., AutoInterface recreated with new hash
+                // after app restart). Drop the stale path entry — matches Python behavior
+                // (Transport.py:105: "The interface is no longer available").
+                // The broadcast fallback below will handle the packet, and a path request
+                // will naturally re-discover the route with the current interface hash.
+                log("Removing stale path for $destHex: interface hash no longer matches any registered interface")
+                pathTable.remove(packet.destinationHash.toKey())
+            }
             if (outboundInterface != null) {
                 log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
                 if (pathEntry.hops > 1) {
