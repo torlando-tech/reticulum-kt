@@ -306,6 +306,10 @@ class Link private constructor(
     var establishmentTimeout: Long = 0
         private set
 
+    /** Expected hop count for LRPROOF validation (Python: self.expected_hops). */
+    var expectedHops: Int = 0
+        private set
+
     // Callbacks
     val callbacks = LinkCallbacks()
 
@@ -405,8 +409,9 @@ class Link private constructor(
         sigPrv = ed25519KeyPair.privateKey
         sigPub = ed25519KeyPair.publicKey
 
-        // Calculate establishment timeout
+        // Calculate establishment timeout and expected hops (Python Link.py:295-296)
         val hops = Transport.hopsTo(destination!!.hash) ?: 1
+        expectedHops = hops
         establishmentTimeout = LinkConstants.ESTABLISHMENT_TIMEOUT_PER_HOP * maxOf(1, hops) +
             LinkConstants.KEEPALIVE
 
@@ -1759,10 +1764,10 @@ class Link private constructor(
      */
     private fun processResponse(packet: Packet) {
         try {
-            System.err.println("[Link] processResponse: decrypting ${packet.data.size} bytes")
+            println("[Link] processResponse: decrypting ${packet.data.size} bytes")
             val packedResponse = decrypt(packet.data)
             if (packedResponse == null) {
-                System.err.println("[Link] processResponse: decrypt returned null!")
+                println("[Link] processResponse: decrypt returned null!")
                 return
             }
 
@@ -1809,10 +1814,10 @@ class Link private constructor(
             val transferSize = responseDataSize
 
             // Pass to handleResponse
-            System.err.println("[Link] processResponse: requestId=${requestId.joinToString("") { "%02x".format(it) }}, dataSize=$responseDataSize")
+            println("[Link] processResponse: requestId=${requestId.joinToString("") { "%02x".format(it) }}, dataSize=$responseDataSize")
             handleResponse(requestId, responseData, responseDataSize, transferSize)
         } catch (e: Exception) {
-            System.err.println("[Link] processResponse EXCEPTION: ${e.message}")
+            println("[Link] processResponse EXCEPTION: ${e.message}")
             e.printStackTrace()
         }
     }

@@ -2,6 +2,8 @@ package network.reticulum.android.db
 
 import androidx.room.Database
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import network.reticulum.android.db.dao.AnnounceCacheDao
 import network.reticulum.android.db.dao.DiscoveredInterfaceDao
 import network.reticulum.android.db.dao.IdentityRatchetDao
@@ -30,7 +32,7 @@ import network.reticulum.android.db.entity.TunnelPathEntity
         IdentityRatchetEntity::class,
         DiscoveredInterfaceEntity::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = true
 )
 abstract class ReticulumDatabase : RoomDatabase() {
@@ -42,4 +44,13 @@ abstract class ReticulumDatabase : RoomDatabase() {
     abstract fun announceCacheDao(): AnnounceCacheDao
     abstract fun identityRatchetDao(): IdentityRatchetDao
     abstract fun discoveredInterfaceDao(): DiscoveredInterfaceDao
+
+    companion object {
+        /** Migration 1→2: Add random_blobs column to paths table. */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE paths ADD COLUMN random_blobs TEXT NOT NULL DEFAULT ''")
+            }
+        }
+    }
 }

@@ -30,7 +30,11 @@ data class PathEntity(
     val state: Int,
 
     @ColumnInfo(name = "failure_count")
-    val failureCount: Int
+    val failureCount: Int,
+
+    /** Serialized random blobs: hex strings joined by commas. */
+    @ColumnInfo(name = "random_blobs", defaultValue = "")
+    val randomBlobs: String = ""
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

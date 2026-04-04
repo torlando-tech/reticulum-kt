@@ -4,6 +4,7 @@ import network.reticulum.Reticulum
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
+import network.reticulum.transport.AnnounceHandler
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.DisplayName
@@ -47,12 +48,12 @@ class LiveTcpServerTest {
             enableTransport = false
         )
 
-        Transport.registerAnnounceHandler { destHash, _, _ ->
+        Transport.registerAnnounceHandler(handler = AnnounceHandler { destHash, _, _ ->
             val hex = destHash.joinToString("") { "%02x".format(it) }
             println("  [Announce] Discovered destination: $hex")
             discoveredPaths.add(hex)
             true
-        }
+        })
 
         tcpClient = TCPClientInterface(
             name = "LiveTest",

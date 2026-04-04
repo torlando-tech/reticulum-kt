@@ -10,6 +10,7 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.packet.Packet
 import network.reticulum.transport.Transport
+import network.reticulum.transport.AnnounceHandler
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
@@ -155,12 +156,12 @@ class TcpIntegrationTest {
         Transport.registerInterface(serverRef)
 
         // Set up announce handler
-        Transport.registerAnnounceHandler { destHash, identity, appData ->
+        Transport.registerAnnounceHandler(handler = AnnounceHandler { destHash, identity, appData ->
             println("Received announce for ${destHash.map { String.format("%02x", it) }.joinToString("")}")
             receivedAnnounce = true
             announceLatch.countDown()
             true
-        }
+        })
 
         // Hook up server received packets to transport
         server.onPacketReceived = { data, iface ->

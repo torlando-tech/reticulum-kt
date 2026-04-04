@@ -9,6 +9,7 @@ import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.packet.Packet
 import network.reticulum.transport.Transport
+import network.reticulum.transport.AnnounceHandler
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
@@ -166,11 +167,11 @@ class TunnelIntegrationTest {
         }
 
         // Set announce handler
-        Transport.registerAnnounceHandler { destHash, identity, appData ->
+        Transport.registerAnnounceHandler(handler = AnnounceHandler { destHash, identity, appData ->
             println("Received announce for ${destHash.take(8).joinToString("") { "%02x".format(it) }}")
             announceLatch.countDown()
             true
-        }
+        })
 
         client.start()
 

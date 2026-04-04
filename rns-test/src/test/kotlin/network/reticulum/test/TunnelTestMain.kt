@@ -6,6 +6,7 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.toRef
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.transport.Transport
+import network.reticulum.transport.AnnounceHandler
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -56,12 +57,12 @@ fun main() {
     val announceLatch = CountDownLatch(1)
 
     // Register announce handler
-    Transport.registerAnnounceHandler { destHash, identity, appData ->
+    Transport.registerAnnounceHandler(AnnounceHandler { destHash, identity, appData ->
         val destHex = destHash.joinToString("") { "%02x".format(it) }
         println("\n✓ Received announce for destination: $destHex")
         announceLatch.countDown()
         true
-    }
+    })
 
     println("Connecting to Python server at 127.0.0.1:4244...")
     tcpClient.start()

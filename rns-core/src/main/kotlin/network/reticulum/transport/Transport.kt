@@ -1652,6 +1652,15 @@ object Transport {
             val lines =
                 pathTable.entries.mapNotNull { (key, entry) ->
                     if (entry.isExpired()) return@mapNotNull null
+                    // Only skip paths with missing interfaces when interfaces are registered
+                    // (matches Python Transport.py:2905-2910)
+                    if (interfaces.isNotEmpty() && findInterfaceByHash(entry.receivingInterfaceHash) == null) {
+                        return@mapNotNull null
+                    }
+                    // Persist up to PERSIST_RANDOM_BLOBS most recent blobs
+                    val blobsHex = entry.randomBlobs
+                        .takeLast(TransportConstants.PERSIST_RANDOM_BLOBS)
+                        .joinToString(",") { it.toHexString() }
                     listOf(
                         key.toString(),
                         entry.nextHop.toHexString(),
@@ -1661,6 +1670,8 @@ object Transport {
                         entry.announcePacketHash.toHexString(),
                         entry.state.ordinal.toString(),
                         entry.failureCount.toString(),
+                        entry.timestamp.toString(),
+                        blobsHex,
                     ).joinToString("|")
                 }
             file.writeText(lines.joinToString("\n"))
@@ -1691,17 +1702,26 @@ object Transport {
                     val announceHash = hexToBytes(parts[5])
                     val stateOrdinal = parts[6].toInt()
                     val failureCount = parts[7].toInt()
+                    // New fields (backward-compatible: missing = defaults)
+                    val timestamp = parts.getOrNull(8)?.toLongOrNull()
+                        ?: System.currentTimeMillis()
+                    val randomBlobs = parts.getOrNull(9)
+                        ?.split(",")
+                        ?.filter { it.isNotBlank() }
+                        ?.map { hexToBytes(it) }
+                        ?.toMutableList()
+                        ?: mutableListOf()
 
                     // Skip expired entries
                     if (System.currentTimeMillis() > expires) continue
 
                     val entry =
                         PathEntry(
-                            timestamp = System.currentTimeMillis(),
+                            timestamp = timestamp,
                             nextHop = nextHop,
                             hops = hops,
                             expires = expires,
-                            randomBlobs = mutableListOf(),
+                            randomBlobs = randomBlobs,
                             receivingInterfaceHash = interfaceHash,
                             announcePacketHash = announceHash,
                             state = PathState.entries.getOrElse(stateOrdinal) { PathState.ACTIVE },
@@ -3686,6 +3706,55 @@ object Transport {
         }
     }
 
+    /**
+     * Validate an LRPROOF signature before forwarding it through the link table.
+     * Matches Python Transport.py:781-802.
+     *
+     * Returns true if the proof signature is valid, false otherwise.
+     * If the peer identity cannot be recalled, returns true (optimistic forwarding)
+     * to avoid dropping valid proofs when the identity cache is cold.
+     */
+    private fun validateLrproofForTransport(packet: Packet, linkEntry: LinkEntry): Boolean {
+        val sigLength = RnsConstants.SIGNATURE_SIZE
+        val pubSize = LinkConstants.KEYSIZE
+
+        // Check data length matches expected LRPROOF format (Python:781)
+        val expectedLen = sigLength + pubSize
+        val expectedLenWithMtu = expectedLen + LinkConstants.LINK_MTU_SIZE
+        if (packet.data.size != expectedLen && packet.data.size != expectedLenWithMtu) {
+            log("LRPROOF data size mismatch: ${packet.data.size} (expected $expectedLen or $expectedLenWithMtu)")
+            return false
+        }
+
+        // Extract signature and peer public key
+        val signature = packet.data.copyOfRange(0, sigLength)
+        val peerPubBytes = packet.data.copyOfRange(sigLength, sigLength + pubSize)
+
+        // Recall the peer identity for the destination (Python:787)
+        val peerIdentity = Identity.recall(linkEntry.destinationHash)
+        if (peerIdentity == null) {
+            // Cannot validate without the identity — allow optimistic forwarding.
+            // The final recipient (pending link) will do full validation.
+            log("Cannot recall identity for ${linkEntry.destinationHash.toHexString()}, forwarding LRPROOF optimistically")
+            return true
+        }
+
+        val peerSigPubBytes = peerIdentity.getPublicKey()
+            .copyOfRange(LinkConstants.KEYSIZE, LinkConstants.ECPUBSIZE)
+
+        // Build signalling bytes if MTU info present
+        var signallingBytes = ByteArray(0)
+        if (packet.data.size == expectedLenWithMtu) {
+            val mtuBytes = packet.data.copyOfRange(expectedLen, expectedLenWithMtu)
+            signallingBytes = mtuBytes
+        }
+
+        // Build signed data (Python:790)
+        val signedData = packet.destinationHash + peerPubBytes + peerSigPubBytes + signallingBytes
+
+        return peerIdentity.validate(signature, signedData)
+    }
+
     private fun processProof(
         packet: Packet,
         interfaceRef: InterfaceRef,
@@ -3705,12 +3774,36 @@ object Transport {
             PacketContext.LRPROOF -> {
                 val pendingLink = pendingLinks.find { getLinkId(it)?.toKey() == packet.destinationHash.toKey() }
                 if (pendingLink != null) {
+                    // Hop count validation (Python Transport.py:828):
+                    // Check that the LRPROOF traveled the expected number of hops.
+                    // Also allow PATHFINDER_M as a fallback when hops were unknown
+                    // at link creation time.
+                    val expectedHops = try {
+                        pendingLink::class.java.getMethod("getExpectedHops").invoke(pendingLink) as? Int
+                    } catch (_: Exception) { null }
+
+                    if (expectedHops != null &&
+                        packet.hops != expectedHops &&
+                        expectedHops != TransportConstants.PATHFINDER_M
+                    ) {
+                        log("LRPROOF hop mismatch for pending link: packet.hops=${packet.hops} != expectedHops=$expectedHops, ignoring")
+                        return
+                    }
+
+                    // Add to packet hash filter BEFORE validation (Python Transport.py:832).
+                    // This prevents duplicate LRPROOFs from being re-processed after the
+                    // link transitions from pendingLinks to activeLinks.
+                    addPacketHash(packet.packetHash)
+
                     log("Delivering LRPROOF to pending link ${packet.destinationHash.toHexString()}")
                     try {
                         val validateMethod = pendingLink::class.java.getMethod("validateProof", Packet::class.java)
-                        validateMethod.invoke(pendingLink, packet)
+                        val result = validateMethod.invoke(pendingLink, packet) as? Boolean ?: false
+                        if (!result) {
+                            log("LRPROOF validation failed for link ${packet.destinationHash.toHexString()}, proof consumed")
+                        }
                     } catch (e: Exception) {
-                        log("Error validating link proof: ${e.message}")
+                        log("Error validating link proof for ${packet.destinationHash.toHexString()}: ${e.message}")
                     }
                     return
                 }
@@ -3732,6 +3825,19 @@ object Transport {
                         return
                     }
 
+                    // Validate LRPROOF signature before forwarding (Python Transport.py:781-802).
+                    // This prevents invalid proofs from being propagated through the network.
+                    val proofValid = try {
+                        validateLrproofForTransport(packet, linkEntry)
+                    } catch (e: Exception) {
+                        log("Error validating LRPROOF for transport: ${e.message}")
+                        false
+                    }
+                    if (!proofValid) {
+                        log("Invalid LRPROOF signature for ${packet.destinationHash.toHexString()}, dropping")
+                        return
+                    }
+
                     val outboundInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
                     if (outboundInterface != null) {
                         // Update hop byte in raw before forwarding (Python:2035-2036)
@@ -3745,7 +3851,7 @@ object Transport {
                     return
                 }
 
-                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links or link_table")
+                log("LRPROOF dest=${packet.destinationHash.toHexString()} not found in pending_links (${pendingLinks.size}) or link_table (${linkTable.size})")
             }
 
             // RESOURCE_PRF (Resource Proof) — Transport.py:2075-2078
@@ -3796,6 +3902,19 @@ object Transport {
                     if (callback != null) {
                         matchedKey = fullHashKey
                         log("Found pending receipt by full hash from proof data")
+                    } else {
+                        // Receipts are registered by truncated hash (16 bytes), but the
+                        // proof data contains the full hash (32 bytes). For link proofs,
+                        // packet.destinationHash is the link ID (not the packet hash),
+                        // so the first lookup misses. Try truncated hash derived from
+                        // the full hash in the proof data.
+                        val truncHash = fullHash.copyOfRange(0, RnsConstants.TRUNCATED_HASH_BYTES)
+                        val truncHashKey = truncHash.toKey()
+                        callback = pendingReceipts[truncHashKey]
+                        if (callback != null) {
+                            matchedKey = truncHashKey
+                            log("Found pending receipt by truncated hash from proof data")
+                        }
                     }
                 }
 
@@ -4341,6 +4460,7 @@ object Transport {
 
     private fun cullTables() {
         val now = System.currentTimeMillis()
+        val withinStartupGrace = now - startTime < TransportConstants.STARTUP_GRACE_PERIOD
 
         // Remove expired path entries and entries whose interface no longer exists
         // (matches Python Transport.py:707-720)
@@ -4348,9 +4468,14 @@ object Transport {
         pathTable.entries.removeIf { entry ->
             val pathEntry = entry.value
             if (pathEntry.isExpired()) {
+                pathStore?.removePath(entry.key.bytes)
                 log("Path to ${entry.key} timed out and was removed")
                 true
-            } else if (findInterfaceByHash(pathEntry.receivingInterfaceHash) == null) {
+            } else if (!withinStartupGrace && findInterfaceByHash(pathEntry.receivingInterfaceHash) == null) {
+                // Skip interface-based culling during startup grace period to allow
+                // async interface registration (e.g., BLE, TCP) to complete.
+                // Python registers interfaces synchronously before first cull.
+                pathStore?.removePath(entry.key.bytes)
                 log("Path to ${entry.key} was removed since the attached interface no longer exists")
                 true
             } else {
@@ -5244,7 +5369,7 @@ object Transport {
                 java.time.format.DateTimeFormatter
                     .ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
             )
-        System.err.println("[$timestamp] [Transport] $message")
+        println("[$timestamp] [Transport] $message")
     }
 }
 

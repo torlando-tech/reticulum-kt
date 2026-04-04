@@ -1436,9 +1436,10 @@ class Destination private constructor(
             ratchet = ratchetPub
             hasRatchet = true
 
-            // Store ratchet for this destination
-            setRatchetForDestination(hash, ratchet)
-            Identity.rememberRatchet(hash, ratchet)
+            // NOTE: Do not store the ratchet public key under our own hash!
+            // The ratchet public key should only be stored by REMOTE parties who receive our announce.
+            // We keep the private keys in our ratchets list for decryption.
+            // Storing the public key under our own hash would confuse the encryption logic.
         } else {
             ratchet = byteArrayOf()
             hasRatchet = false
