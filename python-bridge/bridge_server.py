@@ -3457,6 +3457,94 @@ def cmd_propagation_node_get_messages(params):
     return {'messages': messages, 'count': len(messages)}
 
 
+def cmd_destination_encrypt_debug(params):
+    """Encrypt data using Python's Destination.encrypt(), returning debug info.
+
+    params:
+        public_key (hex): Identity public key (64 bytes)
+        destination_hash (hex): Destination hash (16 bytes)
+        plaintext (hex): Data to encrypt
+        ratchet_public (hex, optional): Ratchet public key to remember first
+
+    Returns:
+        ciphertext (hex): Encrypted data
+        used_ratchet (bool): Whether a ratchet was used
+        ratchet_used (hex): The ratchet public key if used
+        identity_hash (hex): The identity hash used as HKDF salt
+    """
+    RNS = _get_full_rns()
+    public_key = hex_to_bytes(params['public_key'])
+    dest_hash = hex_to_bytes(params['destination_hash'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    ratchet_public = hex_to_bytes(params['ratchet_public']) if params.get('ratchet_public') else None
+
+    # Create identity from public key
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+
+    # Remember identity
+    RNS.Identity.remember(b'\x00'*32, dest_hash, public_key, None)
+
+    # Optionally remember ratchet
+    if ratchet_public and len(ratchet_public) == 32:
+        RNS.Identity._remember_ratchet(dest_hash, ratchet_public)
+
+    # Create destination
+    dest = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery"
+    )
+
+    # Check what ratchet will be used
+    selected_ratchet = RNS.Identity.get_ratchet(dest.hash)
+
+    # Verify dest hash matches
+    dest_hash_matches = (dest.hash == dest_hash)
+
+    # Encrypt
+    ciphertext = dest.encrypt(plaintext)
+
+    return {
+        'ciphertext': bytes_to_hex(ciphertext),
+        'used_ratchet': selected_ratchet is not None,
+        'ratchet_used': bytes_to_hex(selected_ratchet) if selected_ratchet else '',
+        'identity_hash': bytes_to_hex(identity.hash),
+        'dest_hash_computed': bytes_to_hex(dest.hash),
+        'dest_hash_matches': dest_hash_matches,
+        'ratchet_id': bytes_to_hex(dest.latest_ratchet_id) if dest.latest_ratchet_id else ''
+    }
+
+
+def cmd_check_ratchet_for_dest(params):
+    """Check if Python has a ratchet stored for a destination hash.
+
+    params:
+        destination_hash (hex): Destination hash to check (16 bytes)
+
+    Returns:
+        has_ratchet (bool): True if a ratchet is known
+        ratchet_public (hex): The ratchet public key bytes if found
+    """
+    RNS = _get_full_rns()
+    dest_hash = hex_to_bytes(params['destination_hash'])
+    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    if ratchet is not None:
+        return {
+            'has_ratchet': True,
+            'ratchet_public': bytes_to_hex(ratchet),
+            'ratchet_id': bytes_to_hex(RNS.Identity._get_ratchet_id(ratchet))
+        }
+    else:
+        return {
+            'has_ratchet': False,
+            'ratchet_public': '',
+            'ratchet_id': ''
+        }
+
+
 def cmd_propagation_node_submit_for_recipient(params):
     """Store a test message for a recipient on the propagation node.
 
@@ -3536,26 +3624,26 @@ def cmd_propagation_node_submit_for_recipient(params):
     # This encrypts it for the recipient and creates the propagation format
     message.pack()
 
-    # Get the propagation-formatted data
-    # For propagation, the message is encrypted for the destination
-    lxmf_data = message.propagation_packed
-    if lxmf_data is None:
-        # Fallback: manually create propagation format
-        # propagation format = dest_hash + encrypted(source_hash + sig + payload)
-        encrypted_data = recipient_destination.encrypt(message.packed[LXMF.LXMessage.DESTINATION_LENGTH:])
-        lxmf_data = message.packed[:LXMF.LXMessage.DESTINATION_LENGTH] + encrypted_data
-
-    # Extract just the message data (without timebase wrapper)
-    # lxmf_propagation expects raw lxmf_data, not the propagation_packed wrapper
+    # Build raw lxm_data for propagation storage.
+    # message.pack() with PROPAGATED method computes __pn_encrypted_data internally.
+    # lxmf_propagation() expects raw: dest_hash(16) + encrypted_data (NOT the
+    # msgpack([time, [data]]) wrapper that propagation_packed contains).
     import time
+    encrypted_data = recipient_destination.encrypt(message.packed[LXMF.LXMessage.DESTINATION_LENGTH:])
+    lxmf_data = message.packed[:LXMF.LXMessage.DESTINATION_LENGTH] + encrypted_data
     transient_id = RNS.Identity.full_hash(lxmf_data)
 
     # Store directly using lxmf_propagation method
     # This handles all the storage logic including peer distribution
+    # stamp_data MUST be STAMP_SIZE (32) bytes. Python's message_get_request
+    # unconditionally strips lxmf_data[:-STAMP_SIZE] before returning, so if
+    # stamp_data is empty, it corrupts the actual encrypted data.
+    from LXMF.LXStamper import STAMP_SIZE
+    dummy_stamp = b'\x00' * STAMP_SIZE
     result = _lxmf_router.lxmf_propagation(
         lxmf_data,
-        stamp_value=0,  # No stamp required for test messages
-        stamp_data=b''
+        stamp_value=0,
+        stamp_data=dummy_stamp
     )
 
     if result:
@@ -4448,36 +4536,214 @@ def cmd_packet_parse_header(params):
     }
 
 
+def cmd_check_known_ratchet(params):
+    """Check if a ratchet is known for a destination hash."""
+    RNS = _get_full_rns()
+    dest_hash = hex_to_bytes(params['destination_hash'])
+    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    if ratchet:
+        return {
+            'has_ratchet': True,
+            'ratchet_public': bytes_to_hex(ratchet),
+            'ratchet_id': bytes_to_hex(RNS.Identity._get_ratchet_id(ratchet)),
+        }
+    else:
+        return {'has_ratchet': False}
+
 
 def cmd_propagation_encrypt_for_recipient(params):
-    """
-    Encrypt data using Destination.encrypt() - the exact propagation path.
-    Creates an Identity from public key, creates an OUT destination,
-    and encrypts using Destination.encrypt().
+    """Encrypt data for a recipient using Destination.encrypt().
+
+    Returns intermediate crypto values for debugging.
     """
     RNS = _get_full_rns()
-    public_key = hex_to_bytes(params['recipient_public_key'])
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+
+    pub_key = hex_to_bytes(params['recipient_public_key'])
     plaintext = hex_to_bytes(params['plaintext'])
 
-    # Create a recipient identity from public key (like Identity.recall)
     identity = RNS.Identity(create_keys=False)
-    identity.load_public_key(public_key)
+    identity.load_public_key(pub_key)
 
-    # Create OUT destination (as sender would)
     dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
 
-    # Check for ratchets (there shouldn't be any in test)
-    selected_ratchet = RNS.Identity.get_ratchet(dest.hash)
-    used_ratchet = selected_ratchet is not None
+    ratchet = RNS.Identity.get_ratchet(dest.hash)
+    used_ratchet = ratchet is not None
 
-    # Encrypt using Destination.encrypt - the exact propagation code path
-    encrypted = dest.encrypt(plaintext)
+    # Manual encrypt to capture intermediate values
+    ephemeral_key = X25519PrivateKey.generate()
+    ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes_raw()
+
+    if ratchet:
+        target_pub = X25519PublicKey.from_public_bytes(ratchet)
+    else:
+        target_pub = X25519PublicKey.from_public_bytes(identity.pub_bytes)
+
+    shared_key = ephemeral_key.exchange(target_pub)
+    salt = identity.get_salt()
+
+    derived_key = RNS.Cryptography.hkdf(
+        length=64, derive_from=shared_key, salt=salt, context=None
+    )
+
+    from RNS.Cryptography.Token import Token
+    token = Token(derived_key)
+    ciphertext = token.encrypt(plaintext)
+    encrypted = ephemeral_pub_bytes + ciphertext
 
     return {
         'dest_hash': bytes_to_hex(dest.hash),
         'encrypted_data': bytes_to_hex(encrypted),
-        'identity_hash': identity.hash.hex(),
+        'identity_hash': bytes_to_hex(identity.hash),
         'used_ratchet': used_ratchet,
+        'ephemeral_pub': bytes_to_hex(ephemeral_pub_bytes),
+        'shared_key': bytes_to_hex(shared_key),
+        'salt': bytes_to_hex(salt),
+        'derived_key': bytes_to_hex(derived_key),
+        'ratchet_pub_used': bytes_to_hex(ratchet) if ratchet else '',
+    }
+
+
+def cmd_get_test_identity(params):
+    """Get a consistent test identity for interop testing."""
+    # Create a deterministic identity for testing
+    import hashlib
+    seed = hashlib.sha256(b"test_identity_seed_for_interop").digest()
+
+    # Create identity with deterministic keys
+    test_identity = RNS.Identity()
+    # Use the seed to create consistent keys
+    from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    # Derive X25519 and Ed25519 keys from seed
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"x25519_key",
+    )
+    x25519_private_bytes = hkdf.derive(seed)
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"ed25519_key",
+    )
+    ed25519_private_bytes = hkdf.derive(seed)
+
+    # Load the deterministic keys
+    x25519_private = x25519.X25519PrivateKey.from_private_bytes(x25519_private_bytes)
+    ed25519_private = ed25519.Ed25519PrivateKey.from_private_bytes(ed25519_private_bytes)
+
+    # Set the keys on the identity
+    test_identity.prv = x25519_private
+    test_identity.pub = x25519_private.public_key()
+    test_identity.prv_bytes = x25519_private_bytes
+    test_identity.pub_bytes = test_identity.pub.public_bytes()
+
+    test_identity.sig_prv = ed25519_private
+    test_identity.sig_pub = ed25519_private.public_key()
+    test_identity.sig_prv_bytes = ed25519_private_bytes
+    test_identity.sig_pub_bytes = test_identity.sig_pub.public_bytes()
+
+    # Update the hash
+    test_identity.update_hashes()
+
+    return {
+        "identity_bytes": test_identity.get_public_key().hex(),
+        "identity_hash": test_identity.hash.hex(),
+        "private_bytes": test_identity.get_private_key().hex()
+    }
+
+def cmd_extract_ratchet_from_announce(params):
+    """Extract ratchet from an announce packet."""
+    destination_hash = bytes.fromhex(params['destination_hash'])
+    announce_data = bytes.fromhex(params['announce_data'])
+
+    # Create a mock packet to validate the announce
+    class MockPacket:
+        def __init__(self, dest_hash, data):
+            self.packet_type = RNS.Packet.ANNOUNCE
+            self.destination_hash = dest_hash
+            self.data = data
+            # Check if ratchet is present by looking at announce structure
+            keysize = RNS.Identity.KEYSIZE//8  # 32 bytes
+            name_hash_len = RNS.Identity.NAME_HASH_LENGTH//8  # 10 bytes
+            sig_len = RNS.Identity.SIGLENGTH//8  # 64 bytes
+            ratchet_size = RNS.Identity.RATCHETSIZE//8  # 32 bytes
+
+            # Basic announce: pub_key(32) + name_hash(10) + random_hash(10) + signature(64) + [app_data]
+            # With ratchet: pub_key(32) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) + [app_data]
+            min_size_without_ratchet = keysize + name_hash_len + 10 + sig_len  # 116 bytes
+            min_size_with_ratchet = keysize + name_hash_len + 10 + ratchet_size + sig_len  # 148 bytes
+
+            if len(data) >= min_size_with_ratchet:
+                # Likely has ratchet, set context flag
+                self.context_flag = RNS.Packet.FLAG_SET
+            else:
+                self.context_flag = RNS.Packet.FLAG_UNSET
+
+            self.rssi = None
+            self.snr = None
+
+        def get_hash(self):
+            return RNS.Identity.full_hash(self.data)[:16]
+
+    packet = MockPacket(destination_hash, announce_data)
+
+    # Validate announce and extract ratchet
+    if RNS.Identity.validate_announce(packet):
+        # If validation succeeded and ratchet was present, get it from known_ratchets
+        stored_ratchet = RNS.Identity.get_ratchet(destination_hash)
+        if stored_ratchet:
+            return {"ratchet": stored_ratchet.hex()}
+        else:
+            raise Exception("Announce validated but no ratchet was stored")
+    else:
+        raise Exception("Failed to validate announce")
+
+def cmd_encrypt_with_stored_ratchet(params):
+    """Encrypt a message using the stored ratchet for a destination."""
+    destination_hash = bytes.fromhex(params['destination_hash'])
+    identity_bytes = bytes.fromhex(params['identity_bytes'])
+    message = bytes.fromhex(params['message'])
+
+    # Create identity from bytes for encryption
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(identity_bytes)
+
+    # Create a destination for encryption
+    destination = RNS.Destination(
+        identity=identity,
+        direction=RNS.Destination.OUT,
+        type=RNS.Destination.SINGLE,
+        app_name="test_app",
+        aspect="test"
+    )
+
+    # The destination hash should match what we're encrypting to
+    assert destination.hash == destination_hash, f"Destination hash mismatch: {destination.hash.hex()} != {destination_hash.hex()}"
+
+    # Encrypt using the destination (will use stored ratchet if available)
+    encrypted = destination.encrypt(message)
+
+    return {"encrypted": encrypted.hex()}
+
+def cmd_debug_encryption_details(params):
+    """Get debug details about encryption for a destination."""
+    destination_hash = bytes.fromhex(params['destination_hash'])
+
+    # Get stored ratchet
+    stored_ratchet = RNS.Identity.get_ratchet(destination_hash)
+
+    return {
+        "has_stored_ratchet": stored_ratchet is not None,
+        "stored_ratchet": stored_ratchet.hex() if stored_ratchet else None,
+        "ratchet_expiry": RNS.Identity.RATCHET_EXPIRY,
+        "known_ratchets_count": len(RNS.Identity.known_ratchets)
     }
 
 # Command dispatcher
@@ -4598,6 +4864,8 @@ COMMANDS = {
     'propagation_node_start': cmd_propagation_node_start,
     'propagation_node_get_messages': cmd_propagation_node_get_messages,
     'propagation_node_submit_for_recipient': cmd_propagation_node_submit_for_recipient,
+    'check_ratchet_for_dest': cmd_check_ratchet_for_dest,
+    'destination_encrypt_debug': cmd_destination_encrypt_debug,
     'propagation_node_announce': cmd_propagation_node_announce,
     'propagation_encrypt_for_recipient': cmd_propagation_encrypt_for_recipient,
     # Live RNS protocol operations (link, resource, ratchet)
@@ -4630,6 +4898,13 @@ COMMANDS = {
     'local_client_read_packets': cmd_local_client_read_packets,
     'local_client_disconnect': cmd_local_client_disconnect,
     'packet_parse_header': cmd_packet_parse_header,
+    'propagation_encrypt_for_recipient': cmd_propagation_encrypt_for_recipient,
+    # Ratchet interop testing
+    'get_test_identity': cmd_get_test_identity,
+    'extract_ratchet_from_announce': cmd_extract_ratchet_from_announce,
+    'encrypt_with_stored_ratchet': cmd_encrypt_with_stored_ratchet,
+    'debug_encryption_details': cmd_debug_encryption_details,
+    'check_known_ratchet': cmd_check_known_ratchet,
 }
 
 
