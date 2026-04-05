@@ -9,35 +9,6 @@ temporary workarounds or conscious trade-offs, not design choices.
 
 ---
 
-## Transport: Ingress-Limited Announces Processed Locally
-
-**Python behavior** (`Transport.py:328-331`):
-When `should_ingress_limit()` is true for an unknown destination,
-Python calls `interface.hold_announce(packet)` and returns immediately.
-The announce is not processed locally. Later, `process_held_announces()`
-re-injects held announces when the burst subsides.
-
-**Kotlin behavior** (`Transport.kt:processAnnounce`):
-When ingress-limited, Kotlin processes the announce locally (learns
-the path, stores identity, notifies handlers) but skips retransmission
-to other interfaces. The announce is also held for later re-injection,
-but `processHeldAnnounces()` is a no-op stub.
-
-**Why**: Without a working `processHeldAnnounces`, the Python approach
-causes paths to never be learned for new destinations discovered during
-high-traffic periods. This breaks link establishment, NomadNet browsing,
-and any feature that depends on `Identity.recall()` or `Transport.hasPath()`.
-
-**Risk**: Low. The local processing is strictly additive — we learn
-a path that Python would eventually learn when held announces are
-re-injected. The only difference is timing (immediate vs deferred)
-and that we don't retransmit the announce to other interfaces.
-
-**Resolution**: Implement `processHeldAnnounces()` to match Python,
-then revert to Python's hold-and-return behavior.
-
----
-
 ## Transport: Stale Path Entry Removal on Outbound
 
 **Python behavior** (`Transport.py:load_path_table`):
@@ -62,27 +33,6 @@ removed. The timing differs (Python: at load; Kotlin: at first use).
 
 **Resolution**: Add a deferred path validation pass after all interfaces
 are registered, matching Python's load-time filtering.
-
----
-
-## Transport: processHeldAnnounces Not Implemented
-
-**Python behavior**: `Interface.process_held_announces()` is called
-periodically by the Transport jobs loop. It re-injects held announces
-when the ingress rate drops below the threshold.
-
-**Kotlin behavior**: `processHeldAnnounces()` is a no-op stub.
-Held announces are never re-injected.
-
-**Why**: The ingress-limited-local-processing deviation above mitigates
-the impact for local functionality. Full implementation requires porting
-the interface-level held announce queue and the periodic job timer.
-
-**Risk**: Medium. Announces that should be retransmitted to other
-interfaces after the burst subsides are lost. This affects announce
-propagation across the network but not local path/identity learning.
-
-**Resolution**: Port `Interface.process_held_announces()` from Python.
 
 ---
 
