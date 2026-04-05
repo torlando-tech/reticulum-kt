@@ -684,7 +684,7 @@ class AutoInterface(
         if (peer != null) {
             spawnedInterfaces?.remove(peer)
             peer.detach()
-            // Note: Transport.deregisterInterface would need to be implemented
+            Transport.deregisterInterface(peer.toRef())
         }
     }
 
