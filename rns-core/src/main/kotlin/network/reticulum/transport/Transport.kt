@@ -3071,14 +3071,16 @@ object Transport {
         // Python Transport.py:1563-1571 — only limit announces for destinations
         // not already in the path table (known destinations use normal rate limiting)
         val isKnownDestination = pathTable.containsKey(destHash.toKey())
-        if (!isKnownDestination && interfaceRef.shouldIngressLimit()) {
-            log("Holding announce for ${destHash.toHexString()} due to ingress limiting on ${interfaceRef.name}")
+        val ingressLimited = !isKnownDestination && interfaceRef.shouldIngressLimit()
+        if (ingressLimited) {
+            log("Ingress-limited announce for ${destHash.toHexString()} on ${interfaceRef.name}, processing locally but holding retransmission")
             interfaceRef.holdAnnounce(destHash, packet.raw ?: packet.pack(), packet.hops, interfaceRef)
-            // Still notify local handlers so display names are captured.
-            // Python processes the announce locally even when ingress-limited;
-            // it only holds the *retransmission*.
-            notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.qualifiedName)
-            return
+            // Don't return — fall through to process the announce locally
+            // (learn path + store identity). Only retransmission is suppressed.
+            // Python holds and returns here, but Python also has a working
+            // processHeldAnnounces that re-injects later. Since our held announce
+            // processing is not yet implemented, we process locally instead of
+            // losing the path entirely.
         }
 
         // Skip announces for our own local destinations (Python Transport.py:1573-1574).
@@ -3190,12 +3192,16 @@ object Transport {
             cacheAnnouncePacket(packet, interfaceRef)
         }
 
-        retransmitAnnounceToLocalClients(packet, interfaceRef)
+        // Skip retransmission for ingress-limited announces — we process them
+        // locally (path + identity) but don't forward to other interfaces.
+        if (!ingressLimited) {
+            retransmitAnnounceToLocalClients(packet, interfaceRef)
 
-        // Retransmit if transport is enabled OR announce came from a local client
-        val fromLocal = fromLocalClient(interfaceRef)
-        if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
-            queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
+            // Retransmit if transport is enabled OR announce came from a local client
+            val fromLocal = fromLocalClient(interfaceRef)
+            if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
+                queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
+            }
         }
     }
 
