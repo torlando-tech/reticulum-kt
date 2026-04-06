@@ -50,6 +50,16 @@ class AutoInterface(
     private val peers = ConcurrentHashMap<String, PeerInfo>()
     private val spawnedPeers = ConcurrentHashMap<String, AutoInterfacePeer>()
 
+    // Adaptive announce interval: fast after changes, progressively slower when stable.
+    // Receiving peers' multicast is free (socket.receive blocks without CPU cost).
+    // Sending is what costs battery, so we only need to send often enough that
+    // OTHER devices discover US within a reasonable time.
+    @Volatile private var currentAnnounceIntervalMs = AutoInterfaceConstants.ANNOUNCE_INTERVAL_MS
+    @Volatile private var lastPeerChangeTime = System.currentTimeMillis()
+    private val minAnnounceIntervalMs = AutoInterfaceConstants.ANNOUNCE_INTERVAL_MS  // 1.6s
+    private val maxAnnounceIntervalMs = 120_000L  // 2 minutes
+    private val rampUpDurationMs = 60_000L  // reach max interval 60s after last peer change
+
     // Network sockets per interface
     private val discoverySocketsIn = ConcurrentHashMap<String, MulticastSocket>()
     private val discoverySocketsOut = ConcurrentHashMap<String, MulticastSocket>()
@@ -134,8 +144,18 @@ class AutoInterface(
         // Cancel all coroutines
         scope.cancel()
 
-        // Close all sockets
-        discoverySocketsIn.values.forEach { it.close() }
+        // Leave multicast groups and close all sockets
+        discoverySocketsIn.forEach { (ifName, socket) ->
+            try {
+                val netIf = NetworkInterface.getByName(ifName)
+                if (netIf != null && ::multicastGroup.isInitialized) {
+                    socket.leaveGroup(multicastGroup, netIf)
+                }
+            } catch (e: Exception) {
+                log("Error leaving multicast group on $ifName: ${e.message}")
+            }
+            socket.close()
+        }
         discoverySocketsOut.values.forEach { it.close() }
         dataSockets.values.forEach { it.close() }
 
@@ -469,13 +489,40 @@ class AutoInterface(
      */
     private fun startAnnouncementLoop() {
         scope.launch {
-            log("Announcement loop started")
+            log("Announcement loop started (adaptive interval: ${minAnnounceIntervalMs}ms → ${maxAnnounceIntervalMs}ms)")
             while (running.get()) {
                 sendDiscoveryAnnouncements()
-                delay(AutoInterfaceConstants.ANNOUNCE_INTERVAL_MS)
+                updateAnnounceInterval()
+                delay(currentAnnounceIntervalMs)
             }
             log("Announcement loop stopped")
         }
+    }
+
+    /**
+     * Adapt the announce interval based on time since last peer change.
+     *
+     * Immediately after a peer is added/removed (or on startup), we announce
+     * at the fast Python-compatible rate (1.6s). Over the next 60 seconds,
+     * we linearly ramp up to the max interval (2 minutes). This means:
+     * - New peers are discovered quickly after network changes
+     * - Steady-state battery usage is ~75x lower than Python's fixed 1.6s
+     * - Other devices sending at THEIR rate still discover us via receiving
+     */
+    private fun updateAnnounceInterval() {
+        val timeSinceChange = System.currentTimeMillis() - lastPeerChangeTime
+        val progress = (timeSinceChange.toDouble() / rampUpDurationMs).coerceIn(0.0, 1.0)
+        currentAnnounceIntervalMs = (minAnnounceIntervalMs + (maxAnnounceIntervalMs - minAnnounceIntervalMs) * progress).toLong()
+    }
+
+    /**
+     * Signal that peers changed — reset announce interval to fast mode.
+     * Called when a peer is added, removed, or on network change.
+     */
+    fun resetAnnounceInterval() {
+        lastPeerChangeTime = System.currentTimeMillis()
+        currentAnnounceIntervalMs = minAnnounceIntervalMs
+        log("Announce interval reset to fast mode (${minAnnounceIntervalMs}ms)")
     }
 
     /**
@@ -668,6 +715,7 @@ class AutoInterface(
             Transport.inbound(data, peerRef)
         }
         Transport.registerInterface(peerRef)
+        resetAnnounceInterval() // New peer discovered — announce fast so they discover us too
 
         log("Peer $cleanAddr added and registered with Transport")
     }
@@ -677,6 +725,7 @@ class AutoInterface(
      */
     private fun removePeer(address: String) {
         log("Removing timed-out peer: $address")
+        resetAnnounceInterval() // Peer topology changed
 
         peers.remove(address)
 

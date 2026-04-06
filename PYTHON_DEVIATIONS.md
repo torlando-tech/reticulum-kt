@@ -57,6 +57,36 @@ of the identity's base key.
 
 ---
 
+## AutoInterface: Adaptive Announce Interval
+
+**Python behavior** (`AutoInterface.py:announce_handler`):
+Sends multicast discovery announcements every 1.6 seconds continuously
+with no adaptation. This interval is hardcoded and never changes.
+
+**Kotlin behavior** (`AutoInterface.kt:startAnnouncementLoop`):
+Starts at Python's 1.6s rate, then linearly ramps to 2 minutes over
+60 seconds after the last peer topology change. Any peer add/remove
+or network change resets to the fast 1.6s rate.
+
+**Why**: Continuous 1.6s multicast is the single biggest battery drain
+on the native stack. Receiving other nodes' multicast is free (blocking
+socket.receive), but sending wakes the radio every 1.6s indefinitely.
+Since peer discovery is symmetric, other nodes sending at their rate
+still discover us via receiving — we only need to send often enough
+that they discover us within a reasonable time.
+
+**Risk**: Low. A node running Kotlin at 2-minute intervals next to a
+node running Python at 1.6s will still discover each other: the Python
+node's multicast arrives within 1.6s, and the Kotlin node's arrives
+within 2 minutes. After discovery, unicast data flow is unaffected.
+The fast 1.6s rate on startup and peer changes ensures rapid initial
+discovery.
+
+**Resolution**: This is an intentional improvement, not a workaround.
+Could be made configurable if exact Python behavior is needed.
+
+---
+
 ## Conformance Test Status
 
 78 of 79 conformance tests pass (only `bz2_compress` differs due to
