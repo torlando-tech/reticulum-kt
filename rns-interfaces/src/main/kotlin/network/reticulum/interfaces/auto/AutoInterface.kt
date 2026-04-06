@@ -61,6 +61,14 @@ class AutoInterface(
     private val maxAnnounceIntervalMs = 120_000L  // 2 minutes
     private val rampUpDurationMs = 60_000L  // reach max interval 60s after last peer change
 
+    /**
+     * External throttle multiplier (e.g., from ConnectionPolicy).
+     * 1.0 = normal, 5.0 = Doze/low battery.
+     * Applied to maxAnnounceIntervalMs so steady-state interval goes from
+     * 2 minutes (normal) to 10 minutes (Doze).
+     */
+    @Volatile var throttleMultiplier: Float = 1.0f
+
     // Network sockets per interface
     private val discoverySocketsIn = ConcurrentHashMap<String, MulticastSocket>()
     private val discoverySocketsOut = ConcurrentHashMap<String, MulticastSocket>()
@@ -523,7 +531,8 @@ class AutoInterface(
     private fun updateAnnounceInterval() {
         val timeSinceChange = System.currentTimeMillis() - lastPeerChangeTime
         val progress = (timeSinceChange.toDouble() / rampUpDurationMs).coerceIn(0.0, 1.0)
-        currentAnnounceIntervalMs = (minAnnounceIntervalMs + (maxAnnounceIntervalMs - minAnnounceIntervalMs) * progress).toLong()
+        val effectiveMax = (maxAnnounceIntervalMs * throttleMultiplier).toLong()
+        currentAnnounceIntervalMs = (minAnnounceIntervalMs + (effectiveMax - minAnnounceIntervalMs) * progress).toLong()
     }
 
     /**
