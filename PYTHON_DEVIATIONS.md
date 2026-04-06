@@ -64,26 +64,47 @@ Sends multicast discovery announcements every 1.6 seconds continuously
 with no adaptation. This interval is hardcoded and never changes.
 
 **Kotlin behavior** (`AutoInterface.kt:startAnnouncementLoop`):
-Starts at Python's 1.6s rate, then linearly ramps to 2 minutes over
-60 seconds after the last peer topology change. Any peer add/remove
-or network change resets to the fast 1.6s rate.
+The announce interval adapts based on peer activity and device state:
+
+| State | Announce Interval | vs Python (1.6s) |
+|-------|------------------|------------------|
+| Startup / peer change | 1.6s (+ immediate reply) | Same |
+| Stable, 30s | ~60s | 37x less |
+| Stable, 60s+ | 2 minutes | 75x less |
+| Doze, stable | 10 minutes | 375x less |
+| New peer during Doze | Immediate reply → 1.6s | Same responsiveness |
+
+The interval linearly ramps from 1.6s to `maxAnnounceIntervalMs *
+throttleMultiplier` over 60 seconds after the last peer topology
+change. Any peer add/remove resets to fast mode AND triggers an
+immediate announce so the new peer discovers us within ~1 second.
+
+Doze awareness: `NativeReticulumProtocol` observes `DozeStateObserver`
+and sets `AutoInterface.throttleMultiplier` to 5.0 during Doze,
+scaling the max interval from 2 minutes to 10 minutes.
 
 **Why**: Continuous 1.6s multicast is the single biggest battery drain
 on the native stack. Receiving other nodes' multicast is free (blocking
-socket.receive), but sending wakes the radio every 1.6s indefinitely.
-Since peer discovery is symmetric, other nodes sending at their rate
-still discover us via receiving — we only need to send often enough
-that they discover us within a reasonable time.
+`socket.receive()`), but sending wakes the WiFi radio every 1.6s
+indefinitely. Since peer discovery is symmetric, other nodes sending
+at their rate still discover us via receiving — we only need to send
+often enough that they discover us within a reasonable time.
+
+**Multicast socket cleanup**: Kotlin explicitly calls `leaveGroup()`
+before closing multicast sockets on detach, preventing OS-level
+multicast group membership from lingering after the interface is
+stopped. Python relies on `socket.close()` for implicit cleanup.
 
 **Risk**: Low. A node running Kotlin at 2-minute intervals next to a
 node running Python at 1.6s will still discover each other: the Python
-node's multicast arrives within 1.6s, and the Kotlin node's arrives
-within 2 minutes. After discovery, unicast data flow is unaffected.
-The fast 1.6s rate on startup and peer changes ensures rapid initial
-discovery.
+node's multicast arrives within 1.6s, and the Kotlin node's immediate
+reply fires within ~1 second. After discovery, unicast data flow is
+unaffected.
 
 **Resolution**: This is an intentional improvement, not a workaround.
-Could be made configurable if exact Python behavior is needed.
+`throttleMultiplier` can be set to 1.0 and `maxAnnounceIntervalMs`
+can be set to `ANNOUNCE_INTERVAL_MS` to match exact Python behavior
+if needed.
 
 ---
 
