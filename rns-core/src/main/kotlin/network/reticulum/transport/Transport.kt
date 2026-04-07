@@ -250,6 +250,7 @@ object Transport {
 
     /** Last time cache was cleaned. */
     private var cacheLastCleaned: Long = 0
+    private var identitiesLastSaved: Long = 0
 
     /** Cache path for persistent announce storage. Set by Reticulum during init. */
     @Volatile
@@ -4409,6 +4410,17 @@ object Transport {
         if (now - cacheLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             cleanAnnounceCache()
             cacheLastCleaned = now
+        }
+
+        // Persist known destinations periodically (every 5 minutes)
+        // Ensures identities survive process kills without clean shutdown
+        if (now - identitiesLastSaved > TransportConstants.CACHE_CLEAN_INTERVAL) {
+            try {
+                Identity.saveKnownDestinations()
+            } catch (e: Exception) {
+                log("Error saving known destinations: ${e.message}")
+            }
+            identitiesLastSaved = now
         }
     }
 

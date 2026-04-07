@@ -477,6 +477,13 @@ class Reticulum private constructor(
     private fun shutdown() {
         log("Shutting down Reticulum...")
 
+        // Persist known destinations before shutdown so identities survive restart
+        try {
+            Identity.saveKnownDestinations()
+        } catch (e: Exception) {
+            log("Error saving known destinations: ${e.message}")
+        }
+
         // Run shutdown hooks
         shutdownHooks.forEach { hook ->
             try {
