@@ -206,7 +206,9 @@ class RNodeInterface(
 
             // Display logo on RNode screen if configured.
             // Matches columba's Python rnode_interface.py:_display_logo():
-            // display_image FIRST, then enable_external_framebuffer with delay.
+            //   1. display_image() — 64 lines, 15ms delay per line
+            //   2. time.sleep(0.05)
+            //   3. enable_external_framebuffer()
             if (displayImageData != null) {
                 try {
                     displayImage(displayImageData!!)
@@ -231,22 +233,25 @@ class RNodeInterface(
         outputStream.flush()
     }
 
-    /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display. */
-    private fun displayImage(imageData: ByteArray) {
-        // Batch all framebuffer lines into a single write to avoid per-line
-        // BLE latch overhead. The BLE layer will chunk by MTU internally.
-        val buffer = java.io.ByteArrayOutputStream(imageData.size * 2)
+    /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display.
+     *  Matches columba Python rnode_interface.py:display_image() exactly:
+     *  each line written individually with 15ms delay for BLE pacing. */
+    private suspend fun displayImage(imageData: ByteArray) {
         val lines = imageData.size / FB_BYTES_PER_LINE
         for (line in 0 until lines) {
             val lineStart = line * FB_BYTES_PER_LINE
             val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
-            val data = byteArrayOf(line.toByte()) + lineData
-            val escaped = KISS.escape(data)
-            buffer.write(byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE))
-            buffer.write(escaped)
-            buffer.write(byteArrayOf(KISS.FEND))
+            writeFramebuffer(line, lineData)
+            delay(15) // Match Python's time.sleep(0.015) for BLE write pacing
         }
-        outputStream.write(buffer.toByteArray())
+    }
+
+    /** Write a single line to the RNode framebuffer. */
+    private fun writeFramebuffer(line: Int, lineData: ByteArray) {
+        val data = byteArrayOf(line.toByte()) + lineData
+        val escaped = KISS.escape(data)
+        val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
+        outputStream.write(cmd)
         outputStream.flush()
     }
 
