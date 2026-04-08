@@ -5552,6 +5552,9 @@ interface InterfaceRef {
     fun heldAnnounceCount(): Int = 0
 
     fun send(data: ByteArray)
+
+    /** Detach the underlying interface (close connections, release resources). */
+    fun detach() {}
 }
 
 /**

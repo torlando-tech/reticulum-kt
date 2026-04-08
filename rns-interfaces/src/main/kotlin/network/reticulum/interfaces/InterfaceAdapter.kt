@@ -126,6 +126,10 @@ class InterfaceAdapter private constructor(
         iface.processOutgoing(data)
     }
 
+    override fun detach() {
+        iface.detach()
+    }
+
     companion object {
         // Cache adapters to avoid creating duplicates
         private val adapterCache = ConcurrentHashMap<Interface, InterfaceAdapter>()

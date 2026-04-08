@@ -79,6 +79,19 @@ class InterfaceDiscovery(
         handler = null
         monitorJob?.cancel()
         monitorJob = null
+
+        // Disconnect all auto-connected interfaces
+        for (m in monitoredInterfaces.toList()) {
+            try {
+                Transport.deregisterInterface(m.ref)
+                m.ref.detach()
+                log("Detached auto-connected interface on stop: ${m.ref.name}")
+            } catch (e: Exception) {
+                log("Error detaching ${m.ref.name}: ${e.message}")
+            }
+        }
+        monitoredInterfaces.clear()
+
         log("Stopped discovery listener")
     }
 
@@ -102,6 +115,7 @@ class InterfaceDiscovery(
                 monitoredInterfaces.remove(m)
                 try {
                     Transport.deregisterInterface(m.ref)
+                    m.ref.detach()
                     log("Detached auto-connected interface: ${m.ref.name}")
                 } catch (e: Exception) {
                     log("Error detaching interface ${m.ref.name}: ${e.message}")
