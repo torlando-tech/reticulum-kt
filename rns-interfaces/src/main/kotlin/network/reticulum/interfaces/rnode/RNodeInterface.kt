@@ -204,8 +204,11 @@ class RNodeInterface(
             online.set(true)
             log("RNode is configured and online")
 
-            // Display logo on RNode screen if framebuffer is supported
-            if (displayImageData != null) {
+            // Display logo on RNode screen if framebuffer is supported.
+            // Skip if flowControl is disabled (BLE) — the rapid-fire framebuffer
+            // writes overwhelm the BLE latch-based write synchronization and can
+            // desynchronize the write path, causing subsequent data writes to fail.
+            if (displayImageData != null && flowControl) {
                 try {
                     enableExternalFramebuffer()
                     delay(100)
