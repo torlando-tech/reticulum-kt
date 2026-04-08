@@ -204,11 +204,19 @@ class RNodeInterface(
             online.set(true)
             log("RNode is configured and online")
 
-            // Note: framebuffer display (logo) is NOT done during init.
-            // Python RNodeInterface doesn't do it either — the display_image()
-            // methods exist for external use (e.g., Sideband/NomadNet UI updates).
-            // Attempting rapid-fire framebuffer writes during init over BLE causes
-            // write desync. If needed, call displayImage() externally after init.
+            // Display logo on RNode screen if configured.
+            // Matches columba's Python rnode_interface.py:_display_logo():
+            // display_image FIRST, then enable_external_framebuffer with delay.
+            if (displayImageData != null) {
+                try {
+                    displayImage(displayImageData!!)
+                    delay(50)  // Match Python's time.sleep(0.05)
+                    enableExternalFramebuffer()
+                    log("Displayed logo on RNode screen")
+                } catch (e: Exception) {
+                    log("Could not display logo: ${e.message}")
+                }
+            }
         } else {
             throw IOException("Radio parameter validation failed — device reported different values than configured")
         }
