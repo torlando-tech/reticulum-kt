@@ -204,20 +204,11 @@ class RNodeInterface(
             online.set(true)
             log("RNode is configured and online")
 
-            // Display logo on RNode screen if framebuffer is supported.
-            // Skip if flowControl is disabled (BLE) — the rapid-fire framebuffer
-            // writes overwhelm the BLE latch-based write synchronization and can
-            // desynchronize the write path, causing subsequent data writes to fail.
-            if (displayImageData != null && flowControl) {
-                try {
-                    enableExternalFramebuffer()
-                    delay(100)
-                    displayImage(displayImageData!!)
-                    log("Displayed logo on RNode screen")
-                } catch (e: Exception) {
-                    log("Could not display logo: ${e.message}")
-                }
-            }
+            // Note: framebuffer display (logo) is NOT done during init.
+            // Python RNodeInterface doesn't do it either — the display_image()
+            // methods exist for external use (e.g., Sideband/NomadNet UI updates).
+            // Attempting rapid-fire framebuffer writes during init over BLE causes
+            // write desync. If needed, call displayImage() externally after init.
         } else {
             throw IOException("Radio parameter validation failed — device reported different values than configured")
         }
