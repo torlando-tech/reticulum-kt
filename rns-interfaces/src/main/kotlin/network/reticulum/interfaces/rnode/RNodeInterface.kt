@@ -233,20 +233,20 @@ class RNodeInterface(
 
     /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display. */
     private fun displayImage(imageData: ByteArray) {
+        // Batch all framebuffer lines into a single write to avoid per-line
+        // BLE latch overhead. The BLE layer will chunk by MTU internally.
+        val buffer = java.io.ByteArrayOutputStream(imageData.size * 2)
         val lines = imageData.size / FB_BYTES_PER_LINE
         for (line in 0 until lines) {
             val lineStart = line * FB_BYTES_PER_LINE
             val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
-            writeFramebuffer(line, lineData)
+            val data = byteArrayOf(line.toByte()) + lineData
+            val escaped = KISS.escape(data)
+            buffer.write(byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE))
+            buffer.write(escaped)
+            buffer.write(byteArrayOf(KISS.FEND))
         }
-    }
-
-    /** Write a single line to the RNode framebuffer. */
-    private fun writeFramebuffer(line: Int, lineData: ByteArray) {
-        val data = byteArrayOf(line.toByte()) + lineData
-        val escaped = KISS.escape(data)
-        val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
-        outputStream.write(cmd)
+        outputStream.write(buffer.toByteArray())
         outputStream.flush()
     }
 
