@@ -231,6 +231,9 @@ class RNodeInterface(
      *  one line at a time. BLE pacing is handled by the OutputStream's
      *  latch-per-write synchronization — no artificial delay needed. */
     private fun displayImage(imageData: ByteArray) {
+        require(imageData.size == FB_BYTES_PER_LINE * 64) {
+            "displayImage expects ${FB_BYTES_PER_LINE * 64} bytes (64x64 monochrome), got ${imageData.size}"
+        }
         val lines = imageData.size / FB_BYTES_PER_LINE
         for (line in 0 until lines) {
             val lineStart = line * FB_BYTES_PER_LINE
