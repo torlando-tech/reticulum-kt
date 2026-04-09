@@ -45,6 +45,8 @@ class RNodeInterface(
     private val codingRate: Int,
     private val flowControl: Boolean = true,
     private val activityKeepaliveMs: Long? = null,
+    private val framebufferLineDelayMs: Long = 0L,
+    private val framebufferEnableDelayMs: Long = 0L,
     private val parentScope: CoroutineScope? = null,
     /** Optional 512-byte framebuffer image to display on the RNode screen after init. */
     val displayImageData: ByteArray? = null,
@@ -210,6 +212,9 @@ class RNodeInterface(
             if (displayImageData != null) {
                 try {
                     displayImage(displayImageData!!)
+                    if (framebufferEnableDelayMs > 0) {
+                        delay(framebufferEnableDelayMs)
+                    }
                     enableExternalFramebuffer()
                     log("Displayed logo on RNode screen")
                 } catch (e: Exception) {
@@ -226,14 +231,13 @@ class RNodeInterface(
     /** Enable external framebuffer control on the RNode display. */
     private fun enableExternalFramebuffer() {
         val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_EXT, 0x01, KISS.FEND)
-        outputStream.write(cmd)
-        outputStream.flush()
+        writeRaw(cmd)
     }
 
     /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display,
-     *  one line at a time. BLE pacing is handled by the OutputStream's
-     *  latch-per-write synchronization — no artificial delay needed. */
-    private fun displayImage(imageData: ByteArray) {
+     *  one line at a time. Optional pacing can be applied to match Python's
+     *  framebuffer write timing for transports that need it. */
+    private suspend fun displayImage(imageData: ByteArray) {
         require(imageData.size == FB_BYTES_PER_LINE * 64) {
             "displayImage expects ${FB_BYTES_PER_LINE * 64} bytes (64x64 monochrome), got ${imageData.size}"
         }
@@ -242,6 +246,9 @@ class RNodeInterface(
             val lineStart = line * FB_BYTES_PER_LINE
             val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
             writeFramebuffer(line, lineData)
+            if (framebufferLineDelayMs > 0) {
+                delay(framebufferLineDelayMs)
+            }
         }
     }
 
@@ -250,8 +257,7 @@ class RNodeInterface(
         val data = byteArrayOf(line.toByte()) + lineData
         val escaped = KISS.escape(data)
         val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
-        outputStream.write(cmd)
-        outputStream.flush()
+        writeRaw(cmd)
     }
 
     // -- KISS command helpers (matching Python's detect/setFrequency/etc.) --
