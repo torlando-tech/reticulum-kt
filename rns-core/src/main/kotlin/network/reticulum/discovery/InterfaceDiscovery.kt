@@ -39,7 +39,7 @@ class InterfaceDiscovery(
     private val discoveryStore: network.reticulum.storage.DiscoveryStore? = null,
 ) {
     private var handler: InterfaceAnnounceHandler? = null
-    private val monitoredInterfaces = mutableListOf<MonitoredInterface>()
+    private val monitoredInterfaces = java.util.concurrent.CopyOnWriteArrayList<MonitoredInterface>()
     private var monitorJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 

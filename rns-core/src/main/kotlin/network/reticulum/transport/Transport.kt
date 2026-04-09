@@ -4990,8 +4990,7 @@ object Transport {
 
     // ===== Tunnel Table Persistence =====
 
-    /** Maximum random blobs to persist per path */
-    private const val PERSIST_RANDOM_BLOBS = 32
+    /** Maximum random blobs to persist per path — reuses TransportConstants value */
 
     /**
      * Save tunnel table to persistent storage.
@@ -5053,7 +5052,7 @@ object Transport {
                     packer.packLong(pathEntry.expires)
 
                     // random_blobs (limit to last PERSIST_RANDOM_BLOBS)
-                    val blobsToSave = pathEntry.randomBlobs.takeLast(PERSIST_RANDOM_BLOBS)
+                    val blobsToSave = pathEntry.randomBlobs.takeLast(TransportConstants.PERSIST_RANDOM_BLOBS)
                     packer.packArrayHeader(blobsToSave.size)
                     for (blob in blobsToSave) {
                         packer.packBinaryHeader(blob.size)
