@@ -882,7 +882,20 @@ object Transport {
      * Deregister an announce handler.
      */
     fun deregisterAnnounceHandler(handler: AnnounceHandler) {
+        // Collect the aspect filters of the handlers being removed
+        val removedAspects = announceHandlers
+            .filter { it.handler === handler }
+            .mapNotNull { it.aspectFilter }
+
         announceHandlers.removeIf { it.handler === handler }
+
+        // Remove aspects from knownAspects only if no remaining handler uses them
+        for (aspect in removedAspects) {
+            val stillUsed = announceHandlers.any { it.aspectFilter == aspect }
+            if (!stillUsed) {
+                knownAspects.remove(aspect)
+            }
+        }
     }
 
     // ===== Interface Discovery =====
