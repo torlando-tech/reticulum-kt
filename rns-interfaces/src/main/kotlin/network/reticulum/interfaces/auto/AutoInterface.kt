@@ -283,7 +283,11 @@ class AutoInterface(
                         }
                     dataSockets[ifName] = dataChannel.socket()
                 } catch (e: java.net.BindException) {
-                    log("Data port $dataPort already in use on $ifName (another RNS instance running?) — peer connections will still work", "WARNING")
+                    log("Data port $dataPort already in use on $ifName (another RNS instance running?) — rolling back discovery sockets", "WARNING")
+                    // Roll back discovery sockets so this interface is either fully configured or not at all
+                    discoverySocketsIn.remove(ifName)?.close()
+                    discoverySocketsOut.remove(ifName)?.close()
+                    linkLocalAddresses.remove(ifName)
                 }
             } catch (e: java.io.IOException) {
                 log("I/O error setting up sockets for $ifName: ${e.message}", "ERROR")
