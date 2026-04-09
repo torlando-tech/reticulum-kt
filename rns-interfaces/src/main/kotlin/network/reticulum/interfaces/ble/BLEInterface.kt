@@ -123,6 +123,14 @@ class BLEInterface(
         // No-op: Transport calls each spawned BLEPeerInterface's processOutgoing() directly
     }
 
+    /**
+     * Switch BLE scan mode for battery optimization.
+     * Call with true during Doze/background, false when active.
+     */
+    suspend fun setScanLowPower(lowPower: Boolean) {
+        driver.setScanLowPower(lowPower)
+    }
+
     override fun detach() {
         super.detach()
         scope.cancel()

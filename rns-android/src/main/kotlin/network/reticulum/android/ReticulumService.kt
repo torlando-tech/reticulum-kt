@@ -310,6 +310,8 @@ class ReticulumService : LifecycleService() {
                 applicationContext,
                 network.reticulum.android.db.ReticulumDatabase::class.java,
                 "reticulum.db"
+            ).addMigrations(
+                network.reticulum.android.db.ReticulumDatabase.MIGRATION_1_2
             ).build()
             database = db
 

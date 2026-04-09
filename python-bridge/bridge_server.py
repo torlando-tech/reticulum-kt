@@ -4448,6 +4448,38 @@ def cmd_packet_parse_header(params):
     }
 
 
+
+def cmd_propagation_encrypt_for_recipient(params):
+    """
+    Encrypt data using Destination.encrypt() - the exact propagation path.
+    Creates an Identity from public key, creates an OUT destination,
+    and encrypts using Destination.encrypt().
+    """
+    RNS = _get_full_rns()
+    public_key = hex_to_bytes(params['recipient_public_key'])
+    plaintext = hex_to_bytes(params['plaintext'])
+
+    # Create a recipient identity from public key (like Identity.recall)
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+
+    # Create OUT destination (as sender would)
+    dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+
+    # Check for ratchets (there shouldn't be any in test)
+    selected_ratchet = RNS.Identity.get_ratchet(dest.hash)
+    used_ratchet = selected_ratchet is not None
+
+    # Encrypt using Destination.encrypt - the exact propagation code path
+    encrypted = dest.encrypt(plaintext)
+
+    return {
+        'dest_hash': bytes_to_hex(dest.hash),
+        'encrypted_data': bytes_to_hex(encrypted),
+        'identity_hash': identity.hash.hex(),
+        'used_ratchet': used_ratchet,
+    }
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -4567,6 +4599,7 @@ COMMANDS = {
     'propagation_node_get_messages': cmd_propagation_node_get_messages,
     'propagation_node_submit_for_recipient': cmd_propagation_node_submit_for_recipient,
     'propagation_node_announce': cmd_propagation_node_announce,
+    'propagation_encrypt_for_recipient': cmd_propagation_encrypt_for_recipient,
     # Live RNS protocol operations (link, resource, ratchet)
     'rns_create_destination': cmd_rns_create_destination,
     'rns_get_established_link': cmd_rns_get_established_link,

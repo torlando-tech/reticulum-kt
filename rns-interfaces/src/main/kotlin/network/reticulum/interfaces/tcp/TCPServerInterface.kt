@@ -8,6 +8,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import network.reticulum.interfaces.toRef
+import network.reticulum.transport.Transport
 import kotlinx.coroutines.withContext
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
@@ -184,6 +186,7 @@ class TCPServerInterface(
     internal fun clientDisconnected(client: TCPServerClientInterface) {
         clients.remove(client)
         spawnedInterfaces?.remove(client)
+        Transport.deregisterInterface(client.toRef())
         onClientDisconnected?.invoke(client)
         log("Client disconnected: ${client.name}")
     }

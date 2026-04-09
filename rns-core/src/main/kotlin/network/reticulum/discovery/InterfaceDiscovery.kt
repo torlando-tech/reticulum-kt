@@ -6,15 +6,15 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.coroutines.coroutineContext
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
-import network.reticulum.common.ByteArrayKey
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.io.File
+import kotlin.coroutines.coroutineContext
 
 /**
  * High-level interface discovery manager.
@@ -33,13 +33,13 @@ class InterfaceDiscovery(
     private val requiredValue: Int = DiscoveryConstants.DEFAULT_STAMP_VALUE,
     private val discoverySources: Set<ByteArrayKey>? = null,
     private val autoConnectFactory: ((DiscoveredInterface) -> InterfaceRef?)? = null,
-    private val maxAutoConnected: Int = 0,
+    private var maxAutoConnected: Int = 0,
     private val discoveryCallback: ((DiscoveredInterface) -> Unit)? = null,
     /** Pluggable persistent storage. When null, falls back to file-based persistence. */
     private val discoveryStore: network.reticulum.storage.DiscoveryStore? = null,
 ) {
     private var handler: InterfaceAnnounceHandler? = null
-    private val monitoredInterfaces = mutableListOf<MonitoredInterface>()
+    private val monitoredInterfaces = java.util.concurrent.CopyOnWriteArrayList<MonitoredInterface>()
     private var monitorJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
@@ -49,20 +49,24 @@ class InterfaceDiscovery(
     private data class MonitoredInterface(
         val ref: InterfaceRef,
         val endpointHash: ByteArray,
+        val endpoint: String? = null,
         var downSince: Long? = null,
     )
 
     fun start() {
-        handler = InterfaceAnnounceHandler(
-            requiredValue = requiredValue,
-            callback = ::onInterfaceDiscovered,
-            discoverySources = discoverySources,
-        )
+        handler =
+            InterfaceAnnounceHandler(
+                requiredValue = requiredValue,
+                callback = ::onInterfaceDiscovered,
+                discoverySources = discoverySources,
+            )
         Transport.registerAnnounceHandler(handler!!)
-        log("Started discovery listener (requiredValue=$requiredValue, " +
-            "sources=${discoverySources?.size ?: "any"}, " +
-            "autoConnect=${if (autoConnectFactory != null) "max $maxAutoConnected" else "disabled"}, " +
-            "storagePath=$storagePath)")
+        log(
+            "Started discovery listener (requiredValue=$requiredValue, " +
+                "sources=${discoverySources?.size ?: "any"}, " +
+                "autoConnect=${if (autoConnectFactory != null) "max $maxAutoConnected" else "disabled"}, " +
+                "storagePath=$storagePath)",
+        )
 
         // Reconnect previously discovered interfaces
         if (autoConnectFactory != null && maxAutoConnected > 0) {
@@ -75,8 +79,58 @@ class InterfaceDiscovery(
         handler = null
         monitorJob?.cancel()
         monitorJob = null
+
+        // Disconnect all auto-connected interfaces
+        for (m in monitoredInterfaces.toList()) {
+            try {
+                Transport.deregisterInterface(m.ref)
+                m.ref.detach()
+                log("Detached auto-connected interface on stop: ${m.ref.name}")
+            } catch (e: Exception) {
+                log("Error detaching ${m.ref.name}: ${e.message}")
+            }
+        }
+        monitoredInterfaces.clear()
+
         log("Stopped discovery listener")
     }
+
+    /**
+     * Update the auto-connect limit at runtime (no restart needed).
+     * - If increased: connects more discovered interfaces to fill new slots.
+     * - If reduced: detaches excess auto-connected interfaces (LIFO order).
+     * - If set to 0: detaches all auto-connected interfaces.
+     */
+    fun setMaxAutoConnected(count: Int) {
+        val old = maxAutoConnected
+        maxAutoConnected = count
+        log("Auto-connect limit updated: $old → $count")
+
+        // Detach excess interfaces when limit is reduced
+        val excess = monitoredInterfaces.size - count
+        if (excess > 0) {
+            // Remove from the end (most recently added first)
+            val toDetach = monitoredInterfaces.takeLast(excess)
+            for (m in toDetach) {
+                monitoredInterfaces.remove(m)
+                try {
+                    Transport.deregisterInterface(m.ref)
+                    m.ref.detach()
+                    log("Detached auto-connected interface: ${m.ref.name}")
+                } catch (e: Exception) {
+                    log("Error detaching interface ${m.ref.name}: ${e.message}")
+                }
+            }
+        } else if (count > old && autoConnectFactory != null) {
+            // Fill new slots from known discovered interfaces
+            scope.launch { connectDiscovered() }
+        }
+    }
+
+    /**
+     * Get the set of currently auto-connected endpoint strings ("host:port").
+     */
+    fun getAutoconnectedEndpoints(): Set<String> = monitoredInterfaces.mapNotNull { it.endpoint }.toSet()
 
     /**
      * List all discovered interfaces from disk, applying status thresholds and pruning stale entries.
@@ -87,25 +141,35 @@ class InterfaceDiscovery(
         val results = mutableListOf<Pair<DiscoveredInterface, String>>()
 
         // Load from store or file system
-        val allDiscovered: List<DiscoveredInterface> = discoveryStore?.let { store ->
-            store.removeOlderThan(now - DiscoveryConstants.THRESHOLD_REMOVE)
-            store.loadAllDiscovered()
-        } ?: run {
-            val dir = discoveryDir
-            if (!dir.exists()) return results
-            dir.listFiles()?.mapNotNull { file ->
-                try { loadDiscoveredInterface(file) } catch (_: Exception) { null }
-            } ?: emptyList()
-        }
+        val allDiscovered: List<DiscoveredInterface> =
+            discoveryStore?.let { store ->
+                store.removeOlderThan(now - DiscoveryConstants.THRESHOLD_REMOVE)
+                store.loadAllDiscovered()
+            } ?: run {
+                val dir = discoveryDir
+                if (!dir.exists()) return results
+                dir.listFiles()?.mapNotNull { file ->
+                    try {
+                        loadDiscoveredInterface(file)
+                    } catch (_: Exception) {
+                        null
+                    }
+                } ?: emptyList()
+            }
 
         for (info in allDiscovered) {
             try {
                 val heardDelta = now - info.lastHeard
 
                 // Check removal thresholds
-                val shouldRemove = heardDelta > DiscoveryConstants.THRESHOLD_REMOVE
-                    || (discoverySources != null && !discoverySources.contains(
-                        ByteArrayKey(hexToBytes(info.networkId))))
+                val shouldRemove =
+                    heardDelta > DiscoveryConstants.THRESHOLD_REMOVE ||
+                        (
+                            discoverySources != null &&
+                                !discoverySources.contains(
+                                    ByteArrayKey(hexToBytes(info.networkId)),
+                                )
+                        )
 
                 if (shouldRemove) {
                     if (discoveryStore != null) {
@@ -116,11 +180,12 @@ class InterfaceDiscovery(
                     continue
                 }
 
-                val status = when {
-                    heardDelta > DiscoveryConstants.THRESHOLD_STALE -> "stale"
-                    heardDelta > DiscoveryConstants.THRESHOLD_UNKNOWN -> "unknown"
-                    else -> "available"
-                }
+                val status =
+                    when {
+                        heardDelta > DiscoveryConstants.THRESHOLD_STALE -> "stale"
+                        heardDelta > DiscoveryConstants.THRESHOLD_UNKNOWN -> "unknown"
+                        else -> "available"
+                    }
 
                 results.add(info to status)
             } catch (e: Exception) {
@@ -128,14 +193,17 @@ class InterfaceDiscovery(
             }
         }
 
-        val statusOrder = mapOf(
-            "available" to DiscoveryConstants.STATUS_AVAILABLE,
-            "unknown" to DiscoveryConstants.STATUS_UNKNOWN,
-            "stale" to DiscoveryConstants.STATUS_STALE,
+        val statusOrder =
+            mapOf(
+                "available" to DiscoveryConstants.STATUS_AVAILABLE,
+                "unknown" to DiscoveryConstants.STATUS_UNKNOWN,
+                "stale" to DiscoveryConstants.STATUS_STALE,
+            )
+        results.sortWith(
+            compareByDescending<Pair<DiscoveredInterface, String>> {
+                statusOrder[it.second] ?: 0
+            }.thenByDescending { it.first.stampValue }.thenByDescending { it.first.lastHeard },
         )
-        results.sortWith(compareByDescending<Pair<DiscoveredInterface, String>> {
-            statusOrder[it.second] ?: 0
-        }.thenByDescending { it.first.stampValue }.thenByDescending { it.first.lastHeard })
 
         val available = results.count { it.second == "available" }
         val unknown = results.count { it.second == "unknown" }
@@ -162,8 +230,10 @@ class InterfaceDiscovery(
                 }
                 val isNew = existing == null
                 discoveryStore.upsertDiscovered(info)
-                log("${if (isNew) "New" else "Updated"} discovered interface: " +
-                    "${info.type} \"${info.name}\" (heard=${info.heardCount})")
+                log(
+                    "${if (isNew) "New" else "Updated"} discovered interface: " +
+                        "${info.type} \"${info.name}\" (heard=${info.heardCount})",
+                )
             } else {
                 val file = File(discoveryDir, filename)
                 val isNew = !file.exists()
@@ -178,8 +248,10 @@ class InterfaceDiscovery(
                     info.lastHeard = info.received
                 }
                 saveDiscoveredInterface(file, info)
-                log("${if (isNew) "New" else "Updated"} discovered interface: " +
-                    "${info.type} \"${info.name}\" (heard=${info.heardCount}, file=$filename)")
+                log(
+                    "${if (isNew) "New" else "Updated"} discovered interface: " +
+                        "${info.type} \"${info.name}\" (heard=${info.heardCount}, file=$filename)",
+                )
             }
         } catch (e: Exception) {
             log("Error persisting discovered interface: ${e.message}")
@@ -209,15 +281,17 @@ class InterfaceDiscovery(
         }
 
         // Check for duplicate endpoint
-        val endpointSpecifier = buildString {
-            info.reachableOn?.let { append(it) }
-            info.port?.let { append(":$it") }
-        }
+        val endpointSpecifier =
+            buildString {
+                info.reachableOn?.let { append(it) }
+                info.port?.let { append(":$it") }
+            }
         val endpointHash = Hashes.fullHash(endpointSpecifier.toByteArray(Charsets.UTF_8))
 
-        val alreadyExists = monitoredInterfaces.any {
-            it.endpointHash.contentEquals(endpointHash)
-        }
+        val alreadyExists =
+            monitoredInterfaces.any {
+                it.endpointHash.contentEquals(endpointHash)
+            }
         if (alreadyExists) {
             log("Skipping auto-connect for ${info.name}: endpoint $endpointSpecifier already connected")
             return
@@ -225,11 +299,12 @@ class InterfaceDiscovery(
 
         try {
             log("Auto-connecting discovered interface: ${info.type} \"${info.name}\" at $endpointSpecifier")
-            val iface = autoConnectFactory.invoke(info) ?: run {
-                log("Auto-connect factory returned null for ${info.name}")
-                return
-            }
-            val monitored = MonitoredInterface(iface, endpointHash)
+            val iface =
+                autoConnectFactory.invoke(info) ?: run {
+                    log("Auto-connect factory returned null for ${info.name}")
+                    return
+                }
+            val monitored = MonitoredInterface(iface, endpointHash, endpoint = endpointSpecifier)
             monitoredInterfaces.add(monitored)
             log("Auto-connected ${info.name} (${monitoredInterfaces.size}/$maxAutoConnected)")
             startMonitorIfNeeded()
@@ -294,7 +369,10 @@ class InterfaceDiscovery(
 
     // ==================== Persistence ====================
 
-    private fun saveDiscoveredInterface(file: File, info: DiscoveredInterface) {
+    private fun saveDiscoveredInterface(
+        file: File,
+        info: DiscoveredInterface,
+    ) {
         val out = ByteArrayOutputStream()
         val packer = MessagePack.newDefaultPacker(out)
 
@@ -349,10 +427,11 @@ class InterfaceDiscovery(
         }
 
         val discoveryHash = fields["discovery_hash"]
-        val hashBytes = when (discoveryHash) {
-            is ByteArray -> discoveryHash
-            else -> return null
-        }
+        val hashBytes =
+            when (discoveryHash) {
+                is ByteArray -> discoveryHash
+                else -> return null
+            }
 
         return DiscoveredInterface(
             type = fields["type"] as? String ?: return null,
@@ -383,7 +462,10 @@ class InterfaceDiscovery(
         )
     }
 
-    private fun packValue(packer: org.msgpack.core.MessagePacker, value: Any?) {
+    private fun packValue(
+        packer: org.msgpack.core.MessagePacker,
+        value: Any?,
+    ) {
         when (value) {
             null -> packer.packNil()
             is Boolean -> packer.packBoolean(value)
@@ -403,11 +485,17 @@ class InterfaceDiscovery(
     private fun unpackValue(unpacker: org.msgpack.core.MessageUnpacker): Any? {
         val format = unpacker.nextFormat
         return when (format.valueType) {
-            org.msgpack.value.ValueType.NIL -> { unpacker.unpackNil(); null }
+            org.msgpack.value.ValueType.NIL -> {
+                unpacker.unpackNil()
+                null
+            }
             org.msgpack.value.ValueType.BOOLEAN -> unpacker.unpackBoolean()
             org.msgpack.value.ValueType.INTEGER -> {
-                try { unpacker.unpackInt() }
-                catch (_: Exception) { unpacker.unpackLong() }
+                try {
+                    unpacker.unpackInt()
+                } catch (_: Exception) {
+                    unpacker.unpackLong()
+                }
             }
             org.msgpack.value.ValueType.FLOAT -> unpacker.unpackDouble()
             org.msgpack.value.ValueType.STRING -> unpacker.unpackString()
@@ -415,7 +503,10 @@ class InterfaceDiscovery(
                 val len = unpacker.unpackBinaryHeader()
                 unpacker.readPayload(len)
             }
-            else -> { unpacker.skipValue(); null }
+            else -> {
+                unpacker.skipValue()
+                null
+            }
         }
     }
 
@@ -423,8 +514,11 @@ class InterfaceDiscovery(
         val len = hex.length
         val data = ByteArray(len / 2)
         for (i in 0 until len step 2) {
-            data[i / 2] = ((Character.digit(hex[i], 16) shl 4)
-                + Character.digit(hex[i + 1], 16)).toByte()
+            data[i / 2] =
+                (
+                    (Character.digit(hex[i], 16) shl 4) +
+                        Character.digit(hex[i + 1], 16)
+                ).toByte()
         }
         return data
     }

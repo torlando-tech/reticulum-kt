@@ -164,6 +164,15 @@ class AndroidBLEDriver(
         _isRunning = true
     }
 
+    override suspend fun setScanLowPower(lowPower: Boolean) {
+        val mode = if (lowPower) BleScanner.ScanMode.LOW_POWER else BleScanner.ScanMode.BALANCED
+        Log.d(TAG, "Switching BLE scan mode to $mode")
+        if (scanner.isScanning.value) {
+            scanner.stopScanning()
+            scanner.startScanning(mode)
+        }
+    }
+
     override suspend fun stopScanning() {
         scanner.stopScanning()
     }

@@ -45,6 +45,8 @@ class RNodeInterface(
     private val codingRate: Int,
     private val flowControl: Boolean = true,
     private val parentScope: CoroutineScope? = null,
+    /** Optional 512-byte framebuffer image to display on the RNode screen after init. */
+    val displayImageData: ByteArray? = null,
 ) : Interface(name) {
 
     companion object {
@@ -56,6 +58,7 @@ class RNodeInterface(
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
+        private const val FB_BYTES_PER_LINE = 8
 
         // Signal quality computation constants (matching Python RNodeInterface)
         private const val Q_SNR_MIN_BASE = -9f
@@ -200,9 +203,52 @@ class RNodeInterface(
             delay(300)
             online.set(true)
             log("RNode is configured and online")
+
+            if (displayImageData != null) {
+                try {
+                    displayImage(displayImageData!!)
+                    enableExternalFramebuffer()
+                    log("Displayed logo on RNode screen")
+                } catch (e: Exception) {
+                    log("Could not display logo: ${e.message}")
+                }
+            }
         } else {
             throw IOException("Radio parameter validation failed — device reported different values than configured")
         }
+    }
+
+    // -- Framebuffer / display helpers (matching Python RNodeInterface) --
+
+    /** Enable external framebuffer control on the RNode display. */
+    private fun enableExternalFramebuffer() {
+        val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_EXT, 0x01, KISS.FEND)
+        outputStream.write(cmd)
+        outputStream.flush()
+    }
+
+    /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display,
+     *  one line at a time. BLE pacing is handled by the OutputStream's
+     *  latch-per-write synchronization — no artificial delay needed. */
+    private fun displayImage(imageData: ByteArray) {
+        require(imageData.size == FB_BYTES_PER_LINE * 64) {
+            "displayImage expects ${FB_BYTES_PER_LINE * 64} bytes (64x64 monochrome), got ${imageData.size}"
+        }
+        val lines = imageData.size / FB_BYTES_PER_LINE
+        for (line in 0 until lines) {
+            val lineStart = line * FB_BYTES_PER_LINE
+            val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
+            writeFramebuffer(line, lineData)
+        }
+    }
+
+    /** Write a single line to the RNode framebuffer. */
+    private fun writeFramebuffer(line: Int, lineData: ByteArray) {
+        val data = byteArrayOf(line.toByte()) + lineData
+        val escaped = KISS.escape(data)
+        val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
+        outputStream.write(cmd)
+        outputStream.flush()
     }
 
     // -- KISS command helpers (matching Python's detect/setFrequency/etc.) --

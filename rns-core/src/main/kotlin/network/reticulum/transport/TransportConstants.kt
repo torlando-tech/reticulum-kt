@@ -168,4 +168,7 @@ object TransportConstants {
 
     /** Maximum number of tunnels to maintain. */
     const val MAX_TUNNELS = 10000
+
+    /** Grace period after startup before interface-based path culling (30 seconds). */
+    const val STARTUP_GRACE_PERIOD = 30_000L
 }

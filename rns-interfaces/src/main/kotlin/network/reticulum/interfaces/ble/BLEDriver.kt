@@ -50,6 +50,12 @@ interface BLEDriver {
     suspend fun stopScanning()
 
     /**
+     * Switch BLE scan mode for battery optimization.
+     * @param lowPower true for LOW_POWER mode (Doze/background), false for BALANCED (normal)
+     */
+    suspend fun setScanLowPower(lowPower: Boolean) {}
+
+    /**
      * Initiate an outgoing connection to a peer at the given BLE address.
      * Returns a [BLEPeerConnection] representing the GATT client connection.
      *
