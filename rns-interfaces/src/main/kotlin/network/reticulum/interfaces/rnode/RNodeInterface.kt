@@ -44,6 +44,7 @@ class RNodeInterface(
     private val spreadingFactor: Int,
     private val codingRate: Int,
     private val flowControl: Boolean = true,
+    private val activityKeepaliveMs: Long? = null,
     private val parentScope: CoroutineScope? = null,
     /** Optional 512-byte framebuffer image to display on the RNode screen after init. */
     val displayImageData: ByteArray? = null,
@@ -58,6 +59,7 @@ class RNodeInterface(
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
+        private const val CONFIG_DELAY_MS = 150L
         private const val FB_BYTES_PER_LINE = 8
 
         // Signal quality computation constants (matching Python RNodeInterface)
@@ -141,6 +143,7 @@ class RNodeInterface(
 
     // Flow control
     @Volatile private var interfaceReady: Boolean = false
+    @Volatile private var lastWriteMs: Long = System.currentTimeMillis()
     private val packetQueue = CopyOnWriteArrayList<ByteArray>()
     private val txLock = Any()
 
@@ -267,13 +270,19 @@ class RNodeInterface(
         writeRaw(cmd)
     }
 
-    private fun initRadio() {
+    private suspend fun initRadio() {
         sendFrequency()
+        delay(CONFIG_DELAY_MS)
         sendBandwidth()
+        delay(CONFIG_DELAY_MS)
         sendTxPower()
+        delay(CONFIG_DELAY_MS)
         sendSpreadingFactor()
+        delay(CONFIG_DELAY_MS)
         sendCodingRate()
+        delay(CONFIG_DELAY_MS)
         sendRadioState(KISS.RADIO_STATE_ON)
+        delay(CONFIG_DELAY_MS)
     }
 
     private fun sendFrequency() {
@@ -324,6 +333,7 @@ class RNodeInterface(
         try {
             outputStream.write(data)
             outputStream.flush()
+            lastWriteMs = System.currentTimeMillis()
         } catch (e: IOException) {
             log("Write error: ${e.message}")
             throw e
@@ -347,6 +357,14 @@ class RNodeInterface(
         }
         if (rSf != null && spreadingFactor != rSf) {
             log("Spreading factor mismatch: configured=$spreadingFactor, reported=$rSf")
+            valid = false
+        }
+        if (rCr != null && codingRate != rCr) {
+            log("Coding rate mismatch: configured=$codingRate, reported=$rCr")
+            valid = false
+        }
+        if (rState != null && rState != (KISS.RADIO_STATE_ON.toInt() and 0xFF)) {
+            log("Radio state not ON: reported=$rState")
             valid = false
         }
 
@@ -404,9 +422,24 @@ class RNodeInterface(
 
         try {
             while (ioScope.isActive && !detached.get()) {
-                val bytesRead = withContext(Dispatchers.IO) {
-                    inputStream.read(buf)
-                }
+                val bytesRead =
+                    try {
+                        withContext(Dispatchers.IO) {
+                            inputStream.read(buf)
+                        }
+                    } catch (_: java.net.SocketTimeoutException) {
+                        val timeSinceLast = System.currentTimeMillis() - lastReadMs
+                        if (dataBuffer.size() > 0 && timeSinceLast > READ_TIMEOUT_MS) {
+                            log("Read timeout in command ${command.toInt() and 0xFF}")
+                            dataBuffer.reset()
+                            commandBuffer.reset()
+                            inFrame = false
+                            command = KISS.CMD_UNKNOWN
+                            escape = false
+                        }
+                        handleIdleMaintenance()
+                        continue
+                    }
 
                 if (bytesRead <= 0) {
                     // Check for idle timeout
@@ -419,7 +452,11 @@ class RNodeInterface(
                         command = KISS.CMD_UNKNOWN
                         escape = false
                     }
-                    if (bytesRead == -1) break
+                    if (bytesRead == -1) {
+                        log("Read loop reached EOF - remote closed connection")
+                        break
+                    }
+                    handleIdleMaintenance()
                     delay(10)
                     continue
                 }
@@ -681,6 +718,9 @@ class RNodeInterface(
             }
         }
 
+        if (online.get()) {
+            log("Read loop exiting - marking interface offline")
+        }
         online.set(false)
     }
 
@@ -733,6 +773,7 @@ class RNodeInterface(
         try {
             outputStream.write(frame)
             outputStream.flush()
+            lastWriteMs = System.currentTimeMillis()
             txBytes.addAndGet(data.size.toLong())
         } catch (e: IOException) {
             log("TX error: ${e.message}")
@@ -747,6 +788,16 @@ class RNodeInterface(
             processOutgoing(data)
         } else {
             interfaceReady = true
+        }
+    }
+
+    private fun handleIdleMaintenance() {
+        val keepaliveAfterMs = activityKeepaliveMs
+        if (keepaliveAfterMs != null && online.get()) {
+            val timeSinceLastWrite = System.currentTimeMillis() - lastWriteMs
+            if (timeSinceLastWrite >= keepaliveAfterMs) {
+                detect()
+            }
         }
     }
 
