@@ -56,7 +56,7 @@ class AutoInterface(
     // OTHER devices discover US within a reasonable time.
     @Volatile private var currentAnnounceIntervalMs = AutoInterfaceConstants.ANNOUNCE_INTERVAL_MS
     @Volatile private var lastPeerChangeTime = System.currentTimeMillis()
-    @Volatile private var announceImmediately = false
+    private val announceImmediately = AtomicBoolean(false)
     private val minAnnounceIntervalMs = AutoInterfaceConstants.ANNOUNCE_INTERVAL_MS  // 1.6s
     private val maxAnnounceIntervalMs = 120_000L  // 2 minutes
     private val rampUpDurationMs = 60_000L  // reach max interval 60s after last peer change
@@ -502,10 +502,10 @@ class AutoInterface(
             var lastAnnouncedAt = 0L
             while (running.get()) {
                 val now = System.currentTimeMillis()
-                val shouldSend = announceImmediately || (now - lastAnnouncedAt >= currentAnnounceIntervalMs)
+                val shouldSend = announceImmediately.compareAndSet(true, false) ||
+                    (now - lastAnnouncedAt >= currentAnnounceIntervalMs)
 
                 if (shouldSend) {
-                    announceImmediately = false
                     sendDiscoveryAnnouncements()
                     lastAnnouncedAt = System.currentTimeMillis()
                     updateAnnounceInterval()
@@ -542,7 +542,7 @@ class AutoInterface(
     fun resetAnnounceInterval() {
         lastPeerChangeTime = System.currentTimeMillis()
         currentAnnounceIntervalMs = minAnnounceIntervalMs
-        announceImmediately = true  // Send ASAP so the new peer discovers us
+        announceImmediately.set(true)  // Send ASAP so the new peer discovers us
         log("Announce interval reset to fast mode (${minAnnounceIntervalMs}ms)")
     }
 
