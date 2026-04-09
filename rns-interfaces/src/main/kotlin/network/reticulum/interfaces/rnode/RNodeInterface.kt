@@ -204,15 +204,9 @@ class RNodeInterface(
             online.set(true)
             log("RNode is configured and online")
 
-            // Display logo on RNode screen if configured.
-            // Matches columba's Python rnode_interface.py:_display_logo():
-            //   1. display_image() — 64 lines, 15ms delay per line
-            //   2. time.sleep(0.05)
-            //   3. enable_external_framebuffer()
             if (displayImageData != null) {
                 try {
                     displayImage(displayImageData!!)
-                    delay(50)  // Match Python's time.sleep(0.05)
                     enableExternalFramebuffer()
                     log("Displayed logo on RNode screen")
                 } catch (e: Exception) {
@@ -233,16 +227,15 @@ class RNodeInterface(
         outputStream.flush()
     }
 
-    /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display.
-     *  Matches columba Python rnode_interface.py:display_image() exactly:
-     *  each line written individually with 15ms delay for BLE pacing. */
-    private suspend fun displayImage(imageData: ByteArray) {
+    /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display,
+     *  one line at a time. BLE pacing is handled by the OutputStream's
+     *  latch-per-write synchronization — no artificial delay needed. */
+    private fun displayImage(imageData: ByteArray) {
         val lines = imageData.size / FB_BYTES_PER_LINE
         for (line in 0 until lines) {
             val lineStart = line * FB_BYTES_PER_LINE
             val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
             writeFramebuffer(line, lineData)
-            delay(15) // Match Python's time.sleep(0.015) for BLE write pacing
         }
     }
 
