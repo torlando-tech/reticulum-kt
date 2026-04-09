@@ -3228,6 +3228,7 @@ object Transport {
         interfaceName: String?,
     ) {
         var resolvedAspect: String? = null // cached for multiple null-filter handlers
+        var aspectResolved = false
         for (registered in announceHandlers) {
             try {
                 val handler = registered.handler
@@ -3246,7 +3247,12 @@ object Transport {
                     // No filter — resolve aspect for RichAnnounceHandler callers
                     matchedAspect =
                         if (handler is RichAnnounceHandler) {
-                            resolvedAspect ?: resolveAspect(destHash, identity).also { resolvedAspect = it }
+                            if (!aspectResolved) {
+                                aspectResolved = true
+                                resolveAspect(destHash, identity).also { resolvedAspect = it }
+                            } else {
+                                resolvedAspect
+                            }
                         } else {
                             null
                         }
