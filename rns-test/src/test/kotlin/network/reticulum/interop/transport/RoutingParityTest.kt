@@ -20,6 +20,7 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -141,8 +142,19 @@ class RoutingParityTest {
         Reticulum.stop()
 
         println("  [Teardown] Destroying Python process...")
-        pythonProcess?.destroyForcibly()
-        pythonProcess?.waitFor()
+        pythonProcess?.let { process ->
+            process.destroy()
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(5, TimeUnit.SECONDS)
+            }
+        }
+
+        try {
+            stderrReader?.close()
+        } catch (_: Exception) {
+            // Ignore cleanup errors
+        }
 
         println("  [Teardown] Cleaning up temp dir...")
         configDir?.deleteRecursively()

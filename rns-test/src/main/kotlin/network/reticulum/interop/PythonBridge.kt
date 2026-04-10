@@ -12,6 +12,7 @@ import kotlinx.serialization.encodeToString
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -186,10 +187,23 @@ class PythonBridge private constructor(
     override fun close() {
         try {
             writer.close()
+        } catch (_: Exception) {
+            // Ignore cleanup errors
+        }
+
+        try {
             reader.close()
+        } catch (_: Exception) {
+            // Ignore cleanup errors
+        }
+
+        try {
             process.destroy()
-            process.waitFor()
-        } catch (e: Exception) {
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(5, TimeUnit.SECONDS)
+            }
+        } catch (_: Exception) {
             // Ignore cleanup errors
         }
     }
