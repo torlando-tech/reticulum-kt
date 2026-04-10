@@ -44,6 +44,9 @@ class RNodeInterface(
     private val spreadingFactor: Int,
     private val codingRate: Int,
     private val flowControl: Boolean = true,
+    private val activityKeepaliveMs: Long? = null,
+    private val framebufferLineDelayMs: Long = 0L,
+    private val framebufferEnableDelayMs: Long = 0L,
     private val parentScope: CoroutineScope? = null,
     /** Optional 512-byte framebuffer image to display on the RNode screen after init. */
     val displayImageData: ByteArray? = null,
@@ -58,6 +61,7 @@ class RNodeInterface(
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
+        private const val CONFIG_DELAY_MS = 150L
         private const val FB_BYTES_PER_LINE = 8
 
         // Signal quality computation constants (matching Python RNodeInterface)
@@ -141,6 +145,7 @@ class RNodeInterface(
 
     // Flow control
     @Volatile private var interfaceReady: Boolean = false
+    @Volatile private var lastWriteMs: Long = System.currentTimeMillis()
     private val packetQueue = CopyOnWriteArrayList<ByteArray>()
     private val txLock = Any()
 
@@ -207,6 +212,9 @@ class RNodeInterface(
             if (displayImageData != null) {
                 try {
                     displayImage(displayImageData!!)
+                    if (framebufferEnableDelayMs > 0) {
+                        delay(framebufferEnableDelayMs)
+                    }
                     enableExternalFramebuffer()
                     log("Displayed logo on RNode screen")
                 } catch (e: Exception) {
@@ -223,14 +231,13 @@ class RNodeInterface(
     /** Enable external framebuffer control on the RNode display. */
     private fun enableExternalFramebuffer() {
         val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_EXT, 0x01, KISS.FEND)
-        outputStream.write(cmd)
-        outputStream.flush()
+        writeRaw(cmd)
     }
 
     /** Write a 64x64 monochrome bitmap (512 bytes) to the RNode display,
-     *  one line at a time. BLE pacing is handled by the OutputStream's
-     *  latch-per-write synchronization — no artificial delay needed. */
-    private fun displayImage(imageData: ByteArray) {
+     *  one line at a time. Optional pacing can be applied to match Python's
+     *  framebuffer write timing for transports that need it. */
+    private suspend fun displayImage(imageData: ByteArray) {
         require(imageData.size == FB_BYTES_PER_LINE * 64) {
             "displayImage expects ${FB_BYTES_PER_LINE * 64} bytes (64x64 monochrome), got ${imageData.size}"
         }
@@ -239,6 +246,9 @@ class RNodeInterface(
             val lineStart = line * FB_BYTES_PER_LINE
             val lineData = imageData.copyOfRange(lineStart, lineStart + FB_BYTES_PER_LINE)
             writeFramebuffer(line, lineData)
+            if (framebufferLineDelayMs > 0) {
+                delay(framebufferLineDelayMs)
+            }
         }
     }
 
@@ -247,8 +257,7 @@ class RNodeInterface(
         val data = byteArrayOf(line.toByte()) + lineData
         val escaped = KISS.escape(data)
         val cmd = byteArrayOf(KISS.FEND, KISS.CMD_FB_WRITE) + escaped + byteArrayOf(KISS.FEND)
-        outputStream.write(cmd)
-        outputStream.flush()
+        writeRaw(cmd)
     }
 
     // -- KISS command helpers (matching Python's detect/setFrequency/etc.) --
@@ -267,13 +276,19 @@ class RNodeInterface(
         writeRaw(cmd)
     }
 
-    private fun initRadio() {
+    private suspend fun initRadio() {
         sendFrequency()
+        delay(CONFIG_DELAY_MS)
         sendBandwidth()
+        delay(CONFIG_DELAY_MS)
         sendTxPower()
+        delay(CONFIG_DELAY_MS)
         sendSpreadingFactor()
+        delay(CONFIG_DELAY_MS)
         sendCodingRate()
+        delay(CONFIG_DELAY_MS)
         sendRadioState(KISS.RADIO_STATE_ON)
+        delay(CONFIG_DELAY_MS)
     }
 
     private fun sendFrequency() {
@@ -324,6 +339,7 @@ class RNodeInterface(
         try {
             outputStream.write(data)
             outputStream.flush()
+            lastWriteMs = System.currentTimeMillis()
         } catch (e: IOException) {
             log("Write error: ${e.message}")
             throw e
@@ -347,6 +363,14 @@ class RNodeInterface(
         }
         if (rSf != null && spreadingFactor != rSf) {
             log("Spreading factor mismatch: configured=$spreadingFactor, reported=$rSf")
+            valid = false
+        }
+        if (rCr != null && codingRate != rCr) {
+            log("Coding rate mismatch: configured=$codingRate, reported=$rCr")
+            valid = false
+        }
+        if (rState != null && rState != (KISS.RADIO_STATE_ON.toInt() and 0xFF)) {
+            log("Radio state not ON: reported=$rState")
             valid = false
         }
 
@@ -404,9 +428,24 @@ class RNodeInterface(
 
         try {
             while (ioScope.isActive && !detached.get()) {
-                val bytesRead = withContext(Dispatchers.IO) {
-                    inputStream.read(buf)
-                }
+                val bytesRead =
+                    try {
+                        withContext(Dispatchers.IO) {
+                            inputStream.read(buf)
+                        }
+                    } catch (_: java.net.SocketTimeoutException) {
+                        val timeSinceLast = System.currentTimeMillis() - lastReadMs
+                        if (dataBuffer.size() > 0 && timeSinceLast > READ_TIMEOUT_MS) {
+                            log("Read timeout in command ${command.toInt() and 0xFF}")
+                            dataBuffer.reset()
+                            commandBuffer.reset()
+                            inFrame = false
+                            command = KISS.CMD_UNKNOWN
+                            escape = false
+                        }
+                        handleIdleMaintenance()
+                        continue
+                    }
 
                 if (bytesRead <= 0) {
                     // Check for idle timeout
@@ -419,7 +458,11 @@ class RNodeInterface(
                         command = KISS.CMD_UNKNOWN
                         escape = false
                     }
-                    if (bytesRead == -1) break
+                    if (bytesRead == -1) {
+                        log("Read loop reached EOF - remote closed connection")
+                        break
+                    }
+                    handleIdleMaintenance()
                     delay(10)
                     continue
                 }
@@ -646,8 +689,9 @@ class RNodeInterface(
                         }
                     } else if (command == KISS.CMD_RESET) {
                         if (byte == 0xF8) {
-                            if (online.get()) {
-                                log("Device reset detected while online")
+                            if ((platform == (KISS.PLATFORM_ESP32.toInt() and 0xFF)) && online.get()) {
+                                log("Device reset detected while online, reinitialising device")
+                                throw IOException("ESP32 reset")
                             }
                         }
                     } else if (command == KISS.CMD_READY) {
@@ -681,6 +725,9 @@ class RNodeInterface(
             }
         }
 
+        if (online.get()) {
+            log("Read loop exiting - marking interface offline")
+        }
         online.set(false)
     }
 
@@ -733,6 +780,7 @@ class RNodeInterface(
         try {
             outputStream.write(frame)
             outputStream.flush()
+            lastWriteMs = System.currentTimeMillis()
             txBytes.addAndGet(data.size.toLong())
         } catch (e: IOException) {
             log("TX error: ${e.message}")
@@ -747,6 +795,16 @@ class RNodeInterface(
             processOutgoing(data)
         } else {
             interfaceReady = true
+        }
+    }
+
+    private fun handleIdleMaintenance() {
+        val keepaliveAfterMs = activityKeepaliveMs
+        if (keepaliveAfterMs != null && online.get()) {
+            val timeSinceLastWrite = System.currentTimeMillis() - lastWriteMs
+            if (timeSinceLastWrite >= keepaliveAfterMs) {
+                detect()
+            }
         }
     }
 

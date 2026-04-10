@@ -1224,6 +1224,12 @@ class Resource private constructor(
         get() = assembledData
 
     /**
+     * Get extracted metadata bytes, if present.
+     */
+    val metadataBytes: ByteArray?
+        get() = metadata
+
+    /**
      * Get transfer progress (0.0 to 1.0).
      */
     val progress: Float
