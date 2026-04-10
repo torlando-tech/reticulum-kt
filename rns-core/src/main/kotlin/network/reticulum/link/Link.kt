@@ -2727,18 +2727,36 @@ class Link private constructor(
             return
         }
 
-        // Get the resource data
-        val packedResponse = resource.data
-        if (packedResponse == null) {
+        val responseData = resource.data
+        if (responseData == null) {
             log("Response resource has no data")
             return
         }
 
         try {
+            // Python special-case: file responses are sent as raw resource data with metadata,
+            // not as msgpack [request_id, response_data].
+            if (resource.hasMetadata) {
+                val requestId = resource.requestId
+                if (requestId == null) {
+                    log("Response resource has metadata but no request ID")
+                    return
+                }
+
+                handleResponse(
+                    requestId,
+                    responseData,
+                    resource.totalSize,
+                    resource.size,
+                    metadata = resource.metadataBytes,
+                )
+                return
+            }
+
             // Unpack response: [request_id, response_data]
             val unpacker =
                 org.msgpack.core.MessagePack
-                    .newDefaultUnpacker(packedResponse)
+                    .newDefaultUnpacker(responseData)
             val arraySize = unpacker.unpackArrayHeader()
             if (arraySize != 2) {
                 log("Invalid response format: expected 2 elements, got $arraySize")
@@ -2753,7 +2771,7 @@ class Link private constructor(
             val responseValue = unpacker.unpackValue()
             unpacker.close()
 
-            val responseData: ByteArray? =
+            val unpackedResponseData: ByteArray? =
                 when {
                     responseValue.isNilValue -> null
                     responseValue.isBinaryValue -> responseValue.asBinaryValue().asByteArray()
@@ -2770,7 +2788,7 @@ class Link private constructor(
                 }
 
             // Pass to handleResponse
-            handleResponse(requestId, responseData, packedResponse.size, resource.totalSize)
+            handleResponse(requestId, unpackedResponseData, responseData.size, resource.totalSize)
         } catch (e: Exception) {
             log("Error processing response resource: ${e.message}")
         }
