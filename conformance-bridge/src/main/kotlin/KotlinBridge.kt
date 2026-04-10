@@ -846,7 +846,8 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                 "public_key" to hexVal(publicKey),
                 "name_hash" to hexVal(nameHash),
                 "random_hash" to hexVal(randomHash),
-                "signature" to hexVal(signature)
+                "signature" to hexVal(signature),
+                "has_ratchet" to boolVal(hasRatchet)
             )
             ratchet?.let { r.add("ratchet", hexVal(it)) }
             if (appData != null && appData.isNotEmpty()) r.add("app_data", hexVal(appData))
@@ -859,12 +860,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             val publicKey = p.hex("public_key")
             val nameHash = p.hex("name_hash")
             val randomHash = p.hex("random_hash")
+            val ratchet = p.hexOpt("ratchet")
             val appData = p.hexOpt("app_data")
             val signedData = ByteArrayOutputStream()
             signedData.write(destHash)
             signedData.write(publicKey)
             signedData.write(nameHash)
             signedData.write(randomHash)
+            ratchet?.let { signedData.write(it) }
             appData?.let { signedData.write(it) }
             val message = signedData.toByteArray()
             val sigPriv = privBytes.copyOfRange(32, 64)

@@ -386,8 +386,12 @@ class LocalServerInterface : Interface {
 
     /**
      * Get list of connected client interfaces.
+     *
+     * Avoid Kotlin's List.toList() on CopyOnWriteArrayList here. Under concurrent
+     * disconnects it can observe size=1 and then race with a removal before get(0),
+     * producing ArrayIndexOutOfBoundsException during teardown.
      */
-    fun getClients(): List<Interface> = clients.toList()
+    fun getClients(): List<Interface> = ArrayList(clients)
 
     override fun detach() {
         super.detach()
@@ -396,8 +400,10 @@ class LocalServerInterface : Interface {
         acceptJob?.cancel()
         ioScope.cancel()
 
-        // Disconnect all clients
-        for (client in clients.toList()) {
+        // Disconnect all clients using a Java snapshot copy. Kotlin's toList()
+        // has a fast path for size==1 that can race with concurrent removals on
+        // CopyOnWriteArrayList during shutdown.
+        for (client in ArrayList(clients)) {
             try {
                 Transport.deregisterInterface(client.toRef())
             } catch (e: Exception) {
