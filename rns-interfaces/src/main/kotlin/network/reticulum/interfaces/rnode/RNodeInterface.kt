@@ -689,8 +689,9 @@ class RNodeInterface(
                         }
                     } else if (command == KISS.CMD_RESET) {
                         if (byte == 0xF8) {
-                            if (online.get()) {
-                                log("Device reset detected while online")
+                            if ((platform == (KISS.PLATFORM_ESP32.toInt() and 0xFF)) && online.get()) {
+                                log("Device reset detected while online, reinitialising device")
+                                throw IOException("ESP32 reset")
                             }
                         }
                     } else if (command == KISS.CMD_READY) {
