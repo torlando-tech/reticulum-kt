@@ -855,6 +855,12 @@ class Link private constructor(
                     mtu = link.mtu,
                 )
 
+            // Associate the packet with this Link so the receipt can
+            // validate proofs using the Link's signing keys.
+            // Without this, the receipt falls through to destination-based
+            // validation which doesn't match Link proofs.
+            packet.link = link
+
             // Use packet.send() so a PacketReceipt is created, enabling
             // delivery confirmation and timeout callbacks for Channel retry logic
             val receipt = packet.send()
