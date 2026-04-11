@@ -9,7 +9,8 @@ import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.transport.Transport
 import network.reticulum.transport.TransportConstants
-import kotlin.concurrent.thread
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * Callbacks for packet receipt events.
@@ -43,6 +44,10 @@ class PacketReceipt internal constructor(
         // Proof lengths
         val EXPL_LENGTH = RnsConstants.FULL_HASH_BYTES + RnsConstants.SIGNATURE_SIZE
         val IMPL_LENGTH = RnsConstants.SIGNATURE_SIZE
+
+        private val callbackExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "PacketReceipt-callbacks").apply { isDaemon = true }
+        }
     }
 
     /** The full hash of the packet. */
@@ -156,15 +161,8 @@ class PacketReceipt internal constructor(
 
             concludedAt = System.currentTimeMillis()
 
-            // Fire timeout callback in separate thread
             callbacks.timeout?.let { callback ->
-                thread(isDaemon = true) {
-                    try {
-                        callback(this)
-                    } catch (e: Exception) {
-                        // Log error but don't propagate
-                    }
-                }
+                submitCallback("timeout", callback)
             }
             return true
         }
@@ -206,15 +204,22 @@ class PacketReceipt internal constructor(
         this.link = link
     }
 
+    private fun submitCallback(
+        callbackType: String,
+        callback: (PacketReceipt) -> Unit,
+    ) {
+        callbackExecutor.execute {
+            try {
+                callback(this)
+            } catch (e: Exception) {
+                System.err.println("[PacketReceipt] Error in $callbackType callback for ${hash.toHexString()}: ${e.message}")
+            }
+        }
+    }
+
     private fun fireDeliveryCallbackAsync() {
         callbacks.delivery?.let { callback ->
-            thread(isDaemon = true) {
-                try {
-                    callback(this)
-                } catch (_: Exception) {
-                    // Log error but don't propagate
-                }
-            }
+            submitCallback("delivery", callback)
         }
     }
 
