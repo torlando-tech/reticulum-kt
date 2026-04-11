@@ -206,6 +206,18 @@ class PacketReceipt internal constructor(
         this.link = link
     }
 
+    private fun fireDeliveryCallbackAsync() {
+        callbacks.delivery?.let { callback ->
+            thread(isDaemon = true) {
+                try {
+                    callback(this)
+                } catch (_: Exception) {
+                    // Log error but don't propagate
+                }
+            }
+        }
+    }
+
     /**
      * Validate a proof packet.
      *
@@ -253,15 +265,7 @@ class PacketReceipt internal constructor(
                 proved = true
                 concludedAt = System.currentTimeMillis()
                 this.proofPacket = proofPacket
-
-                // Fire delivery callback
-                callbacks.delivery?.let { callback ->
-                    try {
-                        callback(this)
-                    } catch (e: Exception) {
-                        // Log error but don't propagate
-                    }
-                }
+                fireDeliveryCallbackAsync()
             }
 
             return proofValid
@@ -303,15 +307,7 @@ class PacketReceipt internal constructor(
                     proved = true
                     concludedAt = System.currentTimeMillis()
                     this.proofPacket = proofPacket
-
-                    // Fire delivery callback
-                    callbacks.delivery?.let { callback ->
-                        try {
-                            callback(this)
-                        } catch (e: Exception) {
-                            // Log error but don't propagate
-                        }
-                    }
+                    fireDeliveryCallbackAsync()
                 }
 
                 return proofValid
@@ -329,15 +325,7 @@ class PacketReceipt internal constructor(
                     proved = true
                     concludedAt = System.currentTimeMillis()
                     this.proofPacket = proofPacket
-
-                    // Fire delivery callback
-                    callbacks.delivery?.let { callback ->
-                        try {
-                            callback(this)
-                        } catch (e: Exception) {
-                            // Log error but don't propagate
-                        }
-                    }
+                    fireDeliveryCallbackAsync()
                 }
 
                 return proofValid
