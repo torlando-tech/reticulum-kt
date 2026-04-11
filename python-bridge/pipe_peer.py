@@ -11,10 +11,11 @@ Protocol:
 
 The script accepts commands via environment variables:
   PIPE_PEER_ACTION: What to do after startup
-    "announce"     - Create a destination and announce it
-    "listen"       - Just listen and report what arrives
-    "link_listen"  - Create a destination, announce it, and accept incoming links
-    "transport"    - Enable transport mode and forward
+    "announce"      - Create a destination and announce it
+    "listen"        - Just listen and report what arrives
+    "link_listen"   - Create a destination, announce it, and accept incoming links
+    "channel_serve" - Accept a link and send a proof-dependent channel sequence
+    "transport"     - Enable transport mode and forward
 
   PIPE_PEER_APP_NAME: App name for destination (default: "pipetest")
   PIPE_PEER_ASPECTS: Comma-separated aspects (default: "routing")
@@ -54,6 +55,30 @@ def emit(msg):
 
 def bytes_to_hex(b):
     return b.hex() if b else ""
+
+
+_BridgeMessageClass = None
+
+
+def _get_bridge_message_class():
+    """Create a simple channel message type for interoperability tests."""
+    import RNS
+    global _BridgeMessageClass
+    if _BridgeMessageClass is None:
+        class BridgeMessage(RNS.Channel.MessageBase):
+            MSGTYPE = 0x0101
+
+            def __init__(self, data=b""):
+                self.data = data
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = raw
+
+        _BridgeMessageClass = BridgeMessage
+    return _BridgeMessageClass
 
 
 def main():
@@ -200,6 +225,25 @@ def main():
             *aspects
         )
         destination.set_link_established_callback(_link_serve_established)
+        destination.announce()
+        emit({
+            "type": "announced",
+            "destination_hash": bytes_to_hex(destination.hash),
+            "identity_hash": bytes_to_hex(identity.hash),
+            "identity_public_key": bytes_to_hex(identity.get_public_key()),
+        })
+        _path_table_dumper(RNS)
+
+    elif action == "channel_serve":
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects
+        )
+        destination.set_link_established_callback(_channel_serve_established)
         destination.announce()
         emit({
             "type": "announced",
@@ -459,6 +503,67 @@ def _link_serve_established(link):
             emit({"type": "error", "message": f"Welcome send failed: {e}"})
 
     threading.Thread(target=send_welcome, daemon=True).start()
+
+
+def _setup_channel_peer(link, send_sequence=False):
+    """Register a simple channel type and optionally send a proof-gated sequence."""
+    BridgeMessage = _get_bridge_message_class()
+    channel = link.get_channel()
+    channel.register_message_type(BridgeMessage)
+
+    def on_channel_message(message):
+        if isinstance(message, BridgeMessage):
+            data = bytes(message.data)
+            emit({
+                "type": "channel_data",
+                "link_id": bytes_to_hex(link.link_id),
+                "data_hex": data.hex(),
+                "data_utf8": data.decode("utf-8", errors="replace"),
+            })
+            return True
+        return False
+
+    channel.add_message_handler(on_channel_message)
+
+    if not send_sequence:
+        return
+
+    def send_messages():
+        time.sleep(1.0)
+        for payload in (b"channel-one", b"channel-two", b"channel-three"):
+            deadline = time.time() + 5.0
+            while time.time() < deadline and link.status == link.ACTIVE and not channel.is_ready_to_send():
+                time.sleep(0.05)
+
+            if link.status != link.ACTIVE:
+                emit({"type": "error", "message": "Link became inactive before channel send"})
+                return
+
+            if not channel.is_ready_to_send():
+                emit({"type": "error", "message": "Channel never became ready for next send"})
+                return
+
+            try:
+                channel.send(BridgeMessage(payload))
+                emit({"type": "channel_sent", "link_id": bytes_to_hex(link.link_id), "data_hex": payload.hex()})
+            except Exception as e:
+                emit({"type": "error", "message": f"Channel send failed: {e}"})
+                return
+
+    threading.Thread(target=send_messages, daemon=True).start()
+
+
+def _channel_serve_established(link):
+    """Called when a link is established in channel_serve mode."""
+    link_id = link.link_id.hex() if link.link_id else ""
+    dest_hash = link.destination.hash.hex() if link.destination else ""
+    emit({
+        "type": "link_established",
+        "link_id": link_id,
+        "destination_hash": dest_hash,
+    })
+    link.set_link_closed_callback(_link_closed)
+    _setup_channel_peer(link, send_sequence=True)
 
 
 def _link_closed(link):
