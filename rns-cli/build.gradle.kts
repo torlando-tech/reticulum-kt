@@ -40,6 +40,13 @@ tasks {
         exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     }
 
+    register("printPipePeerRuntimeClasspath") {
+        dependsOn("classes")
+        doLast {
+            println(sourceSets.main.get().runtimeClasspath.asPath)
+        }
+    }
+
     // Pipe peer jar for conformance testing
     register<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("pipePeerJar") {
         archiveBaseName.set("kt-pipe-peer")

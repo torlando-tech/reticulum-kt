@@ -2,6 +2,7 @@ package network.reticulum.cli
 
 import kotlinx.serialization.json.*
 import network.reticulum.Reticulum
+import network.reticulum.channel.MessageBase
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.InterfaceMode
@@ -13,6 +14,7 @@ import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import java.io.FileInputStream
@@ -27,7 +29,7 @@ import java.nio.file.Files
  *   stderr: JSON control/status messages (one per line)
  *
  * Environment variables:
- *   PIPE_PEER_ACTION:    announce | listen | link_listen | link_serve | transport
+ *   PIPE_PEER_ACTION:    announce | listen | link_listen | link_serve | channel_serve | transport
  *   PIPE_PEER_APP_NAME:  app name for destination (default: pipetest)
  *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
@@ -41,6 +43,83 @@ import java.nio.file.Files
 private fun fdPath(fd: Int): String = when {
     System.getProperty("os.name").startsWith("Mac", ignoreCase = true) -> "/dev/fd/$fd"
     else -> "/proc/self/fd/$fd"
+}
+
+private class BridgeChannelMessage : MessageBase() {
+    override val msgType: Int = 0x0101
+    var data: ByteArray = ByteArray(0)
+
+    override fun pack(): ByteArray = data
+
+    override fun unpack(raw: ByteArray) {
+        data = raw
+    }
+}
+
+private fun setupChannelPeer(link: Link, sendSequence: Boolean) {
+    val channel = link.getChannel()
+    channel.registerMessageType { BridgeChannelMessage() }
+    channel.addMessageHandler { message ->
+        if (message is BridgeChannelMessage) {
+            emit(buildJsonObject {
+                put("type", "channel_data")
+                put("link_id", link.linkId.toHexString())
+                put("data_hex", message.data.toHexString())
+                put("data_utf8", message.data.decodeToString())
+            })
+            true
+        } else {
+            false
+        }
+    }
+
+    if (!sendSequence) return
+
+    Thread {
+        Thread.sleep(1000)
+        val payloads = listOf("channel-one", "channel-two", "channel-three")
+        for (payload in payloads) {
+            val deadline = System.currentTimeMillis() + 5_000
+            while (System.currentTimeMillis() < deadline &&
+                link.status == LinkConstants.ACTIVE &&
+                !channel.isReadyToSend()
+            ) {
+                Thread.sleep(50)
+            }
+
+            if (link.status != LinkConstants.ACTIVE) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Link became inactive before channel send")
+                })
+                return@Thread
+            }
+
+            if (!channel.isReadyToSend()) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Channel never became ready for next send")
+                })
+                return@Thread
+            }
+
+            try {
+                val data = payload.toByteArray()
+                channel.send(BridgeChannelMessage().apply { this.data = data })
+                emit(buildJsonObject {
+                    put("type", "channel_sent")
+                    put("link_id", link.linkId.toHexString())
+                    put("data_hex", data.toHexString())
+                })
+            } catch (e: Exception) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Channel send failed: ${e.message}")
+                })
+                return@Thread
+            }
+        }
+    }.apply { isDaemon = true }.start()
 }
 
 fun main() {
@@ -273,6 +352,40 @@ fun main() {
                             })
                         }
                     }.apply { isDaemon = true }.start()
+                }
+                destination.announce()
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
+                pathTableDumper()
+            }
+            "channel_serve" -> {
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+                destination.setLinkEstablishedCallback { linkAny ->
+                    val link = linkAny as Link
+                    emit(buildJsonObject {
+                        put("type", "link_established")
+                        put("link_id", link.linkId.toHexString())
+                        put("destination_hash", destination.hash.toHexString())
+                    })
+                    link.setLinkClosedCallback { closedLink ->
+                        emit(buildJsonObject {
+                            put("type", "link_closed")
+                            put("link_id", closedLink.linkId.toHexString())
+                            put("destination_hash", destination.hash.toHexString())
+                        })
+                    }
+                    setupChannelPeer(link, sendSequence = true)
                 }
                 destination.announce()
                 emit(buildJsonObject {

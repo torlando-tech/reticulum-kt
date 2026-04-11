@@ -48,14 +48,30 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build conformance bridge
+      - name: Build conformance bridge and Kotlin pipe peer runtime artifacts
         working-directory: reticulum-kt
-        run: ./gradlew :conformance-bridge:shadowJar
+        run: ./gradlew :conformance-bridge:shadowJar :rns-core:jar :rns-interfaces:jar :rns-cli:classes
 
-      - name: Run conformance tests
+      - name: Resolve Kotlin pipe peer classpath
+        working-directory: reticulum-kt
+        run: |
+          echo 'KOTLIN_PIPE_PEER_CLASSPATH<<EOF' >> "$GITHUB_ENV"
+          ./gradlew -q :rns-cli:printPipePeerRuntimeClasspath | perl -pe 's/\e\][^\a]*\a//g' >> "$GITHUB_ENV"
+          echo 'EOF' >> "$GITHUB_ENV"
+
+      - name: Run bridge conformance tests
         working-directory: reticulum-conformance
         env:
           CONFORMANCE_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         run: python3 -m pytest tests/ --impl=kotlin -v --tb=short
+
+      - name: Run pipe integration conformance tests
+        working-directory: reticulum-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+        run: |
+          python3 -m pytest integration/test_channel_window_pipe.py \
+            --peer-cmd "java -cp \"$KOTLIN_PIPE_PEER_CLASSPATH\" network.reticulum.cli.PipePeerKt" \
+            -v --tb=short
