@@ -9,6 +9,8 @@ import network.reticulum.interop.getString
 import network.reticulum.interop.hexToByteArray
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.packet.Packet
+import network.reticulum.packet.PacketReceipt
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
@@ -192,6 +194,41 @@ class ChannelE2ETest : RnsLiveTestBase() {
         assertTrue(p2kData.contentEquals(kotlinReceived[0]), "P→K channel data should match")
 
         println("  [Test] Bidirectional channel exchange verified!")
+
+        link.teardown()
+    }
+
+    @Test
+    @DisplayName("Channel send receives delivery proof")
+    @Timeout(30)
+    fun `channel send receives delivery proof`() {
+        val (link, _) = establishLinkWithChannel()
+
+        python("rns_channel_clear_messages")
+        Thread.sleep(500)
+
+        val channel = link.getChannel()
+        val envelope = channel.send(TestMessage().apply { data = "proof-check".toByteArray() })
+        val packet = envelope.packet as? Packet
+        assertNotNull(packet, "Channel send should create a backing Packet")
+        assertNotNull(packet.receipt, "Channel packet should have a PacketReceipt")
+
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline) {
+            if (packet.receipt?.status == PacketReceipt.DELIVERED) break
+            if (link.status == LinkConstants.CLOSED) break
+            Thread.sleep(50)
+        }
+
+        assertEquals(
+            PacketReceipt.DELIVERED,
+            packet.receipt?.status,
+            "Channel packet receipt should validate the returned link proof"
+        )
+        assertEquals(LinkConstants.ACTIVE, link.status, "Link should remain active after proof validation")
+
+        val pyResult = python("rns_channel_get_messages")
+        assertTrue(pyResult.getInt("count") > 0, "Python should receive the channel message")
 
         link.teardown()
     }
