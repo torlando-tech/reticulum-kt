@@ -352,6 +352,18 @@ class PipeSession:
         """Wait for the target to report sending data on a link."""
         return self.wait_for_message("link_sent", timeout=timeout)
 
+    def wait_for_channel_sent(self, timeout=15):
+        """Wait for the target to report sending channel data."""
+        return self.wait_for_message("channel_sent", timeout=timeout)
+
+    def wait_for_channel_data(self, timeout=15):
+        """Wait for the target to report receiving channel data."""
+        return self.wait_for_message("channel_data", timeout=timeout)
+
+    def wait_for_error(self, timeout=15):
+        """Wait for the target to report an error."""
+        return self.wait_for_message("error", timeout=timeout)
+
     # ─── Python-side Link Data Receiving ──────────────────────────────
 
     def setup_python_link_callbacks(self, link):
