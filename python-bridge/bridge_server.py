@@ -52,8 +52,18 @@ import hashlib
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'vendor'))
 import umsgpack
 
-# Import LXMF stamper (used for stamp generation/validation)
+# Import LXMF stamper (used for stamp generation/validation). This transitively
+# imports `RNS`, which writes log output to stdout by default — the same
+# stdout the bridge uses for its JSON protocol. Any later RNS.log() call
+# (e.g. Identity.remember_ratchet hitting an AttributeError on Transport.owner
+# before a Reticulum() instance exists) will corrupt the next JSON response
+# and fail the Kotlin test's parseToJsonElement() call. Redirect RNS logs to
+# stderr (via a callback) so stdout stays clean.
 import LXMF.LXStamper as LXStamper
+import RNS as _rns_for_logsetup  # noqa: E402
+_rns_for_logsetup.loglevel = _rns_for_logsetup.LOG_CRITICAL
+_rns_for_logsetup.logdest = _rns_for_logsetup.LOG_CALLBACK
+_rns_for_logsetup.logcall = lambda msg: sys.stderr.write(msg + "\n")
 
 # Import cryptography modules directly from the Cryptography directory
 # This bypasses RNS/__init__.py which would load all interfaces
@@ -3003,6 +3013,13 @@ def _get_full_rns():
 
     # Import real RNS fresh
     import RNS
+    # Re-apply log redirect: _get_full_rns() wipes all RNS* modules from
+    # sys.modules and re-imports, which resets the module-level log config set
+    # at bridge startup. Without this, any RNS.log() after the first
+    # _get_full_rns() call goes back to stdout and corrupts the JSON protocol.
+    RNS.loglevel = RNS.LOG_CRITICAL
+    RNS.logdest = RNS.LOG_CALLBACK
+    RNS.logcall = lambda msg: sys.stderr.write(msg + "\n")
     _rns_module = RNS
     return RNS
 

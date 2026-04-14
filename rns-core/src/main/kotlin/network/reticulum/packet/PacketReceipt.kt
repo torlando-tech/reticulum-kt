@@ -9,7 +9,6 @@ import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.transport.Transport
 import network.reticulum.transport.TransportConstants
-import kotlin.concurrent.thread
 
 /**
  * Callbacks for packet receipt events.
@@ -156,15 +155,8 @@ class PacketReceipt internal constructor(
 
             concludedAt = System.currentTimeMillis()
 
-            // Fire timeout callback in separate thread
             callbacks.timeout?.let { callback ->
-                thread(isDaemon = true) {
-                    try {
-                        callback(this)
-                    } catch (e: Exception) {
-                        // Log error but don't propagate
-                    }
-                }
+                submitCallback("timeout", callback)
             }
             return true
         }
@@ -204,6 +196,25 @@ class PacketReceipt internal constructor(
      */
     internal fun setLink(link: Link) {
         this.link = link
+    }
+
+    private fun submitCallback(
+        callbackType: String,
+        callback: (PacketReceipt) -> Unit,
+    ) {
+        Transport.submitReceiptCallback {
+            try {
+                callback(this)
+            } catch (e: Exception) {
+                System.err.println("[PacketReceipt] Error in $callbackType callback for ${hash.toHexString()}: ${e.message}")
+            }
+        }
+    }
+
+    private fun fireDeliveryCallbackAsync() {
+        callbacks.delivery?.let { callback ->
+            submitCallback("delivery", callback)
+        }
     }
 
     /**
@@ -253,15 +264,7 @@ class PacketReceipt internal constructor(
                 proved = true
                 concludedAt = System.currentTimeMillis()
                 this.proofPacket = proofPacket
-
-                // Fire delivery callback
-                callbacks.delivery?.let { callback ->
-                    try {
-                        callback(this)
-                    } catch (e: Exception) {
-                        // Log error but don't propagate
-                    }
-                }
+                fireDeliveryCallbackAsync()
             }
 
             return proofValid
@@ -303,15 +306,7 @@ class PacketReceipt internal constructor(
                     proved = true
                     concludedAt = System.currentTimeMillis()
                     this.proofPacket = proofPacket
-
-                    // Fire delivery callback
-                    callbacks.delivery?.let { callback ->
-                        try {
-                            callback(this)
-                        } catch (e: Exception) {
-                            // Log error but don't propagate
-                        }
-                    }
+                    fireDeliveryCallbackAsync()
                 }
 
                 return proofValid
@@ -329,15 +324,7 @@ class PacketReceipt internal constructor(
                     proved = true
                     concludedAt = System.currentTimeMillis()
                     this.proofPacket = proofPacket
-
-                    // Fire delivery callback
-                    callbacks.delivery?.let { callback ->
-                        try {
-                            callback(this)
-                        } catch (e: Exception) {
-                            // Log error but don't propagate
-                        }
-                    }
+                    fireDeliveryCallbackAsync()
                 }
 
                 return proofValid

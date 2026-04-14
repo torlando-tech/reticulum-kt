@@ -31,12 +31,15 @@ class PathStoreWriteThroughTest {
         store = InMemoryPathStore()
         tempDir = Files.createTempDirectory("rns-test").toFile()
         Transport.setStoragePath(tempDir.absolutePath)
+        // Clear global pathTable — other tests may have leaked entries.
+        Transport.pathTable.clear()
     }
 
     @AfterEach
     fun teardown() {
         Transport.pathStore = null
         Transport.announceStore = null
+        Transport.pathTable.clear()
         tempDir.deleteRecursively()
     }
 

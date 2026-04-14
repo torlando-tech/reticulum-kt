@@ -129,6 +129,25 @@ fun interface ProofCallback {
  * - Handles announce propagation and path discovery
  */
 object Transport {
+    @Volatile
+    private var receiptCallbackExecutor: java.util.concurrent.ExecutorService? = null
+
+    /**
+     * Submit a packet-receipt callback for asynchronous execution on Transport's
+     * receipt-callback executor. The executor is owned by Transport so it can be
+     * drained and shut down cleanly on [stop]. If Transport is stopped, callbacks
+     * are silently dropped rather than fired against torn-down state.
+     */
+    internal fun submitReceiptCallback(task: Runnable) {
+        try {
+            receiptCallbackExecutor?.execute(task)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // Transport is stopping; drop the callback silently. A racing stop()
+            // call can shutdownNow() the executor between our null-check and
+            // execute(), after which submissions throw.
+        }
+    }
+
     // ===== State =====
 
     /** Transport identity for this node. */
@@ -362,6 +381,11 @@ object Transport {
             return // Already started
         }
 
+        receiptCallbackExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "PacketReceipt-callbacks").apply { isDaemon = true }
+            }
+
         identity = transportIdentity ?: Identity.create()
         transportEnabled = enableTransport
         startTime = System.currentTimeMillis()
@@ -479,6 +503,11 @@ object Transport {
         speedTx = 0
         lastTrafficSnapshot = Pair(0L, 0L)
         lastTrafficTime = 0L
+
+        // Cancel and shut down the packet-receipt callback executor; any
+        // callbacks that have been submitted but not yet started are dropped.
+        receiptCallbackExecutor?.shutdownNow()
+        receiptCallbackExecutor = null
 
         log("Transport stopped")
     }

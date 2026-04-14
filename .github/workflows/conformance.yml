@@ -71,6 +71,11 @@ jobs:
         working-directory: reticulum-conformance
         env:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+        # NOTE: this runs the canonical `integration/test_channel_window_pipe.py`
+        # from the external `reticulum-conformance` repo. The in-tree copy at
+        # `python-bridge/conformance/test_channel_window.py` is a development
+        # scratch copy used when iterating locally; the external file is the
+        # source of truth. Keep the two in sync when changing either.
         run: |
           python3 -m pytest integration/test_channel_window_pipe.py \
             --peer-cmd "java -cp \"$KOTLIN_PIPE_PEER_CLASSPATH\" network.reticulum.cli.PipePeerKt" \
