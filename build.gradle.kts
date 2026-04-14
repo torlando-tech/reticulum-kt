@@ -14,6 +14,10 @@ allprojects {
 dependencies {
     kover(project(":rns-core"))
     kover(project(":rns-interfaces"))
+    // Aggregate rns-test execution data so coverage of rns-core classes that
+    // can only be reached via two-node / interop tests (e.g. Link.rttPacket
+    // owner-callback flow) is counted in the root koverXmlReport.
+    kover(project(":rns-test"))
 }
 
 subprojects {

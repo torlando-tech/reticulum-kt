@@ -4100,12 +4100,15 @@ object Transport {
                         return
                     }
 
-                    // Validate and create the incoming link
+                    // Validate and create the incoming link. The destination's
+                    // link-established callback is invoked from Link.rttPacket() once the
+                    // link reaches ACTIVE state, matching Python RNS (RNS/Link.py
+                    // rtt_packet). Invoking it here would fire while status is still
+                    // HANDSHAKE — at which point link.send() silently fails and any
+                    // caller-side signalling is dropped.
                     val link = Link.validateRequest(destination, packet.data, packet)
                     if (link != null) {
                         log("Link request for ${destination.hexHash} accepted: ${link.linkId.toHexString()}")
-                        // Invoke the destination's link established callback
-                        destination.invokeLinkEstablished(link)
                     } else {
                         log("Link request for ${destination.hexHash} rejected (validation failed)")
                     }
