@@ -245,10 +245,10 @@ class ChannelE2ETest : RnsLiveTestBase() {
         val channel = link.getChannel()
         val messageCount = 5
 
-        // Send multiple K→P messages. The channel has a send window that may
-        // fill up if proof validation fails (known issue with link packet proofs),
-        // so we send as many as the window allows.
-        println("  [Test] Sending up to $messageCount channel messages K→P...")
+        // Send all K→P messages. With the proof callback deadlock fixed, the
+        // channel send window should reopen after each proof so every message
+        // in the loop is sendable.
+        println("  [Test] Sending $messageCount channel messages K→P...")
         var sentCount = 0
         for (i in 0 until messageCount) {
             val msg = TestMessage().apply { data = "Message $i from Kotlin".toByteArray() }
@@ -257,15 +257,19 @@ class ChannelE2ETest : RnsLiveTestBase() {
             while (!channel.isReadyToSend() && System.currentTimeMillis() < readyDeadline) {
                 Thread.sleep(50)
             }
-            if (!channel.isReadyToSend()) {
-                println("  [Test] Channel window full after $sentCount messages (proof pipeline issue)")
-                break
-            }
+            assertTrue(
+                channel.isReadyToSend(),
+                "Channel window should reopen after each proof — stalled after $sentCount messages",
+            )
             channel.send(msg)
             sentCount++
         }
 
-        assertTrue(sentCount > 0, "Should send at least one channel message")
+        assertEquals(
+            messageCount,
+            sentCount,
+            "After deadlock fix, all $messageCount channel messages should be sendable",
+        )
 
         // Wait for Python to receive sent messages
         val deadline = System.currentTimeMillis() + 15_000
