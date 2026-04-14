@@ -1,6 +1,7 @@
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization")
+    id("org.jetbrains.kotlinx.kover")
 }
 
 val coroutinesVersion: String by project

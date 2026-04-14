@@ -78,11 +78,23 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run rns-test tests
+      - name: Run rns-test tests with aggregated coverage
         env:
           PYTHON_RNS_PATH: /tmp/Reticulum
           PYTHON_LXMF_PATH: /tmp/LXMF
-        run: ./gradlew :rns-test:test
+        # Root-level koverXmlReport aggregates execution data across rns-core,
+        # rns-interfaces, and rns-test. `-x :rns-core:test -x :rns-interfaces:test`
+        # keeps the coverage job fast by not re-running unit tests already
+        # covered in the unit-tests job — codecov merges both uploads.
+        run: ./gradlew :rns-test:test koverXmlReport -x :rns-core:test -x :rns-interfaces:test
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: build/reports/kover/report.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload test reports
         if: always()
