@@ -1880,13 +1880,27 @@ class Link private constructor(
             log("Link RTT measured: ${rtt}ms")
             updateKeepalive()
 
-            // Notify callback
+            // Notify the Link-level callback (set via link.setLinkEstablishedCallback).
             callbacks.linkEstablished?.let { callback ->
                 thread(isDaemon = true) {
                     try {
                         callback(this)
                     } catch (e: Exception) {
                         log("Error in link established callback: ${e.message}")
+                    }
+                }
+            }
+
+            // Notify the owning Destination's link-established callback. Python RNS fires
+            // this from rtt_packet() once status == ACTIVE (RNS/Link.py line 550–551);
+            // firing it earlier (e.g. on LINKREQUEST) leaves link.status == HANDSHAKE, and
+            // any link.send() from the callback silently fails.
+            owner?.let { ownerDest ->
+                thread(isDaemon = true) {
+                    try {
+                        ownerDest.invokeLinkEstablished(this)
+                    } catch (e: Exception) {
+                        log("Error in destination link established callback: ${e.message}")
                     }
                 }
             }
