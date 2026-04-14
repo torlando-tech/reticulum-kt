@@ -3504,7 +3504,29 @@ def cmd_destination_encrypt_debug(params):
 
     # Optionally remember ratchet
     if ratchet_public and len(ratchet_public) == 32:
-        RNS.Identity._remember_ratchet(dest_hash, ratchet_public)
+        # Some bridge-only commands import full RNS without starting a
+        # Reticulum instance. Upstream RNS Identity._remember_ratchet()
+        # assumes RNS.Transport.owner exists and will log AttributeError to
+        # stdout if it does not, which corrupts this bridge's JSON protocol.
+        # Install a temporary shared-instance owner stub so ratchet persistence
+        # is skipped while still populating the in-memory ratchet cache.
+        _sentinel = object()
+        original_owner = getattr(RNS.Transport, "owner", _sentinel)
+        needs_stub = original_owner is _sentinel or original_owner is None
+        if needs_stub:
+            class _BridgeSharedInstanceOwner:
+                is_connected_to_shared_instance = True
+            RNS.Transport.owner = _BridgeSharedInstanceOwner()
+
+        try:
+            RNS.Identity._remember_ratchet(dest_hash, ratchet_public)
+        finally:
+            if needs_stub:
+                if original_owner is _sentinel:
+                    delattr(RNS.Transport, "owner")
+                else:
+                    # Was explicitly None; restore that rather than deleting.
+                    RNS.Transport.owner = original_owner
 
     # Create destination
     dest = RNS.Destination(
