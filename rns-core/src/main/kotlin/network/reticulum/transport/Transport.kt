@@ -139,7 +139,13 @@ object Transport {
      * are silently dropped rather than fired against torn-down state.
      */
     internal fun submitReceiptCallback(task: Runnable) {
-        receiptCallbackExecutor?.execute(task)
+        try {
+            receiptCallbackExecutor?.execute(task)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // Transport is stopping; drop the callback silently. A racing stop()
+            // call can shutdownNow() the executor between our null-check and
+            // execute(), after which submissions throw.
+        }
     }
 
     // ===== State =====
