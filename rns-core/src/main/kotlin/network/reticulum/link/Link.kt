@@ -287,6 +287,7 @@ class Link private constructor(
     val hash: ByteArray get() = linkId
 
     // State
+    @Volatile
     var status: Int = LinkConstants.PENDING
         private set
 
