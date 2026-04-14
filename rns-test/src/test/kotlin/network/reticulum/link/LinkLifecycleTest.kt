@@ -13,8 +13,11 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -173,5 +176,70 @@ class LinkLifecycleTest {
         val responderLink = Link.validateRequest(destination, requestData, packet)
         assertNotNull(responderLink)
         assertTrue(!responderLink.initiator, "Validated link should not be initiator")
+    }
+
+    @Test
+    @DisplayName("Destination link-established callback does NOT fire during LINKREQUEST handling")
+    @Timeout(5)
+    fun `destination link established callback does not fire during linkrequest`() {
+        // Regression test: Transport's LINKREQUEST handler previously invoked
+        // destination.invokeLinkEstablished() immediately after Link.validateRequest()
+        // succeeded — while link.status was still HANDSHAKE. Any link.send() from
+        // inside that callback would then silently fail because sendWithReceipt
+        // rejects non-ACTIVE links. Python RNS only fires the owner callback from
+        // rtt_packet() after status = ACTIVE (RNS/Link.py line 550–551), and the
+        // Kotlin port now matches by invoking from Link.rttPacket().
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lifecycle",
+            aspects = arrayOf("test", "callback-timing")
+        )
+        destination.acceptLinkRequests = true
+        Transport.registerDestination(destination)
+
+        val callbackInvocations = AtomicInteger(0)
+        val statusAtCallback = AtomicReference<Int?>(null)
+        destination.setLinkEstablishedCallback { link ->
+            callbackInvocations.incrementAndGet()
+            if (link is Link) {
+                statusAtCallback.set(link.status)
+            }
+        }
+
+        val crypto = defaultCryptoProvider()
+        val initiatorX25519 = crypto.generateX25519KeyPair()
+        val initiatorEd25519 = crypto.generateEd25519KeyPair()
+        val requestData = initiatorX25519.publicKey + initiatorEd25519.publicKey
+
+        val packet = Packet.createRaw(
+            destinationHash = destination.hash,
+            data = requestData,
+            packetType = PacketType.LINKREQUEST,
+            destinationType = DestinationType.SINGLE
+        )
+        packet.pack()
+
+        val link = Link.validateRequest(destination, requestData, packet)
+        assertNotNull(link, "validateRequest should create a link")
+        assertEquals(
+            LinkConstants.HANDSHAKE, link.status,
+            "Link should be in HANDSHAKE state immediately after validateRequest"
+        )
+
+        // Give any daemon-thread callback a chance to race; it should never fire
+        // because nothing has transitioned the link to ACTIVE yet.
+        Thread.sleep(100)
+
+        assertEquals(
+            0, callbackInvocations.get(),
+            "Destination link-established callback must not fire while link is in HANDSHAKE"
+        )
+        assertNull(
+            statusAtCallback.get(),
+            "No callback should have observed a status yet"
+        )
     }
 }
