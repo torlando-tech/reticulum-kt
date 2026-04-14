@@ -1842,6 +1842,10 @@ class Link private constructor(
      * Process RTT measurement packet.
      */
     private fun rttPacket(packet: Packet) {
+        // Guard against duplicate/replayed LRRTT packets. Matches the peer-side
+        // validateProof() check on HANDSHAKE and prevents double-firing the
+        // link-established callbacks or re-measuring rtt/activatedAt.
+        if (status != LinkConstants.HANDSHAKE) return
         try {
             val measuredRtt = System.currentTimeMillis() - requestTime
             val plaintext = decrypt(packet.data) ?: return
