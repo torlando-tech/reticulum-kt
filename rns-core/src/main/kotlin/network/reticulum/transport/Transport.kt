@@ -504,7 +504,8 @@ object Transport {
         lastTrafficSnapshot = Pair(0L, 0L)
         lastTrafficTime = 0L
 
-        // Drain and shut down the packet-receipt callback executor
+        // Cancel and shut down the packet-receipt callback executor; any
+        // callbacks that have been submitted but not yet started are dropped.
         receiptCallbackExecutor?.shutdownNow()
         receiptCallbackExecutor = null
 

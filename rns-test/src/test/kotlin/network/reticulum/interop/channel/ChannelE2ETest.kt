@@ -265,11 +265,7 @@ class ChannelE2ETest : RnsLiveTestBase() {
             sentCount++
         }
 
-        assertEquals(
-            messageCount,
-            sentCount,
-            "After deadlock fix, all $messageCount channel messages should be sendable",
-        )
+        // sentCount == messageCount is guaranteed by the assertTrue inside the loop.
 
         // Wait for Python to receive sent messages
         val deadline = System.currentTimeMillis() + 15_000
