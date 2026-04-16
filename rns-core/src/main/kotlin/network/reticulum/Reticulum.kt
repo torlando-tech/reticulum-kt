@@ -192,9 +192,13 @@ class Reticulum private constructor(
                 return rns
             }
             if (transportIdentity != null) {
-                log(
-                    "WARNING: transportIdentity was provided but Reticulum is already started; " +
-                        "the supplied identity will not be used.",
+                // Callers pass transportIdentity precisely because they rely on the plaintext
+                // private key never touching disk. Silently handing back an already-running
+                // instance — which may have been started with the file-backed flow — would
+                // break that guarantee without the caller ever noticing. Fail loudly instead.
+                throw IllegalStateException(
+                    "Reticulum is already started; cannot apply transportIdentity. " +
+                        "Call Reticulum.stop() before restarting with a new identity.",
                 )
             }
             return instance!!
