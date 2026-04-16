@@ -545,6 +545,9 @@ object Transport {
     /** Persistent discovery storage. When null, falls back to file-based persistence. */
     var discoveryStore: network.reticulum.storage.DiscoveryStore? = null
 
+    /** Persistent per-destination inbound ratchet storage. When null, falls back to file-based persistence. */
+    var destinationRatchetStore: network.reticulum.storage.DestinationRatchetStore? = null
+
     // ===== Memory Management =====
 
     /**

@@ -2,6 +2,7 @@ package network.reticulum.android.db
 
 import android.util.Log
 import network.reticulum.android.db.entity.AnnounceCacheEntity
+import network.reticulum.android.db.entity.DestinationRatchetEntity
 import network.reticulum.android.db.entity.DiscoveredInterfaceEntity
 import network.reticulum.android.db.entity.IdentityRatchetEntity
 import network.reticulum.android.db.entity.KnownDestinationEntity
@@ -21,16 +22,26 @@ import java.io.File
 class FileMigrator(
     private val db: ReticulumDatabase,
     private val storagePath: String,
-    private val cachePath: String
+    private val cachePath: String,
+    /**
+     * Optional LXMF ratchet directory. When LXMF-kt is in the dependency tree
+     * it writes per-destination ratchet private keys under
+     * `$configDir/lxmf/ratchets/<hash>` (Kotlin) or `<hash>.ratchets` (Python
+     * reference layout). Pass `$configDir/lxmf/ratchets` here and FileMigrator
+     * will import those into the destination_ratchets Room table and scrub the
+     * files. Leave null for bare rns-core deployments.
+     */
+    private val lxmfRatchetsPath: String? = null,
 ) {
     fun migrateIfNeeded() {
         val marker = File(storagePath, ".room_migrated")
         if (marker.exists()) {
-            // Migration already ran. Earlier versions of this migrator left the
-            // source files on disk afterward, which accumulated forever and kept
-            // sensitive routing state (known destinations, ratchets, announces)
-            // in plaintext outside the Room DB. Idempotent cleanup on every
-            // launch so upgraders eventually converge on Room-only storage.
+            // Full migration already ran, but earlier versions of this migrator
+            // didn't know about the LXMF destination-ratchet files (they were
+            // added later) and left legacy source files on disk forever.
+            // Re-import ratchets and run the scrub on every launch — upsert
+            // is idempotent, so repeated runs are safe.
+            migrateDestinationRatchets()
             deleteLegacySourceFiles()
             return
         }
@@ -45,6 +56,7 @@ class FileMigrator(
             migrateTunnels()
             migrateAnnounceCache()
             migrateRatchets()
+            migrateDestinationRatchets()
             migrateDiscovery()
 
             // storagePath is no longer eagerly created by Reticulum.initialize(),
@@ -93,6 +105,52 @@ class FileMigrator(
         runCatching { File(cachePath, "announces").deleteRecursively() }
         runCatching { File(storagePath, "ratchets").deleteRecursively() }
         runCatching { File(storagePath, "discovery/interfaces").deleteRecursively() }
+        // LXMF per-destination ratchets — only present when LXMF-kt is in use.
+        // Both filename flavours (Kotlin's `<hash>`, Python's `<hash>.ratchets`)
+        // landed under the same directory.
+        lxmfRatchetsPath?.let { runCatching { File(it).deleteRecursively() } }
+    }
+
+    /**
+     * Import LXMF per-destination inbound ratchets into Room.
+     *
+     * The on-disk blob (`{signature, ratchets}` msgpack) is stored opaquely —
+     * `Destination.reloadRatchets` unpacks it and verifies the signature when
+     * the router re-registers the destination. This keeps the migration
+     * signature-agnostic, so it still works when the destination's identity
+     * isn't materialized at migration time.
+     *
+     * Accepts both `<hash>` (LXMF-kt layout) and `<hash>.ratchets` (Python
+     * LXMF reference layout); strips the suffix when parsing the hash.
+     */
+    private fun migrateDestinationRatchets() {
+        val dir = lxmfRatchetsPath?.let { File(it) } ?: return
+        if (!dir.exists() || !dir.isDirectory) return
+        try {
+            var count = 0
+            for (file in dir.listFiles() ?: emptyArray()) {
+                if (!file.isFile) continue
+                if (file.name.endsWith(".tmp")) continue
+                val hashName = file.name.removeSuffix(".ratchets")
+                val destHash =
+                    try {
+                        hexToBytes(hashName)
+                    } catch (_: Exception) {
+                        continue
+                    }
+                try {
+                    db.destinationRatchetDao().upsert(
+                        DestinationRatchetEntity(destHash = destHash, data = file.readBytes()),
+                    )
+                    count++
+                } catch (_: Exception) {
+                    // Skip a single bad file, continue with the rest.
+                }
+            }
+            Log.i(TAG, "Migrated $count destination ratchets")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to migrate destination ratchets: ${e.message}")
+        }
     }
 
     private fun migratePathTable() {
