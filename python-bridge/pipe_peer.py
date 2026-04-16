@@ -629,6 +629,7 @@ def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):
     class StreamPipeInterface(BaseInterface):
         """Interface that communicates via HDLC framing over binary streams."""
 
+        DEFAULT_IFAC_SIZE = 8
         FLAG = 0x7E
         ESC = 0x7D
         ESC_MASK = 0x20
