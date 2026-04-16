@@ -157,6 +157,9 @@ class Reticulum private constructor(
          * @param shareInstance Whether to share this instance with other apps (starts local server)
          * @param sharedInstancePort TCP port for shared instance communication
          * @param connectToSharedInstance Whether to connect to an existing shared instance
+         * @param transportIdentity Optional in-memory transport identity. When non-null, the
+         *   private key is used directly and the `$storagePath/transport_identity` file is
+         *   never read or written. When null (default), the legacy file-backed flow runs.
          * @return The Reticulum instance
          */
         fun start(
@@ -187,6 +190,12 @@ class Reticulum private constructor(
 
                 rns.initialize()
                 return rns
+            }
+            if (transportIdentity != null) {
+                log(
+                    "WARNING: transportIdentity was provided but Reticulum is already started; " +
+                        "the supplied identity will not be used.",
+                )
             }
             return instance!!
         }
