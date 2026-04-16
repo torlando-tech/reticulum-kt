@@ -202,8 +202,14 @@ class Reticulum private constructor(
                     // Roll back the started/instance state so the caller can retry
                     // (e.g. with a different identity or after fixing a filesystem issue)
                     // without hitting the "already started" guard on the next start() call.
-                    instance = null
+                    //
+                    // Order matters: flip `started` false *first*, then null out `instance`.
+                    // If we cleared instance first, a concurrent start() whose
+                    // compareAndSet(false, true) was still false would fall through to
+                    // `return instance!!` and throw NPE. Flipping `started` first means a
+                    // racing caller wins the CAS and constructs its own instance.
                     started.set(false)
+                    instance = null
                     throw t
                 }
                 return rns
