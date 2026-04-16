@@ -54,12 +54,13 @@ class Reticulum private constructor(
     val connectToSharedInstance: Boolean,
     /**
      * Optional in-memory transport identity. When non-null, [initialize] uses this
-     * identity directly and skips the load-from-file / create-and-save-to-file flow,
-     * so the private key never has to touch disk as plaintext. Callers that manage
-     * their own identity persistence (e.g. encrypted-at-rest in a Room database or
-     * Keystore-wrapped in a secure enclave) can pass an Identity built via
-     * [Identity.fromBytes]. When null, Reticulum retains the legacy
-     * `$storagePath/transport_identity` file behaviour.
+     * identity directly, skips the load-from-file / create-and-save-to-file flow,
+     * and deletes any stale `$storagePath/transport_identity` file left behind by
+     * a prior file-backed run — so the private key never has to touch disk as
+     * plaintext. Callers that manage their own identity persistence (e.g.
+     * encrypted-at-rest in a Room database or Keystore-wrapped in a secure enclave)
+     * can pass an Identity built via [Identity.fromBytes]. When null, Reticulum
+     * retains the legacy `$storagePath/transport_identity` file behaviour.
      */
     private val transportIdentityOverride: Identity? = null,
 ) {
@@ -158,8 +159,10 @@ class Reticulum private constructor(
          * @param sharedInstancePort TCP port for shared instance communication
          * @param connectToSharedInstance Whether to connect to an existing shared instance
          * @param transportIdentity Optional in-memory transport identity. When non-null, the
-         *   private key is used directly and the `$storagePath/transport_identity` file is
-         *   never read or written. When null (default), the legacy file-backed flow runs.
+         *   private key is used directly, `$storagePath/transport_identity` is never read or
+         *   written, and any stale file left by a prior file-backed run is deleted so no
+         *   plaintext key lingers on disk. When null (default), the legacy file-backed flow
+         *   runs.
          * @return The Reticulum instance
          */
         fun start(
@@ -303,7 +306,16 @@ class Reticulum private constructor(
         // Use the caller-provided identity if given (so the plaintext private key
         // never has to touch disk), otherwise fall back to the legacy file-backed flow.
         val transportIdentity =
-            transportIdentityOverride ?: loadOrCreateTransportIdentity()
+            if (transportIdentityOverride != null) {
+                // A caller on a device that previously ran the file-backed flow may still
+                // have a plaintext $storagePath/transport_identity on disk. Since the whole
+                // point of supplying an override is to keep plaintext keys off disk, remove
+                // the stale file on behalf of the caller.
+                deleteLegacyTransportIdentityFile()
+                transportIdentityOverride
+            } else {
+                loadOrCreateTransportIdentity()
+            }
 
         // Configure Transport and Identity storage paths
         Transport.setCachePath(cachePath)
@@ -441,6 +453,23 @@ class Reticulum private constructor(
         val identity = Identity.create()
         identity.toFile(file.absolutePath)
         return identity
+    }
+
+    /**
+     * Delete `$storagePath/transport_identity` if present. Called when a caller
+     * supplies an in-memory transport identity override, to clean up a plaintext
+     * file left behind by a previous file-backed run — matching the caller's
+     * stated intent of keeping private keys off disk.
+     */
+    private fun deleteLegacyTransportIdentityFile() {
+        val identityFile = File("$storagePath/transport_identity")
+        if (identityFile.exists()) {
+            if (identityFile.delete()) {
+                log("Deleted legacy plaintext transport_identity file (in-memory override active)")
+            } else {
+                log("WARNING: failed to delete legacy transport_identity file at ${identityFile.absolutePath}")
+            }
+        }
     }
 
     /**
