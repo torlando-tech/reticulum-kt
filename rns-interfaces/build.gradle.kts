@@ -17,7 +17,7 @@ val junitVersion: String by project
 val kotestVersion: String by project
 
 dependencies {
-    implementation(project(":rns-core"))
+    api(project(":rns-core"))
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
