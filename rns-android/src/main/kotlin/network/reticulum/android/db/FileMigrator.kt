@@ -25,7 +25,15 @@ class FileMigrator(
 ) {
     fun migrateIfNeeded() {
         val marker = File(storagePath, ".room_migrated")
-        if (marker.exists()) return
+        if (marker.exists()) {
+            // Migration already ran. Earlier versions of this migrator left the
+            // source files on disk afterward, which accumulated forever and kept
+            // sensitive routing state (known destinations, ratchets, announces)
+            // in plaintext outside the Room DB. Idempotent cleanup on every
+            // launch so upgraders eventually converge on Room-only storage.
+            deleteLegacySourceFiles()
+            return
+        }
 
         Log.i(TAG, "Starting file-to-Room migration...")
         val start = System.currentTimeMillis()
@@ -40,11 +48,48 @@ class FileMigrator(
             migrateDiscovery()
 
             marker.createNewFile()
+            // Room is authoritative for every entity we just imported — delete
+            // the source files so they don't drift out of sync and don't leak
+            // sensitive routing state via backup archives or forensic access.
+            deleteLegacySourceFiles()
             Log.i(TAG, "Migration completed in ${System.currentTimeMillis() - start}ms")
         } catch (e: Exception) {
             Log.e(TAG, "Migration failed: ${e.message}", e)
             // Don't create marker — will retry next launch
         }
+    }
+
+    /**
+     * Remove legacy file-backed state that is now mirrored in Room.
+     * Best-effort: each delete is isolated so a single failure doesn't abort
+     * the rest. Safe to run when the files are already gone.
+     *
+     * Note on `ratchets/`: `migrateRatchets()` intentionally skips `.out`
+     * files, but those are just transient atomic-write staging (see
+     * `Identity.persistRatchet()` — it writes to `$hash.out`, then renames
+     * to `$hash`). A stranded `.out` file means a write was interrupted and
+     * the data is not authoritative; safe to delete alongside the real
+     * ratchet files that Room now owns.
+     *
+     * Note on `discovery/`: the migrator only touches
+     * `discovery/interfaces/`, so we scope the delete there rather than
+     * nuking the whole `discovery/` tree — future subdirectories should
+     * not be silently wiped.
+     */
+    private fun deleteLegacySourceFiles() {
+        val storageFiles = listOf(
+            "destination_table",
+            "packet_hashlist",
+            "known_destinations",
+            "known_destinations.tmp",
+            "tunnels"
+        )
+        for (name in storageFiles) {
+            runCatching { File(storagePath, name).delete() }
+        }
+        runCatching { File(cachePath, "announces").deleteRecursively() }
+        runCatching { File(storagePath, "ratchets").deleteRecursively() }
+        runCatching { File(storagePath, "discovery/interfaces").deleteRecursively() }
     }
 
     private fun migratePathTable() {
