@@ -63,6 +63,18 @@ class FileMigrator(
      * Remove legacy file-backed state that is now mirrored in Room.
      * Best-effort: each delete is isolated so a single failure doesn't abort
      * the rest. Safe to run when the files are already gone.
+     *
+     * Note on `ratchets/`: `migrateRatchets()` intentionally skips `.out`
+     * files, but those are just transient atomic-write staging (see
+     * `Identity.persistRatchet()` — it writes to `$hash.out`, then renames
+     * to `$hash`). A stranded `.out` file means a write was interrupted and
+     * the data is not authoritative; safe to delete alongside the real
+     * ratchet files that Room now owns.
+     *
+     * Note on `discovery/`: the migrator only touches
+     * `discovery/interfaces/`, so we scope the delete there rather than
+     * nuking the whole `discovery/` tree — future subdirectories should
+     * not be silently wiped.
      */
     private fun deleteLegacySourceFiles() {
         val storageFiles = listOf(
@@ -75,10 +87,9 @@ class FileMigrator(
         for (name in storageFiles) {
             runCatching { File(storagePath, name).delete() }
         }
-        // Directory contents: the stores own these now.
         runCatching { File(cachePath, "announces").deleteRecursively() }
         runCatching { File(storagePath, "ratchets").deleteRecursively() }
-        runCatching { File(storagePath, "discovery").deleteRecursively() }
+        runCatching { File(storagePath, "discovery/interfaces").deleteRecursively() }
     }
 
     private fun migratePathTable() {
