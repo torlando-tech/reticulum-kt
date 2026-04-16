@@ -55,12 +55,15 @@ class Reticulum private constructor(
     /**
      * Optional in-memory transport identity. When non-null, [initialize] uses this
      * identity directly, skips the load-from-file / create-and-save-to-file flow,
-     * and deletes any stale `$storagePath/transport_identity` file left behind by
-     * a prior file-backed run — so the private key never has to touch disk as
-     * plaintext. Callers that manage their own identity persistence (e.g.
-     * encrypted-at-rest in a Room database or Keystore-wrapped in a secure enclave)
-     * can pass an Identity built via [Identity.fromBytes]. When null, Reticulum
-     * retains the legacy `$storagePath/transport_identity` file behaviour.
+     * and zero-overwrites + deletes any stale `$storagePath/transport_identity`
+     * file left behind by a prior file-backed run — so the private key does not
+     * need to touch disk as plaintext in the current session. The overwrite-and-
+     * delete of the legacy file is best-effort; on wear-levelled or journalled
+     * storage the underlying blocks may still be recoverable forensically.
+     * Callers that manage their own identity persistence (e.g. encrypted-at-rest
+     * in a Room database or Keystore-wrapped in a secure enclave) can pass an
+     * Identity built via [Identity.fromBytes]. When null, Reticulum retains the
+     * legacy `$storagePath/transport_identity` file behaviour.
      */
     private val transportIdentityOverride: Identity? = null,
 ) {
@@ -160,9 +163,11 @@ class Reticulum private constructor(
          * @param connectToSharedInstance Whether to connect to an existing shared instance
          * @param transportIdentity Optional in-memory transport identity. When non-null, the
          *   private key is used directly, `$storagePath/transport_identity` is never read or
-         *   written, and any stale file left by a prior file-backed run is deleted so no
-         *   plaintext key lingers on disk. When null (default), the legacy file-backed flow
-         *   runs.
+         *   written in the current session, and any stale file left by a prior file-backed
+         *   run is zero-overwritten and deleted on a best-effort basis. True secure erasure
+         *   is not achievable on wear-levelled or journalled storage; callers needing that
+         *   guarantee must rely on device-level full-disk encryption. When null (default),
+         *   the legacy file-backed flow runs.
          * @return The Reticulum instance
          */
         fun start(
@@ -191,7 +196,16 @@ class Reticulum private constructor(
                 pendingLocalServerFactory?.let { rns.localServerInterfaceFactory = it }
                 pendingInterfaceRegistrar?.let { rns.interfaceRegistrar = it }
 
-                rns.initialize()
+                try {
+                    rns.initialize()
+                } catch (t: Throwable) {
+                    // Roll back the started/instance state so the caller can retry
+                    // (e.g. with a different identity or after fixing a filesystem issue)
+                    // without hitting the "already started" guard on the next start() call.
+                    instance = null
+                    started.set(false)
+                    throw t
+                }
                 return rns
             }
             if (transportIdentity != null) {
@@ -456,20 +470,36 @@ class Reticulum private constructor(
     }
 
     /**
-     * Delete `$storagePath/transport_identity` if present. Called when a caller
-     * supplies an in-memory transport identity override, to clean up a plaintext
-     * file left behind by a previous file-backed run — matching the caller's
-     * stated intent of keeping private keys off disk.
+     * Best-effort removal of `$storagePath/transport_identity` when a caller
+     * supplies an in-memory transport identity override. Performs a zero-fill
+     * overwrite before [File.delete] to reduce plaintext remnants in the
+     * directory entry's previously-allocated blocks.
      *
-     * Throws [IllegalStateException] if the file exists but cannot be deleted.
-     * Callers using the override are relying on a security guarantee that a
-     * leftover plaintext key actively breaks; a warning-and-continue in that
-     * case would leave a forensic artifact with the caller having no
-     * programmatic way to detect it.
+     * Caveat: neither the overwrite nor the delete is a true secure erase on
+     * wear-levelled (F2FS, eMMC controller-level) or journalled (ext4 data=
+     * journal) storage. Copy-on-write and the FS journal may retain
+     * previous block contents for an unbounded time before they're reused.
+     * This is the best Android userspace can offer without vendor APIs for
+     * secure discard; callers who need stronger guarantees must rely on
+     * full-disk encryption being active on the device.
+     *
+     * Throws [IllegalStateException] if the file exists but cannot be
+     * deleted. Callers using the override are relying on a security
+     * guarantee that a leftover plaintext key actively breaks; a
+     * warning-and-continue in that case would leave a forensic artifact
+     * with the caller having no programmatic way to detect it.
      */
     private fun deleteLegacyTransportIdentityFile() {
         val identityFile = File("$storagePath/transport_identity")
         if (identityFile.exists()) {
+            // Best-effort overwrite. Failure here is non-fatal — the delete
+            // below still runs and is what the invariant actually depends on.
+            try {
+                val zeros = ByteArray(identityFile.length().toInt())
+                identityFile.writeBytes(zeros)
+            } catch (_: Exception) {
+                // Overwrite is best-effort; fall through to delete.
+            }
             if (!identityFile.delete()) {
                 throw IllegalStateException(
                     "In-memory transport identity override requested but failed to delete " +
