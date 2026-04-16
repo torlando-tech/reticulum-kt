@@ -460,15 +460,24 @@ class Reticulum private constructor(
      * supplies an in-memory transport identity override, to clean up a plaintext
      * file left behind by a previous file-backed run — matching the caller's
      * stated intent of keeping private keys off disk.
+     *
+     * Throws [IllegalStateException] if the file exists but cannot be deleted.
+     * Callers using the override are relying on a security guarantee that a
+     * leftover plaintext key actively breaks; a warning-and-continue in that
+     * case would leave a forensic artifact with the caller having no
+     * programmatic way to detect it.
      */
     private fun deleteLegacyTransportIdentityFile() {
         val identityFile = File("$storagePath/transport_identity")
         if (identityFile.exists()) {
-            if (identityFile.delete()) {
-                log("Deleted legacy plaintext transport_identity file (in-memory override active)")
-            } else {
-                log("WARNING: failed to delete legacy transport_identity file at ${identityFile.absolutePath}")
+            if (!identityFile.delete()) {
+                throw IllegalStateException(
+                    "In-memory transport identity override requested but failed to delete " +
+                        "legacy plaintext key file at ${identityFile.absolutePath}. " +
+                        "Refusing to start to avoid a false sense of security.",
+                )
             }
+            log("Deleted legacy plaintext transport_identity file (in-memory override active)")
         }
     }
 
