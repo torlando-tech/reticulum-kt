@@ -47,6 +47,9 @@ class FileMigrator(
             migrateRatchets()
             migrateDiscovery()
 
+            // storagePath is no longer eagerly created by Reticulum.initialize(),
+            // so make sure it exists before dropping the marker.
+            marker.parentFile?.mkdirs()
             marker.createNewFile()
             // Room is authoritative for every entity we just imported — delete
             // the source files so they don't drift out of sync and don't leak

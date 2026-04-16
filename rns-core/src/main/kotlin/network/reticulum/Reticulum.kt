@@ -295,7 +295,6 @@ class Reticulum private constructor(
     // Storage paths
     val storagePath: String = "$configDir/storage"
     val cachePath: String = "$configDir/cache"
-    val identityPath: String = "$configDir/identities"
 
     // State
     private val interfaces = mutableListOf<Any>()
@@ -327,8 +326,10 @@ class Reticulum private constructor(
     private fun initialize() {
         log("Initializing Reticulum...")
 
-        // Ensure directories exist
-        ensureDirectories()
+        // Directory layout is lazily created at each write site (Transport, Identity,
+        // InterfaceDiscovery, Destination all mkdirs parents on demand) and on Android
+        // everything routes through Room stores anyway, so there's no reason to
+        // eagerly create empty subdirectories that may never be written to.
 
         // Use the caller-provided identity if given (so the plaintext private key
         // never has to touch disk), otherwise fall back to the legacy file-backed flow.
@@ -521,18 +522,6 @@ class Reticulum private constructor(
                 )
             }
             log("Deleted legacy plaintext transport_identity file (in-memory override active)")
-        }
-    }
-
-    /**
-     * Ensure required directories exist.
-     */
-    private fun ensureDirectories() {
-        listOf(configDir, storagePath, cachePath, identityPath).forEach { path ->
-            val dir = File(path)
-            if (!dir.exists()) {
-                dir.mkdirs()
-            }
         }
     }
 
