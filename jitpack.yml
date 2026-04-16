@@ -1,0 +1,4 @@
+jdk:
+  - openjdk17
+install:
+  - ./gradlew clean :rns-core:publishToMavenLocal :rns-interfaces:publishToMavenLocal :rns-android:publishToMavenLocal -x test
