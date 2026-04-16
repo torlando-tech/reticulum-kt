@@ -52,6 +52,16 @@ class Reticulum private constructor(
     val shareInstance: Boolean,
     val sharedInstancePort: Int,
     val connectToSharedInstance: Boolean,
+    /**
+     * Optional in-memory transport identity. When non-null, [initialize] uses this
+     * identity directly and skips the load-from-file / create-and-save-to-file flow,
+     * so the private key never has to touch disk as plaintext. Callers that manage
+     * their own identity persistence (e.g. encrypted-at-rest in a Room database or
+     * Keystore-wrapped in a secure enclave) can pass an Identity built via
+     * [Identity.fromBytes]. When null, Reticulum retains the legacy
+     * `$storagePath/transport_identity` file behaviour.
+     */
+    private val transportIdentityOverride: Identity? = null,
 ) {
     companion object {
         /**
@@ -155,10 +165,19 @@ class Reticulum private constructor(
             shareInstance: Boolean = false,
             sharedInstancePort: Int = DEFAULT_SHARED_INSTANCE_PORT,
             connectToSharedInstance: Boolean = false,
+            transportIdentity: Identity? = null,
         ): Reticulum {
             if (started.compareAndSet(false, true)) {
                 val dir = configDir ?: getDefaultConfigDir()
-                val rns = Reticulum(dir, enableTransport, shareInstance, sharedInstancePort, connectToSharedInstance)
+                val rns =
+                    Reticulum(
+                        configDir = dir,
+                        enableTransport = enableTransport,
+                        shareInstance = shareInstance,
+                        sharedInstancePort = sharedInstancePort,
+                        connectToSharedInstance = connectToSharedInstance,
+                        transportIdentityOverride = transportIdentity,
+                    )
                 instance = rns
 
                 // Apply pre-set factories before initialize
@@ -268,8 +287,10 @@ class Reticulum private constructor(
         // Ensure directories exist
         ensureDirectories()
 
-        // Load or create transport identity
-        val transportIdentity = loadOrCreateTransportIdentity()
+        // Use the caller-provided identity if given (so the plaintext private key
+        // never has to touch disk), otherwise fall back to the legacy file-backed flow.
+        val transportIdentity =
+            transportIdentityOverride ?: loadOrCreateTransportIdentity()
 
         // Configure Transport and Identity storage paths
         Transport.setCachePath(cachePath)
