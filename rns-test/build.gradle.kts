@@ -2,6 +2,15 @@ plugins {
     kotlin("jvm")
     kotlin("plugin.serialization")
     id("org.jetbrains.kotlinx.kover")
+    `maven-publish`
+}
+
+java { withSourcesJar() }
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") { from(components["java"]) }
+    }
 }
 
 val coroutinesVersion: String by project
@@ -11,7 +20,7 @@ val serializationVersion: String by project
 
 dependencies {
     api(project(":rns-core"))
-    implementation(project(":rns-interfaces"))
+    api(project(":rns-interfaces"))
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
