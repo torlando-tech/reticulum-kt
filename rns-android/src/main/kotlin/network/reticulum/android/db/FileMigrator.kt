@@ -25,7 +25,15 @@ class FileMigrator(
 ) {
     fun migrateIfNeeded() {
         val marker = File(storagePath, ".room_migrated")
-        if (marker.exists()) return
+        if (marker.exists()) {
+            // Migration already ran. Earlier versions of this migrator left the
+            // source files on disk afterward, which accumulated forever and kept
+            // sensitive routing state (known destinations, ratchets, announces)
+            // in plaintext outside the Room DB. Idempotent cleanup on every
+            // launch so upgraders eventually converge on Room-only storage.
+            deleteLegacySourceFiles()
+            return
+        }
 
         Log.i(TAG, "Starting file-to-Room migration...")
         val start = System.currentTimeMillis()
@@ -40,11 +48,37 @@ class FileMigrator(
             migrateDiscovery()
 
             marker.createNewFile()
+            // Room is authoritative for every entity we just imported — delete
+            // the source files so they don't drift out of sync and don't leak
+            // sensitive routing state via backup archives or forensic access.
+            deleteLegacySourceFiles()
             Log.i(TAG, "Migration completed in ${System.currentTimeMillis() - start}ms")
         } catch (e: Exception) {
             Log.e(TAG, "Migration failed: ${e.message}", e)
             // Don't create marker — will retry next launch
         }
+    }
+
+    /**
+     * Remove legacy file-backed state that is now mirrored in Room.
+     * Best-effort: each delete is isolated so a single failure doesn't abort
+     * the rest. Safe to run when the files are already gone.
+     */
+    private fun deleteLegacySourceFiles() {
+        val storageFiles = listOf(
+            "destination_table",
+            "packet_hashlist",
+            "known_destinations",
+            "known_destinations.tmp",
+            "tunnels"
+        )
+        for (name in storageFiles) {
+            runCatching { File(storagePath, name).delete() }
+        }
+        // Directory contents: the stores own these now.
+        runCatching { File(cachePath, "announces").deleteRecursively() }
+        runCatching { File(storagePath, "ratchets").deleteRecursively() }
+        runCatching { File(storagePath, "discovery").deleteRecursively() }
     }
 
     private fun migratePathTable() {
