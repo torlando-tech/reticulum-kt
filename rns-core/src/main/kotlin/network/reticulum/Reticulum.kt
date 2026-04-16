@@ -109,6 +109,7 @@ class Reticulum private constructor(
          */
         const val DEFAULT_SHARED_INSTANCE_PORT = 37428
 
+        @Volatile
         private var instance: Reticulum? = null
         private val started = AtomicBoolean(false)
 
@@ -200,16 +201,22 @@ class Reticulum private constructor(
                     rns.initialize()
                 } catch (t: Throwable) {
                     // Roll back the started/instance state so the caller can retry
-                    // (e.g. with a different identity or after fixing a filesystem issue)
-                    // without hitting the "already started" guard on the next start() call.
+                    // (e.g. with a different identity or after fixing a filesystem
+                    // issue) without hitting the "already started" guard on the
+                    // next start() call.
                     //
-                    // Order matters: flip `started` false *first*, then null out `instance`.
-                    // If we cleared instance first, a concurrent start() whose
-                    // compareAndSet(false, true) was still false would fall through to
-                    // `return instance!!` and throw NPE. Flipping `started` first means a
-                    // racing caller wins the CAS and constructs its own instance.
-                    started.set(false)
+                    // Order matters: null `instance` *first*, then flip `started`
+                    // false. The opposite order would let a racing start() win the
+                    // CAS, build and assign its own rns to `instance`, and then
+                    // this catch block would overwrite that with null — silently
+                    // corrupting the racing caller's successful init. With
+                    // `instance` marked @Volatile, a racing caller whose CAS sees
+                    // started=true and falls through to `return instance!!` can
+                    // still NPE during the narrow window between these two writes;
+                    // that's an acceptable degradation (loud failure) versus the
+                    // silent-corruption alternative.
                     instance = null
+                    started.set(false)
                     throw t
                 }
                 return rns
