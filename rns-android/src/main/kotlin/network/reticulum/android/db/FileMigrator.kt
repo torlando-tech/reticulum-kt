@@ -128,6 +128,7 @@ class FileMigrator(
         if (!dir.exists() || !dir.isDirectory) return
         try {
             var count = 0
+            var skipped = 0
             for (file in dir.listFiles() ?: emptyArray()) {
                 if (!file.isFile) continue
                 if (file.name.endsWith(".tmp")) continue
@@ -135,7 +136,12 @@ class FileMigrator(
                 val destHash =
                     try {
                         hexToBytes(hashName)
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        // deleteLegacySourceFiles will erase this file afterwards, so
+                        // log loudly — the operator gets no other chance to catch an
+                        // unparseable filename before it's gone.
+                        Log.w(TAG, "Skipping non-hex ratchet filename ${file.name}: ${e.message}")
+                        skipped++
                         continue
                     }
                 try {
@@ -143,11 +149,23 @@ class FileMigrator(
                         DestinationRatchetEntity(destHash = destHash, data = file.readBytes()),
                     )
                     count++
-                } catch (_: Exception) {
-                    // Skip a single bad file, continue with the rest.
+                } catch (e: Exception) {
+                    // Same reasoning as above — file is about to be deleted. If this
+                    // was a transient SQLite error the destination loses ratchet
+                    // history until the next rotation, so surface it clearly.
+                    Log.w(
+                        TAG,
+                        "Failed to import ratchet file ${file.name} for destination " +
+                            "${hashName.take(8)}... into Room: ${e.message}",
+                    )
+                    skipped++
                 }
             }
-            Log.i(TAG, "Migrated $count destination ratchets")
+            if (skipped > 0) {
+                Log.w(TAG, "Migrated $count destination ratchets, skipped $skipped")
+            } else {
+                Log.i(TAG, "Migrated $count destination ratchets")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to migrate destination ratchets: ${e.message}")
         }

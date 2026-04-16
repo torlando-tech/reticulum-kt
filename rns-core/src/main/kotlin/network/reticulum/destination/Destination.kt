@@ -1100,9 +1100,12 @@ class Destination private constructor(
                     // Try decryption with current in-memory ratchets
                     var plaintext = tryDecryptWithRatchets(id, ciphertext)
 
-                    // If failed and we have a ratchets file, reload and retry
-                    // (matches Python: reload from disk on failure)
-                    if (plaintext == null && ratchetsPath != null) {
+                    // If failed and we have persistent ratchet storage (file OR store),
+                    // reload and retry (matches Python: reload from disk on failure).
+                    if (plaintext == null &&
+                        (ratchetsPath != null ||
+                            network.reticulum.transport.Transport.destinationRatchetStore != null)
+                    ) {
                         try {
                             println("Decryption with ratchets failed on $this, reloading ratchets from storage and retrying")
                             reloadRatchets()
