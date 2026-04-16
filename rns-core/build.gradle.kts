@@ -30,9 +30,8 @@ dependencies {
     // Compression - Apache Commons Compress for BZ2
     implementation("org.apache.commons:commons-compress:1.26.0")
 
-    // Logging
+    // Logging — SLF4J API only; consumers supply their own binding (Logback, Log4j2, etc.)
     implementation("io.github.microutils:kotlin-logging-jvm:3.0.5")
-    implementation("org.slf4j:slf4j-simple:2.0.9")
 
     // Testing
     testImplementation(kotlin("test"))
@@ -40,4 +39,5 @@ dependencies {
     testImplementation("io.kotest:kotest-runner-junit5:$kotestVersion")
     testImplementation("io.kotest:kotest-assertions-core:$kotestVersion")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
+    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.9")
 }
