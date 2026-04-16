@@ -2,6 +2,7 @@ plugins {
     id("com.android.library")
     id("kotlin-parcelize")
     id("com.google.devtools.ksp")
+    `maven-publish`
 }
 
 val coroutinesVersion: String by project
@@ -44,6 +45,18 @@ android {
     testOptions {
         unitTests.all {
             it.useJUnit()
+        }
+    }
+
+    publishing {
+        singleVariant("release") { withSourcesJar() }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") { from(components["release"]) }
         }
     }
 }

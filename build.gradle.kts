@@ -7,8 +7,8 @@ plugins {
 }
 
 allprojects {
-    group = "network.reticulum"
-    version = "0.1.0-SNAPSHOT"
+    group = "com.github.torlando-tech.reticulum-kt"
+    version = "0.1.0"
 }
 
 dependencies {
