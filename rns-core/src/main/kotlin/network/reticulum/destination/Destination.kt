@@ -407,7 +407,6 @@ class Destination private constructor(
      * @throws java.io.IOException if file write fails
      */
     private fun persistRatchets() {
-        val path = ratchetsPath ?: throw IllegalStateException("No ratchets path set")
         val id = identity ?: throw IllegalStateException("Cannot persist ratchets without identity")
         require(id.hasPrivateKey) { "Cannot persist ratchets without private key" }
 
@@ -437,7 +436,16 @@ class Destination private constructor(
                 outerPacker.writePayload(packedRatchets)
                 val fileData = outerPacker.toByteArray()
 
-                // Write to temporary file first
+                // Prefer the pluggable store (Room on Android) so private ratchet keys
+                // don't touch the filesystem. Fall back to file-based persistence when
+                // no store is wired (bare rns-core, tests, etc.).
+                val store = network.reticulum.transport.Transport.destinationRatchetStore
+                if (store != null) {
+                    store.save(hash, fileData)
+                    return@withLock
+                }
+
+                val path = ratchetsPath ?: throw IllegalStateException("No ratchets path set")
                 val file = File(path)
                 val tempFile = File("$path.tmp")
 
@@ -470,18 +478,22 @@ class Destination private constructor(
      * @throws java.io.IOException if file read or verification fails
      */
     private fun reloadRatchets(): Boolean {
-        val path = ratchetsPath ?: throw IllegalStateException("No ratchets path set")
         val id = identity ?: throw IllegalStateException("Cannot reload ratchets without identity")
 
-        val file = File(path)
-        if (!file.exists()) {
+        // Prefer the pluggable store (Room on Android). Fall back to reading the file
+        // on disk when no store is wired.
+        val store = network.reticulum.transport.Transport.destinationRatchetStore
+        val storedBytes = store?.load(hash)
+
+        val file: File? = if (storedBytes == null && ratchetsPath != null) File(ratchetsPath!!) else null
+        if (storedBytes == null && (file == null || !file.exists())) {
             return false
         }
 
         ratchetFileLock.withLock {
             fun loadAttempt() {
-                // Read file
-                val fileData = file.readBytes()
+                // Read from store if present, otherwise from disk
+                val fileData = storedBytes ?: file!!.readBytes()
 
                 // Unpack outer msgpack dict: {"signature": bytes, "ratchets": bytes}
                 // Matches Python: umsgpack.unpackb(ratchets_file.read())
@@ -1088,9 +1100,12 @@ class Destination private constructor(
                     // Try decryption with current in-memory ratchets
                     var plaintext = tryDecryptWithRatchets(id, ciphertext)
 
-                    // If failed and we have a ratchets file, reload and retry
-                    // (matches Python: reload from disk on failure)
-                    if (plaintext == null && ratchetsPath != null) {
+                    // If failed and we have persistent ratchet storage (file OR store),
+                    // reload and retry (matches Python: reload from disk on failure).
+                    if (plaintext == null &&
+                        (ratchetsPath != null ||
+                            network.reticulum.transport.Transport.destinationRatchetStore != null)
+                    ) {
                         try {
                             println("Decryption with ratchets failed on $this, reloading ratchets from storage and retrying")
                             reloadRatchets()

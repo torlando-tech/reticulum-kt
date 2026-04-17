@@ -268,6 +268,7 @@ class ReticulumService : LifecycleService() {
         network.reticulum.transport.Transport.tunnelStore = null
         network.reticulum.transport.Transport.announceStore = null
         network.reticulum.transport.Transport.discoveryStore = null
+        network.reticulum.transport.Transport.destinationRatchetStore = null
         network.reticulum.identity.Identity.identityStore = null
 
         database?.close()
@@ -311,7 +312,8 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.ReticulumDatabase::class.java,
                 "reticulum.db"
             ).addMigrations(
-                network.reticulum.android.db.ReticulumDatabase.MIGRATION_1_2
+                network.reticulum.android.db.ReticulumDatabase.MIGRATION_1_2,
+                network.reticulum.android.db.ReticulumDatabase.MIGRATION_2_3,
             ).build()
             database = db
 
@@ -332,6 +334,8 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.store.RoomDiscoveryStore(db.discoveredInterfaceDao(), executor)
             network.reticulum.identity.Identity.identityStore =
                 network.reticulum.android.db.store.RoomIdentityStore(db.knownDestinationDao(), db.identityRatchetDao(), executor)
+            network.reticulum.transport.Transport.destinationRatchetStore =
+                network.reticulum.android.db.store.RoomDestinationRatchetStore(db.destinationRatchetDao(), executor)
 
             Log.i(TAG, "Room database initialized with persistent stores")
 
@@ -340,7 +344,10 @@ class ReticulumService : LifecycleService() {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 // Migrate existing file-based data to Room (one-time, idempotent)
                 network.reticulum.android.db.FileMigrator(
-                    db, "$configDir/storage", "$configDir/cache"
+                    db = db,
+                    storagePath = "$configDir/storage",
+                    cachePath = "$configDir/cache",
+                    lxmfRatchetsPath = "$configDir/lxmf/ratchets",
                 ).migrateIfNeeded()
 
                 // Configure Transport for coroutine-based job loop on Android
