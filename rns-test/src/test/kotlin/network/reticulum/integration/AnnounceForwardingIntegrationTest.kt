@@ -194,9 +194,14 @@ class AnnounceForwardingIntegrationTest {
         for (raw in packets) {
             val parsed = Packet.unpack(raw)
             if (parsed != null && parsed.packetType == PacketType.ANNOUNCE) {
-                // The hop count should match what Transport processed
-                // (incremented by 1 from inbound processing, then preserved in forwarding)
-                assertTrue(parsed.hops >= 0, "Hop count should be non-negative: ${parsed.hops}")
+                // The injected announce arrived on ExternalInterface with wire_hops=0
+                // (it was never sent over a real network, just handed to Transport).
+                // processInbound does one +1, and retransmitAnnounceToLocalClients
+                // preserves that value. So the local client must see hops=1.
+                // If this assertion starts failing with hops=2 or higher, the forward
+                // path is double-counting (the exact bug class we'd want to catch).
+                assertEquals(1, parsed.hops,
+                    "Forwarded announce should have hops=1 after one +1 at inbound")
                 println("  [Test] Hop count preserved: ${parsed.hops}")
                 return
             }
