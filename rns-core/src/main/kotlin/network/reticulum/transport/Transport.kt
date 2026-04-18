@@ -2866,10 +2866,8 @@ object Transport {
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
-        // Use path routing when we have a valid, unexpired path.
-        // For DATA packets with multi-hop paths, we still broadcast since HEADER_2 transport
-        // routing has issues with nextHop. But for 1-hop (direct) paths, we use path routing
-        // to avoid duplicate sends across multiple interfaces.
+        // Use path routing when we have a valid, unexpired path (Python
+        // Transport.py:972-1019).
         val usePathRouting =
             pathEntry != null &&
                 !pathEntry.isExpired() &&
@@ -2877,16 +2875,7 @@ object Transport {
                 packet.destinationType != DestinationType.PLAIN &&
                 packet.destinationType != DestinationType.GROUP
 
-        // For DATA packets, only use path routing for direct (1-hop) connections
-        // Multi-hop DATA packets still need broadcasting until transport routing is fixed
-        val effectiveUsePathRouting =
-            if (packet.packetType == PacketType.DATA && pathEntry != null) {
-                usePathRouting && pathEntry.hops == 1
-            } else {
-                usePathRouting
-            }
-
-        if (effectiveUsePathRouting) {
+        if (usePathRouting) {
             // We have a path - use it
             val outboundInterface = findInterfaceByHash(pathEntry!!.receivingInterfaceHash)
             if (outboundInterface == null) {
@@ -2900,28 +2889,45 @@ object Transport {
             }
             if (outboundInterface != null) {
                 log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
-                if (pathEntry.hops > 1) {
-                    // Insert into transport (HEADER_2)
-                    val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
-                    transmit(outboundInterface, transportRaw)
-                    sent = true
-                } else if (pathEntry.hops == 1 && isConnectedToSharedInstance) {
-                    // When behind a shared instance, even 1-hop destinations need
-                    // transport headers so the shared instance can route them onto
-                    // the network. Python Transport.py:993-1011
-                    val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
-                    transmit(outboundInterface, transportRaw)
-                    sent = true
-                } else {
-                    // Direct transmission
-                    transmit(outboundInterface, packedData)
-                    sent = true
+
+                // Python-parity branching (Transport.py:980-1019):
+                //   hops > 1  + HEADER_1  → wrap in HEADER_2 with nextHop as transport_id
+                //   hops == 1 + shared-instance + HEADER_1 → same wrap (Python:993-1011)
+                //   hops == 1 + direct                     → transmit packet.raw as-is
+                //   hops > 1  + HEADER_2                   → fall through to broadcast
+                //                                            (Python's own clients don't
+                //                                            generate HEADER_2 outbound; if
+                //                                            a caller supplies one, we don't
+                //                                            double-wrap — identical to Python)
+                val isHeader1 = packet.headerType == HeaderType.HEADER_1
+                when {
+                    pathEntry.hops > 1 && isHeader1 -> {
+                        val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
+                        transmit(outboundInterface, transportRaw)
+                        sent = true
+                    }
+                    pathEntry.hops == 1 && isConnectedToSharedInstance && isHeader1 -> {
+                        // Python Transport.py:993-1011: a 1-hop destination behind a shared
+                        // instance still needs transport wrapping so the instance forwards.
+                        val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
+                        transmit(outboundInterface, transportRaw)
+                        sent = true
+                    }
+                    pathEntry.hops <= 1 -> {
+                        // Direct transmission (hops==0 for self/local-client, hops==1 direct)
+                        transmit(outboundInterface, packedData)
+                        sent = true
+                    }
+                    // pathEntry.hops > 1 but packet is already HEADER_2: fall through to
+                    // broadcast below, matching Python's "sent stays False" behavior.
                 }
 
-                // Update path timestamp
-                val touched = pathEntry.touch()
-                pathTable[packet.destinationHash.toKey()] = touched
-                pathStore?.upsertPath(packet.destinationHash, touched)
+                if (sent) {
+                    // Update path timestamp
+                    val touched = pathEntry.touch()
+                    pathTable[packet.destinationHash.toKey()] = touched
+                    pathStore?.upsertPath(packet.destinationHash, touched)
+                }
             } else {
                 log("Path exists for $destHex but interface not found")
             }
@@ -3088,12 +3094,21 @@ object Transport {
 
     /**
      * Insert a packet into transport by adding HEADER_2.
+     *
+     * Expects a HEADER_1 input. Double-wrapping a HEADER_2 packet would shift the
+     * original transport_id out of its expected offset and produce a malformed
+     * packet whose destination hash lands in the wrong position — a silent
+     * corruption the receiver would just drop. Enforce the invariant at the
+     * entry point so any caller bug fails loudly in tests.
      */
     private fun insertIntoTransport(
         packet: Packet,
         nextHop: ByteArray,
     ): ByteArray {
         val raw = packet.raw ?: packet.pack()
+        require(packet.headerType == HeaderType.HEADER_1) {
+            "insertIntoTransport expects a HEADER_1 packet; got ${packet.headerType}"
+        }
 
         // Build new flags with HEADER_2 and TRANSPORT type
         val newFlags =
