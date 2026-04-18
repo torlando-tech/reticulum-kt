@@ -3582,17 +3582,31 @@ object Transport {
         val targetInterface = packet.attachedInterface
 
         for (iface in interfaces) {
-            if (!iface.canSend ||
-                !iface.online ||
-                iface.hash.contentEquals(receivingInterface.hash) ||
-                isLocalClientInterface(iface)
-            ) {
+            if (!iface.canSend || !iface.online || isLocalClientInterface(iface)) {
                 continue
             }
 
-            // Targeted emission: skip all interfaces except the attached one.
-            if (targetInterface != null && !iface.hash.contentEquals(targetInterface.hash)) {
-                continue
+            if (targetInterface != null) {
+                // Targeted emission (path response): emit ONLY on the attached
+                // interface, ignoring the receiving-interface skip. The skip
+                // rule exists to prevent broadcast announce loops; it doesn't
+                // apply when the caller has explicitly asked us to reply on a
+                // specific interface, and applying it here would silently
+                // drop the packet when targetInterface == receivingInterface
+                // (the common case for path_request handling where
+                // originalInterface is null and the fallback resolves to
+                // receivingInterface).
+                if (!iface.hash.contentEquals(targetInterface.hash)) {
+                    continue
+                }
+            } else {
+                // Broadcast retransmit: skip the interface we received on to
+                // avoid re-emitting an announce back to its source (Python
+                // loop-prevention via packet hashlist is the real guard;
+                // this is a cheap local optimization).
+                if (iface.hash.contentEquals(receivingInterface.hash)) {
+                    continue
+                }
             }
 
             if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
