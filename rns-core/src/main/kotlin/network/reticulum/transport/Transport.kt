@@ -2285,6 +2285,13 @@ object Transport {
             // Set hop count from path table (Python line 2736)
             cachedPacket.hops = pathEntry.hops
 
+            // Target the response at the requesting interface only (Python line 2781:
+            // announce_table entry stores attached_interface = requesting_interface).
+            // queueAnnounceRetransmit below respects attachedInterface for targeted
+            // emission. Without this the response would be broadcast, inflating
+            // hop counts on unrelated peers that receive the stale cached announce.
+            cachedPacket.attachedInterface = receivingInterface
+
             // Roaming mode check: don't answer if path is on the same roaming-mode interface
             // Python line 2731-2732
             if (receivingInterface.mode == InterfaceMode.ROAMING &&
@@ -3106,6 +3113,29 @@ object Transport {
 
     // ===== Packet Type Handlers =====
 
+    /**
+     * Extract the 5-byte big-endian emission timestamp from a 10-byte random_blob.
+     *
+     * The random_blob layout is 5 bytes of random material + 5 bytes of emission time
+     * (seconds since epoch, big-endian). Matches Python Transport.py:2935-2936
+     * `timebase_from_random_blob`.
+     */
+    private fun timebaseFromRandomBlob(randomBlob: ByteArray): Long {
+        if (randomBlob.size < 10) return 0L
+        var value = 0L
+        for (i in 5..9) {
+            value = (value shl 8) or (randomBlob[i].toLong() and 0xFF)
+        }
+        return value
+    }
+
+    /**
+     * Take the max emission timestamp across a list of random_blobs. Matches Python
+     * Transport.py:2938-2945 `timebase_from_random_blobs`.
+     */
+    private fun timebaseFromRandomBlobs(randomBlobs: List<ByteArray>): Long =
+        randomBlobs.maxOfOrNull { timebaseFromRandomBlob(it) } ?: 0L
+
     private fun processAnnounce(
         packet: Packet,
         interfaceRef: InterfaceRef,
@@ -3120,6 +3150,25 @@ object Transport {
         val destHash = packet.destinationHash
         val identity = announceData.identity
         val appData = announceData.appData
+
+        // Store the identity and ratchet unconditionally on a valid announce,
+        // matching Python Identity.validate_announce (Identity.py:457,478). These
+        // must happen BEFORE the path-table should_add check because ratchet and
+        // identity recall are needed for decryption regardless of whether the
+        // announce also updates our routing path. The previous Kotlin placement
+        // inside the should_add branch meant a stricter replacement rule (e.g.,
+        // rejecting a re-announce that arrives within the same emission-second)
+        // would silently drop ratchet rotation.
+        Identity.remember(
+            packetHash = packet.packetHash,
+            destHash = destHash,
+            publicKey = identity.getPublicKey(),
+            appData = appData,
+        )
+        announceData.ratchet?.let { ratchet ->
+            network.reticulum.destination.Destination.setRatchetForDestination(destHash, ratchet)
+            Identity.rememberRatchet(destHash, ratchet)
+        }
 
         // Record incoming announce for frequency tracking
         interfaceRef.recordIncomingAnnounce()
@@ -3156,22 +3205,36 @@ object Transport {
                 destHash.copyOf()
             }
 
-        // Check if this announce should update the path table (Python:1604-1686)
+        // Check if this announce should update the path table (Python:1604-1686).
+        //
+        // Python requires two conditions for a same-or-better-hop replacement:
+        //   (a) random_blob has not been seen (replay protection), AND
+        //   (b) announce_emitted > max(emission_time stored in random_blobs)
+        // The Kotlin port previously checked only (a), which let stale announces
+        // (e.g., a path_response holding an old cached route) overwrite a fresh
+        // direct path if their random_blobs happened to differ. The worse-hop
+        // branch is similarly emission-time-aware in Python.
         val existingEntry = pathTable[destHash.toKey()]
         val shouldAdd =
             if (existingEntry != null) {
+                val announceEmitted = timebaseFromRandomBlob(announceData.randomHash)
+                val pathTimebase = timebaseFromRandomBlobs(existingEntry.randomBlobs)
+                val blobIsNew = !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+
                 if (packet.hops <= existingEntry.hops) {
-                    // Better or equal path — update if we haven't seen this random blob
-                    !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
+                    // Equal or better hop count — accept only if blob is new AND the
+                    // announce is strictly more recent than any existing blob. Python
+                    // Transport.py:1620-1631.
+                    blobIsNew && announceEmitted > pathTimebase
                 } else {
-                    // Worse path — only update if existing is expired or unresponsive
+                    // Worse hop count — accept only under specific conditions (Python
+                    // Transport.py:1632-1681).
                     val now = System.currentTimeMillis()
-                    if (now >= existingEntry.expires) {
-                        !existingEntry.randomBlobs.any { it.contentEquals(announceData.randomHash) }
-                    } else if (isPathUnresponsive(destHash)) {
-                        true
-                    } else {
-                        false
+                    when {
+                        now >= existingEntry.expires -> blobIsNew
+                        announceEmitted > pathTimebase -> blobIsNew
+                        announceEmitted == pathTimebase && isPathUnresponsive(destHash) -> true
+                        else -> false
                     }
                 }
             } else {
@@ -3218,21 +3281,8 @@ object Transport {
             interface_ = interfaceRef,
         )
 
-        // Store the identity for later recall
-        Identity.remember(
-            packetHash = packet.packetHash,
-            destHash = destHash,
-            publicKey = identity.getPublicKey(),
-            appData = appData,
-        )
-
-        // Store ratchet if present in announce
-        val ratchet = announceData.ratchet
-        if (ratchet != null) {
-            network.reticulum.destination.Destination
-                .setRatchetForDestination(destHash, ratchet)
-            Identity.rememberRatchet(destHash, ratchet)
-        }
+        // Identity and ratchet are already stored above (before the should_add
+        // branch), matching Python's validate_announce.
 
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
@@ -3506,8 +3556,15 @@ object Transport {
         // Spawned local client interfaces have OUT=False in Python (LocalInterface.py:417),
         // so they are excluded from announce retransmission. Local clients receive announces
         // through retransmitAnnounceToLocalClients() instead.
+        //
+        // If the packet has an attachedInterface set, this is a targeted emission
+        // (e.g., a path response replying to a specific requester). Restrict to that
+        // interface only, matching Python's `attached_interface` semantics in
+        // Transport.py:2781 where path-response announces carry the requesting
+        // interface as their attached_interface.
         val isLocal = destinations.any { it.hash.contentEquals(destinationHash) }
         val sourceMode = nextHopInterface(destinationHash)?.mode
+        val targetInterface = packet.attachedInterface
 
         for (iface in interfaces) {
             if (!iface.canSend ||
@@ -3515,6 +3572,11 @@ object Transport {
                 iface.hash.contentEquals(receivingInterface.hash) ||
                 isLocalClientInterface(iface)
             ) {
+                continue
+            }
+
+            // Targeted emission: skip all interfaces except the attached one.
+            if (targetInterface != null && !iface.hash.contentEquals(targetInterface.hash)) {
                 continue
             }
 
