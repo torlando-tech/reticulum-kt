@@ -1640,7 +1640,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             result("valid" to boolVal(valid), "value" to intVal(if (valid) zeros else 0))
         }
 
-        else -> throw IllegalArgumentException("Unknown command: $command")
+        else -> {
+            if (command.startsWith("behavioral_")) {
+                handleBehavioralCommand(command, p)
+            } else {
+                throw IllegalArgumentException("Unknown command: $command")
+            }
+        }
     }
 }
 
