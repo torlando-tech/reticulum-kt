@@ -2518,6 +2518,17 @@ object Transport {
         interfaceRef.rStatSnr?.let { packet.snr = it }
         interfaceRef.rStatQ?.let { packet.q = it }
 
+        // Log wire-side hops before the +1 increment for diagnostics.
+        // Pairs with the TX PACKET log in transmit() so hop progression
+        // across the mesh can be reconstructed from logs alone.
+        if (packet.packetType == PacketType.ANNOUNCE) {
+            log(
+                "RX ANNOUNCE: dest=${packet.destinationHash.toHexString()} " +
+                    "wire_hops=${packet.hops} iface=${interfaceRef.name} " +
+                    "ctx=${packet.context}",
+            )
+        }
+
         // Increment hop count (Python Transport.py:1319)
         packet.hops++
 
@@ -3237,9 +3248,15 @@ object Transport {
 
         retransmitAnnounceToLocalClients(packet, interfaceRef)
 
-        // Retransmit if transport is enabled OR announce came from a local client
+        // Retransmit if transport is enabled OR announce came from a local client.
+        // PATH_RESPONSE is excluded to match Python Transport.py:1741 — path responses
+        // are targeted replies to a specific requester and must not be rebroadcast as
+        // fresh announces, which would inflate hop counts and flood the mesh.
         val fromLocal = fromLocalClient(interfaceRef)
-        if ((transportEnabled || fromLocal) && packet.hops < TransportConstants.PATHFINDER_M) {
+        if ((transportEnabled || fromLocal) &&
+            packet.context != PacketContext.PATH_RESPONSE &&
+            packet.hops < TransportConstants.PATHFINDER_M
+        ) {
             queueAnnounceRetransmit(destHash, packet, interfaceRef, fromLocalClient = fromLocal)
         }
     }
