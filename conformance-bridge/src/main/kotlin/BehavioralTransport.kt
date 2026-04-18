@@ -11,7 +11,6 @@
  */
 
 import com.google.gson.JsonArray
-import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import network.reticulum.Reticulum
@@ -19,8 +18,8 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.toRef
-import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedDeque
 
@@ -76,12 +75,15 @@ class MockInterface(
 }
 
 // --- Handle-indexed state ---
-
-private data class BehavioralInstance(
+//
+// Plain class (not data class): `data class` with a ByteArray field uses
+// reference equality for the generated equals/hashCode, which is misleading
+// and this class isn't used structurally.
+private class BehavioralInstance(
     val rns: Reticulum,
     val identityHash: ByteArray,
+    val configDir: File,
     val interfaces: MutableMap<String, MockInterface> = mutableMapOf(),
-    val interfaceRefs: MutableMap<String, InterfaceRef> = mutableMapOf(),
 )
 
 private val behavioralInstances = mutableMapOf<String, BehavioralInstance>()
@@ -117,9 +119,9 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             Identity.fromPrivateKey(seed)
         }
 
-        val configDir = java.nio.file.Files.createTempDirectory("rns_behav_").toString()
+        val configDir = java.nio.file.Files.createTempDirectory("rns_behav_").toFile()
         val rns = Reticulum.start(
-            configDir = configDir,
+            configDir = configDir.absolutePath,
             enableTransport = enableTransport,
             shareInstance = false,
             connectToSharedInstance = false,
@@ -130,7 +132,7 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             ?: throw IllegalStateException("Transport started without an identity")
 
         val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
-        behavioralInstances[handle] = BehavioralInstance(rns, identityHash)
+        behavioralInstances[handle] = BehavioralInstance(rns, identityHash, configDir)
 
         result(
             "handle" to JsonPrimitive(handle),
@@ -147,6 +149,13 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             }
             try {
                 Reticulum.stop()
+            } catch (_: Throwable) {
+                // Best-effort.
+            }
+            // Clean up the config dir so a full pytest session doesn't
+            // accumulate one /tmp/rns_behav_* per test.
+            try {
+                inst.configDir.deleteRecursively()
             } catch (_: Throwable) {
                 // Best-effort.
             }
@@ -172,7 +181,6 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
 
         val ifaceId = UUID.randomUUID().toString().replace("-", "").substring(0, 12)
         inst.interfaces[ifaceId] = iface
-        inst.interfaceRefs[ifaceId] = ifaceRef
 
         result(
             "iface_id" to JsonPrimitive(ifaceId),
