@@ -70,6 +70,20 @@ private fun allocateFreePort(): Int {
     }
 }
 
+/** Detach interfaces, clear the map, and stop the RNS singleton.
+ *  Clearing the map BEFORE stopping ensures no stale handle can survive
+ *  and point at a dead Reticulum. */
+private fun resetWireState() {
+    val stale = wireInstances.values.toList()
+    wireInstances.clear()
+    for (inst in stale) {
+        runCatching { inst.serverIface?.detach() }
+        runCatching { inst.clientIface?.detach() }
+        runCatching { inst.configDir.deleteRecursively() }
+    }
+    runCatching { Reticulum.stop() }
+}
+
 fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (command) {
     "wire_start_tcp_server" -> {
         val networkName = p.get("network_name")?.asString?.takeIf { it.isNotEmpty() }
@@ -77,56 +91,62 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val bindPortReq = p.get("bind_port")?.asInt ?: 0
         val bindPort = if (bindPortReq == 0) allocateFreePort() else bindPortReq
 
-        // Stop any prior Reticulum left over from behavioral tests so our
-        // start() isn't a no-op with stale state.
-        try {
-            Reticulum.stop()
-        } catch (_: Throwable) {
-        }
+        // Clear any prior wire state (detach interfaces, drop handles,
+        // stop the RNS singleton) so this call starts clean and no stale
+        // handle can survive pointing at a dead Reticulum.
+        resetWireState()
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_wire_server_").toFile()
-        val rns = Reticulum.start(
-            configDir = configDir.absolutePath,
-            enableTransport = true,
-            shareInstance = false,
-            connectToSharedInstance = false,
-        )
+        try {
+            val rns = Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = true,
+                shareInstance = false,
+                connectToSharedInstance = false,
+            )
 
-        val server = TCPServerInterface(
-            name = "Wire TCP Server",
-            bindAddress = "127.0.0.1",
-            bindPort = bindPort,
-            ifacNetname = networkName,
-            ifacNetkey = passphrase,
-        )
-        server.start()
-        // Register with Transport so the Transport layer considers this
-        // interface a valid outbound path AND so inbound packets land in
-        // the announce/path pipeline.
-        val serverRef = server.toRef()
-        Transport.registerInterface(serverRef)
-        server.onPacketReceived = { data, iface ->
-            Transport.inbound(data, iface.toRef())
+            val server = TCPServerInterface(
+                name = "Wire TCP Server",
+                bindAddress = "127.0.0.1",
+                bindPort = bindPort,
+                ifacNetname = networkName,
+                ifacNetkey = passphrase,
+            )
+            server.start()
+            // Register with Transport so the Transport layer considers this
+            // interface a valid outbound path AND so inbound packets land in
+            // the announce/path pipeline.
+            val serverRef = server.toRef()
+            Transport.registerInterface(serverRef)
+            server.onPacketReceived = { data, iface ->
+                Transport.inbound(data, iface.toRef())
+            }
+
+            val identityHash = Transport.identity?.hash
+                ?: throw IllegalStateException("Transport started without an identity")
+
+            val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            wireInstances[handle] = WireInstance(
+                rns = rns,
+                identityHash = identityHash,
+                configDir = configDir,
+                role = "server",
+                port = bindPort,
+                serverIface = server,
+            )
+
+            result(
+                "handle" to JsonPrimitive(handle),
+                "port" to JsonPrimitive(bindPort),
+                "identity_hash" to hexVal(identityHash),
+            )
+        } catch (t: Throwable) {
+            // Partial setup — roll back RNS and the temp dir so we don't
+            // leak them for the remainder of the bridge process's lifetime.
+            runCatching { Reticulum.stop() }
+            runCatching { configDir.deleteRecursively() }
+            throw t
         }
-
-        val identityHash = Transport.identity?.hash
-            ?: throw IllegalStateException("Transport started without an identity")
-
-        val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
-        wireInstances[handle] = WireInstance(
-            rns = rns,
-            identityHash = identityHash,
-            configDir = configDir,
-            role = "server",
-            port = bindPort,
-            serverIface = server,
-        )
-
-        result(
-            "handle" to JsonPrimitive(handle),
-            "port" to JsonPrimitive(bindPort),
-            "identity_hash" to hexVal(identityHash),
-        )
     }
 
     "wire_start_tcp_client" -> {
@@ -135,50 +155,53 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val targetHost = p.str("target_host")
         val targetPort = p.int("target_port")
 
-        try {
-            Reticulum.stop()
-        } catch (_: Throwable) {
-        }
+        resetWireState()
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_wire_client_").toFile()
-        val rns = Reticulum.start(
-            configDir = configDir.absolutePath,
-            enableTransport = true,
-            shareInstance = false,
-            connectToSharedInstance = false,
-        )
+        try {
+            val rns = Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = true,
+                shareInstance = false,
+                connectToSharedInstance = false,
+            )
 
-        val client = TCPClientInterface(
-            name = "Wire TCP Client",
-            targetHost = targetHost,
-            targetPort = targetPort,
-            ifacNetname = networkName,
-            ifacNetkey = passphrase,
-        )
-        client.start()
-        val clientRef = client.toRef()
-        Transport.registerInterface(clientRef)
-        client.onPacketReceived = { data, iface ->
-            Transport.inbound(data, iface.toRef())
+            val client = TCPClientInterface(
+                name = "Wire TCP Client",
+                targetHost = targetHost,
+                targetPort = targetPort,
+                ifacNetname = networkName,
+                ifacNetkey = passphrase,
+            )
+            client.start()
+            val clientRef = client.toRef()
+            Transport.registerInterface(clientRef)
+            client.onPacketReceived = { data, iface ->
+                Transport.inbound(data, iface.toRef())
+            }
+
+            val identityHash = Transport.identity?.hash
+                ?: throw IllegalStateException("Transport started without an identity")
+
+            val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            wireInstances[handle] = WireInstance(
+                rns = rns,
+                identityHash = identityHash,
+                configDir = configDir,
+                role = "client",
+                port = targetPort,
+                clientIface = client,
+            )
+
+            result(
+                "handle" to JsonPrimitive(handle),
+                "identity_hash" to hexVal(identityHash),
+            )
+        } catch (t: Throwable) {
+            runCatching { Reticulum.stop() }
+            runCatching { configDir.deleteRecursively() }
+            throw t
         }
-
-        val identityHash = Transport.identity?.hash
-            ?: throw IllegalStateException("Transport started without an identity")
-
-        val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
-        wireInstances[handle] = WireInstance(
-            rns = rns,
-            identityHash = identityHash,
-            configDir = configDir,
-            role = "client",
-            port = targetPort,
-            clientIface = client,
-        )
-
-        result(
-            "handle" to JsonPrimitive(handle),
-            "identity_hash" to hexVal(identityHash),
-        )
     }
 
     "wire_announce" -> {
@@ -217,10 +240,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        // Busy-loop until path appears or deadline hits. Structured this
-        // way (no early return) because `when` branches can't use
-        // `return@when` without a label — simplest to just compute the
-        // result once the loop exits.
+        // Busy-loop until path appears or deadline hits.
         val deadline = System.currentTimeMillis() + timeoutMs
         var foundHops: Int? = null
         while (System.currentTimeMillis() < deadline && foundHops == null) {
