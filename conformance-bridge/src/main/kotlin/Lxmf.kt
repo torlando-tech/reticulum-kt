@@ -89,7 +89,10 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         // failures before start() so stop() is never called on a
         // half-constructed router.
         var startedRouter: LXMRouter? = null
-        val inst: LxmfInstance
+        // Tracks the map key so catch{} can undo the insertion if the
+        // post-start setup (announce) throws. Null before insertion.
+        var registeredHandle: String? = null
+        val handle: String
         try {
             val router = LXMRouter(
                 identity = identity,
@@ -100,7 +103,7 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
                 displayName = displayName,
             )
 
-            inst = LxmfInstance(
+            val inst = LxmfInstance(
                 wireHandle = wireHandle,
                 router = router,
                 identity = identity,
@@ -139,6 +142,19 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             router.start()
             startedRouter = router
 
+            // Register in the map BEFORE announce() so that even if
+            // announce() (or any later step) throws, the catch block
+            // can still reach the started router via the map and stop
+            // it. Without this, a throw between start() and the map
+            // insertion orphans the router: startedRouter handles the
+            // stop() half, but if UUID.randomUUID() or the map
+            // insertion itself throws after this block, the router
+            // would otherwise be untrackable — matching the
+            // wire_start_tcp_server defensive pattern.
+            handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            lxmfInstances[handle] = inst
+            registeredHandle = handle
+
             // Announce the delivery destination so the propagation node
             // and other peers can route to it / recall its identity for
             // encryption. Caller (the test / fixture) must give
@@ -147,19 +163,19 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             deliveryDestination.announce()
         } catch (t: Throwable) {
             // Partial setup — roll back the router (if start() ran, so
-            // its background coroutines get stopped) and the temp
-            // storage dir so we don't leak either one for the remainder
-            // of the bridge process's lifetime. Matches the
-            // wire_start_tcp_server pattern (WireTcp.kt) which also
-            // catches Throwable so JVM Errors still trigger cleanup.
+            // its background coroutines get stopped), the map entry
+            // (if insertion happened), and the temp storage dir so we
+            // don't leak any of these for the remainder of the bridge
+            // process's lifetime. Matches the wire_start_tcp_server
+            // pattern (WireTcp.kt) which also catches Throwable so JVM
+            // Errors still trigger cleanup.
+            registeredHandle?.let { lxmfInstances.remove(it) }
             startedRouter?.let { runCatching { it.stop() } }
             runCatching { storageDir.deleteRecursively() }
             throw t
         }
 
-        val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
-        lxmfInstances[handle] = inst
-
+        val inst = lxmfInstances.getValue(handle)
         result(
             "handle" to JsonPrimitive(handle),
             "delivery_dest_hash" to hexVal(inst.deliveryDestination.hash),
