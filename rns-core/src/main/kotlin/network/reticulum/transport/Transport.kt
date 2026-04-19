@@ -1051,19 +1051,24 @@ object Transport {
      *
      * The `hops` parameter is accepted for diagnostic/logging purposes (callers pass the
      * traversed hop count of the establishment packet), but the stored path entry always
-     * uses `hops = 1` so that [outbound] takes the direct-transmit branch.
+     * uses `hops = 1`.
      *
-     * Rationale: Python RNS never adds link_id entries to its path_table. Link DATA
-     * packets are sent as HEADER_1 with destination_hash = linkId over the link's
-     * `attached_interface`. Intermediate transport nodes forward them by looking up
-     * `linkId` in their own [linkTable], not by HEADER_2 transport routing.
-     *
-     * Storing `hops = packet.hops` (> 1 for multi-hop establishment) would cause
-     * [outbound] to HEADER_2-wrap link DATA with `transport_id = linkId`, which no
-     * transport node's identity matches, so the intermediate drops the packet as
+     * Link DATA packets must never be HEADER_2-wrapped: their `destination_hash` IS the
+     * `linkId`, which no transport node's identity matches. Any HEADER_2 wrap that uses
+     * `nextHop = linkId` as `transport_id` is dropped by the intermediate transport as
      * "in transport for other transport instance" (see Python `Transport.py:1428`).
-     * Forcing `hops = 1` here keeps outgoing link DATA on the HEADER_1 path, where
-     * the transport's linkTable lookup does the forwarding the way Python does.
+     *
+     * This is enforced by TWO checks — belt and suspenders:
+     *  1. `hops = 1` here, so [outbound] won't take the `hops > 1` HEADER_2 branch.
+     *  2. An `isLink` guard in [outbound] that also skips the shared-instance HEADER_2
+     *     wrap branch (`hops == 1 + isConnectedToSharedInstance`), which would
+     *     otherwise still re-wrap with `nextHop = linkId`.
+     *
+     * Net effect: link DATA always goes on the HEADER_1 path. Intermediate transports
+     * (both Python and Kotlin) forward link DATA by looking `linkId` up in their own
+     * [linkTable], which is populated during LINKREQUEST / LRPROOF traversal. Python
+     * RNS never adds link_id entries to its `path_table` at all — this is the closest
+     * Kotlin-side equivalent given the existing PathEntry-centric routing primitives.
      */
     fun registerLinkPath(
         linkId: ByteArray,
@@ -1074,12 +1079,11 @@ object Transport {
         val entry =
             PathEntry(
                 timestamp = now,
-                // Transport.outbound with hops <= 1 doesn't consult nextHop for the
-                // wire bytes (it transmits packet.raw as-is), so the exact value is
-                // only used for diagnostics. Keep it as linkId for symmetry.
+                // `nextHop` is not read by [outbound] on the paths link DATA takes
+                // (direct transmit uses `packet.raw`), but it's logged and persisted,
+                // so keep it as linkId for symmetry with the entry's key.
                 nextHop = linkId,
-                // ALWAYS 1, even when the actual establishment was multi-hop. See
-                // rationale above.
+                // Always 1 — see doc above for why.
                 hops = 1,
                 expires = now + TransportConstants.PATHFINDER_E,
                 randomBlobs = mutableListOf(),
@@ -2921,21 +2925,31 @@ object Transport {
                 //                                            a caller supplies one, we don't
                 //                                            double-wrap — identical to Python)
                 val isHeader1 = packet.headerType == HeaderType.HEADER_1
+                // Link DATA packets must never be HEADER_2-wrapped: their
+                // destination_hash IS the linkId, which no transport's
+                // identity matches, so any HEADER_2 wrap with `nextHop =
+                // linkId` as transport_id is dropped by the intermediate
+                // as "in transport for other transport instance".
+                // Intermediate transports (Python and Kotlin) forward link
+                // DATA by looking the linkId up in their own link_table —
+                // that lookup requires HEADER_1 so it actually runs.
+                val isLink = packet.destinationType == DestinationType.LINK
                 when {
-                    pathEntry.hops > 1 && isHeader1 -> {
+                    pathEntry.hops > 1 && isHeader1 && !isLink -> {
                         val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                         transmit(outboundInterface, transportRaw)
                         sent = true
                     }
-                    pathEntry.hops == 1 && isConnectedToSharedInstance && isHeader1 -> {
+                    pathEntry.hops == 1 && isConnectedToSharedInstance && isHeader1 && !isLink -> {
                         // Python Transport.py:993-1011: a 1-hop destination behind a shared
                         // instance still needs transport wrapping so the instance forwards.
                         val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                         transmit(outboundInterface, transportRaw)
                         sent = true
                     }
-                    pathEntry.hops <= 1 -> {
-                        // Direct transmission (hops==0 for self/local-client, hops==1 direct)
+                    pathEntry.hops <= 1 || isLink -> {
+                        // Direct transmission (hops==0 for self/local-client, hops==1 direct,
+                        // or any Link destination — see isLink comment above).
                         transmit(outboundInterface, packedData)
                         sent = true
                     }
