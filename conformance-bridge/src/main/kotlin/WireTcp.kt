@@ -306,21 +306,42 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             // Accept any incoming Resource transfer and buffer its
             // reassembled data on completion.
             link.setResourceStrategy(Link.ACCEPT_ALL)
+
+            // Per-link dedup set: reticulum-kt's Resource.assemble() invokes
+            // Link.resourceConcluded twice for the same completed resource
+            // (once directly at Resource.kt:1194, again via
+            // callbacks.completed at Resource.kt:1200 — which itself was
+            // wired to Link.resourceConcluded by Link.ACCEPT_ALL's call
+            // to Resource.accept at Link.kt:2036). Both invocations spawn
+            // daemon threads that land here, so without dedup a single
+            // completed transfer gets enqueued twice and wire_resource_poll
+            // returns duplicate entries. Keyed by resource.hash hex so
+            // distinct resources on the same link each get their own slot.
+            val seenResources: MutableSet<String> =
+                java.util.Collections.newSetFromMap(ConcurrentHashMap())
+
             link.setResourceConcludedCallback { resourceObj ->
                 val resource = resourceObj as? Resource ?: return@setResourceConcludedCallback
-                if (resource.status == ResourceConstants.COMPLETE) {
-                    val data = resource.data
-                    if (data != null) {
-                        listener.resourceBuffer.add(data.copyOf())
-                    } else {
-                        // `Resource.data` is nullable even for a COMPLETE
-                        // resource. Silently dropping the payload would make
-                        // a successful transfer indistinguishable from a
-                        // missed one (wire_resource_poll would block until
-                        // timeout). Surface it on stderr so a test author
-                        // debugging an apparent missed delivery can see it.
-                        System.err.println("[WireTcp] wire_listen: COMPLETE resource has null data, dropping")
-                    }
+                if (resource.status != ResourceConstants.COMPLETE) return@setResourceConcludedCallback
+
+                val hashHex = resource.hash.toHex()
+                if (!seenResources.add(hashHex)) {
+                    // Duplicate invocation from the upstream double-fire —
+                    // drop silently.
+                    return@setResourceConcludedCallback
+                }
+
+                val data = resource.data
+                if (data != null) {
+                    listener.resourceBuffer.add(data.copyOf())
+                } else {
+                    // `Resource.data` is nullable even for a COMPLETE
+                    // resource. Silently dropping the payload would make
+                    // a successful transfer indistinguishable from a
+                    // missed one (wire_resource_poll would block until
+                    // timeout). Surface it on stderr so a test author
+                    // debugging an apparent missed delivery can see it.
+                    System.err.println("[WireTcp] wire_listen: COMPLETE resource has null data, dropping")
                 }
             }
         }
