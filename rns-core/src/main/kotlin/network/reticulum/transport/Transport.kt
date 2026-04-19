@@ -1180,6 +1180,21 @@ object Transport {
         discoveryPathRequests.containsKey(destinationHash.toKey())
 
     /**
+     * Unconditionally emit a path-request packet for `destinationHash`,
+     * bypassing [requestPath]'s Kotlin-only early-skip guards (existing
+     * path / too-recent). Mirrors Python `RNS.Transport.request_path`
+     * (RNS/Transport.py:2541), which also sends unconditionally.
+     *
+     * Exposed primarily for the conformance bridge so tests can observe
+     * a fresh PR on the wire even when this peer already has a path or
+     * recently requested one; production callers should use [requestPath]
+     * and benefit from the guards.
+     */
+    fun sendPathRequestUnconditional(destinationHash: ByteArray) {
+        requestPathInternal(destinationHash)
+    }
+
+    /**
      * Get hop count to a destination.
      *
      * @return Hop count, or null if no path

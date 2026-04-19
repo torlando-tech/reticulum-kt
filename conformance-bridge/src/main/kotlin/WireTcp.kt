@@ -621,13 +621,13 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        // requestPath's own early-skip guards (already has path / too recent)
-        // would make this a no-op in the path-discovery tests — the whole
-        // point is to issue a fresh request even for destinations we
-        // already know / have recently requested. Fire a raw path-request
-        // packet directly, matching Python's behaviour when a test calls
-        // `RNS.Transport.request_path(dest_hash)` without any guard.
-        Transport.requestPath(destHash)
+        // `Transport.requestPath` adds Kotlin-only early-skip guards
+        // (already has path / too recent) that would make this a no-op in
+        // the path-discovery tests — the whole point is to issue a fresh
+        // request even for destinations we already know / have recently
+        // requested. `sendPathRequestUnconditional` bypasses those guards,
+        // matching Python's `RNS.Transport.request_path` behaviour.
+        Transport.sendPathRequestUnconditional(destHash)
         result("sent" to boolVal(true))
     }
 
@@ -716,14 +716,17 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        // Sum of TX bytes across the bridge's configured interface and
-        // any spawned children. Used as a model-agnostic "did this peer
-        // emit any wire traffic" signal for tests where introspecting
-        // internal state (announce_table, discovery_path_requests) is
-        // sensitive to impl-specific held/restore timing.
+        // TX bytes for the bridge's configured interface. For a server,
+        // this already aggregates all spawned clients because
+        // TCPServerClientInterface.processOutgoing propagates each send
+        // up to its parent via `parentInterface?.txBytes?.addAndGet(...)`.
+        // Summing spawned children on top would double-count. Used as a
+        // model-agnostic "did this peer emit any wire traffic" signal for
+        // tests where introspecting internal state (announce_table,
+        // discovery_path_requests) is sensitive to impl-specific
+        // held/restore timing.
         val primary = inst.serverIface ?: inst.clientIface
-        val total = (primary?.txBytes?.get() ?: 0L) +
-            (inst.serverIface?.spawnedInterfaces?.sumOf { it.txBytes.get() } ?: 0L)
+        val total = primary?.txBytes?.get() ?: 0L
         result("tx_bytes" to JsonPrimitive(total))
     }
 
