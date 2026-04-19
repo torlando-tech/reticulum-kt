@@ -426,6 +426,15 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
 
         val finished = done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        if (!finished) {
+            // Cancel the still-running transfer so its background worker
+            // can't fire the resource-concluded callback on the receiver
+            // later and leave a phantom payload in the listener's buffer
+            // for a subsequent wire_resource_poll in the same test to
+            // pick up. Symmetric with the Python bridge's on-timeout
+            // cancel.
+            runCatching { resource.cancel() }
+        }
         val status = finalStatus.get().takeIf { it >= 0 } ?: resource.status
         val success = finished && status == ResourceConstants.COMPLETE
         result(
