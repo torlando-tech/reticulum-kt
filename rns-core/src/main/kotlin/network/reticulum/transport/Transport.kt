@@ -1167,6 +1167,19 @@ object Transport {
     }
 
     /**
+     * Check whether a discovery path request is currently pending for a
+     * destination, meaning this transport has forwarded (or is about to
+     * forward) a path request for that destination on behalf of another
+     * peer. Observable proof that DISCOVER_PATHS_FOR gating allowed the
+     * forward for the receiving interface's mode.
+     *
+     * Exposed primarily for the conformance bridge; production callers
+     * typically don't need this.
+     */
+    fun hasDiscoveryPathRequest(destinationHash: ByteArray): Boolean =
+        discoveryPathRequests.containsKey(destinationHash.toKey())
+
+    /**
      * Get hop count to a destination.
      *
      * @return Hop count, or null if no path

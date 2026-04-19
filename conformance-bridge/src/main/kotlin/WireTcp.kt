@@ -13,10 +13,17 @@
  * this because they don't exercise the full transmit/receive pipeline.
  *
  * Commands handled:
- *   wire_start_tcp_server
- *   wire_start_tcp_client
+ *   wire_start_tcp_server          (accepts optional `mode`)
+ *   wire_start_tcp_client          (accepts optional `mode`)
+ *   wire_set_interface_mode        (runtime mutation of the interface mode)
  *   wire_announce
  *   wire_poll_path
+ *   wire_request_path              (synchronous path request packet send)
+ *   wire_read_path_entry           (timestamp / expires / hops / next hop / iface)
+ *   wire_has_discovery_path_request
+ *   wire_has_announce_table_entry
+ *   wire_read_path_random_hash     (for cached-announce byte-identity tests)
+ *   wire_listen / wire_link_* / wire_resource_*   (link + resource I/O)
  *   wire_stop
  *
  * One bridge process hosts at most one wire Reticulum singleton. The
@@ -25,11 +32,13 @@
  */
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import network.reticulum.Reticulum
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
+import network.reticulum.common.InterfaceMode
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.tcp.TCPClientInterface
@@ -37,6 +46,7 @@ import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
@@ -78,6 +88,29 @@ private class Listener(
 )
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
+
+/**
+ * Parse a free-form `mode` string into an [InterfaceMode].
+ *
+ * Accepts the same synonyms Python RNS's config parser accepts
+ * (`Reticulum.py:619-647`), so either side of a cross-impl wire test can
+ * pass the same literal and land on the same mode value. Null / empty
+ * input returns null (caller applies the default).
+ */
+private fun parseInterfaceMode(raw: String?): InterfaceMode? {
+    if (raw == null) return null
+    val s = raw.trim().lowercase()
+    if (s.isEmpty()) return null
+    return when (s) {
+        "full" -> InterfaceMode.FULL
+        "access_point", "accesspoint", "ap" -> InterfaceMode.ACCESS_POINT
+        "pointtopoint", "point_to_point", "ptp" -> InterfaceMode.POINT_TO_POINT
+        "roaming" -> InterfaceMode.ROAMING
+        "boundary" -> InterfaceMode.BOUNDARY
+        "gateway", "gw" -> InterfaceMode.GATEWAY
+        else -> throw IllegalArgumentException("Unknown interface mode: $raw")
+    }
+}
 
 /**
  * Existence check for the LXMF bridge layer.
@@ -123,6 +156,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val passphrase = p.get("passphrase")?.asString?.takeIf { it.isNotEmpty() }
         val bindPortReq = p.get("bind_port")?.asInt ?: 0
         val bindPort = if (bindPortReq == 0) allocateFreePort() else bindPortReq
+        val desiredMode = parseInterfaceMode(p.get("mode")?.asString)
 
         // Clear any prior wire state (detach interfaces, drop handles,
         // stop the RNS singleton) so this call starts clean and no stale
@@ -145,6 +179,25 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 ifacNetname = networkName,
                 ifacNetkey = passphrase,
             )
+            // Park the interface in the requested mode BEFORE registering
+            // with Transport. The mode is read by the InterfaceAdapter's
+            // getter, so the Transport-facing view reflects the override
+            // as soon as it's observed. Setting it post-register would
+            // race with any in-flight inbound packet that reads mode to
+            // decide DISCOVER_PATHS_FOR eligibility.
+            if (desiredMode != null) server.modeOverride = desiredMode
+            // Register spawned client interfaces with Transport so the
+            // outbound routing layer can locate them — without this,
+            // path responses with `attachedInterface = spawned-child` get
+            // silently dropped at Transport.kt:3632-3658 because the
+            // spawned child isn't in `interfaces`. Python registers all
+            // spawned children at RNS/Interfaces/TCPInterface.py:623
+            // (Transport.interfaces.append(spawned_interface)); we mirror
+            // that here. See also: deregister on disconnect handled
+            // by TCPServerInterface:195.
+            server.onClientConnected = { spawnedChild ->
+                runCatching { Transport.registerInterface(spawnedChild.toRef()) }
+            }
             server.start()
             // Register with Transport so the Transport layer considers this
             // interface a valid outbound path AND so inbound packets land in
@@ -187,6 +240,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val passphrase = p.get("passphrase")?.asString?.takeIf { it.isNotEmpty() }
         val targetHost = p.str("target_host")
         val targetPort = p.int("target_port")
+        val desiredMode = parseInterfaceMode(p.get("mode")?.asString)
 
         resetWireState()
 
@@ -206,6 +260,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 ifacNetname = networkName,
                 ifacNetkey = passphrase,
             )
+            if (desiredMode != null) client.modeOverride = desiredMode
             client.start()
             val clientRef = client.toRef()
             Transport.registerInterface(clientRef)
@@ -529,6 +584,185 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             arr.add(item.toHex())
         }
         result("packets" to arr)
+    }
+
+    "wire_set_interface_mode" -> {
+        val handle = p.str("handle")
+        val modeStr = p.str("mode")
+        val newMode = parseInterfaceMode(modeStr)
+            ?: throw IllegalArgumentException("Empty mode string")
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        // Mutate the bridge's only declared interface. We support exactly
+        // one per handle (server OR client), so there's no ambiguity about
+        // which interface gets the override.
+        val target = inst.serverIface ?: inst.clientIface
+            ?: throw IllegalStateException(
+                "Handle $handle has neither serverIface nor clientIface",
+            )
+        target.modeOverride = newMode
+        // TCPServerInterface's spawned client interfaces each hold their
+        // own `modeOverride` copied at spawn time (TCPServerInterface.kt).
+        // Keep them in sync with the parent so a runtime mode change
+        // affects packets received via existing connections, not just
+        // future ones.
+        inst.serverIface?.spawnedInterfaces?.forEach { child ->
+            child.modeOverride = newMode
+        }
+        result("mode" to JsonPrimitive(modeStr))
+    }
+
+    "wire_request_path" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        // requestPath's own early-skip guards (already has path / too recent)
+        // would make this a no-op in the path-discovery tests — the whole
+        // point is to issue a fresh request even for destinations we
+        // already know / have recently requested. Fire a raw path-request
+        // packet directly, matching Python's behaviour when a test calls
+        // `RNS.Transport.request_path(dest_hash)` without any guard.
+        Transport.requestPath(destHash)
+        result("sent" to boolVal(true))
+    }
+
+    "wire_read_path_entry" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val entry = Transport.pathTable[network.reticulum.common.ByteArrayKey(destHash)]
+        if (entry == null) {
+            result("found" to boolVal(false))
+        } else {
+            val ifaceName = Transport.getInterfaces()
+                .find { it.hash.contentEquals(entry.receivingInterfaceHash) }
+                ?.name
+            result(
+                "found" to boolVal(true),
+                "timestamp" to JsonPrimitive(entry.timestamp),
+                "expires" to JsonPrimitive(entry.expires),
+                "hops" to intVal(entry.hops),
+                "next_hop" to hexVal(entry.nextHop),
+                "receiving_interface_name" to (ifaceName?.let { JsonPrimitive(it) } ?: JsonNull.INSTANCE),
+            )
+        }
+    }
+
+    "wire_has_discovery_path_request" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        result("found" to boolVal(Transport.hasDiscoveryPathRequest(destHash)))
+    }
+
+    "wire_has_announce_table_entry" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        // Membership test on announce_table: a cached-announce re-emission
+        // scheduled in response to a path request lives here for the
+        // PATH_REQUEST_GRACE window before being retransmitted and cleaned
+        // up. Absence immediately after a path request is the observable
+        // for "B refused to answer this PR" (e.g., ROAMING loop
+        // prevention, Transport.py:2731).
+        result(
+            "found" to boolVal(
+                Transport.announceTable.containsKey(
+                    network.reticulum.common.ByteArrayKey(destHash),
+                ),
+            ),
+        )
+    }
+
+    "wire_read_announce_table_timestamp" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        // Return the `timestamp` field of the announce_table entry, or
+        // null if absent. A change in timestamp after a path request
+        // indicates the PR caused B to insert/replace the entry (the
+        // normal answer path); an unchanged timestamp means the PR's
+        // answer path was skipped (e.g. ROAMING loop-prevention).
+        val entry = Transport.announceTable[network.reticulum.common.ByteArrayKey(destHash)]
+        if (entry == null) {
+            result("found" to boolVal(false))
+        } else {
+            result(
+                "found" to boolVal(true),
+                "timestamp" to JsonPrimitive(entry.timestamp),
+            )
+        }
+    }
+
+    "wire_tx_bytes" -> {
+        val handle = p.str("handle")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        // Sum of TX bytes across the bridge's configured interface and
+        // any spawned children. Used as a model-agnostic "did this peer
+        // emit any wire traffic" signal for tests where introspecting
+        // internal state (announce_table, discovery_path_requests) is
+        // sensitive to impl-specific held/restore timing.
+        val primary = inst.serverIface ?: inst.clientIface
+        val total = (primary?.txBytes?.get() ?: 0L) +
+            (inst.serverIface?.spawnedInterfaces?.sumOf { it.txBytes.get() } ?: 0L)
+        result("tx_bytes" to JsonPrimitive(total))
+    }
+
+    "wire_read_path_random_hash" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val entry = Transport.pathTable[network.reticulum.common.ByteArrayKey(destHash)]
+        if (entry == null) {
+            result("found" to boolVal(false))
+        } else {
+            // announcePacketHash is the KEY into the announce cache.
+            // getCachedAnnouncePacket returns the raw on-wire bytes.
+            val cached = Transport.getCachedAnnouncePacket(entry.announcePacketHash)
+            if (cached == null) {
+                result("found" to boolVal(false))
+            } else {
+                val unpacked = Packet.unpack(cached.first)
+                    ?: throw IllegalStateException(
+                        "Could not unpack cached announce for ${destHash.toHex()}",
+                    )
+                // Announce data layout (Python RNS + reticulum-kt):
+                //   public_key[0:64] + name_hash[64:74] + random_hash[74:84] + ...
+                // KEYSIZE=256*2 bits=64 bytes; NAME_HASH_LENGTH=10 bytes;
+                // random_hash=10 bytes. Slice defensively so a malformed
+                // payload surfaces a clear error rather than ArrayIndexOOB.
+                val data = unpacked.data
+                if (data.size < 84) {
+                    throw IllegalStateException(
+                        "Cached announce data too short (${data.size} < 84) for ${destHash.toHex()}",
+                    )
+                }
+                val randomHash = data.copyOfRange(74, 84)
+                result("found" to boolVal(true), "random_hash" to hexVal(randomHash))
+            }
+        }
     }
 
     "wire_stop" -> {
