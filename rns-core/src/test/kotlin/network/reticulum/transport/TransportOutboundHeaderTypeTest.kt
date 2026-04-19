@@ -79,7 +79,7 @@ class TransportOutboundHeaderTypeTest {
         // Clear any state leaked from other tests in the same JVM.
         try {
             Transport.stop()
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             // Best-effort — a prior test may have left things in an odd state.
         }
         Transport.pathTable.clear()
@@ -97,13 +97,13 @@ class TransportOutboundHeaderTypeTest {
     fun teardown() {
         try {
             Transport.deregisterInterface(iface)
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             // Best-effort.
         }
         Transport.pathTable.clear()
         try {
             Transport.stop()
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             // Best-effort.
         }
     }
