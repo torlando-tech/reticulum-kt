@@ -65,7 +65,11 @@ jobs:
           CONFORMANCE_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        run: python3 -m pytest tests/ --impl=kotlin -v --tb=short
+        # tests/lxmf/ is the LXMF-layer conformance suite, owned by
+        # LXMF-kt. It rides the same bridge but has its own CI target
+        # (to be added in a follow-up PR on LXMF-kt); ignoring it here
+        # keeps reticulum-kt CI focused on RNS-layer parity.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=kotlin -v --tb=short
 
       - name: Run pipe integration conformance tests
         working-directory: reticulum-conformance
