@@ -38,7 +38,7 @@ class LocalInterfaceTest {
         server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
 
-        assertTrue(server!!.online.get())
+        assertTrue(server!!.online.value)
         assertTrue(server!!.clientCount() == 0)
     }
 
@@ -57,8 +57,8 @@ class LocalInterfaceTest {
         // Give connection time to establish
         Thread.sleep(200)
 
-        assertTrue(server!!.online.get())
-        assertTrue(client.online.get())
+        assertTrue(server!!.online.value)
+        assertTrue(client.online.value)
         assertEquals(1, server!!.clientCount())
     }
 
@@ -225,7 +225,7 @@ class LocalInterfaceTest {
             server = LocalServerInterface(name = "TestServer", socketPath = socketPath)
             server!!.start()
 
-            assertTrue(server!!.online.get())
+            assertTrue(server!!.online.value)
 
             // Start client
             val client = LocalClientInterface(name = "TestClient", socketPath = socketPath)
@@ -235,7 +235,7 @@ class LocalInterfaceTest {
             // Give connection time to establish
             Thread.sleep(200)
 
-            assertTrue(client.online.get())
+            assertTrue(client.online.value)
             assertEquals(1, server!!.clientCount())
         } catch (e: UnsupportedOperationException) {
             // Unix sockets detected but not fully supported by JVM implementation

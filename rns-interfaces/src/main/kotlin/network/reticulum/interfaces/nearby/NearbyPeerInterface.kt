@@ -36,7 +36,7 @@ class NearbyPeerInterface(
      * Send data to this specific endpoint.
      */
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         try {
             driver.send(endpointId, data)
@@ -52,17 +52,17 @@ class NearbyPeerInterface(
      * Called by [NearbyInterface] when data arrives from this endpoint.
      */
     fun deliverIncoming(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
         processIncoming(data)
     }
 
     override fun start() {
-        online.set(true)
+        setOnline(true)
     }
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         try {
             driver.disconnect(endpointId)

@@ -38,7 +38,7 @@ fun main() {
     // Wait for connection
     Thread.sleep(1000)
 
-    if (client.online.get()) {
+    if (client.online.value) {
         println("Connected! Waiting for tunnel synthesis...")
 
         // Check wantsTunnel flag
@@ -64,7 +64,7 @@ fun main() {
             Thread.sleep(5000)
 
             println("Status:")
-            println("  Online: ${client.online.get()}")
+            println("  Online: ${client.online.value}")
             println("  WantsTunnel: ${clientRef.wantsTunnel}")
             println("  TunnelId: ${clientRef.tunnelId?.let { it.take(8).joinToString("") { "%02x".format(it) } }}")
             println("  Active tunnels: ${Transport.getTunnels().size}")

@@ -1,6 +1,10 @@
 package network.reticulum.interfaces
 
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.udp.UDPInterface
 import org.junit.jupiter.api.AfterEach
@@ -54,12 +58,12 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online")
+        assertTrue(udp.online.value, "Should be online")
 
         // Explicit stop should work
         udp.stop()
         Thread.sleep(100)
-        assertFalse(udp.online.get(), "Should be offline after stop")
+        assertFalse(udp.online.value, "Should be offline after stop")
     }
 
     @Test
@@ -80,14 +84,14 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online")
+        assertTrue(udp.online.value, "Should be online")
 
         // Cancel parent scope (simulates service stop)
         parentScope.cancel()
 
         // Wait for cancellation to propagate (should be quick)
         delay(500)
-        assertFalse(udp.online.get(), "Should be offline after parent cancellation")
+        assertFalse(udp.online.value, "Should be offline after parent cancellation")
     }
 
     @Test
@@ -106,7 +110,7 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // Measure cancellation time
         val startTime = System.currentTimeMillis()
@@ -114,12 +118,12 @@ class ScopeInjectionTest {
 
         // Poll for completion (max 1 second)
         var elapsed = 0L
-        while (udp.online.get() && elapsed < 1000) {
+        while (udp.online.value && elapsed < 1000) {
             delay(50)
             elapsed = System.currentTimeMillis() - startTime
         }
 
-        assertFalse(udp.online.get(), "Should be offline within 1 second")
+        assertFalse(udp.online.value, "Should be offline within 1 second")
         assertTrue(elapsed < 1000, "Cancellation took ${elapsed}ms, should be < 1000ms")
     }
 
@@ -149,14 +153,14 @@ class ScopeInjectionTest {
 
         udp1.start()
         udp2.start()
-        assertTrue(udp1.online.get() && udp2.online.get(), "Both should be online")
+        assertTrue(udp1.online.value && udp2.online.value, "Both should be online")
 
         // Cancel parent
         parentScope.cancel()
         delay(500)
 
-        assertFalse(udp1.online.get(), "UDP1 should be offline")
-        assertFalse(udp2.online.get(), "UDP2 should be offline")
+        assertFalse(udp1.online.value, "UDP1 should be offline")
+        assertFalse(udp2.online.value, "UDP2 should be offline")
     }
 
     // ========================
@@ -264,15 +268,15 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online after start")
+        assertTrue(udp.online.value, "Should be online after start")
 
         // Wait and verify interface STAYS online while parent is active
         // This simulates the app being backgrounded (service keeps running)
         delay(500)
-        assertTrue(udp.online.get(), "Should STILL be online after 500ms with active parent")
+        assertTrue(udp.online.value, "Should STILL be online after 500ms with active parent")
 
         delay(500)
-        assertTrue(udp.online.get(), "Should STILL be online after 1 second with active parent")
+        assertTrue(udp.online.value, "Should STILL be online after 1 second with active parent")
 
         // Parent scope is still active - interface should remain operational
         assertTrue(parentScope.isActive, "Parent scope should still be active")
@@ -351,7 +355,7 @@ class ScopeInjectionTest {
         delay(500)
 
         // UDP should still be online despite TCP failure
-        assertTrue(udp.online.get(), "UDP should remain online when sibling TCP fails")
+        assertTrue(udp.online.value, "UDP should remain online when sibling TCP fails")
     }
 
     @Test
@@ -370,7 +374,7 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // Multiple detach calls should be safe
         udp.detach()
@@ -378,7 +382,7 @@ class ScopeInjectionTest {
         udp.detach()
 
         assertTrue(udp.detached.get(), "Should be detached")
-        assertFalse(udp.online.get(), "Should be offline")
+        assertFalse(udp.online.value, "Should be offline")
     }
 
     @Test
@@ -397,12 +401,105 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // stop() should work the same as detach()
         udp.stop()
 
         assertTrue(udp.detached.get(), "Should be detached after stop()")
-        assertFalse(udp.online.get(), "Should be offline after stop()")
+        assertFalse(udp.online.value, "Should be offline after stop()")
+    }
+
+    // ========================
+    // StateFlow Emission Tests (reactive observation — core motivation of refactor)
+    // ========================
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow emits false to true transition on start`() = runBlocking {
+        // Regression guard for the core motivation of the AtomicBoolean -> StateFlow refactor:
+        // consumers that captured the scalar at registration must now observe the transition.
+        val udp = UDPInterface(
+            name = "emission-udp",
+            bindPort = 15601,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15602
+        )
+        interfaces.add(udp)
+
+        // Use a CompletableDeferred to guarantee happens-before between "collector has
+        // subscribed and received the initial false replay" and "start() fires the true
+        // emission". Without this handshake, start() could race ahead of the subscription
+        // and the collector would see true as its initial replay, missing the transition.
+        val subscribed = CompletableDeferred<Unit>()
+        val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val observed = collectScope.async {
+            udp.online
+                .onEach { if (!subscribed.isCompleted) subscribed.complete(Unit) }
+                .take(2)
+                .toList()
+        }
+
+        subscribed.await()  // barrier: collector has the initial false
+        udp.start()
+
+        val values = observed.await()  // barrier: take(2) has completed
+        collectScope.cancel()
+
+        assertEquals(listOf(false, true), values,
+            "StateFlow must emit false -> true transition to observers subscribed before start()")
+    }
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow emits true to false transition on stop`() = runBlocking {
+        val udp = UDPInterface(
+            name = "emission-stop-udp",
+            bindPort = 15611,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15612
+        )
+        interfaces.add(udp)
+
+        udp.start()
+        assertTrue(udp.online.value, "Precondition: online after start")
+
+        // Handshake guarantees the subscription is live (and has replayed true) before stop()
+        val subscribed = CompletableDeferred<Unit>()
+        val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val observed = collectScope.async {
+            udp.online
+                .onEach { if (!subscribed.isCompleted) subscribed.complete(Unit) }
+                .take(2)
+                .toList()
+        }
+
+        subscribed.await()  // barrier: collector has the initial true
+        udp.stop()
+
+        val values = observed.await()  // barrier: take(2) has completed
+        collectScope.cancel()
+
+        assertEquals(listOf(true, false), values,
+            "StateFlow must emit true -> false transition on stop")
+    }
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow replays current value to late subscribers`() = runBlocking {
+        val udp = UDPInterface(
+            name = "replay-udp",
+            bindPort = 15621,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15622
+        )
+        interfaces.add(udp)
+
+        udp.start()
+        assertTrue(udp.online.value)
+
+        // Late subscriber receives the current value without waiting for a new emission
+        val replayed = udp.online.first()
+        assertTrue(replayed, "StateFlow.first() must return the current value to a late subscriber")
     }
 }

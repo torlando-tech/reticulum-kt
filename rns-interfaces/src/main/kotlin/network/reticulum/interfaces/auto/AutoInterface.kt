@@ -134,7 +134,7 @@ class AutoInterface(
             // Start peer management job
             startPeerManagementJob()
 
-            online.set(true)
+            setOnline(true)
             log("AutoInterface started on ${linkLocalAddresses.size} interface(s)")
         } catch (e: Exception) {
             log("Failed to start AutoInterface: ${e.message}")
@@ -147,7 +147,7 @@ class AutoInterface(
         if (!running.getAndSet(false)) return
 
         log("Detaching AutoInterface...")
-        online.set(false)
+        setOnline(false)
         detached.set(true)
 
         // Cancel all coroutines

@@ -128,7 +128,7 @@ class EmulatorLinkTest {
 
         // Wait for interface to connect
         val connectTimeout = System.currentTimeMillis() + 10_000
-        while (!clientInterface!!.online.get()) {
+        while (!clientInterface!!.online.value) {
             if (System.currentTimeMillis() > connectTimeout) {
                 throw AssertionError("Failed to connect to emulator on $EMULATOR_HOST:$EMULATOR_PORT")
             }
@@ -222,7 +222,7 @@ class EmulatorLinkTest {
 
         // Wait for connection
         val connectTimeout = System.currentTimeMillis() + 10_000
-        while (!clientInterface!!.online.get()) {
+        while (!clientInterface!!.online.value) {
             if (System.currentTimeMillis() > connectTimeout) {
                 throw AssertionError("Failed to connect to emulator")
             }

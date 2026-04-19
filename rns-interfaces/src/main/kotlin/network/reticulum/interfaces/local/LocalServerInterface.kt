@@ -208,7 +208,7 @@ class LocalServerInterface : Interface {
                 throw IllegalStateException("No socket path or TCP port configured")
             }
 
-            online.set(true)
+            setOnline(true)
 
             acceptJob = ioScope.launch {
                 acceptLoop()
@@ -266,7 +266,7 @@ class LocalServerInterface : Interface {
     }
 
     private suspend fun acceptLoop() {
-        while (online.get() && !detached.get()) {
+        while (online.value && !detached.get()) {
             try {
                 // Blocking accept wrapped in IO dispatcher
                 val socket = withContext(Dispatchers.IO) {

@@ -137,11 +137,11 @@ class AnnounceForwardingE2ETest : InteropTestBase() {
         // Wait for TCP connection
         val tcpDeadline = System.currentTimeMillis() + 10_000
         while (System.currentTimeMillis() < tcpDeadline) {
-            if (kotlinTcpClient!!.online.get()) break
+            if (kotlinTcpClient!!.online.value) break
             Thread.sleep(100)
         }
 
-        if (!kotlinTcpClient!!.online.get()) {
+        if (!kotlinTcpClient!!.online.value) {
             println("  [Setup] WARNING: TCP to Python did not establish, TCP E2E tests may fail")
             println("  [Setup] (Known issue: tunnel synthesis packets cause Python to drop connection)")
         } else {

@@ -78,12 +78,12 @@ class NearbyInterface(
                 // driver.start() suspends until advertising + discovery are confirmed.
                 // It throws on failure, so online stays false.
                 driver.start(localEndpointName, maxConnections)
-                online.set(true)
+                setOnline(true)
                 log("Advertising and discovery started (name=$localEndpointName)")
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                online.set(false)
+                setOnline(false)
                 log("Failed to start: ${e.message}")
             }
         }
@@ -106,13 +106,13 @@ class NearbyInterface(
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
         log("Detaching — shutting down all peers and driver")
 
         // Tear down all peer interfaces directly (don't call peer.detach() which
         // would re-enter peerDisconnected and double-deregister from Transport)
         for ((_, peer) in peers) {
-            peer.online.set(false)
+            peer.setOnline(false)
             peer.detached.set(true)
             try {
                 Transport.deregisterInterface(peer.toRef())
@@ -153,7 +153,7 @@ class NearbyInterface(
     private suspend fun collectConnectedEndpoints() {
         try {
             driver.connectedEndpoints.collect { endpoint ->
-                if (!online.get() || detached.get()) return@collect
+                if (!online.value || detached.get()) return@collect
 
                 // Skip if already have a peer for this endpoint
                 if (peers.containsKey(endpoint.endpointId)) return@collect
@@ -195,7 +195,7 @@ class NearbyInterface(
     private suspend fun collectDataReceived() {
         try {
             driver.dataReceived.collect { received ->
-                if (!online.get() || detached.get()) return@collect
+                if (!online.value || detached.get()) return@collect
 
                 val peer = peers[received.endpointId]
                 if (peer != null) {
@@ -249,7 +249,7 @@ class NearbyInterface(
         }
 
         if (!peer.detached.get()) {
-            peer.online.set(false)
+            peer.setOnline(false)
             peer.detached.set(true)
         }
 

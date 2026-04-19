@@ -101,13 +101,13 @@ abstract class RnsLiveTestBase : InteropTestBase() {
         println("  [Setup] Waiting for TCP connection...")
         val connectionDeadline = System.currentTimeMillis() + 10_000
         while (System.currentTimeMillis() < connectionDeadline) {
-            if (kotlinTcpClient!!.online.get()) {
+            if (kotlinTcpClient!!.online.value) {
                 println("  [Setup] TCP connection established")
                 break
             }
             Thread.sleep(100)
         }
-        require(kotlinTcpClient!!.online.get()) {
+        require(kotlinTcpClient!!.online.value) {
             "TCP connection to Python not established within 10 seconds"
         }
 

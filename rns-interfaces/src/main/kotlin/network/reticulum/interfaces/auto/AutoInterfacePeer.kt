@@ -47,7 +47,7 @@ class AutoInterfacePeer(
             outboundSocket = DatagramSocket().apply {
                 reuseAddress = true
             }
-            online.set(true)
+            setOnline(true)
             log("Started peer connection to $targetAddress")
         } catch (e: Exception) {
             log("Failed to start peer connection: ${e.message}")
@@ -59,7 +59,7 @@ class AutoInterfacePeer(
         if (!running.getAndSet(false)) return
 
         log("Detaching peer connection to $targetAddress")
-        online.set(false)
+        setOnline(false)
         detached.set(true)
 
         try {
@@ -72,8 +72,8 @@ class AutoInterfacePeer(
 
     override fun processOutgoing(data: ByteArray) {
         val socket = outboundSocket
-        if (socket == null || !online.get() || detached.get()) {
-            log("Cannot send: socket=${socket != null}, online=${online.get()}, detached=${detached.get()}")
+        if (socket == null || !online.value || detached.get()) {
+            log("Cannot send: socket=${socket != null}, online=${online.value}, detached=${detached.get()}")
             return
         }
 
@@ -95,7 +95,7 @@ class AutoInterfacePeer(
      * This handles the inbound data flow.
      */
     fun handleIncomingData(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
         processIncoming(data)
     }
 

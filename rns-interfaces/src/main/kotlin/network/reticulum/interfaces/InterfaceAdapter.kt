@@ -17,7 +17,7 @@ class InterfaceAdapter private constructor(
     override val hash: ByteArray = iface.getHash()
     override val canSend: Boolean = iface.canSend
     override val canReceive: Boolean = iface.canReceive
-    override val online: Boolean get() = iface.online.get()
+    override val online: Boolean get() = iface.online.value
     override val rxBytes: Long get() = iface.rxBytes.get()
     override val txBytes: Long get() = iface.txBytes.get()
     override val mode: InterfaceMode get() = iface.mode

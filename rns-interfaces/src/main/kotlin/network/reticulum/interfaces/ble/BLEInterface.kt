@@ -81,7 +81,7 @@ class BLEInterface(
      * disconnections, and periodic cleanup.
      */
     override fun start() {
-        online.set(true)
+        setOnline(true)
         log("start() called — launching BLE coroutines")
 
         // Start advertising (peripheral role)
@@ -228,7 +228,7 @@ class BLEInterface(
             val existingAddress = identityToAddress[identityHex]
             if (existingAddress != null && existingAddress != address) {
                 val existing = peers[identityHex]
-                if (existing != null && existing.online.get() && !existing.detached.get()) {
+                if (existing != null && existing.online.value && !existing.detached.get()) {
                     // Existing connection is healthy — keep it, reject new
                     log("Duplicate identity ${identityHex.take(8)}: keeping existing at ${existingAddress.takeLast(8)}, rejecting outgoing ${address.takeLast(8)}")
                     reconnectBackoff[address] = System.currentTimeMillis() + 30_000
@@ -331,7 +331,7 @@ class BLEInterface(
             val existingAddress = identityToAddress[identityHex]
             if (existingAddress != null && existingAddress != address) {
                 val existing = peers[identityHex]
-                if (existing != null && existing.online.get() && !existing.detached.get()) {
+                if (existing != null && existing.online.value && !existing.detached.get()) {
                     // Existing connection is healthy — keep it, reject incoming
                     log("Duplicate identity ${identityHex.take(8)}: keeping existing at ${existingAddress.takeLast(8)}, rejecting incoming ${address.takeLast(8)}")
                     reconnectBackoff[address] = System.currentTimeMillis() + 30_000
@@ -586,7 +586,7 @@ class BLEInterface(
      * Runs every 30 seconds.
      */
     private suspend fun periodicCleanup() {
-        while (online.get() && !detached.get()) {
+        while (online.value && !detached.get()) {
             delay(30_000)
             val now = System.currentTimeMillis()
 
@@ -609,7 +609,7 @@ class BLEInterface(
      * Flow: graceful disconnect -> grace period -> force teardown -> blacklist.
      */
     private suspend fun zombieDetectionLoop() {
-        while (online.get() && !detached.get()) {
+        while (online.value && !detached.get()) {
             delay(BLEConstants.ZOMBIE_CHECK_INTERVAL_MS)
             val now = System.currentTimeMillis()
 

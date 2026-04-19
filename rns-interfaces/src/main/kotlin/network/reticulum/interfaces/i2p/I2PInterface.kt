@@ -160,7 +160,7 @@ class I2PInterface(
         // We go online even before tunnels are up — the server socket is ready
         // Peers will connect once their tunnels establish
         if (!connectable && peers.isEmpty()) {
-            online.set(true)
+            setOnline(true)
         }
     }
 
@@ -201,7 +201,7 @@ class I2PInterface(
                     i2pController.setupServerTunnel(name, bindPort)
                 }
                 b32 = addr
-                online.set(true)
+                setOnline(true)
                 log("I2P endpoint ready: $addr.b32.i2p")
                 // Tunnel is up — wait until we're detached
                 while (!detached.get()) {

@@ -211,7 +211,7 @@ class TcpPythonInteropTest {
 
         // Wait for connection
         val startTime = System.currentTimeMillis()
-        while (!newClient.online.get() && System.currentTimeMillis() - startTime < CONNECTION_TIMEOUT_MS) {
+        while (!newClient.online.value && System.currentTimeMillis() - startTime < CONNECTION_TIMEOUT_MS) {
             Thread.sleep(50)
         }
 
@@ -264,13 +264,13 @@ class TcpPythonInteropTest {
     @EnabledIf("isPythonServerRunning")
     fun `connection holds for 5 seconds`() {
         val client = connectClient()
-        assertTrue(client.online.get(), "Client should be online after connect")
+        assertTrue(client.online.value, "Client should be online after connect")
 
         // Wait 5 seconds
         println("Waiting 5 seconds to verify connection stability...")
         Thread.sleep(5000)
 
-        assertTrue(client.online.get(), "Client should still be online after 5 seconds")
+        assertTrue(client.online.value, "Client should still be online after 5 seconds")
         println("Connection held stable for 5 seconds")
     }
 
@@ -280,7 +280,7 @@ class TcpPythonInteropTest {
     @EnabledIf("isPythonServerRunning")
     fun `kotlin to python packet delivery`() {
         val client = connectClient()
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(client.online.value, "Client should be online")
 
         // Clear previous output
         pythonOutputLines.clear()
@@ -305,7 +305,7 @@ class TcpPythonInteropTest {
     @EnabledIf("isPythonServerRunning")
     fun `python to kotlin packet delivery`() {
         val client = connectClient()
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(client.online.value, "Client should be online")
 
         // Clear received packets
         receivedPackets.clear()
@@ -339,7 +339,7 @@ class TcpPythonInteropTest {
     @EnabledIf("isPythonServerRunning")
     fun `bidirectional exchange`() {
         val client = connectClient()
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(client.online.value, "Client should be online")
 
         // Clear state
         receivedPackets.clear()

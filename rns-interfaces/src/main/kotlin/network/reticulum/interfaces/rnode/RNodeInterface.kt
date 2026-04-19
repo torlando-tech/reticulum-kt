@@ -165,7 +165,7 @@ class RNodeInterface(
                 throw e
             } catch (e: Exception) {
                 log("Failed to configure RNode: ${e.message}")
-                online.set(false)
+                setOnline(false)
             }
         }
     }
@@ -206,7 +206,7 @@ class RNodeInterface(
         if (validateRadioState()) {
             interfaceReady = true
             delay(300)
-            online.set(true)
+            setOnline(true)
             log("RNode is configured and online")
 
             if (displayImageData != null) {
@@ -689,7 +689,7 @@ class RNodeInterface(
                         }
                     } else if (command == KISS.CMD_RESET) {
                         if (byte == 0xF8) {
-                            if ((platform == (KISS.PLATFORM_ESP32.toInt() and 0xFF)) && online.get()) {
+                            if ((platform == (KISS.PLATFORM_ESP32.toInt() and 0xFF)) && online.value) {
                                 log("Device reset detected while online, reinitialising device")
                                 throw IOException("ESP32 reset")
                             }
@@ -721,14 +721,14 @@ class RNodeInterface(
         } catch (e: IOException) {
             if (!detached.get()) {
                 log("Read loop error: ${e.message}")
-                online.set(false)
+                setOnline(false)
             }
         }
 
-        if (online.get()) {
+        if (online.value) {
             log("Read loop exiting - marking interface offline")
+            setOnline(false)
         }
-        online.set(false)
     }
 
     /**
@@ -753,10 +753,10 @@ class RNodeInterface(
     // -- TX path --
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         synchronized(txLock) {
-            if (!online.get()) return // re-check after acquiring lock
+            if (!online.value) return // re-check after acquiring lock
 
             if (interfaceReady) {
                 if (flowControl) {
@@ -784,7 +784,7 @@ class RNodeInterface(
             txBytes.addAndGet(data.size.toLong())
         } catch (e: IOException) {
             log("TX error: ${e.message}")
-            online.set(false)
+            setOnline(false)
         }
     }
 
@@ -800,7 +800,7 @@ class RNodeInterface(
 
     private fun handleIdleMaintenance() {
         val keepaliveAfterMs = activityKeepaliveMs
-        if (keepaliveAfterMs != null && online.get()) {
+        if (keepaliveAfterMs != null && online.value) {
             val timeSinceLastWrite = System.currentTimeMillis() - lastWriteMs
             if (timeSinceLastWrite >= keepaliveAfterMs) {
                 detect()

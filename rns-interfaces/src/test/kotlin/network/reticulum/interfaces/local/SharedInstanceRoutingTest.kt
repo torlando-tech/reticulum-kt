@@ -262,7 +262,7 @@ class SharedInstanceRoutingTest {
 
         // All clients should be disconnected
         clients.forEach { client ->
-            assertFalse(client.online.get())
+            assertFalse(client.online.value)
         }
     }
 }

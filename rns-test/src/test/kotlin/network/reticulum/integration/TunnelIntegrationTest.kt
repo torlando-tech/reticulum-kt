@@ -88,7 +88,7 @@ class TunnelIntegrationTest {
 
         // Wait for connection
         Thread.sleep(1000)
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(client.online.value, "Client should be online")
 
         // wantsTunnel might already be false if job loop processed it
         println("Initial wantsTunnel: ${clientRef.wantsTunnel}")
@@ -178,7 +178,7 @@ class TunnelIntegrationTest {
         // Wait for connection and tunnel synthesis
         Thread.sleep(3000)
 
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(client.online.value, "Client should be online")
 
         // Build announce, then deregister destination so Transport doesn't skip
         // it as local (in a real setup, server and client have separate Transport instances)

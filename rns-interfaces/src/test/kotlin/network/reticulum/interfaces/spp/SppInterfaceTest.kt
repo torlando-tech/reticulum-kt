@@ -81,7 +81,7 @@ class SppInterfaceTest {
         iface.start()
 
         // Wait for interface to come online
-        waitForCondition { iface.online.get() }
+        waitForCondition { iface.online.value }
 
         // Test 1: Send data via processOutgoing, verify HDLC framing on wire
         // Payload must be > 19 bytes (HEADER_MIN_SIZE) or deframer will drop it
@@ -174,7 +174,7 @@ class SppInterfaceTest {
         clientIface.start()
         serverIface.start()
 
-        waitForCondition { clientIface.online.get() && serverIface.online.get() }
+        waitForCondition { clientIface.online.value && serverIface.online.value }
 
         // Client → Server (payload > 19 bytes)
         val clientPayload = ByteArray(40) { (it + 0x30).toByte() }
@@ -226,16 +226,16 @@ class SppInterfaceTest {
         iface.start()
 
         // Wait for first connection
-        waitForCondition { iface.online.get() }
+        waitForCondition { iface.online.value }
         assertEquals(1, connectCount.get())
 
         // Kill the first connection by closing its streams
         firstConnection.close()
 
         // Wait for reconnection to succeed
-        waitForCondition(timeoutMs = 10_000) { connectCount.get() >= 2 && iface.online.get() }
+        waitForCondition(timeoutMs = 10_000) { connectCount.get() >= 2 && iface.online.value }
         assertEquals(2, connectCount.get())
-        assertTrue(iface.online.get(), "Should be online after reconnection")
+        assertTrue(iface.online.value, "Should be online after reconnection")
     }
 
     @Test
@@ -252,7 +252,7 @@ class SppInterfaceTest {
         interfaces.add(iface)
 
         // Don't start — interface should be offline
-        assertFalse(iface.online.get())
+        assertFalse(iface.online.value)
         assertThrows(IllegalStateException::class.java) {
             iface.processOutgoing(ByteArray(32))
         }

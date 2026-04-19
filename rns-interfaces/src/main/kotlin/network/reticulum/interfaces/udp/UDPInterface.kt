@@ -135,7 +135,7 @@ class UDPInterface(
                 setupSender()
             }
 
-            online.set(true)
+            setOnline(true)
             log("Interface started successfully")
 
         } catch (e: Exception) {
@@ -305,7 +305,7 @@ class UDPInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -342,7 +342,7 @@ class UDPInterface(
 
         log("Detaching interface")
         running.set(false)
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines first
         readJob?.cancel()

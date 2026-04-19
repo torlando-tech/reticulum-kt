@@ -71,7 +71,7 @@ fun main() {
     println("Waiting for tunnel synthesis...")
     Thread.sleep(3000)
 
-    if (!tcpClient.online.get()) {
+    if (!tcpClient.online.value) {
         println("✗ Failed to connect to server")
         return
     }
