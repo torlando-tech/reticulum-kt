@@ -23,6 +23,8 @@
  *   lxmf_start
  *   lxmf_set_outbound_propagation_node
  *   lxmf_send_propagated
+ *   lxmf_send_opportunistic
+ *   lxmf_send_direct
  *   lxmf_sync_inbound
  *   lxmf_poll_inbox
  *   lxmf_stop
@@ -30,9 +32,19 @@
  * Intentionally NOT handled (no Kotlin equivalent):
  *   lxmf_spawn_daemon_propagation_node  — Python-only; lxmd is Python.
  *   lxmf_stop_daemon_propagation_node   — paired with the above.
+ *
+ * Pattern B for send commands: three parallel `lxmf_send_<method>`
+ * commands instead of one unified dispatch. Rationale: propagated has
+ * mandatory stamp-cost / propagation-node prerequisites that
+ * opportunistic/direct do not, and direct/opportunistic accept a
+ * `fields` map (for attachment / telemetry / image tests) that
+ * propagated currently does not. A unified command would be mostly
+ * branching-on-method; three commands stay focused.
  */
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import kotlinx.coroutines.runBlocking
@@ -41,6 +53,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMessage
 import java.io.File
@@ -125,15 +138,14 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
                 entry.addProperty("title", message.title)
                 entry.addProperty("content", message.content)
                 val fields = JsonObject()
+                // Fields may contain nested ByteArrays — e.g. the
+                // canonical Python-LXMF FIELD_FILE_ATTACHMENTS shape is
+                // List<List<Any>> where element [1] is the raw bytes of
+                // the attachment. Recursively hex-encode so the JSON
+                // response never contains a non-serializable ByteArray
+                // and the receiving-side tests can compare exact hex.
                 message.fields.forEach { (k, v) ->
-                    val key = k.toString()
-                    when (v) {
-                        is ByteArray -> fields.addProperty(key, v.toHex())
-                        is String -> fields.addProperty(key, v)
-                        is Number -> fields.addProperty(key, v)
-                        is Boolean -> fields.addProperty(key, v)
-                        else -> fields.addProperty(key, v.toString())
-                    }
+                    fields.add(k.toString(), lxmfFieldValueToJson(v))
                 }
                 entry.add("fields", fields)
                 inst.inbox.add(entry)
@@ -258,6 +270,78 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    "lxmf_send_opportunistic" -> {
+        // Single-packet unicast, no link. Caller MUST ensure the recipient's
+        // delivery announce has been observed (we recall its identity here).
+        // Fields, if provided, support attachment/image/telemetry tests —
+        // see lxmfFieldValueFromJson for the accepted shapes. Oversized
+        // content is rejected UP FRONT rather than silently upgraded to
+        // direct/Resource — LXMF-kt's own size check in
+        // determineDeliveryMethod would log-and-fall-back; the
+        // conformance suite intentionally keeps opportunistic tests
+        // single-packet and treats the upgrade as a distinct case.
+        val target = resolveLxmfOutboundTarget(p, "lxmf_send_opportunistic")
+
+        val message = LXMessage.create(
+            destination = target.destination,
+            source = target.inst.deliveryDestination,
+            content = target.content,
+            title = target.title,
+            fields = target.fields,
+            desiredMethod = DeliveryMethod.OPPORTUNISTIC,
+        )
+
+        // Pre-pack to check the packed payload size BEFORE handing the
+        // message to the router. LXMF-kt's determineDeliveryMethod (called
+        // inside handleOutbound -> sendOpportunisticMessage) would silently
+        // mutate `desiredMethod` to DIRECT when packedSize exceeds
+        // ENCRYPTED_PACKET_MAX_CONTENT; by the time we saw that mutation,
+        // a DIRECT delivery would already be queued on the wire. Rejecting
+        // here — before handleOutbound — guarantees no packet leaves the
+        // bridge when the caller violates the single-packet contract.
+        // pack() is idempotent: the router will reuse `message.packed`
+        // when it does its own pack, so we don't pay the cost twice.
+        message.pack()
+        if (message.packedSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT) {
+            throw IllegalStateException(
+                "Opportunistic delivery would silently upgrade to DIRECT: " +
+                    "packedSize=${message.packedSize} exceeds " +
+                    "ENCRYPTED_PACKET_MAX_CONTENT=" +
+                    "${LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT}. " +
+                    "Shrink the payload or use lxmf_send_direct.",
+            )
+        }
+
+        runBlocking { target.inst.router.handleOutbound(message) }
+
+        result(
+            "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
+        )
+    }
+
+    "lxmf_send_direct" -> {
+        // Link-based delivery. Payload > LINK_PACKET_MAX_CONTENT (319 bytes)
+        // is transferred via Resource (multi-packet, per LXMF-kt's
+        // determineDeliveryMethod). Handle both single-packet direct and
+        // multi-packet direct; caller picks by payload size.
+        val target = resolveLxmfOutboundTarget(p, "lxmf_send_direct")
+
+        val message = LXMessage.create(
+            destination = target.destination,
+            source = target.inst.deliveryDestination,
+            content = target.content,
+            title = target.title,
+            fields = target.fields,
+            desiredMethod = DeliveryMethod.DIRECT,
+        )
+
+        runBlocking { target.inst.router.handleOutbound(message) }
+
+        result(
+            "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
+        )
+    }
+
     "lxmf_sync_inbound" -> {
         // Drive LXMF-kt's two-phase pull: it opens a link to the active
         // propagation node, lists stored messages, then downloads them.
@@ -360,4 +444,210 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
     }
 
     else -> throw IllegalArgumentException("Unknown lxmf command: $command")
+}
+
+/**
+ * Resolved sender-side state shared by lxmf_send_opportunistic and
+ * lxmf_send_direct. Keeps the two command handlers focused on the
+ * method-specific pieces (pre-pack size guard for opportunistic; direct
+ * goes straight to handleOutbound) without duplicating the
+ * handle/identity/destination/fields plumbing.
+ */
+private data class ResolvedLxmfOutboundTarget(
+    val inst: LxmfInstance,
+    val destination: Destination,
+    val content: String,
+    val title: String,
+    val fields: MutableMap<Int, Any>,
+)
+
+/**
+ * Shared setup for the outbound lxmf_send_* commands: looks up the
+ * instance by handle, recalls the recipient identity, builds the
+ * delivery destination, and decodes the `fields` map.
+ *
+ * `commandName` is threaded only into the identity-missing error
+ * message so the caller sees which command was attempted when the
+ * recipient announce hasn't been observed yet.
+ */
+private fun resolveLxmfOutboundTarget(
+    p: JsonObject,
+    commandName: String,
+): ResolvedLxmfOutboundTarget {
+    val handle = p.str("handle")
+    val recipientHash = p.hex("recipient_delivery_dest_hash")
+    val content = p.str("content")
+    val title = p.get("title")?.asString ?: ""
+    val fieldsJson = p.get("fields")?.asJsonObject
+
+    val inst = lxmfInstances[handle]
+        ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+    val recipientIdentity = Identity.recall(recipientHash)
+        ?: throw IllegalStateException(
+            "No identity known for recipient ${recipientHash.toHex()}. " +
+                "Ensure the recipient announced its delivery destination " +
+                "before calling $commandName.",
+        )
+
+    val recipientDestination = Destination.create(
+        identity = recipientIdentity,
+        direction = DestinationDirection.OUT,
+        type = DestinationType.SINGLE,
+        appName = "lxmf",
+        "delivery",
+    )
+
+    val decodedFields = mutableMapOf<Int, Any>()
+    if (fieldsJson != null) {
+        fieldsJson.entrySet().forEach { (k, v) ->
+            // LXMF field keys are msgpack int keys by wire; the JSON
+            // bridge keys arrive as strings. Surface a friendly error
+            // when a non-integer key slips in (e.g. a caller typo)
+            // instead of the bare NumberFormatException "For input
+            // string: ..." that toInt() would emit.
+            val fieldId = k.toIntOrNull()
+                ?: throw IllegalArgumentException(
+                    "LXMF field key must be an integer, got: \"$k\" " +
+                        "(in $commandName `fields` map)",
+                )
+            decodedFields[fieldId] = lxmfFieldValueFromJson(v)
+        }
+    }
+
+    return ResolvedLxmfOutboundTarget(
+        inst = inst,
+        destination = recipientDestination,
+        content = content,
+        title = title,
+        fields = decodedFields,
+    )
+}
+
+/**
+ * Recursively decode a JSON field value into the native Kotlin/Java type
+ * that LXMF-kt's msgpack packer understands.
+ *
+ * Accepted shapes:
+ *   - JSON object `{"bytes": "<hex>"}`        -> ByteArray
+ *   - JSON object `{"int": 123}` / `{"str": "..."}` / `{"bool": true}`
+ *                                             -> explicit-typed primitive
+ *   - JSON array                              -> List<Any>  (recursive)
+ *   - JSON primitive (unwrapped)              -> its native Kotlin type
+ *
+ * The explicit-tag wrapper is load-bearing for FIELD_FILE_ATTACHMENTS:
+ * the canonical positional shape is `[[filename_str, data_bytes]]` where
+ * the caller needs to distinguish a hex-encoded-bytes string from a
+ * literal string value. Without a tag, both would arrive as JSON strings
+ * on the wire and we'd have no way to round-trip the attachment.
+ */
+fun lxmfFieldValueFromJson(v: JsonElement): Any = when {
+    v.isJsonArray -> {
+        v.asJsonArray.map { lxmfFieldValueFromJson(it) }
+    }
+    v.isJsonObject -> {
+        val obj = v.asJsonObject
+        when {
+            obj.has("bytes") -> obj.get("bytes").asString.fromHex()
+            obj.has("str") -> obj.get("str").asString
+            // `int` tag must be an integer-valued JSON number — truncating a
+            // caller-supplied 3.14 to 3 would be silent data loss. Require
+            // the float form to be routed through an unwrapped primitive or
+            // a dedicated wrapper if we ever need one.
+            obj.has("int") -> {
+                val n = obj.get("int").asJsonPrimitive
+                require(n.isNumber && !jsonNumberIsFloat(n)) {
+                    "`int` tag requires an integer JSON number, got: $n"
+                }
+                n.asLong
+            }
+            obj.has("bool") -> obj.get("bool").asBoolean
+            else -> throw IllegalArgumentException(
+                "Unsupported LXMF field object shape; expected one of " +
+                    "{bytes|str|int|bool}: $obj",
+            )
+        }
+    }
+    v.isJsonPrimitive -> {
+        val prim = v.asJsonPrimitive
+        when {
+            prim.isBoolean -> prim.asBoolean
+            // Route floats (anything that serialised with `.` or exponent)
+            // through Double so 3.14 doesn't silently truncate to 3. The
+            // msgpack packer in LXMF-kt encodes Double as float64 and Long
+            // as the narrowest int type, so the wire type matches the
+            // JSON-source type.
+            prim.isNumber -> if (jsonNumberIsFloat(prim)) prim.asDouble else prim.asLong
+            prim.isString -> prim.asString
+            else -> throw IllegalArgumentException(
+                "Unsupported LXMF field primitive: $prim",
+            )
+        }
+    }
+    else -> throw IllegalArgumentException("Unsupported LXMF field JSON element: $v")
+}
+
+/**
+ * Detect whether a JSON number primitive carries a fractional component
+ * or exponent. Gson parses JSON numbers lazily as LazilyParsedNumber
+ * (backed by the original token string), so the source-text check below
+ * catches both `3.14` and `1e6` without forcing a double conversion we
+ * might not need.
+ */
+private fun jsonNumberIsFloat(prim: JsonPrimitive): Boolean {
+    val s = prim.asString
+    // Any fractional-component marker means the source was definitely a
+    // float. No further check needed — `3.0` is reasonably interpreted
+    // as a float by the caller who wrote it that way.
+    if (s.contains('.')) return true
+    // Exponent form without a fractional component (`1e6`) is still an
+    // integer value — treat it as float only when the numeric value
+    // genuinely loses precision when coerced through Long. This keeps
+    // large integers in scientific notation on the integer path while
+    // still routing `1.5e2` (via the `.` branch above) to Double.
+    if (s.contains('e') || s.contains('E')) {
+        val d = prim.asDouble
+        // Non-finite doubles (+Inf/-Inf/NaN) are obviously float-shaped.
+        if (!d.isFinite()) return true
+        // Outside the signed-Long range → must be float to avoid
+        // overflow on the Long path.
+        if (d < Long.MIN_VALUE.toDouble() || d > Long.MAX_VALUE.toDouble()) return true
+        // Round-trip test: integer-valued doubles (e.g. 1e6 = 1000000.0)
+        // stay on the Long path; anything that loses magnitude is a float.
+        return d != d.toLong().toDouble()
+    }
+    return false
+}
+
+/**
+ * Recursively encode an LXMF field value delivered by the router into a
+ * JSON-safe element. ByteArray -> hex string at every nesting level so
+ * the JSON serializer in the bridge framework never sees a raw ByteArray
+ * (which would serialize as an empty array).
+ *
+ * Mirrored in reference/lxmf_bridge.py's recursive field serializer so
+ * tests can compare exact hex across the two implementations — a
+ * FIELD_FILE_ATTACHMENTS value `[[filename, data_bytes]]` arrives on
+ * either impl as a JSON list-of-lists with hex-encoded data.
+ */
+fun lxmfFieldValueToJson(v: Any?): JsonElement = when (v) {
+    null -> JsonNull.INSTANCE
+    is ByteArray -> JsonPrimitive(v.toHex())
+    is String -> JsonPrimitive(v)
+    is Boolean -> JsonPrimitive(v)
+    is Number -> JsonPrimitive(v)
+    is List<*> -> JsonArray().also { arr ->
+        v.forEach { arr.add(lxmfFieldValueToJson(it)) }
+    }
+    is Map<*, *> -> JsonObject().also { obj ->
+        v.forEach { (k, vv) -> obj.add(k.toString(), lxmfFieldValueToJson(vv)) }
+    }
+    // Fail loud on unhandled types instead of round-tripping their
+    // `toString()` form. Mirrors the throw-on-unknown pattern in
+    // lxmfFieldValueFromJson — if LXMF-kt grows a new field representation
+    // (e.g. UByteArray, msgpack extension types) we'd rather the test
+    // crash here than silently corrupt the value.
+    else -> throw IllegalArgumentException(
+        "Unsupported LXMF field type in delivery callback: ${v::class}",
+    )
 }
