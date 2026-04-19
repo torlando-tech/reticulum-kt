@@ -53,6 +53,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.lxmf.DeliveryMethod
+import network.reticulum.lxmf.LXMFConstants
 import network.reticulum.lxmf.LXMRouter
 import network.reticulum.lxmf.LXMessage
 import java.io.File
@@ -319,21 +320,28 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             desiredMethod = DeliveryMethod.OPPORTUNISTIC,
         )
 
-        runBlocking { inst.router.handleOutbound(message) }
-
-        // After pack(), LXMF-kt's determineDeliveryMethod() mutates
-        // `desiredMethod` to DIRECT if content exceeded 295 bytes. Surface
-        // that silently-upgraded case as a hard error — the conformance
-        // suite's opportunistic tests assume single-packet semantics; an
-        // upgrade is itself the bug being looked for.
-        if (message.desiredMethod != DeliveryMethod.OPPORTUNISTIC) {
+        // Pre-pack to check the packed payload size BEFORE handing the
+        // message to the router. LXMF-kt's determineDeliveryMethod (called
+        // inside handleOutbound -> sendOpportunisticMessage) would silently
+        // mutate `desiredMethod` to DIRECT when packedSize exceeds
+        // ENCRYPTED_PACKET_MAX_CONTENT; by the time we saw that mutation,
+        // a DIRECT delivery would already be queued on the wire. Rejecting
+        // here — before handleOutbound — guarantees no packet leaves the
+        // bridge when the caller violates the single-packet contract.
+        // pack() is idempotent: the router will reuse `message.packed`
+        // when it does its own pack, so we don't pay the cost twice.
+        message.pack()
+        if (message.packedSize > LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT) {
             throw IllegalStateException(
-                "Opportunistic delivery silently upgraded to " +
-                    "${message.desiredMethod} — content+fields exceeded " +
-                    "ENCRYPTED_PACKET_MAX_CONTENT. Shrink the payload or " +
-                    "use lxmf_send_direct.",
+                "Opportunistic delivery would silently upgrade to DIRECT: " +
+                    "packedSize=${message.packedSize} exceeds " +
+                    "ENCRYPTED_PACKET_MAX_CONTENT=" +
+                    "${LXMFConstants.ENCRYPTED_PACKET_MAX_CONTENT}. " +
+                    "Shrink the payload or use lxmf_send_direct.",
             )
         }
+
+        runBlocking { inst.router.handleOutbound(message) }
 
         result(
             "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
@@ -522,7 +530,17 @@ fun lxmfFieldValueFromJson(v: JsonElement): Any = when {
         when {
             obj.has("bytes") -> obj.get("bytes").asString.fromHex()
             obj.has("str") -> obj.get("str").asString
-            obj.has("int") -> obj.get("int").asLong
+            // `int` tag must be an integer-valued JSON number — truncating a
+            // caller-supplied 3.14 to 3 would be silent data loss. Require
+            // the float form to be routed through an unwrapped primitive or
+            // a dedicated wrapper if we ever need one.
+            obj.has("int") -> {
+                val n = obj.get("int").asJsonPrimitive
+                require(n.isNumber && !jsonNumberIsFloat(n)) {
+                    "`int` tag requires an integer JSON number, got: $n"
+                }
+                n.asLong
+            }
             obj.has("bool") -> obj.get("bool").asBoolean
             else -> throw IllegalArgumentException(
                 "Unsupported LXMF field object shape; expected one of " +
@@ -534,7 +552,12 @@ fun lxmfFieldValueFromJson(v: JsonElement): Any = when {
         val prim = v.asJsonPrimitive
         when {
             prim.isBoolean -> prim.asBoolean
-            prim.isNumber -> prim.asLong
+            // Route floats (anything that serialised with `.` or exponent)
+            // through Double so 3.14 doesn't silently truncate to 3. The
+            // msgpack packer in LXMF-kt encodes Double as float64 and Long
+            // as the narrowest int type, so the wire type matches the
+            // JSON-source type.
+            prim.isNumber -> if (jsonNumberIsFloat(prim)) prim.asDouble else prim.asLong
             prim.isString -> prim.asString
             else -> throw IllegalArgumentException(
                 "Unsupported LXMF field primitive: $prim",
@@ -542,6 +565,18 @@ fun lxmfFieldValueFromJson(v: JsonElement): Any = when {
         }
     }
     else -> throw IllegalArgumentException("Unsupported LXMF field JSON element: $v")
+}
+
+/**
+ * Detect whether a JSON number primitive carries a fractional component
+ * or exponent. Gson parses JSON numbers lazily as LazilyParsedNumber
+ * (backed by the original token string), so the source-text check below
+ * catches both `3.14` and `1e6` without forcing a double conversion we
+ * might not need.
+ */
+private fun jsonNumberIsFloat(prim: JsonPrimitive): Boolean {
+    val s = prim.asString
+    return s.contains('.') || s.contains('e') || s.contains('E')
 }
 
 /**
@@ -567,5 +602,12 @@ fun lxmfFieldValueToJson(v: Any?): JsonElement = when (v) {
     is Map<*, *> -> JsonObject().also { obj ->
         v.forEach { (k, vv) -> obj.add(k.toString(), lxmfFieldValueToJson(vv)) }
     }
-    else -> JsonPrimitive(v.toString())
+    // Fail loud on unhandled types instead of round-tripping their
+    // `toString()` form. Mirrors the throw-on-unknown pattern in
+    // lxmfFieldValueFromJson — if LXMF-kt grows a new field representation
+    // (e.g. UByteArray, msgpack extension types) we'd rather the test
+    // crash here than silently corrupt the value.
+    else -> throw IllegalArgumentException(
+        "Unsupported LXMF field type in delivery callback: ${v::class}",
+    )
 }
