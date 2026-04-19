@@ -196,7 +196,17 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             // that here. See also: deregister on disconnect handled
             // by TCPServerInterface:195.
             server.onClientConnected = { spawnedChild ->
+                // Surface registration failures (e.g., Transport not yet
+                // initialized) so a silently-unregistered child doesn't
+                // re-introduce the exact symptom this callback fixes —
+                // path responses dropped at Transport.kt:3632-3658
+                // because the spawned interface isn't in `interfaces`.
                 runCatching { Transport.registerInterface(spawnedChild.toRef()) }
+                    .onFailure { e ->
+                        System.err.println(
+                            "[WireTcp] Failed to register spawned client ${spawnedChild.name}: $e",
+                        )
+                    }
             }
             server.start()
             // Register with Transport so the Transport layer considers this
