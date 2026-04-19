@@ -309,7 +309,18 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             link.setResourceConcludedCallback { resourceObj ->
                 val resource = resourceObj as? Resource ?: return@setResourceConcludedCallback
                 if (resource.status == ResourceConstants.COMPLETE) {
-                    resource.data?.let { listener.resourceBuffer.add(it.copyOf()) }
+                    val data = resource.data
+                    if (data != null) {
+                        listener.resourceBuffer.add(data.copyOf())
+                    } else {
+                        // `Resource.data` is nullable even for a COMPLETE
+                        // resource. Silently dropping the payload would make
+                        // a successful transfer indistinguishable from a
+                        // missed one (wire_resource_poll would block until
+                        // timeout). Surface it on stderr so a test author
+                        // debugging an apparent missed delivery can see it.
+                        System.err.println("[WireTcp] wire_listen: COMPLETE resource has null data, dropping")
+                    }
                 }
             }
         }
