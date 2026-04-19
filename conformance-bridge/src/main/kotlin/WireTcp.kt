@@ -37,6 +37,8 @@ import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.resource.Resource
+import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
 import java.io.File
 import java.net.ServerSocket
@@ -67,11 +69,12 @@ private class WireInstance(
     val outLinks: ConcurrentHashMap<String, Link> = ConcurrentHashMap(),
 )
 
-/** Per-destination receive buffer for incoming link data. */
+/** Per-destination receive buffer for incoming link data + resources. */
 private class Listener(
     val destination: Destination,
     val identity: Identity,
     val recvBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
+    val resourceBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
 )
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
@@ -293,11 +296,53 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
 
         val listener = Listener(destination, identity)
-        // On link established, wire a packet callback into the listener's buffer.
+        // On link established, wire both packet and resource callbacks into
+        // the listener's buffers.
         destination.setLinkEstablishedCallback { linkObj ->
             val link = linkObj as? Link ?: return@setLinkEstablishedCallback
             link.setPacketCallback { data, _packet ->
                 listener.recvBuffer.add(data.copyOf())
+            }
+            // Accept any incoming Resource transfer and buffer its
+            // reassembled data on completion.
+            link.setResourceStrategy(Link.ACCEPT_ALL)
+
+            // Per-link dedup set: reticulum-kt's Resource.assemble() invokes
+            // Link.resourceConcluded twice for the same completed resource
+            // (once directly at Resource.kt:1194, again via
+            // callbacks.completed at Resource.kt:1200 — which itself was
+            // wired to Link.resourceConcluded by Link.ACCEPT_ALL's call
+            // to Resource.accept at Link.kt:2036). Both invocations spawn
+            // daemon threads that land here, so without dedup a single
+            // completed transfer gets enqueued twice and wire_resource_poll
+            // returns duplicate entries. Keyed by resource.hash hex so
+            // distinct resources on the same link each get their own slot.
+            val seenResources: MutableSet<String> =
+                java.util.Collections.newSetFromMap(ConcurrentHashMap())
+
+            link.setResourceConcludedCallback { resourceObj ->
+                val resource = resourceObj as? Resource ?: return@setResourceConcludedCallback
+                if (resource.status != ResourceConstants.COMPLETE) return@setResourceConcludedCallback
+
+                val hashHex = resource.hash.toHex()
+                if (!seenResources.add(hashHex)) {
+                    // Duplicate invocation from the upstream double-fire —
+                    // drop silently.
+                    return@setResourceConcludedCallback
+                }
+
+                val data = resource.data
+                if (data != null) {
+                    listener.resourceBuffer.add(data.copyOf())
+                } else {
+                    // `Resource.data` is nullable even for a COMPLETE
+                    // resource. Silently dropping the payload would make
+                    // a successful transfer indistinguishable from a
+                    // missed one (wire_resource_poll would block until
+                    // timeout). Surface it on stderr so a test author
+                    // debugging an apparent missed delivery can see it.
+                    System.err.println("[WireTcp] wire_listen: COMPLETE resource has null data, dropping")
+                }
             }
         }
 
@@ -375,6 +420,76 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
 
         val ok = link.send(payload)
         result("sent" to boolVal(ok))
+    }
+
+    "wire_resource_send" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val payload = p.hex("data")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val done = CountDownLatch(1)
+        val finalStatus = java.util.concurrent.atomic.AtomicInteger(-1)
+
+        val resource = Resource.create(
+            data = payload,
+            link = link,
+            callback = { r ->
+                finalStatus.set(r.status)
+                done.countDown()
+            },
+        )
+
+        val finished = done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        if (!finished) {
+            // Cancel the still-running transfer so its background worker
+            // can't fire the resource-concluded callback on the receiver
+            // later and leave a phantom payload in the listener's buffer
+            // for a subsequent wire_resource_poll in the same test to
+            // pick up. Symmetric with the Python bridge's on-timeout
+            // cancel.
+            runCatching { resource.cancel() }
+        }
+        val status = finalStatus.get().takeIf { it >= 0 } ?: resource.status
+        val success = finished && status == ResourceConstants.COMPLETE
+        result(
+            "success" to boolVal(success),
+            "status" to intVal(status),
+            "size" to intVal(payload.size),
+            "timed_out" to boolVal(!finished),
+        )
+    }
+
+    "wire_resource_poll" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.str("destination_hash")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException(
+                "No listener registered for destination_hash=$destHashHex",
+            )
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && listener.resourceBuffer.isEmpty()) {
+            Thread.sleep(100)
+        }
+
+        val arr = JsonArray()
+        while (true) {
+            val item = listener.resourceBuffer.pollFirst() ?: break
+            arr.add(item.toHex())
+        }
+        result("resources" to arr)
     }
 
     "wire_link_poll" -> {
