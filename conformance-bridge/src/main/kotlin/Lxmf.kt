@@ -84,55 +84,70 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
 
         val storageDir = java.nio.file.Files.createTempDirectory("lxmf_conf_").toFile()
         val identity = Identity.create()
-        val router = LXMRouter(
-            identity = identity,
-            storagePath = storageDir.absolutePath,
-        )
-        val deliveryDestination = router.registerDeliveryIdentity(
-            identity = identity,
-            displayName = displayName,
-        )
-        router.start()
+        val router: LXMRouter
+        val deliveryDestination: Destination
+        val inst: LxmfInstance
+        try {
+            router = LXMRouter(
+                identity = identity,
+                storagePath = storageDir.absolutePath,
+            )
+            deliveryDestination = router.registerDeliveryIdentity(
+                identity = identity,
+                displayName = displayName,
+            )
 
-        val inst = LxmfInstance(
-            wireHandle = wireHandle,
-            router = router,
-            identity = identity,
-            deliveryDestination = deliveryDestination,
-            storageDir = storageDir,
-        )
+            inst = LxmfInstance(
+                wireHandle = wireHandle,
+                router = router,
+                identity = identity,
+                deliveryDestination = deliveryDestination,
+                storageDir = storageDir,
+            )
 
-        // Wire the delivery callback so when LXMF-kt acquires full
-        // propagation-receiver support, lxmf_poll_inbox will already
-        // be connected. For MVP the sender never receives its own
-        // messages, so this is wired but unused.
-        router.registerDeliveryCallback { message ->
-            val entry = JsonObject()
-            entry.addProperty("hash", message.hash?.toHex() ?: "")
-            entry.addProperty("source", message.sourceHash.toHex())
-            entry.addProperty("destination", message.destinationHash.toHex())
-            entry.addProperty("title", message.title)
-            entry.addProperty("content", message.content)
-            val fields = JsonObject()
-            message.fields.forEach { (k, v) ->
-                val key = k.toString()
-                when (v) {
-                    is ByteArray -> fields.addProperty(key, v.toHex())
-                    is String -> fields.addProperty(key, v)
-                    is Number -> fields.addProperty(key, v)
-                    is Boolean -> fields.addProperty(key, v)
-                    else -> fields.addProperty(key, v.toString())
+            // Wire the delivery callback BEFORE router.start() so a fast
+            // propagation node pushing a stored message during startup
+            // doesn't land on a null/no-op handler and get silently
+            // dropped. The receiver-side follow-up (sync_inbound /
+            // poll_inbox) relies on this being in place before the
+            // router can begin delivering.
+            router.registerDeliveryCallback { message ->
+                val entry = JsonObject()
+                entry.addProperty("hash", message.hash?.toHex() ?: "")
+                entry.addProperty("source", message.sourceHash.toHex())
+                entry.addProperty("destination", message.destinationHash.toHex())
+                entry.addProperty("title", message.title)
+                entry.addProperty("content", message.content)
+                val fields = JsonObject()
+                message.fields.forEach { (k, v) ->
+                    val key = k.toString()
+                    when (v) {
+                        is ByteArray -> fields.addProperty(key, v.toHex())
+                        is String -> fields.addProperty(key, v)
+                        is Number -> fields.addProperty(key, v)
+                        is Boolean -> fields.addProperty(key, v)
+                        else -> fields.addProperty(key, v.toString())
+                    }
                 }
+                entry.add("fields", fields)
+                inst.inbox.add(entry)
             }
-            entry.add("fields", fields)
-            inst.inbox.add(entry)
-        }
 
-        // Announce the delivery destination so the propagation node and
-        // other peers can route to it / recall its identity for
-        // encryption. Caller (the test / fixture) must give announces
-        // time to propagate before sending — same as the wire layer.
-        deliveryDestination.announce()
+            router.start()
+
+            // Announce the delivery destination so the propagation node
+            // and other peers can route to it / recall its identity for
+            // encryption. Caller (the test / fixture) must give
+            // announces time to propagate before sending — same as the
+            // wire layer.
+            deliveryDestination.announce()
+        } catch (e: Exception) {
+            // Partial setup — roll back the temp storage dir so we
+            // don't leak it for the remainder of the bridge process's
+            // lifetime. Matches the wire_start_tcp_server pattern.
+            runCatching { storageDir.deleteRecursively() }
+            throw e
+        }
 
         val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
         lxmfInstances[handle] = inst
@@ -205,6 +220,15 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         // queue handoff, not the actual transfer.
         runBlocking { inst.router.handleOutbound(message) }
 
+        // message.hash is populated by LXMF-kt during packing inside
+        // handleOutbound, so in the sender-only conformance path it is
+        // expected to be non-null here and the test harness asserts it
+        // is truthy. We still fall back to "" for parity with the
+        // Python reference bridge (reference/lxmf_bridge.py returns
+        // `message.hash.hex() if message.hash else ""`). An empty
+        // string therefore indicates "packing did not produce a hash"
+        // rather than "hash will arrive later" — callers MUST NOT use
+        // this value for delivery tracking.
         result(
             "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
         )
