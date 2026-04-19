@@ -68,11 +68,15 @@ class PathStoreWriteThroughTest {
             val linkId = ByteArray(16) { it.toByte() }
             val interfaceHash = ByteArray(16) { 0xFF.toByte() }
 
+            // `hops = 2` is accepted for call-site compatibility but the
+            // stored entry always carries hops = 1 so that outbound link
+            // DATA packets don't get HEADER_2-wrapped with the linkId as
+            // transport_id. See Transport.registerLinkPath doc comment.
             Transport.registerLinkPath(linkId, interfaceHash, hops = 2)
 
             store.data.size shouldBe 1
             store.data[linkId.toKey()] shouldNotBe null
-            store.data[linkId.toKey()]!!.hops shouldBe 2
+            store.data[linkId.toKey()]!!.hops shouldBe 1
         }
 
         @Test
