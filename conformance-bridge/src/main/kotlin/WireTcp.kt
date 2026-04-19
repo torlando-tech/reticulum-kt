@@ -24,6 +24,7 @@
  * a server with a client.
  */
 
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import network.reticulum.Reticulum
@@ -34,10 +35,16 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.transport.Transport
 import java.io.File
 import java.net.ServerSocket
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Handle-indexed state.
@@ -55,6 +62,16 @@ private class WireInstance(
     val serverIface: TCPServerInterface? = null,
     val clientIface: TCPClientInterface? = null,
     val destinations: MutableList<Pair<Identity, Destination>> = mutableListOf(),
+    // Link bookkeeping — used by wire_listen / wire_link_* commands below.
+    val listeners: ConcurrentHashMap<String, Listener> = ConcurrentHashMap(),
+    val outLinks: ConcurrentHashMap<String, Link> = ConcurrentHashMap(),
+)
+
+/** Per-destination receive buffer for incoming link data. */
+private class Listener(
+    val destination: Destination,
+    val identity: Identity,
+    val recvBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
 )
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
@@ -255,6 +272,135 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         } else {
             result("found" to boolVal(false))
         }
+    }
+
+    "wire_listen" -> {
+        val handle = p.str("handle")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = appName,
+            aspects = aspects,
+        )
+
+        val listener = Listener(destination, identity)
+        // On link established, wire a packet callback into the listener's buffer.
+        destination.setLinkEstablishedCallback { linkObj ->
+            val link = linkObj as? Link ?: return@setLinkEstablishedCallback
+            link.setPacketCallback { data, _packet ->
+                listener.recvBuffer.add(data.copyOf())
+            }
+        }
+
+        // Announce so the sender peer can learn a path via the transport.
+        destination.announce()
+
+        inst.listeners[destination.hash.toHex()] = listener
+        // Keep strong refs so neither gets GC'd.
+        inst.destinations.add(identity to destination)
+
+        result(
+            "destination_hash" to hexVal(destination.hash),
+            "identity_hash" to hexVal(identity.hash),
+        )
+    }
+
+    "wire_link_open" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 10000
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; " +
+                    "ensure an announce was received first.",
+            )
+
+        val outDest = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.OUT,
+            type = DestinationType.SINGLE,
+            appName = appName,
+            aspects = aspects,
+        )
+
+        val latch = CountDownLatch(1)
+        val link = Link.create(
+            destination = outDest,
+            establishedCallback = { latch.countDown() },
+            closedCallback = { latch.countDown() },
+        )
+
+        if (!latch.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
+            throw IllegalStateException(
+                "Link to ${destHash.toHex()} did not become active within ${timeoutMs}ms",
+            )
+        }
+        if (link.status != LinkConstants.ACTIVE) {
+            throw IllegalStateException(
+                "Link to ${destHash.toHex()} closed before becoming active (status=${link.status})",
+            )
+        }
+
+        val linkIdHex = link.linkId.toHex()
+        inst.outLinks[linkIdHex] = link
+        result("link_id" to JsonPrimitive(linkIdHex))
+    }
+
+    "wire_link_send" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val payload = p.hex("data")
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val ok = link.send(payload)
+        result("sent" to boolVal(ok))
+    }
+
+    "wire_link_poll" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.str("destination_hash")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 5000
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException(
+                "No listener registered for destination_hash=$destHashHex",
+            )
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && listener.recvBuffer.isEmpty()) {
+            Thread.sleep(50)
+        }
+
+        val arr = JsonArray()
+        while (true) {
+            val item = listener.recvBuffer.pollFirst() ?: break
+            arr.add(item.toHex())
+        }
+        result("packets" to arr)
     }
 
     "wire_stop" -> {

@@ -1048,22 +1048,43 @@ object Transport {
     /**
      * Register a path entry for a link so that outbound packets use the correct interface.
      * This should be called when a link is established with the receiving interface hash.
+     *
+     * The `hops` parameter is accepted for diagnostic/logging purposes (callers pass the
+     * traversed hop count of the establishment packet), but the stored path entry always
+     * uses `hops = 1` so that [outbound] takes the direct-transmit branch.
+     *
+     * Rationale: Python RNS never adds link_id entries to its path_table. Link DATA
+     * packets are sent as HEADER_1 with destination_hash = linkId over the link's
+     * `attached_interface`. Intermediate transport nodes forward them by looking up
+     * `linkId` in their own [linkTable], not by HEADER_2 transport routing.
+     *
+     * Storing `hops = packet.hops` (> 1 for multi-hop establishment) would cause
+     * [outbound] to HEADER_2-wrap link DATA with `transport_id = linkId`, which no
+     * transport node's identity matches, so the intermediate drops the packet as
+     * "in transport for other transport instance" (see Python `Transport.py:1428`).
+     * Forcing `hops = 1` here keeps outgoing link DATA on the HEADER_1 path, where
+     * the transport's linkTable lookup does the forwarding the way Python does.
      */
     fun registerLinkPath(
         linkId: ByteArray,
         receivingInterfaceHash: ByteArray,
-        hops: Int = 1,
+        @Suppress("UNUSED_PARAMETER") hops: Int = 1,
     ) {
         val now = System.currentTimeMillis()
         val entry =
             PathEntry(
                 timestamp = now,
-                nextHop = linkId, // Use linkId as nextHop (will route to link)
-                hops = hops,
+                // Transport.outbound with hops <= 1 doesn't consult nextHop for the
+                // wire bytes (it transmits packet.raw as-is), so the exact value is
+                // only used for diagnostics. Keep it as linkId for symmetry.
+                nextHop = linkId,
+                // ALWAYS 1, even when the actual establishment was multi-hop. See
+                // rationale above.
+                hops = 1,
                 expires = now + TransportConstants.PATHFINDER_E,
                 randomBlobs = mutableListOf(),
                 receivingInterfaceHash = receivingInterfaceHash,
-                announcePacketHash = linkId, // Use linkId as placeholder
+                announcePacketHash = linkId,
             )
         pathTable[linkId.toKey()] = entry
         pathStore?.upsertPath(linkId, entry)
