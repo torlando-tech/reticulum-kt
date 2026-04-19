@@ -281,6 +281,21 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             LXMRouter.PropagationTransferState.NO_PATH,
             LXMRouter.PropagationTransferState.NO_LINK,
         )
+        // If a prior lxmf_sync_inbound left the state machine in a
+        // terminal state (COMPLETE is the common case), the new
+        // requestMessagesFromPropagationNode() call above may not have
+        // synchronously reset it yet. Wait briefly for the state to
+        // leave the previous terminal before entering the completion-
+        // wait loop — otherwise the loop would observe the stale
+        // terminal and return immediately without actually waiting for
+        // the new transfer.
+        val transitionDeadline = System.currentTimeMillis() + 2000
+        while (System.currentTimeMillis() < transitionDeadline &&
+            inst.router.propagationTransferState in terminalStates
+        ) {
+            Thread.sleep(50)
+        }
+
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             if (inst.router.propagationTransferState in terminalStates) {
@@ -317,7 +332,13 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         val inst = lxmfInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        // Drain atomically — tests assert on exact counts.
+        // Best-effort drain — the delivery callback enqueues onto
+        // inst.inbox from the router's own threads, so a late delivery
+        // arriving between two pollFirst() calls WILL land in this
+        // drain. Tests that assert exact counts must call
+        // lxmf_sync_inbound first (its 300 ms settle window lets the
+        // router finish dispatching pending callbacks before we
+        // return) to avoid racy counts here.
         val drained = JsonArray()
         while (true) {
             val entry = inst.inbox.pollFirst() ?: break
