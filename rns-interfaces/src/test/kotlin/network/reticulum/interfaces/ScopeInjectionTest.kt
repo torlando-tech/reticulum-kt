@@ -1,6 +1,9 @@
 package network.reticulum.interfaces
 
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.udp.UDPInterface
 import org.junit.jupiter.api.AfterEach
@@ -404,5 +407,94 @@ class ScopeInjectionTest {
 
         assertTrue(udp.detached.get(), "Should be detached after stop()")
         assertFalse(udp.online.value, "Should be offline after stop()")
+    }
+
+    // ========================
+    // StateFlow Emission Tests (reactive observation — core motivation of refactor)
+    // ========================
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow emits false to true transition on start`() = runBlocking {
+        // Regression guard for the core motivation of the AtomicBoolean -> StateFlow refactor:
+        // consumers that captured the scalar at registration must now observe the transition.
+        val udp = UDPInterface(
+            name = "emission-udp",
+            bindPort = 15601,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15602
+        )
+        interfaces.add(udp)
+
+        // Collect the flow BEFORE start() — simulates a consumer that subscribes at registration
+        // time, when the interface is still offline. StateFlow replays the current value (false),
+        // then emits true once start() completes.
+        val observed = mutableListOf<Boolean>()
+        val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val collectJob = collectScope.launch {
+            udp.online.take(2).toList(observed)
+        }
+
+        // Ensure the collector has subscribed and replayed the initial false
+        delay(50)
+        assertEquals(listOf(false), observed, "Initial StateFlow value must replay to late subscriber")
+
+        udp.start()
+        collectJob.join()
+        collectScope.cancel()
+
+        assertEquals(listOf(false, true), observed,
+            "StateFlow must emit false -> true transition to observers subscribed before start()")
+    }
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow emits true to false transition on stop`() = runBlocking {
+        val udp = UDPInterface(
+            name = "emission-stop-udp",
+            bindPort = 15611,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15612
+        )
+        interfaces.add(udp)
+
+        udp.start()
+        assertTrue(udp.online.value, "Precondition: online after start")
+
+        // Subscribe after start — should replay current value (true), then observe false on stop
+        val observed = mutableListOf<Boolean>()
+        val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val collectJob = collectScope.launch {
+            udp.online.take(2).toList(observed)
+        }
+
+        delay(50)
+        assertEquals(listOf(true), observed, "Post-start subscriber must replay current value (true)")
+
+        udp.stop()
+        collectJob.join()
+        collectScope.cancel()
+
+        assertEquals(listOf(true, false), observed,
+            "StateFlow must emit true -> false transition on stop")
+    }
+
+    @Test
+    @Timeout(5)
+    fun `online StateFlow replays current value to late subscribers`() = runBlocking {
+        val udp = UDPInterface(
+            name = "replay-udp",
+            bindPort = 15621,
+            forwardIp = "127.0.0.1",
+            forwardPort = 15622
+        )
+        interfaces.add(udp)
+
+        udp.start()
+        assertTrue(udp.online.value)
+
+        // Late subscriber receives the current value without waiting for a new emission
+        val replayed = udp.online.first()
+        assertTrue(replayed, "StateFlow.first() must return the current value to a late subscriber")
     }
 }
