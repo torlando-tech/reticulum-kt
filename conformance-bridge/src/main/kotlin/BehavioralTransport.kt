@@ -45,7 +45,7 @@ class MockInterface(
     private val txQueue = ConcurrentLinkedDeque<ByteArray>()
 
     override fun start() {
-        online.set(true)
+        setOnline(true)
     }
 
     override fun processOutgoing(data: ByteArray) {

@@ -66,11 +66,11 @@ class LiveTcpServerTest {
         // Wait for TCP connection
         val deadline = System.currentTimeMillis() + 10_000
         while (System.currentTimeMillis() < deadline) {
-            if (tcpClient!!.online.get()) break
+            if (tcpClient!!.online.value) break
             Thread.sleep(100)
         }
 
-        assertTrue(tcpClient!!.online.get(), "Should connect to $host:$port")
+        assertTrue(tcpClient!!.online.value, "Should connect to $host:$port")
         println("  [Setup] Connected to live server")
     }
 
@@ -85,9 +85,9 @@ class LiveTcpServerTest {
     @DisplayName("TCP connection stays online")
     @Timeout(10)
     fun `tcp connection stays online`() {
-        assertTrue(tcpClient!!.online.get(), "TCP connection should be online")
+        assertTrue(tcpClient!!.online.value, "TCP connection should be online")
         Thread.sleep(2000)
-        assertTrue(tcpClient!!.online.get(), "TCP connection should stay online after 2s")
+        assertTrue(tcpClient!!.online.value, "TCP connection should stay online after 2s")
         println("  [Test] TCP connection stable")
     }
 

@@ -126,7 +126,7 @@ class I2PInterfacePeer(
         if (connectedSocket != null) {
             // Inbound connection — socket already connected
             socket = connectedSocket
-            online.set(true)
+            setOnline(true)
             neverConnected.set(false)
 
             configureSocket(socket!!)
@@ -178,7 +178,7 @@ class I2PInterfacePeer(
                 socket = streamConn.socket
                 configureSocket(streamConn.socket)
 
-                online.set(true)
+                setOnline(true)
                 neverConnected.set(false)
                 tunnelState = TUNNEL_STATE_ACTIVE
 
@@ -253,7 +253,7 @@ class I2PInterfacePeer(
         val buffer = ByteArray(4096)
 
         try {
-            while (ioScope.isActive && online.get() && !detached.get()) {
+            while (ioScope.isActive && online.value && !detached.get()) {
                 val bytesRead = withContext(Dispatchers.IO) {
                     input.read(buffer)
                 }
@@ -269,7 +269,7 @@ class I2PInterfacePeer(
                     }
                 } else if (bytesRead == -1) {
                     // Connection closed
-                    online.set(false)
+                    setOnline(false)
                     break
                 }
             }
@@ -277,7 +277,7 @@ class I2PInterfacePeer(
             // Normal shutdown
         } catch (e: IOException) {
             if (!detached.get()) {
-                online.set(false)
+                setOnline(false)
             }
         }
 
@@ -302,7 +302,7 @@ class I2PInterfacePeer(
      */
     private suspend fun readWatchdog(sock: Socket) {
         try {
-            while (ioScope.isActive && online.get() && !detached.get()) {
+            while (ioScope.isActive && online.value && !detached.get()) {
                 delay(1000)
 
                 val now = System.currentTimeMillis()
@@ -349,7 +349,7 @@ class I2PInterfacePeer(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -388,14 +388,14 @@ class I2PInterfacePeer(
         if (isInitiator && !detached.get()) {
             log("Unrecoverable error, tearing down")
         }
-        online.set(false)
+        setOnline(false)
         closeSocket(socket)
         parentI2P.peerDisconnected(this)
     }
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         readJob?.cancel()
         watchdogJob?.cancel()

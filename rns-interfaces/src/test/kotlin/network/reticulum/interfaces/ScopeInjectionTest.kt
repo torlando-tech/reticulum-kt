@@ -54,12 +54,12 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online")
+        assertTrue(udp.online.value, "Should be online")
 
         // Explicit stop should work
         udp.stop()
         Thread.sleep(100)
-        assertFalse(udp.online.get(), "Should be offline after stop")
+        assertFalse(udp.online.value, "Should be offline after stop")
     }
 
     @Test
@@ -80,14 +80,14 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online")
+        assertTrue(udp.online.value, "Should be online")
 
         // Cancel parent scope (simulates service stop)
         parentScope.cancel()
 
         // Wait for cancellation to propagate (should be quick)
         delay(500)
-        assertFalse(udp.online.get(), "Should be offline after parent cancellation")
+        assertFalse(udp.online.value, "Should be offline after parent cancellation")
     }
 
     @Test
@@ -106,7 +106,7 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // Measure cancellation time
         val startTime = System.currentTimeMillis()
@@ -114,12 +114,12 @@ class ScopeInjectionTest {
 
         // Poll for completion (max 1 second)
         var elapsed = 0L
-        while (udp.online.get() && elapsed < 1000) {
+        while (udp.online.value && elapsed < 1000) {
             delay(50)
             elapsed = System.currentTimeMillis() - startTime
         }
 
-        assertFalse(udp.online.get(), "Should be offline within 1 second")
+        assertFalse(udp.online.value, "Should be offline within 1 second")
         assertTrue(elapsed < 1000, "Cancellation took ${elapsed}ms, should be < 1000ms")
     }
 
@@ -149,14 +149,14 @@ class ScopeInjectionTest {
 
         udp1.start()
         udp2.start()
-        assertTrue(udp1.online.get() && udp2.online.get(), "Both should be online")
+        assertTrue(udp1.online.value && udp2.online.value, "Both should be online")
 
         // Cancel parent
         parentScope.cancel()
         delay(500)
 
-        assertFalse(udp1.online.get(), "UDP1 should be offline")
-        assertFalse(udp2.online.get(), "UDP2 should be offline")
+        assertFalse(udp1.online.value, "UDP1 should be offline")
+        assertFalse(udp2.online.value, "UDP2 should be offline")
     }
 
     // ========================
@@ -264,15 +264,15 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get(), "Should be online after start")
+        assertTrue(udp.online.value, "Should be online after start")
 
         // Wait and verify interface STAYS online while parent is active
         // This simulates the app being backgrounded (service keeps running)
         delay(500)
-        assertTrue(udp.online.get(), "Should STILL be online after 500ms with active parent")
+        assertTrue(udp.online.value, "Should STILL be online after 500ms with active parent")
 
         delay(500)
-        assertTrue(udp.online.get(), "Should STILL be online after 1 second with active parent")
+        assertTrue(udp.online.value, "Should STILL be online after 1 second with active parent")
 
         // Parent scope is still active - interface should remain operational
         assertTrue(parentScope.isActive, "Parent scope should still be active")
@@ -351,7 +351,7 @@ class ScopeInjectionTest {
         delay(500)
 
         // UDP should still be online despite TCP failure
-        assertTrue(udp.online.get(), "UDP should remain online when sibling TCP fails")
+        assertTrue(udp.online.value, "UDP should remain online when sibling TCP fails")
     }
 
     @Test
@@ -370,7 +370,7 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // Multiple detach calls should be safe
         udp.detach()
@@ -378,7 +378,7 @@ class ScopeInjectionTest {
         udp.detach()
 
         assertTrue(udp.detached.get(), "Should be detached")
-        assertFalse(udp.online.get(), "Should be offline")
+        assertFalse(udp.online.value, "Should be offline")
     }
 
     @Test
@@ -397,12 +397,12 @@ class ScopeInjectionTest {
         interfaces.add(udp)
 
         udp.start()
-        assertTrue(udp.online.get())
+        assertTrue(udp.online.value)
 
         // stop() should work the same as detach()
         udp.stop()
 
         assertTrue(udp.detached.get(), "Should be detached after stop()")
-        assertFalse(udp.online.get(), "Should be offline after stop()")
+        assertFalse(udp.online.value, "Should be offline after stop()")
     }
 }

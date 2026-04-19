@@ -85,7 +85,7 @@ class BLEPeerInterface(
      * Called by [BLEInterface] after spawning and registering with Transport.
      */
     fun startReceiving() {
-        online.set(true)
+        setOnline(true)
 
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
@@ -99,9 +99,9 @@ class BLEPeerInterface(
     private fun startRssiPolling() {
         if (!isOutgoing) return
         rssiJob = scope.launch {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 delay(10_000)
-                if (!online.get() || detached.get()) break
+                if (!online.value || detached.get()) break
                 try {
                     currentRssi = connection.readRemoteRssi()
                 } catch (_: Exception) {
@@ -118,7 +118,7 @@ class BLEPeerInterface(
     private suspend fun receiveLoop() {
         try {
             connection.receivedFragments.collect { fragment ->
-                if (!online.get() || detached.get()) return@collect
+                if (!online.value || detached.get()) return@collect
 
                 // Any traffic resets the zombie detection timer
                 lastTrafficReceived = System.currentTimeMillis()
@@ -160,7 +160,7 @@ class BLEPeerInterface(
      * so we bridge with runBlocking(Dispatchers.IO).
      */
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         try {
             val fragments = fragmenter.fragment(data)
@@ -188,10 +188,10 @@ class BLEPeerInterface(
      */
     private suspend fun keepaliveLoop() {
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 delay(BLEConstants.KEEPALIVE_INTERVAL_MS)
 
-                if (!online.get() || detached.get()) break
+                if (!online.value || detached.get()) break
 
                 try {
                     connection.sendFragment(byteArrayOf(BLEConstants.KEEPALIVE_BYTE))
@@ -200,7 +200,7 @@ class BLEPeerInterface(
                     log("Keepalive failed, grace period...")
                     delay(BLEConstants.KEEPALIVE_INTERVAL_MS)
 
-                    if (!online.get() || detached.get()) break
+                    if (!online.value || detached.get()) break
 
                     try {
                         connection.sendFragment(byteArrayOf(BLEConstants.KEEPALIVE_BYTE))
@@ -252,7 +252,7 @@ class BLEPeerInterface(
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines
         receiveJob?.cancel()

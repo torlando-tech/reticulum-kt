@@ -105,7 +105,7 @@ class TCPServerInterface(
             serverSocket = ServerSocket()
             serverSocket?.reuseAddress = true
             serverSocket?.bind(InetSocketAddress(bindAddress, bindPort))
-            online.set(true)
+            setOnline(true)
             log("Listening on $bindAddress:$bindPort")
 
             acceptJob = ioScope.launch {
@@ -118,7 +118,7 @@ class TCPServerInterface(
     }
 
     private suspend fun acceptLoop() {
-        while (online.get() && !detached.get()) {
+        while (online.value && !detached.get()) {
             try {
                 val server = serverSocket ?: break
                 // Blocking accept wrapped in IO dispatcher
@@ -151,7 +151,7 @@ class TCPServerInterface(
 
                     // Rebroadcast to all OTHER clients (not the sender)
                     for (otherClient in clients) {
-                        if (otherClient !== iface && otherClient.online.get()) {
+                        if (otherClient !== iface && otherClient.online.value) {
                             try {
                                 otherClient.processOutgoing(data)
                             } catch (e: Exception) {
@@ -197,7 +197,7 @@ class TCPServerInterface(
     override fun processOutgoing(data: ByteArray) {
         for (client in clients) {
             try {
-                if (client.online.get()) {
+                if (client.online.value) {
                     client.processOutgoing(data)
                 }
             } catch (e: Exception) {
@@ -292,7 +292,7 @@ class TCPServerClientInterface internal constructor(
     override fun start() {
         socket.tcpNoDelay = true
         socket.soTimeout = 0
-        online.set(true)
+        setOnline(true)
 
         readJob = ioScope.launch {
             readLoop()
@@ -303,7 +303,7 @@ class TCPServerClientInterface internal constructor(
         val buffer = ByteArray(4096)
 
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 // Blocking read wrapped in IO dispatcher
                 val bytesRead = withContext(Dispatchers.IO) {
                     socket.getInputStream().read(buffer)
@@ -334,7 +334,7 @@ class TCPServerClientInterface internal constructor(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -368,7 +368,7 @@ class TCPServerClientInterface internal constructor(
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines first
         readJob?.cancel()

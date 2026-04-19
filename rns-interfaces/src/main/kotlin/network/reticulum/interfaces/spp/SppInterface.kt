@@ -206,7 +206,7 @@ class SppInterface(
             outputStream = conn.outputStream
             remoteDeviceName = conn.remoteName
             remoteDeviceAddress = conn.remoteAddress
-            online.set(true)
+            setOnline(true)
             neverConnected.set(false)
 
             if (initial) {
@@ -230,7 +230,7 @@ class SppInterface(
     private suspend fun reconnect() {
         if (reconnecting.getAndSet(true)) return
 
-        while (!online.get() && !detached.get()) {
+        while (!online.value && !detached.get()) {
             val delayMs = backoff.nextDelay()
 
             if (delayMs == null) {
@@ -266,7 +266,7 @@ class SppInterface(
             val buffer = ByteArray(READ_BUFFER_SIZE)
 
             try {
-                while (isActive && online.get() && !detached.get()) {
+                while (isActive && online.value && !detached.get()) {
                     val bytesRead = withContext(Dispatchers.IO) {
                         stream.read(buffer)
                     }
@@ -280,7 +280,7 @@ class SppInterface(
                             debugLog("Read loop: EOF, connection closed by peer")
                             debugLog("  frames sent: ${framesSent.get()}, received: ${framesReceived.get()}")
                         }
-                        online.set(false)
+                        setOnline(false)
                         break
                     }
                 }
@@ -291,7 +291,7 @@ class SppInterface(
                     debugLog("Read loop: IOException - ${e.javaClass.name}: ${e.message}")
                 }
                 if (!detached.get()) {
-                    online.set(false)
+                    setOnline(false)
                 }
             }
 
@@ -305,7 +305,7 @@ class SppInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -350,7 +350,7 @@ class SppInterface(
         log("Bluetooth state changed - resetting reconnection backoff")
         backoff.reset()
 
-        if (!online.get() && !detached.get() && !reconnecting.get()) {
+        if (!online.value && !detached.get() && !reconnecting.get()) {
             ioScope.launch {
                 reconnect()
             }
@@ -372,7 +372,7 @@ class SppInterface(
         if (DEBUG) {
             debugLog("Teardown - frames sent: ${framesSent.get()}, received: ${framesReceived.get()}")
         }
-        online.set(false)
+        setOnline(false)
         closeConnection()
 
         if (!detached.get()) {

@@ -44,7 +44,7 @@ class UDPInterfaceTest {
         interfaces.add(receiver)
         receiver.start()
 
-        assertTrue(receiver.online.get(), "Receiver should be online")
+        assertTrue(receiver.online.value, "Receiver should be online")
         assertTrue(receiver.canReceive, "Receiver should be able to receive")
 
         // Create sender interface
@@ -57,7 +57,7 @@ class UDPInterfaceTest {
         interfaces.add(sender)
         sender.start()
 
-        assertTrue(sender.online.get(), "Sender should be online")
+        assertTrue(sender.online.value, "Sender should be online")
         assertTrue(sender.canSend, "Sender should be able to send")
 
         // Send test data
@@ -382,13 +382,13 @@ class UDPInterfaceTest {
         assertEquals(1064, iface.getEffectiveMtu())
         assertTrue(iface.canReceive)
         assertTrue(iface.canSend)
-        assertFalse(iface.online.get())
+        assertFalse(iface.online.value)
 
         iface.start()
-        assertTrue(iface.online.get())
+        assertTrue(iface.online.value)
 
         iface.detach()
-        assertFalse(iface.online.get())
+        assertFalse(iface.online.value)
         assertTrue(iface.detached.get())
     }
 
@@ -422,11 +422,11 @@ class UDPInterfaceTest {
         interfaces.add(iface)
 
         iface.start()
-        assertTrue(iface.online.get())
+        assertTrue(iface.online.value)
 
         // Second start should be safe
         iface.start()
-        assertTrue(iface.online.get())
+        assertTrue(iface.online.value)
     }
 
     @Test
@@ -455,10 +455,10 @@ class UDPInterfaceTest {
         interfaces.add(iface)
 
         iface.start()
-        assertTrue(iface.online.get())
+        assertTrue(iface.online.value)
 
         iface.detach()
-        assertFalse(iface.online.get())
+        assertFalse(iface.online.value)
 
         assertThrows(IllegalStateException::class.java) {
             iface.processOutgoing("test".toByteArray())

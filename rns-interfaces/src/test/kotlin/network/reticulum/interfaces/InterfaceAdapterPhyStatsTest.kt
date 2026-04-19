@@ -20,7 +20,7 @@ class InterfaceAdapterPhyStatsTest {
      */
     private class StubInterface : Interface("StubPhyStats") {
         override fun processOutgoing(data: ByteArray) {}
-        override fun start() { online.set(true) }
+        override fun start() { setOnline(true) }
     }
 
     @Test

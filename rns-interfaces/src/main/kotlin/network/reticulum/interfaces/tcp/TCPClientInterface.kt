@@ -192,7 +192,7 @@ class TCPClientInterface(
             val inputStream = sock.getInputStream()
 
             socket = sock
-            online.set(true)
+            setOnline(true)
             neverConnected.set(false)
 
             // Request tunnel synthesis for this connection
@@ -249,7 +249,7 @@ class TCPClientInterface(
         // Note: Do NOT reset backoff here - network change handler will reset when appropriate
         // This allows progressive backoff across reconnect cycles
 
-        while (!online.get() && !detached.get()) {
+        while (!online.value && !detached.get()) {
             val delayMs = backoff.nextDelay()
 
             if (delayMs == null) {
@@ -287,7 +287,7 @@ class TCPClientInterface(
             val buffer = ByteArray(4096)
 
             try {
-                while (isActive && online.get() && !detached.get()) {
+                while (isActive && online.value && !detached.get()) {
                     if (sock.isClosed || !sock.isConnected || sock.isInputShutdown) {
                         break
                     }
@@ -312,7 +312,7 @@ class TCPClientInterface(
                             debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
                             debugLog("  socket state: isInputShutdown=${sock.isInputShutdown}, isOutputShutdown=${sock.isOutputShutdown}")
                         }
-                        online.set(false)
+                        setOnline(false)
                         break
                     }
                 }
@@ -333,7 +333,7 @@ class TCPClientInterface(
                     }
                 }
                 if (!detached.get()) {
-                    online.set(false)
+                    setOnline(false)
                 }
             }
 
@@ -346,7 +346,7 @@ class TCPClientInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -446,7 +446,7 @@ class TCPClientInterface(
         backoff.reset()
 
         // If currently offline and not detached, trigger reconnection
-        if (!online.get() && !detached.get() && !reconnecting.get()) {
+        if (!online.value && !detached.get() && !reconnecting.get()) {
             ioScope.launch {
                 reconnect()
             }
@@ -468,7 +468,7 @@ class TCPClientInterface(
             debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")
             debugLog("  detached: ${detached.get()}")
         }
-        online.set(false)
+        setOnline(false)
         closeSocket()
 
         if (!detached.get()) {

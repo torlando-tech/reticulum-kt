@@ -1,5 +1,8 @@
 package network.reticulum.interfaces
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.InterfaceMode
 import network.reticulum.common.RnsConstants
@@ -121,8 +124,37 @@ abstract class Interface(
     /** Total bytes transmitted. */
     val txBytes = AtomicLong(0)
 
-    /** Whether this interface is currently online. */
-    val online = AtomicBoolean(false)
+    private val _online = MutableStateFlow(false)
+
+    /**
+     * Whether this interface is currently online, exposed as a [StateFlow]
+     * so observers can react to transitions (e.g., UI state, handshake
+     * completion in [network.reticulum.interfaces.rnode.RNodeInterface]
+     * which flips to online several seconds after registration).
+     *
+     * Scalar reads use `online.value`; to observe, collect the flow.
+     *
+     * The exposed type is the read-only [StateFlow]; mutation happens
+     * through [setOnline] (the backing [MutableStateFlow] stays private).
+     */
+    val online: StateFlow<Boolean> = _online.asStateFlow()
+
+    /**
+     * Update the online state. Public so subclasses (and parents managing
+     * spawned peers) can flip the flag during their lifecycle.
+     *
+     * Public rather than protected because some subclass hierarchies —
+     * [network.reticulum.interfaces.nearby.NearbyInterface] tearing down
+     * its spawned [network.reticulum.interfaces.nearby.NearbyPeerInterface]
+     * peers, and the conformance bridge's `MockInterface` in a separate
+     * module — need cross-instance or cross-module write access that JVM
+     * protected semantics won't allow. External Columba-side consumers
+     * read via the [online] StateFlow; they have no incentive to call
+     * this, and doing so would fight with the owning subclass.
+     */
+    fun setOnline(value: Boolean) {
+        _online.value = value
+    }
 
     /** Whether this interface has been detached (shutdown). */
     val detached = AtomicBoolean(false)
@@ -209,7 +241,7 @@ abstract class Interface(
      * Implementations should deframe the data and call [processIncoming].
      */
     protected fun processIncoming(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         rxBytes.addAndGet(data.size.toLong())
         parentInterface?.rxBytes?.addAndGet(data.size.toLong())
@@ -226,7 +258,7 @@ abstract class Interface(
      * Stop and detach the interface.
      */
     open fun detach() {
-        online.set(false)
+        setOnline(false)
         detached.set(true)
     }
 

@@ -14,7 +14,7 @@ class RNodeInterfaceTcpKeepaliveTest {
         val output = ByteArrayOutputStream()
         val iface = createInterface(output, activityKeepaliveMs = 3_500L)
 
-        iface.online.set(true)
+        iface.setOnline(true)
         setLastWriteMs(iface, System.currentTimeMillis() - 4_000L)
 
         invokeHandleIdleMaintenance(iface)
@@ -27,7 +27,7 @@ class RNodeInterfaceTcpKeepaliveTest {
         val output = ByteArrayOutputStream()
         val iface = createInterface(output, activityKeepaliveMs = 3_500L)
 
-        iface.online.set(false)
+        iface.setOnline(false)
         setLastWriteMs(iface, System.currentTimeMillis() - 4_000L)
 
         invokeHandleIdleMaintenance(iface)
@@ -40,7 +40,7 @@ class RNodeInterfaceTcpKeepaliveTest {
         val output = ByteArrayOutputStream()
         val iface = createInterface(output, activityKeepaliveMs = 3_500L)
 
-        iface.online.set(true)
+        iface.setOnline(true)
         setLastWriteMs(iface, System.currentTimeMillis() - 1_000L)
 
         invokeHandleIdleMaintenance(iface)

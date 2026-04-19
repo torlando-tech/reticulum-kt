@@ -182,12 +182,12 @@ class IfacTcpIntegrationTest {
 
         // Wait for connection
         var attempts = 0
-        while (!kotlinInterface!!.online.get() && attempts < 30) {
+        while (!kotlinInterface!!.online.value && attempts < 30) {
             Thread.sleep(500)
             attempts++
         }
 
-        assertTrue(kotlinInterface!!.online.get(), "Interface should come online")
+        assertTrue(kotlinInterface!!.online.value, "Interface should come online")
         println("Connection established!")
 
         // Wait for packets from Python (announces happen every 30 seconds in the test server)
@@ -236,12 +236,12 @@ class IfacTcpIntegrationTest {
 
         // Wait for connection
         var attempts = 0
-        while (!kotlinInterface!!.online.get() && attempts < 20) {
+        while (!kotlinInterface!!.online.value && attempts < 20) {
             Thread.sleep(500)
             attempts++
         }
 
-        assertTrue(kotlinInterface!!.online.get(), "Interface should come online")
+        assertTrue(kotlinInterface!!.online.value, "Interface should come online")
         println("Connection established without IFAC!")
 
         // Wait briefly for any packets
@@ -281,13 +281,13 @@ class IfacTcpIntegrationTest {
 
         // Wait for connection (TCP should still connect)
         var attempts = 0
-        while (!kotlinInterface!!.online.get() && attempts < 20) {
+        while (!kotlinInterface!!.online.value && attempts < 20) {
             Thread.sleep(500)
             attempts++
         }
 
         // Connection may establish at TCP level
-        if (kotlinInterface!!.online.get()) {
+        if (kotlinInterface!!.online.value) {
             println("TCP connected (expected - IFAC is application-layer)")
 
             // Wait for packets

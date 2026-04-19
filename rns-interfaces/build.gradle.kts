@@ -19,8 +19,8 @@ val kotestVersion: String by project
 dependencies {
     api(project(":rns-core"))
 
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
+    // Coroutines — `api` because Interface.online: StateFlow<Boolean> is a public API
+    api("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
 
     // Testing
     testImplementation(kotlin("test"))

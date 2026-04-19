@@ -67,8 +67,8 @@ class TcpIntegrationTest {
         // Wait for connection
         Thread.sleep(500)
 
-        assertTrue(server.online.get(), "Server should be online")
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(server.online.value, "Server should be online")
+        assertTrue(client.online.value, "Client should be online")
         assertEquals(1, server.clientCount(), "Server should have one client")
     }
 
