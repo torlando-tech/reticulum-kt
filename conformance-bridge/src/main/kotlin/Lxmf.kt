@@ -272,12 +272,6 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             }
             Thread.sleep(100)
         }
-        // Capture timeout state before the settle sleep — we need to
-        // distinguish a genuine terminal state from "deadline expired
-        // with the state machine still stuck". Without this, a hung
-        // router looks identical to a real NO_PATH / NO_LINK result
-        // and the test harness cannot tell them apart.
-        val timedOut = inst.router.propagationTransferState !in terminalStates
 
         // Let any freshly-decrypted messages hit the delivery callback
         // before we return — callbacks run on the router's own threads
@@ -285,9 +279,19 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         // settle window in reference/lxmf_bridge.py.
         Thread.sleep(300)
 
+        // Snapshot the state AFTER the settle sleep so `state` and
+        // `timed_out` are always consistent with each other: if the
+        // router transitions to a terminal state during the settle
+        // window, we want to report that terminal state and
+        // timed_out=false, not timed_out=true with state=COMPLETE.
+        // The test harness relies on these two fields agreeing to
+        // distinguish a hung state machine from a late completion.
+        val finalState = inst.router.propagationTransferState
+        val timedOut = finalState !in terminalStates
+
         result(
             "messages_received" to JsonPrimitive(inst.router.propagationTransferLastResult),
-            "state" to JsonPrimitive(inst.router.propagationTransferState.name),
+            "state" to JsonPrimitive(finalState.name),
             "timed_out" to boolVal(timedOut),
         )
     }
