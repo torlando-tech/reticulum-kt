@@ -186,7 +186,16 @@ class BouncyCastleProvider : CryptoProvider {
         // Expand phase
         val hashLen = 32
         val n = (length + hashLen - 1) / hashLen
-        require(n <= 255) { "HKDF output too long" }
+        // NOTE: RFC 5869 limits HKDF output to 255 * HashLen bytes. We
+        // intentionally do NOT enforce that limit here. The Python RNS
+        // reference (RNS/Cryptography/HKDF.py) uses the same counter-byte
+        // wrap `(i + 1) % (0xFF + 1)` and will silently produce output
+        // beyond the RFC cap. IFAC masking derives a mask the size of the
+        // full packet — for a Resource chunk near the link MDU (~8 KB),
+        // mask length exceeds 8160 bytes (255 * 32), so a strict check
+        // here breaks wire compatibility with Python peers for any IFAC-
+        // protected Resource transfer. See reticulum-conformance
+        // tests/wire/test_resource_multihop.py which encodes this.
 
         val result = ByteArray(length)
         var previousBlock = ByteArray(0)
