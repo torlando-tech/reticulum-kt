@@ -2,6 +2,7 @@ package network.reticulum.interfaces
 
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import network.reticulum.interfaces.tcp.TCPClientInterface
@@ -426,24 +427,26 @@ class ScopeInjectionTest {
         )
         interfaces.add(udp)
 
-        // Collect the flow BEFORE start() — simulates a consumer that subscribes at registration
-        // time, when the interface is still offline. StateFlow replays the current value (false),
-        // then emits true once start() completes.
-        val observed = mutableListOf<Boolean>()
+        // Use a CompletableDeferred to guarantee happens-before between "collector has
+        // subscribed and received the initial false replay" and "start() fires the true
+        // emission". Without this handshake, start() could race ahead of the subscription
+        // and the collector would see true as its initial replay, missing the transition.
+        val subscribed = CompletableDeferred<Unit>()
         val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val collectJob = collectScope.launch {
-            udp.online.take(2).toList(observed)
+        val observed = collectScope.async {
+            udp.online
+                .onEach { if (!subscribed.isCompleted) subscribed.complete(Unit) }
+                .take(2)
+                .toList()
         }
 
-        // Ensure the collector has subscribed and replayed the initial false
-        delay(50)
-        assertEquals(listOf(false), observed, "Initial StateFlow value must replay to late subscriber")
-
+        subscribed.await()  // barrier: collector has the initial false
         udp.start()
-        collectJob.join()
+
+        val values = observed.await()  // barrier: take(2) has completed
         collectScope.cancel()
 
-        assertEquals(listOf(false, true), observed,
+        assertEquals(listOf(false, true), values,
             "StateFlow must emit false -> true transition to observers subscribed before start()")
     }
 
@@ -461,21 +464,23 @@ class ScopeInjectionTest {
         udp.start()
         assertTrue(udp.online.value, "Precondition: online after start")
 
-        // Subscribe after start — should replay current value (true), then observe false on stop
-        val observed = mutableListOf<Boolean>()
+        // Handshake guarantees the subscription is live (and has replayed true) before stop()
+        val subscribed = CompletableDeferred<Unit>()
         val collectScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val collectJob = collectScope.launch {
-            udp.online.take(2).toList(observed)
+        val observed = collectScope.async {
+            udp.online
+                .onEach { if (!subscribed.isCompleted) subscribed.complete(Unit) }
+                .take(2)
+                .toList()
         }
 
-        delay(50)
-        assertEquals(listOf(true), observed, "Post-start subscriber must replay current value (true)")
-
+        subscribed.await()  // barrier: collector has the initial true
         udp.stop()
-        collectJob.join()
+
+        val values = observed.await()  // barrier: take(2) has completed
         collectScope.cancel()
 
-        assertEquals(listOf(true, false), observed,
+        assertEquals(listOf(true, false), values,
             "StateFlow must emit true -> false transition on stop")
     }
 
