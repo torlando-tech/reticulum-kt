@@ -79,6 +79,19 @@ private class Listener(
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
 
+/**
+ * Existence check for the LXMF bridge layer.
+ *
+ * The LXMF layer borrows the RNS singleton that the wire layer brought
+ * up and attaches its own LXMRouter — it never needs to mutate wire
+ * state. All we expose is a "did this handle ever exist" check so that
+ * Lxmf.kt can throw a coherent `IllegalArgumentException("Unknown
+ * wire_handle")` instead of letting an NPE bubble out of the Destination
+ * constructor when Transport isn't initialized.
+ */
+internal fun wireHandleExists(handle: String): Boolean =
+    wireInstances.containsKey(handle)
+
 /** Pre-allocate a free loopback port using bind-then-release.
  *  Tiny race window; acceptable for localhost test use. */
 private fun allocateFreePort(): Int {
