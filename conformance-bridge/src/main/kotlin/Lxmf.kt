@@ -280,43 +280,14 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         // determineDeliveryMethod would log-and-fall-back; the
         // conformance suite intentionally keeps opportunistic tests
         // single-packet and treats the upgrade as a distinct case.
-        val handle = p.str("handle")
-        val recipientHash = p.hex("recipient_delivery_dest_hash")
-        val content = p.str("content")
-        val title = p.get("title")?.asString ?: ""
-        val fieldsJson = p.get("fields")?.asJsonObject
-
-        val inst = lxmfInstances[handle]
-            ?: throw IllegalArgumentException("Unknown handle: $handle")
-
-        val recipientIdentity = Identity.recall(recipientHash)
-            ?: throw IllegalStateException(
-                "No identity known for recipient ${recipientHash.toHex()}. " +
-                    "Ensure the recipient announced its delivery destination " +
-                    "before calling lxmf_send_opportunistic.",
-            )
-
-        val recipientDestination = Destination.create(
-            identity = recipientIdentity,
-            direction = DestinationDirection.OUT,
-            type = DestinationType.SINGLE,
-            appName = "lxmf",
-            "delivery",
-        )
-
-        val decodedFields = mutableMapOf<Int, Any>()
-        if (fieldsJson != null) {
-            fieldsJson.entrySet().forEach { (k, v) ->
-                decodedFields[k.toInt()] = lxmfFieldValueFromJson(v)
-            }
-        }
+        val target = resolveLxmfOutboundTarget(p, "lxmf_send_opportunistic")
 
         val message = LXMessage.create(
-            destination = recipientDestination,
-            source = inst.deliveryDestination,
-            content = content,
-            title = title,
-            fields = decodedFields,
+            destination = target.destination,
+            source = target.inst.deliveryDestination,
+            content = target.content,
+            title = target.title,
+            fields = target.fields,
             desiredMethod = DeliveryMethod.OPPORTUNISTIC,
         )
 
@@ -341,7 +312,7 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
             )
         }
 
-        runBlocking { inst.router.handleOutbound(message) }
+        runBlocking { target.inst.router.handleOutbound(message) }
 
         result(
             "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
@@ -353,47 +324,18 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
         // is transferred via Resource (multi-packet, per LXMF-kt's
         // determineDeliveryMethod). Handle both single-packet direct and
         // multi-packet direct; caller picks by payload size.
-        val handle = p.str("handle")
-        val recipientHash = p.hex("recipient_delivery_dest_hash")
-        val content = p.str("content")
-        val title = p.get("title")?.asString ?: ""
-        val fieldsJson = p.get("fields")?.asJsonObject
-
-        val inst = lxmfInstances[handle]
-            ?: throw IllegalArgumentException("Unknown handle: $handle")
-
-        val recipientIdentity = Identity.recall(recipientHash)
-            ?: throw IllegalStateException(
-                "No identity known for recipient ${recipientHash.toHex()}. " +
-                    "Ensure the recipient announced its delivery destination " +
-                    "before calling lxmf_send_direct.",
-            )
-
-        val recipientDestination = Destination.create(
-            identity = recipientIdentity,
-            direction = DestinationDirection.OUT,
-            type = DestinationType.SINGLE,
-            appName = "lxmf",
-            "delivery",
-        )
-
-        val decodedFields = mutableMapOf<Int, Any>()
-        if (fieldsJson != null) {
-            fieldsJson.entrySet().forEach { (k, v) ->
-                decodedFields[k.toInt()] = lxmfFieldValueFromJson(v)
-            }
-        }
+        val target = resolveLxmfOutboundTarget(p, "lxmf_send_direct")
 
         val message = LXMessage.create(
-            destination = recipientDestination,
-            source = inst.deliveryDestination,
-            content = content,
-            title = title,
-            fields = decodedFields,
+            destination = target.destination,
+            source = target.inst.deliveryDestination,
+            content = target.content,
+            title = target.title,
+            fields = target.fields,
             desiredMethod = DeliveryMethod.DIRECT,
         )
 
-        runBlocking { inst.router.handleOutbound(message) }
+        runBlocking { target.inst.router.handleOutbound(message) }
 
         result(
             "message_hash" to JsonPrimitive(message.hash?.toHex() ?: ""),
@@ -505,6 +447,84 @@ fun handleLxmfCommand(command: String, p: JsonObject): JsonObject = when (comman
 }
 
 /**
+ * Resolved sender-side state shared by lxmf_send_opportunistic and
+ * lxmf_send_direct. Keeps the two command handlers focused on the
+ * method-specific pieces (pre-pack size guard for opportunistic; direct
+ * goes straight to handleOutbound) without duplicating the
+ * handle/identity/destination/fields plumbing.
+ */
+private data class ResolvedLxmfOutboundTarget(
+    val inst: LxmfInstance,
+    val destination: Destination,
+    val content: String,
+    val title: String,
+    val fields: MutableMap<Int, Any>,
+)
+
+/**
+ * Shared setup for the outbound lxmf_send_* commands: looks up the
+ * instance by handle, recalls the recipient identity, builds the
+ * delivery destination, and decodes the `fields` map.
+ *
+ * `commandName` is threaded only into the identity-missing error
+ * message so the caller sees which command was attempted when the
+ * recipient announce hasn't been observed yet.
+ */
+private fun resolveLxmfOutboundTarget(
+    p: JsonObject,
+    commandName: String,
+): ResolvedLxmfOutboundTarget {
+    val handle = p.str("handle")
+    val recipientHash = p.hex("recipient_delivery_dest_hash")
+    val content = p.str("content")
+    val title = p.get("title")?.asString ?: ""
+    val fieldsJson = p.get("fields")?.asJsonObject
+
+    val inst = lxmfInstances[handle]
+        ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+    val recipientIdentity = Identity.recall(recipientHash)
+        ?: throw IllegalStateException(
+            "No identity known for recipient ${recipientHash.toHex()}. " +
+                "Ensure the recipient announced its delivery destination " +
+                "before calling $commandName.",
+        )
+
+    val recipientDestination = Destination.create(
+        identity = recipientIdentity,
+        direction = DestinationDirection.OUT,
+        type = DestinationType.SINGLE,
+        appName = "lxmf",
+        "delivery",
+    )
+
+    val decodedFields = mutableMapOf<Int, Any>()
+    if (fieldsJson != null) {
+        fieldsJson.entrySet().forEach { (k, v) ->
+            // LXMF field keys are msgpack int keys by wire; the JSON
+            // bridge keys arrive as strings. Surface a friendly error
+            // when a non-integer key slips in (e.g. a caller typo)
+            // instead of the bare NumberFormatException "For input
+            // string: ..." that toInt() would emit.
+            val fieldId = k.toIntOrNull()
+                ?: throw IllegalArgumentException(
+                    "LXMF field key must be an integer, got: \"$k\" " +
+                        "(in $commandName `fields` map)",
+                )
+            decodedFields[fieldId] = lxmfFieldValueFromJson(v)
+        }
+    }
+
+    return ResolvedLxmfOutboundTarget(
+        inst = inst,
+        destination = recipientDestination,
+        content = content,
+        title = title,
+        fields = decodedFields,
+    )
+}
+
+/**
  * Recursively decode a JSON field value into the native Kotlin/Java type
  * that LXMF-kt's msgpack packer understands.
  *
@@ -576,7 +596,27 @@ fun lxmfFieldValueFromJson(v: JsonElement): Any = when {
  */
 private fun jsonNumberIsFloat(prim: JsonPrimitive): Boolean {
     val s = prim.asString
-    return s.contains('.') || s.contains('e') || s.contains('E')
+    // Any fractional-component marker means the source was definitely a
+    // float. No further check needed — `3.0` is reasonably interpreted
+    // as a float by the caller who wrote it that way.
+    if (s.contains('.')) return true
+    // Exponent form without a fractional component (`1e6`) is still an
+    // integer value — treat it as float only when the numeric value
+    // genuinely loses precision when coerced through Long. This keeps
+    // large integers in scientific notation on the integer path while
+    // still routing `1.5e2` (via the `.` branch above) to Double.
+    if (s.contains('e') || s.contains('E')) {
+        val d = prim.asDouble
+        // Non-finite doubles (+Inf/-Inf/NaN) are obviously float-shaped.
+        if (!d.isFinite()) return true
+        // Outside the signed-Long range → must be float to avoid
+        // overflow on the Long path.
+        if (d < Long.MIN_VALUE.toDouble() || d > Long.MAX_VALUE.toDouble()) return true
+        // Round-trip test: integer-valued doubles (e.g. 1e6 = 1000000.0)
+        // stay on the Long path; anything that loses magnitude is a float.
+        return d != d.toLong().toDouble()
+    }
+    return false
 }
 
 /**
