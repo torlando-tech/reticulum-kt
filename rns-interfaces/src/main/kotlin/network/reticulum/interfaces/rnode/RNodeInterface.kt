@@ -727,8 +727,8 @@ class RNodeInterface(
 
         if (online.value) {
             log("Read loop exiting - marking interface offline")
+            setOnline(false)
         }
-        setOnline(false)
     }
 
     /**
