@@ -93,17 +93,27 @@ class BLEPeerInterface(
     }
 
     /**
-     * Poll RSSI every 10 seconds on central (outgoing) connections.
-     * Peripheral connections don't have a GATT client handle, so RSSI reads are unsupported.
+     * Poll RSSI every 10 seconds on central (outgoing) connections and mirror
+     * the value into the base-class [rStatRssi] so Transport.inbound annotates
+     * every received packet with it. This is a poll-interval-stale proxy for
+     * per-packet RSSI — Android's BluetoothGatt does not expose RSSI per GATT
+     * notification. Peripheral connections have no GATT client handle so
+     * [android.bluetooth.BluetoothGatt.readRemoteRssi] is unavailable there;
+     * we leave [rStatRssi] null on that side (packets stay un-annotated).
      */
     private fun startRssiPolling() {
         if (!isOutgoing) return
+        // Seed with the scan-time RSSI so packets received during the first
+        // 10-second polling window are still annotated with a meaningful value.
+        rStatRssi = discoveryRssi
         rssiJob = scope.launch {
             while (online.value && !detached.get()) {
                 delay(10_000)
                 if (!online.value || detached.get()) break
                 try {
-                    currentRssi = connection.readRemoteRssi()
+                    val rssi = connection.readRemoteRssi()
+                    currentRssi = rssi
+                    rStatRssi = rssi
                 } catch (_: Exception) {
                     // Not all connections support RSSI reading — silently ignore
                 }
