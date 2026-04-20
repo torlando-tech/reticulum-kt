@@ -100,8 +100,13 @@ class BLEPeerInterface(
      * notification. Peripheral connections have no GATT client handle so
      * [android.bluetooth.BluetoothGatt.readRemoteRssi] is unavailable there;
      * we leave [rStatRssi] null on that side (packets stay un-annotated).
+     *
+     * Visible as `internal` (rather than private) so unit tests can exercise
+     * the seed-from-[discoveryRssi] path without waiting on a real 10-second
+     * GATT polling loop. The per-tick poll logic lives in [pollAndApplyRssi]
+     * and is tested separately.
      */
-    private fun startRssiPolling() {
+    internal fun startRssiPolling() {
         if (!isOutgoing) return
         // Seed with the scan-time RSSI so packets received during the first
         // 10-second polling window are still annotated with a meaningful value.
@@ -110,14 +115,29 @@ class BLEPeerInterface(
             while (online.value && !detached.get()) {
                 delay(10_000)
                 if (!online.value || detached.get()) break
-                try {
-                    val rssi = connection.readRemoteRssi()
-                    currentRssi = rssi
-                    rStatRssi = rssi
-                } catch (_: Exception) {
-                    // Not all connections support RSSI reading — silently ignore
-                }
+                pollAndApplyRssi()
             }
+        }
+    }
+
+    /**
+     * One RSSI poll tick: read from the GATT connection and mirror the result
+     * into both [currentRssi] (for peer scoring) and the base-class
+     * [rStatRssi] (for per-packet annotation via Transport.inbound). Any
+     * exception from [BLEPeerConnection.readRemoteRssi] is silently swallowed
+     * so a flaky read doesn't clobber a previously-valid reading.
+     *
+     * Visible as `internal` so unit tests can call it directly with a fake
+     * connection, avoiding the 10-second `delay` inside [startRssiPolling]'s
+     * launch block.
+     */
+    internal suspend fun pollAndApplyRssi() {
+        try {
+            val rssi = connection.readRemoteRssi()
+            currentRssi = rssi
+            rStatRssi = rssi
+        } catch (_: Exception) {
+            // Not all connections support RSSI reading — silently ignore
         }
     }
 
