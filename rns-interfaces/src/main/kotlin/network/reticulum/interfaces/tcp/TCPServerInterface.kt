@@ -141,6 +141,21 @@ class TCPServerInterface(
                     parentServer = this,
                     useKissFraming = useKissFraming
                 )
+                // Mirror Python TCPInterface.py:619 — spawned_interface.mode = self.mode.
+                // The spawned child inherits the parent's effective mode so that
+                // Transport sees the configured mode when a packet arrives (the
+                // `receiving_interface` for a client-sourced packet is the spawned
+                // child, not the parent server).
+                //
+                // Contract: snapshot-at-spawn, backfill-on-change. This line
+                // copies the parent's effective mode as a concrete value at
+                // spawn time; later mutation of the parent's `modeOverride`
+                // does NOT automatically propagate to already-spawned children
+                // (each child has its own `modeOverride` field). Callers that
+                // need runtime mode changes to affect existing children must
+                // iterate `spawnedInterfaces` and back-fill — the conformance
+                // bridge does this in `wire_set_interface_mode`.
+                clientInterface.modeOverride = this.modeOverride ?: this.mode
 
                 clients.add(clientInterface)
                 spawnedInterfaces?.add(clientInterface)

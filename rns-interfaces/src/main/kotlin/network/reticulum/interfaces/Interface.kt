@@ -63,6 +63,22 @@ abstract class Interface(
     /** Interface operational mode. */
     open val mode: InterfaceMode = InterfaceMode.FULL
 
+    /**
+     * Runtime override for [mode], settable after interface construction.
+     *
+     * When non-null, [InterfaceAdapter.mode] surfaces this value to Transport
+     * instead of the declared [mode]. Introduced so the conformance bridge
+     * can park a peer in any of the six modes without requiring a
+     * per-subclass constructor parameter, mirroring Python RNS's post-init
+     * `interface.mode = MODE_X` assignment used by `Reticulum._synthesize_interface`
+     * (Reticulum.py:773) and by runtime tests.
+     *
+     * Production code paths should never set this — prefer declaring the
+     * intended mode via the subclass's natural configuration surface.
+     */
+    @Volatile
+    var modeOverride: InterfaceMode? = null
+
     /** Estimated bitrate in bits per second. */
     open val bitrate: Int = 62500
 
