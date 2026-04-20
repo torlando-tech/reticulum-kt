@@ -1097,12 +1097,38 @@ object Transport {
 
     /**
      * Deregister a link.
+     *
+     * If the link was removed from [pendingLinks] (i.e. it never activated) and was
+     * torn down due to establishment timeout, and we are an endpoint (not a transport
+     * node), expire the path to the destination and kick off a fresh path request.
+     * Mirrors Python `Transport.py:472-494`: if a leaf node can't establish a link
+     * over its cached path, the path is almost certainly stale, so invalidate it and
+     * rediscover. [requestPath] internally rate-limits via
+     * [TransportConstants.PATH_REQUEST_MI] so repeat failures on the same destination
+     * don't spam the network.
+     *
+     * Transport nodes skip path expiry: they forward for unrelated clients and
+     * shouldn't churn their path table on downstream failures (Python guard at
+     * `Transport.py:477`).
      */
     fun deregisterLink(link: Any) {
         val linkId = getLinkId(link) ?: return
-        pendingLinks.remove(link)
+        val wasPending = pendingLinks.remove(link)
         activeLinks.remove(link)
         log("Deregistered link: ${linkId.toHexString()}")
+
+        if (wasPending && !transportEnabled && link is Link &&
+            link.initiator &&
+            link.teardownReason == LinkConstants.TEARDOWN_REASON_TIMEOUT
+        ) {
+            val destHash = link.destination?.hash ?: return
+            log(
+                "Pending link to ${destHash.toHexString()} never established; " +
+                    "expiring path and requesting rediscovery",
+            )
+            expirePath(destHash)
+            requestPath(destHash)
+        }
     }
 
     /**
