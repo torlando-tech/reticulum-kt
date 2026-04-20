@@ -452,8 +452,11 @@ class BLEInterface(
         // Check if interface already exists for this identity (MAC rotation)
         val existing = peers[identityHex]
         if (existing != null) {
-            existing.updateConnection(connection, address)
+            // Order matters: discoveryRssi is read by startRssiPolling() inside
+            // updateConnection() to seed rStatRssi. Write the fresh scan RSSI
+            // first so the seed reflects the new connection, not the old one.
             existing.discoveryRssi = rssi
+            existing.updateConnection(connection, address)
             addressToIdentity[address] = identityHex
             identityToAddress[identityHex] = address
             log("Reused existing interface for ${identityHex.take(8)} at new address ${address.takeLast(8)}")
