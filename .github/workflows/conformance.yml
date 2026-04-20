@@ -59,6 +59,20 @@ jobs:
           ./gradlew -q :rns-cli:printPipePeerRuntimeClasspath | perl -pe 's/\e\][^\a]*\a//g' >> "$GITHUB_ENV"
           echo 'EOF' >> "$GITHUB_ENV"
 
+      # Guard against a silent coverage regression: if this workflow is run
+      # against a reticulum-conformance checkout that predates per-impl
+      # override support (reticulum-conformance#13), then
+      # CONFORMANCE_KOTLIN_BRIDGE_CMD is silently ignored, kotlin peers fall
+      # back to the default Python RNS bridge, and CI can pass green without
+      # ever spawning the freshly-built JAR. Fail loudly instead.
+      - name: Verify conformance framework supports per-impl bridge overrides
+        working-directory: reticulum-conformance
+        run: |
+          if ! grep -q 'CONFORMANCE_KOTLIN_BRIDGE_CMD' conftest.py; then
+            echo "::error file=.github/workflows/conformance.yml::reticulum-conformance conftest.py does not recognize CONFORMANCE_KOTLIN_BRIDGE_CMD; kotlin peers would silently fall back to the Python bridge. Merge reticulum-conformance#13 first." >&2
+            exit 1
+          fi
+
       - name: Run bridge conformance tests
         working-directory: reticulum-conformance
         env:
