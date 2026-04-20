@@ -315,6 +315,13 @@ object Transport {
     private val receipts = CopyOnWriteArrayList<PacketReceipt>()
     private var receiptsLastChecked: Long = 0
 
+    /**
+     * Last time the pending-links sweep ran. Paired with
+     * [TransportConstants.LINKS_CHECK_INTERVAL] to rate-limit
+     * [checkPendingLinks].
+     */
+    private var linksLastChecked: Long = 0
+
     /** Announce timing per destination: dest_hash -> allowed_at timestamp. */
     private val announceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
 
@@ -4618,6 +4625,13 @@ object Transport {
             receiptsLastChecked = now
         }
 
+        // Sweep pending links for establishment-timeout CLOSED entries
+        // and expire the corresponding paths (Python Transport.py:470-494).
+        if (now - linksLastChecked > TransportConstants.LINKS_CHECK_INTERVAL) {
+            checkPendingLinks()
+            linksLastChecked = now
+        }
+
         // Cull stale table entries (expensive, use battery-adjusted interval)
         val tablesCullInterval = customTablesCullIntervalMs ?: TransportConstants.TABLES_CULL_INTERVAL
         if (now - tablesLastCulled > tablesCullInterval) {
@@ -4701,6 +4715,53 @@ object Transport {
         // The old global queue is no longer used - announces are now queued per-interface
         // and processed asynchronously via scheduleAnnounceQueueProcessing()
         // This method is kept empty for compatibility with the job loop
+    }
+
+    /**
+     * Sweep pending (initiator-side) links and, for endpoints, expire the
+     * path to any destination whose link establishment timed out. Matches
+     * Python Transport.py:472-494: if a leaf node can't even establish a
+     * link over its cached path, the path is almost certainly stale, so
+     * remove it and issue a fresh path request.
+     *
+     * The check is guarded on [transportEnabled] — transport nodes forward
+     * traffic for unrelated clients and shouldn't churn their path table
+     * on downstream link failures they have no causal relationship with
+     * (that would defeat the caching the transport node exists to provide).
+     *
+     * CLOSED links are removed from [pendingLinks] regardless of the
+     * transport guard, so the list doesn't grow unboundedly with dead
+     * entries.
+     *
+     * [requestPath] internally rate-limits via
+     * [TransportConstants.PATH_REQUEST_MI], so repeated failures on the
+     * same destination don't spam path requests on the network.
+     */
+    private fun checkPendingLinks() {
+        // Collect the closed-link snapshot first so we can mutate
+        // pendingLinks safely inside the loop regardless of whether
+        // we're expiring paths or just pruning.
+        val closedLinks = pendingLinks.filter { (it as? Link)?.status == LinkConstants.CLOSED }
+        if (closedLinks.isEmpty()) return
+
+        pendingLinks.removeAll(closedLinks.toSet())
+
+        if (transportEnabled) {
+            // Transport-enabled parity with Python: prune, but don't
+            // expire paths. See Python Transport.py:477 guard.
+            return
+        }
+
+        for (linkAny in closedLinks) {
+            val link = linkAny as? Link ?: continue
+            val destHash = link.destination?.hash ?: continue
+            log(
+                "Pending link to ${destHash.toHexString()} never established; " +
+                    "expiring path and requesting rediscovery",
+            )
+            expirePath(destHash)
+            requestPath(destHash)
+        }
     }
 
     private fun cullTables() {
