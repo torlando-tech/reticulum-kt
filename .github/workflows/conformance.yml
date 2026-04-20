@@ -62,7 +62,13 @@ jobs:
       - name: Run bridge conformance tests
         working-directory: reticulum-conformance
         env:
-          CONFORMANCE_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
+          # Per-impl bridge overrides. Kotlin peers use the freshly-built
+          # JAR from the matching checkout; reference peers use the default
+          # Python bridge (conftest.py BRIDGE_COMMANDS["reference"]) so
+          # cross-impl parametrization actually exercises both stacks.
+          # The legacy CONFORMANCE_BRIDGE_CMD override was a superset of
+          # both, which silently masked xfails keyed off transport_impl.
+          CONFORMANCE_KOTLIN_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         # tests/lxmf/ is the LXMF-layer conformance suite, owned by
