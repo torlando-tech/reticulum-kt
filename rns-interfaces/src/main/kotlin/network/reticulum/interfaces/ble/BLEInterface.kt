@@ -59,7 +59,7 @@ class BLEInterface(
     private val identityToAddress = ConcurrentHashMap<String, String>()
 
     // Exponential blacklist: address -> expiry + failure count
-    private data class BlacklistEntry(val expiry: Long, val failureCount: Int)
+    internal data class BlacklistEntry(val expiry: Long, val failureCount: Int)
     private val blacklist = ConcurrentHashMap<String, BlacklistEntry>()
 
     // Reconnection backoff: address -> next-attempt-after timestamp
@@ -68,6 +68,12 @@ class BLEInterface(
 
     // Addresses currently being connected to (prevents concurrent attempts to same address)
     private val pendingConnections = ConcurrentHashMap.newKeySet<String>()
+
+    // Addresses with an in-flight incoming identity handshake. Single-flight
+    // guard so rapid repeated GATT connects from the same MAC don't each spawn
+    // their own 30-second handshake coroutine (battery-burning log storm seen
+    // 2026-04-21 on the .71 phone).
+    private val incomingHandshakesInFlight = ConcurrentHashMap.newKeySet<String>()
 
     init {
         spawnedInterfaces = java.util.concurrent.CopyOnWriteArrayList()
@@ -148,6 +154,7 @@ class BLEInterface(
         addressToIdentity.clear()
         identityToAddress.clear()
         pendingConnections.clear()
+        incomingHandshakesInFlight.clear()
 
         // Shut down the BLE driver
         driver.shutdown()
@@ -294,11 +301,38 @@ class BLEInterface(
 
     /**
      * Collect incoming connections from the GATT server and handle identity handshake.
+     *
+     * Pre-flight filtering (before spawning the 30s-timeout handshake coroutine):
+     *  - Blacklisted address: disconnect immediately; do not waste a handshake slot.
+     *  - Already an incoming handshake in flight for this MAC: disconnect the
+     *    duplicate so one connection can complete instead of three timing out.
+     *
+     * This guards against the 2026-04-21 battery-burning log storm where the
+     * same MAC spawned concurrent handshake coroutines, all timing out at the
+     * same instant and racing to bump the blacklist counter.
      */
     private suspend fun collectIncomingConnections() {
         driver.incomingConnections.collect { connection ->
+            val address = connection.address
+
+            if (isBlacklisted(address)) {
+                log("Rejecting incoming from ${address.takeLast(8)}: blacklisted")
+                try { driver.disconnect(address) } catch (_: Exception) {}
+                return@collect
+            }
+
+            if (!incomingHandshakesInFlight.add(address)) {
+                log("Handshake already in flight for ${address.takeLast(8)}, rejecting duplicate incoming")
+                try { driver.disconnect(address) } catch (_: Exception) {}
+                return@collect
+            }
+
             scope.launch {
-                handleIncomingConnection(connection)
+                try {
+                    handleIncomingConnection(connection)
+                } finally {
+                    incomingHandshakesInFlight.remove(address)
+                }
             }
         }
     }
@@ -563,17 +597,34 @@ class BLEInterface(
     /**
      * Add an address to the blacklist with exponential backoff.
      * Duration grows: 60s, 120s, 180s, 240s, 300s, 360s, 420s, 480s (capped at 8x base).
+     *
+     * Uses [ConcurrentHashMap.compute] so concurrent callers serialize on the
+     * map bucket lock — the prior read-then-write race dropped increments and
+     * produced duplicate log lines (#2 / #3 / #4 at the same timestamp for a
+     * single underlying failure event).
      */
     private fun addToBlacklist(address: String) {
-        val existing = blacklist[address]
-        val count = (existing?.failureCount ?: 0) + 1
-        val duration = BLEConstants.BLACKLIST_BASE_DURATION_MS * minOf(count, BLEConstants.BLACKLIST_MAX_MULTIPLIER)
-        blacklist[address] = BlacklistEntry(
-            expiry = System.currentTimeMillis() + duration,
-            failureCount = count,
-        )
-        log("Blacklisted ${address.takeLast(8)} for ${duration / 1000}s (failure #$count)")
+        val entry = blacklist.compute(address) { _, existing ->
+            val count = (existing?.failureCount ?: 0) + 1
+            val duration = BLEConstants.BLACKLIST_BASE_DURATION_MS *
+                minOf(count, BLEConstants.BLACKLIST_MAX_MULTIPLIER)
+            BlacklistEntry(
+                expiry = System.currentTimeMillis() + duration,
+                failureCount = count,
+            )
+        }!!
+        val durationSec = (entry.expiry - System.currentTimeMillis()) / 1000
+        log("Blacklisted ${address.takeLast(8)} for ${durationSec}s (failure #${entry.failureCount})")
     }
+
+    // ---- Test-only accessors ----
+    // Narrow visibility concession so `BLEInterfaceIncomingHandshakeTest` can
+    // seed/inspect the blacklist without broadening the public API.
+
+    internal fun addToBlacklistForTest(address: String) = addToBlacklist(address)
+
+    internal fun getBlacklistEntryForTest(address: String): BlacklistEntry? =
+        blacklist[address]
 
     private fun isInBackoff(address: String): Boolean {
         val nextAttemptAfter = reconnectBackoff[address] ?: return false
