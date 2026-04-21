@@ -1,6 +1,6 @@
 package network.reticulum.interfaces.ble
 
-import io.kotest.matchers.collections.shouldContain
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.ints.shouldBeLessThanOrEqual
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.delay
@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Regression tests for the 2026-04-21 BLE incoming-handshake storm.
@@ -64,26 +65,35 @@ class BLEInterfaceIncomingHandshakeTest {
             driver.incomingConnections.emit(connB)
 
             // Deterministic waits instead of a fixed quiescence delay (flaky on
-            // slow CI): wait until the first handshake subscribes AND the
-            // duplicate is rejected via driver.disconnect.
+            // slow CI): wait until the first handshake subscribes AND exactly
+            // one of the two FakeBLEPeerConnection objects has been close()d.
             waitUntil("first handshake subscribes to receivedFragments") {
                 connA.receivedFragmentsSubscribers +
                     connB.receivedFragmentsSubscribers >= 1
             }
-            waitUntil("duplicate is rejected via driver.disconnect") {
-                driver.disconnectCalls.contains(DUP_MAC)
+            waitUntil("duplicate connection is closed via BLEPeerConnection.close") {
+                connA.closeCount + connB.closeCount >= 1
             }
 
             // Exactly one handshake must have subscribed to receivedFragments.
-            // With the concurrency bug, BOTH connections subscribe and each
+            // With the single-flight bug, BOTH connections subscribe and each
             // burns its own 30s handshake-timeout coroutine.
             val subscribers = connA.receivedFragmentsSubscribers +
                 connB.receivedFragmentsSubscribers
             subscribers shouldBe 1
 
-            // The duplicate must be proactively disconnected via the driver
-            // (not left to time out after 30s).
-            driver.disconnectCalls shouldContain DUP_MAC
+            // Exactly one of the two connections must have been closed (the
+            // duplicate). Closing a specific BLEPeerConnection rather than
+            // calling driver.disconnect(address) is important: the latter is
+            // address-scoped per the driver contract and would tear down the
+            // in-flight handshake we are trying to protect.
+            val closes = connA.closeCount + connB.closeCount
+            closes shouldBe 1
+
+            // driver.disconnect(address) must NOT be called here — it is
+            // address-scoped and would kill the live handshake. Guard against
+            // the regression Greptile flagged on PR #51 iteration 3.
+            driver.disconnectCalls.shouldBeEmpty()
         }
     }
 
@@ -107,19 +117,25 @@ class BLEInterfaceIncomingHandshakeTest {
             driver.incomingConnections.emit(conn)
 
             // Deterministic wait on the observable outcome: the pre-flight
-            // blacklist check must have called driver.disconnect.
-            waitUntil("blacklisted MAC rejected via driver.disconnect") {
-                driver.disconnectCalls.contains(BLACKLISTED_MAC)
+            // blacklist check closes the new connection directly.
+            waitUntil("blacklisted MAC closed via BLEPeerConnection.close") {
+                conn.closeCount >= 1
             }
 
             // No handshake subscription — we never read receivedFragments.
-            // With the current bug, handleIncomingConnection proceeds into
-            // performHandshakeAsPeripheral() regardless of blacklist status,
-            // subscribing to receivedFragments and burning a 30s timeout.
+            // With the missing pre-flight bug, handleIncomingConnection
+            // proceeds into performHandshakeAsPeripheral() regardless of
+            // blacklist status, subscribing to receivedFragments and burning
+            // a 30s timeout.
             conn.receivedFragmentsSubscribers shouldBe 0
 
-            // Driver was told to drop the connection.
-            driver.disconnectCalls shouldContain BLACKLISTED_MAC
+            // The incoming connection was closed directly.
+            conn.closeCount shouldBe 1
+
+            // driver.disconnect(address) must NOT be called — address-scoped
+            // teardown could collide with any other active connection to the
+            // same MAC.
+            driver.disconnectCalls.shouldBeEmpty()
         }
     }
 
@@ -229,7 +245,9 @@ class BLEInterfaceIncomingHandshakeTest {
     /**
      * Minimal [BLEPeerConnection] fake. Exposes subscriber count on the
      * receivedFragments flow so tests can tell whether the peripheral-side
-     * identity handshake actually started (which subscribes via `first { }`).
+     * identity handshake actually started (which subscribes via `first { }`),
+     * and a close-call counter so tests can verify the duplicate-rejection
+     * path closed THIS specific connection rather than a different one.
      */
     private class FakeBLEPeerConnection(
         override val address: String,
@@ -241,11 +259,15 @@ class BLEInterfaceIncomingHandshakeTest {
             _receivedFragments.asSharedFlow()
         val receivedFragmentsSubscribers: Int
             get() = _receivedFragments.subscriptionCount.value
+        private val _closeCount = AtomicInteger(0)
+        val closeCount: Int get() = _closeCount.get()
         override suspend fun sendFragment(data: ByteArray) = Unit
         override suspend fun readIdentity(): ByteArray = ByteArray(16)
         override suspend fun writeIdentity(identity: ByteArray) = Unit
         override suspend fun readRemoteRssi(): Int = -70
-        override fun close() = Unit
+        override fun close() {
+            _closeCount.incrementAndGet()
+        }
     }
 
     /**

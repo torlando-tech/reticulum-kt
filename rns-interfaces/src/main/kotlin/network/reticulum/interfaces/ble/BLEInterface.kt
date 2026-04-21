@@ -317,13 +317,13 @@ class BLEInterface(
 
             if (isBlacklisted(address)) {
                 log("Rejecting incoming from ${address.takeLast(8)}: blacklisted")
-                rejectConnection(address)
+                closeRejectedConnection(connection)
                 return@collect
             }
 
             if (!incomingHandshakesInFlight.add(address)) {
                 log("Handshake already in flight for ${address.takeLast(8)}, rejecting duplicate incoming")
-                rejectConnection(address)
+                closeRejectedConnection(connection)
                 return@collect
             }
 
@@ -338,18 +338,17 @@ class BLEInterface(
     }
 
     /**
-     * Fire-and-forget driver disconnect used by the incoming collect lambda's
-     * pre-flight rejects. Swallows driver errors (the remote may already be
-     * gone) but re-throws [CancellationException] so scope cancellation still
-     * propagates through the outer `collect`.
+     * Close the specific rejected [BLEPeerConnection] without invoking
+     * [BLEDriver.disconnect], which is address-scoped and would tear down any
+     * other active GATT slot for the same MAC — including the first incoming
+     * connection in a duplicate-rejection scenario, defeating the single-flight
+     * guard. [BLEPeerConnection.close] only drops this specific connection.
      */
-    private suspend fun rejectConnection(address: String) {
+    private fun closeRejectedConnection(connection: BLEPeerConnection) {
         try {
-            driver.disconnect(address)
-        } catch (e: CancellationException) {
-            throw e
+            connection.close()
         } catch (_: Exception) {
-            // Driver disconnect is best-effort — the connection may already be gone.
+            // Best-effort: the remote may have already torn the connection down.
         }
     }
 
