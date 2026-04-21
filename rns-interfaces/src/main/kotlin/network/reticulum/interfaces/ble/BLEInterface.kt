@@ -317,13 +317,13 @@ class BLEInterface(
 
             if (isBlacklisted(address)) {
                 log("Rejecting incoming from ${address.takeLast(8)}: blacklisted")
-                try { driver.disconnect(address) } catch (_: Exception) {}
+                rejectConnection(address)
                 return@collect
             }
 
             if (!incomingHandshakesInFlight.add(address)) {
                 log("Handshake already in flight for ${address.takeLast(8)}, rejecting duplicate incoming")
-                try { driver.disconnect(address) } catch (_: Exception) {}
+                rejectConnection(address)
                 return@collect
             }
 
@@ -334,6 +334,22 @@ class BLEInterface(
                     incomingHandshakesInFlight.remove(address)
                 }
             }
+        }
+    }
+
+    /**
+     * Fire-and-forget driver disconnect used by the incoming collect lambda's
+     * pre-flight rejects. Swallows driver errors (the remote may already be
+     * gone) but re-throws [CancellationException] so scope cancellation still
+     * propagates through the outer `collect`.
+     */
+    private suspend fun rejectConnection(address: String) {
+        try {
+            driver.disconnect(address)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Driver disconnect is best-effort — the connection may already be gone.
         }
     }
 
