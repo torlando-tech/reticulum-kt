@@ -613,8 +613,13 @@ class BLEInterface(
                 failureCount = count,
             )
         }!!
-        val durationSec = (entry.expiry - System.currentTimeMillis()) / 1000
-        log("Blacklisted ${address.takeLast(8)} for ${durationSec}s (failure #${entry.failureCount})")
+        // Recompute duration from failureCount instead of (expiry - now) so the
+        // log line matches the stored window exactly (avoids the "59s for a 60s
+        // entry" jitter when the compute lambda and the log line straddle a
+        // millisecond boundary).
+        val durationMs = BLEConstants.BLACKLIST_BASE_DURATION_MS *
+            minOf(entry.failureCount, BLEConstants.BLACKLIST_MAX_MULTIPLIER)
+        log("Blacklisted ${address.takeLast(8)} for ${durationMs / 1000}s (failure #${entry.failureCount})")
     }
 
     // ---- Test-only accessors ----

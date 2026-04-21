@@ -63,10 +63,16 @@ class BLEInterfaceIncomingHandshakeTest {
             driver.incomingConnections.emit(connA)
             driver.incomingConnections.emit(connB)
 
-            // Let the launched handlers run. We don't need the 30s handshake to fire,
-            // just enough time for the handlers to either start the handshake
-            // (subscribe to receivedFragments) or reject the duplicate.
-            waitForQuiescence()
+            // Deterministic waits instead of a fixed quiescence delay (flaky on
+            // slow CI): wait until the first handshake subscribes AND the
+            // duplicate is rejected via driver.disconnect.
+            waitUntil("first handshake subscribes to receivedFragments") {
+                connA.receivedFragmentsSubscribers +
+                    connB.receivedFragmentsSubscribers >= 1
+            }
+            waitUntil("duplicate is rejected via driver.disconnect") {
+                driver.disconnectCalls.contains(DUP_MAC)
+            }
 
             // Exactly one handshake must have subscribed to receivedFragments.
             // With the concurrency bug, BOTH connections subscribe and each
@@ -100,7 +106,11 @@ class BLEInterfaceIncomingHandshakeTest {
             val conn = FakeBLEPeerConnection(address = BLACKLISTED_MAC)
             driver.incomingConnections.emit(conn)
 
-            waitForQuiescence()
+            // Deterministic wait on the observable outcome: the pre-flight
+            // blacklist check must have called driver.disconnect.
+            waitUntil("blacklisted MAC rejected via driver.disconnect") {
+                driver.disconnectCalls.contains(BLACKLISTED_MAC)
+            }
 
             // No handshake subscription — we never read receivedFragments.
             // With the current bug, handleIncomingConnection proceeds into
@@ -192,9 +202,23 @@ class BLEInterfaceIncomingHandshakeTest {
         }
     }
 
-    /** Let launched handlers make progress before we inspect state. */
-    private suspend fun waitForQuiescence() {
-        delay(150)
+    /**
+     * Poll [condition] until it holds or a 2-second deadline elapses. Preferred
+     * over a fixed [delay] because a slow CI scheduler can postpone launched
+     * coroutines past a hard-coded wait window; polling a deterministic
+     * observable is robust to that. Throws [kotlinx.coroutines.TimeoutCancellationException]
+     * with [description] included on timeout to give a legible failure message.
+     */
+    private suspend fun waitUntil(description: String, condition: () -> Boolean) {
+        try {
+            withTimeout(2_000) {
+                while (!condition()) {
+                    delay(10)
+                }
+            }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            error("waitUntil: $description never became true within 2s")
+        }
     }
 
     companion object {
