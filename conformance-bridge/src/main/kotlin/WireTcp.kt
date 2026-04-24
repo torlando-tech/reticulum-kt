@@ -104,7 +104,9 @@ private fun recordInboundPacket(data: ByteArray, ifaceName: String?) {
     try {
         val nowMs = System.currentTimeMillis()
         // Parse light header — matches the Python tap so tests can filter
-        // by packet_type / dest_hash without impl-specific parsing.
+        // by packet_type / dest_hash without impl-specific parsing. Low
+        // 2 bits of byte 0 encode the packet type (DATA=0, ANNOUNCE=1,
+        // LINKREQUEST=2, PROOF=3 per RNS Packet.py).
         var packetType: Int? = null
         var destHashHex: String? = null
         var context: Int? = null
