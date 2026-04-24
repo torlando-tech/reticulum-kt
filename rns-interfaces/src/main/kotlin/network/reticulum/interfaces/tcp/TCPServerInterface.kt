@@ -161,19 +161,15 @@ class TCPServerInterface(
                 spawnedInterfaces?.add(clientInterface)
 
                 clientInterface.onPacketReceived = { data, iface ->
-                    // Forward received packets to our callback
+                    // Forward received packets to Transport via the parent's callback.
+                    // Do NOT fan out to other connected clients — matches Python's
+                    // TCPServerInterface.incoming_connection semantics where spawned
+                    // children's process_outgoing is a pass. Packets reach peers through
+                    // Transport's routing decisions (outbound(packet)), not via raw
+                    // rebroadcast at the TCP layer. See #46 for why the fan-out broke
+                    // path-layer invariants (cached-announce overwrite, PR leakage,
+                    // announce mode filtering bypass, double delivery races).
                     onPacketReceived?.invoke(data, iface)
-
-                    // Rebroadcast to all OTHER clients (not the sender)
-                    for (otherClient in clients) {
-                        if (otherClient !== iface && otherClient.online.value) {
-                            try {
-                                otherClient.processOutgoing(data)
-                            } catch (e: Exception) {
-                                // Client will be cleaned up by its own error handling
-                            }
-                        }
-                    }
                 }
 
                 clientInterface.start()
