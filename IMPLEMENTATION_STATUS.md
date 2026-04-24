@@ -1,11 +1,11 @@
 # Reticulum-KT Implementation Status
 
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-24
 **Version**: 0.1.0-SNAPSHOT
 
 ## Executive Summary
 
-The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. All interfaces (TCP, UDP, Local, RNode, BLE Mesh, Auto) are implemented and tested. The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
+The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P) plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
 
 LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
@@ -43,7 +43,11 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 - **Local**: Server/client IPC for sharing Reticulum across apps
 - **RNode (LoRa)**: Full KISS protocol, firmware checking, BLE + serial transport
 - **BLE Mesh**: Dual-role GATT, identity handshake, fragmentation, Android driver
+- **Nearby Connections**: Kotlin-only — Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover
 - **Auto**: IPv6 multicast peer discovery, per-peer UDP connections
+- **I2P**: SAM API tunnels with HDLC-framed TCP through localhost, server tunnel + client tunnels to configured peers
+- **Bluetooth SPP**: Bluetooth Classic RFCOMM with HDLC framing, client + server modes, automatic reconnect
+- **Pipe**: HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity port
 
 #### Interface Discovery
 - **InterfaceAnnouncer**: Periodic discovery announces with PoW stamps
@@ -56,8 +60,9 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 - **Power Management**: Doze handler, battery monitor/stats/exemption, network monitor
 
 #### Testing
-- **599+ test methods** across 71 test files, 100% passing with Python implementation
-- **14 conformance tests** in `python-bridge/conformance/` (Kotlin ↔ Python over pipe interfaces)
+- **667+ test methods** across 86 test files, 100% passing with Python implementation
+- **15 in-repo conformance tests** in `python-bridge/conformance/` (Kotlin ↔ Python over pipe interfaces)
+- **22 cross-implementation test files** in [`torlando-tech/reticulum-conformance`](https://github.com/torlando-tech/reticulum-conformance) — wire-level and behavioral parity tests parametrized across `(sender, transport, receiver)` impl triples covering byte-level identity, transport routing, link multi-hop, resource transfer, IFAC interop, path discovery, and announce semantics
 - **Integration tests**: Links, resources, channels, tunnels, IFAC verified
 - **Python interop**: Kotlin ↔ Python communication tested across all protocol features
 
@@ -73,7 +78,6 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
 | CLI utilities (rnstatus, rnpath, rnprobe) | Low | Network diagnostic tools |
 | SerialInterface | Low | Direct serial port (RNode covers most use cases) |
-| I2PInterface | Low | I2P anonymity network integration |
 
 ---
 
@@ -124,14 +128,17 @@ Client-only mode disables routing/forwarding and eliminates the job loop, reduci
 | Local Interface | ✅ | ✅ | Shared instance IPC |
 | RNode Interface | ✅ | ✅ | KISS protocol, BLE + serial |
 | BLE Mesh | ❌ | ✅ | Kotlin-only, dual-role GATT |
+| Nearby Connections | ❌ | ✅ | Kotlin-only, Google Nearby Connections (WiFi Direct + BLE) |
 | Auto Interface | ✅ | ✅ | IPv6 multicast discovery |
+| I2P Interface | ✅ | ✅ | SAM API tunnels, server + client |
+| Bluetooth SPP | ❌ | ✅ | Kotlin-only, Bluetooth Classic RFCOMM with HDLC |
+| Pipe Interface | ❌ | ✅ | Kotlin-only, HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) |
 | Blackhole | ✅ | ❌ | Identity blacklisting |
 | Remote Mgmt | ✅ | ❌ | Status/path endpoints |
-| I2P Interface | ✅ | ❌ | Not needed for Android |
 | Serial Interface | ✅ | ❌ | RNode covers most use cases |
 | CLI Utilities | ✅ | Partial | rnsd-kt complete; rnstatus/rnpath/rnprobe not started |
 
-**Result**: Kotlin achieves 100% core protocol compatibility and implements all major interfaces. Missing features are optional (blackhole, remote management) or platform-inappropriate (serial, I2P).
+**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships, plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
 
 ---
 

@@ -30,11 +30,14 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | UDP | Complete | Unicast, broadcast, multicast |
 | Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps |
 | RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport |
-| BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver |
+| BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver — Kotlin-only |
+| Nearby Connections | Complete | Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover — Kotlin-only |
+| Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server modes — Kotlin-only |
+| Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Kotlin-only |
 | Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections |
+| I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
 | KISS Framing | Complete | Used by TCP and RNode interfaces |
-| HDLC Framing | Complete | Used by TCP interfaces |
-| I2P | Not implemented | Stub in config factory |
+| HDLC Framing | Complete | Used by TCP, SPP, Pipe, and I2P interfaces |
 | Serial | Not implemented | RNode covers most serial use cases |
 
 ### Android
@@ -58,7 +61,6 @@ Features that exist in the Python reference but are not yet implemented:
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
 | CLI utilities | Low | `rnstatus`, `rnpath`, `rnprobe` equivalents |
 | SerialInterface | Low | Direct serial port (RNode covers most use cases) |
-| I2PInterface | Low | I2P anonymity network integration |
 
 ### Utilities/CLI
 
@@ -81,11 +83,11 @@ Features that exist in the Python reference but are not yet implemented:
 
 ```
 rns-core/        # Core protocol (Identity, Destination, Transport, Link, Channel, Resource)
-rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto)
+rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto, I2P, Nearby, SPP, Pipe)
 rns-android/     # Android-specific code (BLE driver, foreground service, power management)
 rns-cli/         # CLI utilities (rnsd-kt daemon)
 rns-test/        # Integration and interop tests
-python-bridge/   # Python bridge server for interop testing (120+ commands)
+python-bridge/   # Python bridge server for interop testing (145+ commands)
 ```
 
 ## Building
@@ -169,7 +171,7 @@ Reticulum.stop()
 
 ## Interop Testing
 
-The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 120+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
+The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 145+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
 
 Tests are started automatically - no manual setup required.
 
