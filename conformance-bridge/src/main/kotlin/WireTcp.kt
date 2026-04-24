@@ -90,6 +90,52 @@ private class Listener(
 private val wireInstances = mutableMapOf<String, WireInstance>()
 
 /**
+ * Inbound tap — every packet that the bridge hands to Transport.inbound is
+ * recorded here. Tests query this buffer (via `wire_get_received_packets`)
+ * to prove that a hub node does not fan packets out to peers that shouldn't
+ * see them.
+ */
+private const val INBOUND_TAP_CAP = 1024
+private val inboundTapBuffer: ArrayDeque<JsonObject> = ArrayDeque()
+private var inboundTapSeq: Long = 0L
+private val inboundTapLock = Any()
+
+private fun recordInboundPacket(data: ByteArray, ifaceName: String?) {
+    try {
+        val nowMs = System.currentTimeMillis()
+        // Parse light header — matches the Python tap so tests can filter
+        // by packet_type / dest_hash without impl-specific parsing.
+        var packetType: Int? = null
+        var destHashHex: String? = null
+        var context: Int? = null
+        if (data.isNotEmpty()) {
+            packetType = data[0].toInt() and 0b00000011
+            if (data.size >= 18) {
+                destHashHex = data.copyOfRange(2, 18).toHex()
+            }
+            if (data.size >= 19) {
+                context = data[18].toInt() and 0xff
+            }
+        }
+        val entry = JsonObject()
+        synchronized(inboundTapLock) {
+            inboundTapSeq += 1
+            entry.addProperty("seq", inboundTapSeq)
+            entry.addProperty("timestamp_ms", nowMs)
+            entry.addProperty("raw_hex", data.toHex())
+            if (packetType != null) entry.addProperty("packet_type", packetType) else entry.add("packet_type", JsonNull.INSTANCE)
+            if (destHashHex != null) entry.addProperty("destination_hash_hex", destHashHex) else entry.add("destination_hash_hex", JsonNull.INSTANCE)
+            if (context != null) entry.addProperty("context", context) else entry.add("context", JsonNull.INSTANCE)
+            if (ifaceName != null) entry.addProperty("interface_name", ifaceName) else entry.add("interface_name", JsonNull.INSTANCE)
+            if (inboundTapBuffer.size >= INBOUND_TAP_CAP) inboundTapBuffer.removeFirst()
+            inboundTapBuffer.addLast(entry)
+        }
+    } catch (_: Throwable) {
+        // The tap must never break routing.
+    }
+}
+
+/**
  * Parse a free-form `mode` string into an [InterfaceMode].
  *
  * Accepts the same synonyms Python RNS's config parser accepts
@@ -215,6 +261,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             val serverRef = server.toRef()
             Transport.registerInterface(serverRef)
             server.onPacketReceived = { data, iface ->
+                recordInboundPacket(data, iface.name)
                 Transport.inbound(data, iface.toRef())
             }
 
@@ -275,6 +322,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             val clientRef = client.toRef()
             Transport.registerInterface(clientRef)
             client.onPacketReceived = { data, iface ->
+                recordInboundPacket(data, iface.name)
                 Transport.inbound(data, iface.toRef())
             }
 
@@ -776,6 +824,22 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 result("found" to boolVal(true), "random_hash" to hexVal(randomHash))
             }
         }
+    }
+
+    "wire_get_received_packets" -> {
+        val sinceSeq = p.get("since_seq")?.asLong ?: 0L
+        val packets = JsonArray()
+        val highestSeq: Long
+        synchronized(inboundTapLock) {
+            highestSeq = inboundTapSeq
+            for (entry in inboundTapBuffer) {
+                if (entry.get("seq").asLong > sinceSeq) packets.add(entry)
+            }
+        }
+        result(
+            "packets" to packets,
+            "highest_seq" to JsonPrimitive(highestSeq),
+        )
     }
 
     "wire_stop" -> {
