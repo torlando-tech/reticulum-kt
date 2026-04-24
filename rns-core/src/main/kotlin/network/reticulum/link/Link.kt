@@ -606,12 +606,21 @@ class Link private constructor(
                 return false
             }
 
-            // Link is now active
+            // Link is now active — but do NOT publish status=ACTIVE until every
+            // piece of bookkeeping that an outbound send() depends on is in place.
+            // `status` is @Volatile, so the final write at the end of this block
+            // acts as a release fence: any thread that subsequently observes
+            // status==ACTIVE is guaranteed to see the activeLinks membership,
+            // attachedInterfaceHash, and pathTable entry written earlier.
+            //
+            // This ordering fixes the race behind #42: bridge callers that
+            // `link_open(...)` and then immediately `link_send(first_payload)`
+            // could previously observe status=ACTIVE during the ~16-line window
+            // before registerLinkPath ran, causing Transport.outbound() to miss
+            // the pathTable entry and drop the first DATA packet.
             rtt = System.currentTimeMillis() - requestTime
             remoteIdentity = destination.identity
             mdu = LinkConstants.calculateMdu(mtu)
-            status = LinkConstants.ACTIVE
-            activatedAt = System.currentTimeMillis()
 
             // Calculate establishment rate (bytes per ms)
             val linkRtt = rtt
@@ -628,6 +637,10 @@ class Link private constructor(
             packet.receivingInterfaceHash?.let { interfaceHash ->
                 Transport.registerLinkPath(linkId, interfaceHash, packet.hops)
             }
+
+            // Publish ACTIVE only after all the above is visible.
+            activatedAt = System.currentTimeMillis()
+            status = LinkConstants.ACTIVE
 
             log("Link ${linkId.toHexString()} established, RTT: ${rtt}ms")
 
@@ -1873,8 +1886,12 @@ class Link private constructor(
 
             // Use max of measured and remote RTT
             rtt = maxOf(measuredRtt, remoteRtt)
-            status = LinkConstants.ACTIVE
+            // Set activatedAt BEFORE the volatile status write so any thread that
+            // observes status==ACTIVE via the volatile read is also guaranteed to
+            // see a non-zero activatedAt (getAge()/noInboundFor() correctness).
+            // This mirrors the ordering applied to validateProof() for issue #42.
             activatedAt = System.currentTimeMillis()
+            status = LinkConstants.ACTIVE
 
             // Calculate establishment rate (bytes per ms)
             val linkRtt = rtt
