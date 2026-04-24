@@ -1886,8 +1886,12 @@ class Link private constructor(
 
             // Use max of measured and remote RTT
             rtt = maxOf(measuredRtt, remoteRtt)
-            status = LinkConstants.ACTIVE
+            // Set activatedAt BEFORE the volatile status write so any thread that
+            // observes status==ACTIVE via the volatile read is also guaranteed to
+            // see a non-zero activatedAt (getAge()/noInboundFor() correctness).
+            // This mirrors the ordering applied to validateProof() for issue #42.
             activatedAt = System.currentTimeMillis()
+            status = LinkConstants.ACTIVE
 
             // Calculate establishment rate (bytes per ms)
             val linkRtt = rtt
