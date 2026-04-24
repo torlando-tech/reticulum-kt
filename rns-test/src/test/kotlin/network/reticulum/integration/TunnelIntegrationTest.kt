@@ -186,7 +186,13 @@ class TunnelIntegrationTest {
         val announcePacket = destination.announce(send = false)
         Transport.deregisterDestination(destination)
         val packedAnnounce = announcePacket!!.raw ?: announcePacket.pack()
-        server.processOutgoing(packedAnnounce)
+        // Server parent's processOutgoing is a pass per Python semantics
+        // (TCPInterface.py:627-628); push through the spawned child that
+        // represents the connected client, the way Transport.outbound
+        // would address it in production.
+        val spawnedChild = server.getClients().firstOrNull()
+        assertNotNull(spawnedChild, "Server should have a spawned child for the connected client")
+        spawnedChild!!.processOutgoing(packedAnnounce)
 
         // Wait for announce
         assertTrue(announceLatch.await(10, TimeUnit.SECONDS), "Should receive announce")
