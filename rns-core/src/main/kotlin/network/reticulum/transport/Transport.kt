@@ -1576,10 +1576,16 @@ object Transport {
                 // Update allowed timestamp
                 interfaceAnnounceAllowedAt[ifaceKey] = now + waitTime
 
-                // Transmit the announce
+                // Transmit the announce via Transport.transmit so IFAC
+                // masking is applied on interfaces with IFAC configured. The
+                // prior direct `interfaceRef.send(raw)` call here bypassed
+                // masking, which was invisible while TCPServerInterface's
+                // fan-out delivered the original (already-masked) bytes to
+                // sibling clients; once the fan-out was removed for #46,
+                // queued announces hit the wire unmasked and were silently
+                // dropped by the peer's IFAC unmasker.
                 try {
-                    interfaceRef.send(selected.raw)
-                    recordTxBytes(interfaceRef, selected.raw.size)
+                    transmit(interfaceRef, selected.raw)
                     recordAnnounceSent(interfaceRef)
                     log("Sent queued announce for ${selected.destinationHash.toHexString()} on ${interfaceRef.name}")
                 } catch (e: Exception) {
@@ -2865,6 +2871,23 @@ object Transport {
             }
         }
 
+        // Link transport forwarding (Python Transport.py:1512-1549). Python
+        // places this BEFORE the type dispatch so it fires for DATA *and*
+        // PROOF packets (including RESOURCE_PRF) on links we transit. Keep
+        // it outside processData so RESOURCE_PRF — which dispatches to
+        // processProof and would otherwise get dropped on the hub — still
+        // gets forwarded to the correct spawned-child. Exclusion list
+        // matches Python: ANNOUNCE goes through its own retransmit path,
+        // LINKREQUEST creates the link_table entry via transport-mode
+        // forwarding (not by a reverse link_table lookup), and LRPROOF
+        // has its own dedicated forwarding in processProof.
+        if (packet.packetType != PacketType.ANNOUNCE &&
+            packet.packetType != PacketType.LINKREQUEST &&
+            packet.context != PacketContext.LRPROOF
+        ) {
+            forwardViaLinkTable(packet, interfaceRef)
+        }
+
         // Route based on packet type (Python:1559+, 1937+, 1968+)
         // This runs AFTER transport forwarding — a packet may be both forwarded and delivered locally.
         when (packet.packetType) {
@@ -2873,6 +2896,58 @@ object Transport {
             PacketType.PROOF -> processProof(packet, interfaceRef)
             PacketType.DATA -> processData(packet, interfaceRef)
         }
+    }
+
+    /**
+     * Forward a link-attached packet via the link_table if we transit it.
+     *
+     * Mirrors Python Transport.py:1514-1549. Returns `true` if forwarded.
+     * Does not early-return the caller — Python falls through to further
+     * processing even on a successful forward (the commented-out `return`
+     * at Transport.py:1553 is a historical TODO, not active behavior).
+     */
+    private fun forwardViaLinkTable(
+        packet: Packet,
+        interfaceRef: InterfaceRef,
+    ): Boolean {
+        val linkEntry = linkTable[packet.destinationHash.toKey()] ?: return false
+        val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
+        val rcvdIface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+        val outboundInterface =
+            when {
+                // Same interface for both directions — just repeat (Python lines 1521-1525).
+                nhIface != null &&
+                    rcvdIface != null &&
+                    nhIface.hash.contentEquals(rcvdIface.hash) -> {
+                    if (packet.hops == linkEntry.remainingHops || packet.hops == linkEntry.takenHops) {
+                        nhIface
+                    } else {
+                        null
+                    }
+                }
+                // Different interfaces — transmit on opposite side (Python lines 1526-1537).
+                nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> {
+                    if (packet.hops == linkEntry.remainingHops) rcvdIface else null
+                }
+                rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> {
+                    if (packet.hops == linkEntry.takenHops) nhIface else null
+                }
+                else -> null
+            }
+        if (outboundInterface == null) return false
+
+        addPacketHash(packet.packetHash) // Python line 1543
+        val raw = packet.raw ?: packet.pack()
+        val newRaw = raw.copyOf()
+        newRaw[1] = packet.hops.toByte()
+        transmit(outboundInterface, newRaw)
+        linkTable[packet.destinationHash.toKey()] =
+            linkEntry.copy(timestamp = System.currentTimeMillis())
+        log(
+            "Forwarding ${packet.packetType}/${packet.context} for " +
+                "${packet.destinationHash.toHexString()} via ${outboundInterface.name}",
+        )
+        return true
     }
 
     /**
@@ -3797,56 +3872,11 @@ object Transport {
             }
         }
 
-        // Link transport handling: forward data/proof via link_table entries
-        // (Python Transport.py:1514-1548)
-        if (packet.packetType != PacketType.ANNOUNCE &&
-            packet.packetType != PacketType.LINKREQUEST &&
-            packet.context != PacketContext.LRPROOF
-        ) {
-            val linkEntry = linkTable[packet.destinationHash.toKey()]
-            if (linkEntry != null) {
-                val nhIface = findInterfaceByHash(linkEntry.nextHopInterfaceHash)
-                val rcvdIface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
-                val outboundInterface =
-                    when {
-                        // Same interface for both directions — just repeat (Python lines 1521-1525)
-                        nhIface != null &&
-                            rcvdIface != null &&
-                            nhIface.hash.contentEquals(rcvdIface.hash) -> {
-                            if (packet.hops == linkEntry.remainingHops || packet.hops == linkEntry.takenHops) {
-                                nhIface
-                            } else {
-                                null
-                            }
-                        }
-                        // Different interfaces — transmit on opposite side (Python lines 1526-1537)
-                        nhIface != null && interfaceRef.hash.contentEquals(nhIface.hash) -> {
-                            if (packet.hops == linkEntry.remainingHops) rcvdIface else null
-                        }
-                        rcvdIface != null && interfaceRef.hash.contentEquals(rcvdIface.hash) -> {
-                            if (packet.hops == linkEntry.takenHops) nhIface else null
-                        }
-                        else -> null
-                    }
-                if (outboundInterface != null) {
-                    addPacketHash(packet.packetHash) // Python line 1543
-                    val raw = packet.raw ?: packet.pack()
-                    val newRaw = raw.copyOf()
-                    newRaw[1] = packet.hops.toByte()
-                    transmit(outboundInterface, newRaw)
-                    linkTable[packet.destinationHash.toKey()] =
-                        linkEntry.copy(
-                            timestamp = System.currentTimeMillis(),
-                        )
-                    log("Forwarding link data for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                    return
-                }
-            }
-        }
-
-        // NOTE: Transport-mode forwarding for transport_id-based path routing is now handled
-        // in processInbound() BEFORE type dispatch, matching Python Transport.py:1404-1510.
-        // This ensures LINKREQUEST, PROOF, and DATA packets all get transport forwarding.
+        // Link-table forwarding for in-transit data/proof packets now lives in
+        // processInbound() before the type dispatch (see forwardViaLinkTable),
+        // so PROOF packets on an active link get forwarded too. Prior to that
+        // move, this block sat here and RESOURCE_PRF was silently dropped on
+        // hub nodes because processProof doesn't carry a link_table lookup.
     }
 
     private fun processLinkRequest(

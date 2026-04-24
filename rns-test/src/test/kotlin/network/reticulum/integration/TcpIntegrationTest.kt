@@ -128,10 +128,19 @@ class TcpIntegrationTest {
 
         Thread.sleep(300)
 
-        // Send a test packet from server (broadcasts to all clients)
-        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
+        // Send a test packet from server to the connected client.
+        // Matches Python semantics (TCPInterface.py:627-628): parent
+        // `process_outgoing` is a pass — the spawned child interfaces
+        // are what actually write to the wire, addressed individually by
+        // Transport.outbound via `Transport.interfaces`. The pre-#46
+        // fan-out loop that let `server.processOutgoing(data)` reach
+        // every client at once is gone; production code reaches a peer
+        // through its spawned child, which is what we exercise here.
+        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer.
         val testData = ByteArray(24) { (it + 0x10).toByte() }
-        server.processOutgoing(testData)
+        val spawnedChild = server.getClients().firstOrNull()
+        assertNotNull(spawnedChild, "Server should have a spawned child for the connected client")
+        spawnedChild!!.processOutgoing(testData)
 
         // Wait for receive
         assertTrue(receivedLatch.await(5, TimeUnit.SECONDS), "Should receive packet")
@@ -242,10 +251,14 @@ class TcpIntegrationTest {
             Thread.sleep(50)
         }
 
-        // Send 5 packets from server to client
+        // Send 5 packets from server to client through the spawned child
+        // (server parent's processOutgoing is a no-op per Python semantics,
+        // see `Server can send packet to client` above for the full note).
+        val spawnedChild = server.getClients().firstOrNull()
+        assertNotNull(spawnedChild, "Server should have a spawned child for the connected client")
         for (i in 0 until 5) {
             val testData = ByteArray(24) { (it + i + 100).toByte() }
-            server.processOutgoing(testData)
+            spawnedChild!!.processOutgoing(testData)
             Thread.sleep(50)
         }
 

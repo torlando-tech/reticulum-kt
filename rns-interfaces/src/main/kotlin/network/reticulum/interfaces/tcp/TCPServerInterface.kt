@@ -73,8 +73,21 @@ class TCPServerInterface(
         network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to bindAddress,
         network.reticulum.discovery.DiscoveryConstants.PORT to bindPort,
     )
-    // Server can receive/send via its spawned client interfaces
-    // processOutgoing broadcasts to all connected clients
+    // Python-exact semantics (RNS/Interfaces/TCPInterface.py): the
+    // parent TCPServerInterface sets `IN=True` (canReceive) and starts
+    // with `OUT=False`, but `Reticulum.interface_post_init` flips OUT
+    // to True at config load (Reticulum.py:770-771). It therefore
+    // participates in Transport.outbound iteration. Its own
+    // `process_outgoing` is a `pass` (TCPInterface.py:627-628); the
+    // spawned child interfaces are what actually write to the wire,
+    // each registered with Transport via `onClientConnected` so
+    // Transport.transmit addresses them directly.
+    //
+    // Setting canSend=false here would exclude the parent from
+    // Transport.interfaces iteration entirely, breaking any code that
+    // looks up an interface by hash (link_table resolution, announce
+    // path broadcast, etc.) — see #46 follow-up where the send-inert
+    // variant regressed multi-hop resource transfers.
     override val canReceive: Boolean = true
     override val canSend: Boolean = true
 
@@ -161,19 +174,15 @@ class TCPServerInterface(
                 spawnedInterfaces?.add(clientInterface)
 
                 clientInterface.onPacketReceived = { data, iface ->
-                    // Forward received packets to our callback
+                    // Forward received packets to Transport via the parent's callback.
+                    // Do NOT fan out to other connected clients — matches Python's
+                    // TCPServerInterface.incoming_connection semantics where spawned
+                    // children's process_outgoing is a pass. Packets reach peers through
+                    // Transport's routing decisions (outbound(packet)), not via raw
+                    // rebroadcast at the TCP layer. See #46 for why the fan-out broke
+                    // path-layer invariants (cached-announce overwrite, PR leakage,
+                    // announce mode filtering bypass, double delivery races).
                     onPacketReceived?.invoke(data, iface)
-
-                    // Rebroadcast to all OTHER clients (not the sender)
-                    for (otherClient in clients) {
-                        if (otherClient !== iface && otherClient.online.value) {
-                            try {
-                                otherClient.processOutgoing(data)
-                            } catch (e: Exception) {
-                                // Client will be cleaned up by its own error handling
-                            }
-                        }
-                    }
                 }
 
                 clientInterface.start()
@@ -207,18 +216,18 @@ class TCPServerInterface(
     }
 
     /**
-     * Send data to all connected clients.
+     * Parent-level outbound is a no-op — mirrors Python
+     * `TCPServerInterface.process_outgoing` (RNS/Interfaces/TCPInterface.py:627-628,
+     * which is `pass`). Each spawned child is its own Transport-registered
+     * interface (via `onClientConnected`), so Transport.transmit addresses
+     * the correct child directly. Fanning out here would duplicate every
+     * Transport broadcast: once via this parent, again via each child that
+     * Transport iterates independently — producing the path-layer invariant
+     * violations that #46 set out to fix (cached-announce overwrite, PR
+     * leakage, announce mode-filter bypass, double delivery races).
      */
     override fun processOutgoing(data: ByteArray) {
-        for (client in clients) {
-            try {
-                if (client.online.value) {
-                    client.processOutgoing(data)
-                }
-            } catch (e: Exception) {
-                // Client will be cleaned up by its own error handling
-            }
-        }
+        // Intentionally empty.
     }
 
     /**
@@ -353,31 +362,39 @@ class TCPServerClientInterface internal constructor(
             throw IllegalStateException("Interface is not online")
         }
 
-        while (writing.get()) {
-            Thread.sleep(10)
-        }
+        // Serialize all writes to this spawned-client socket. Pre-#46 the
+        // TCPServerInterface's raw fan-out delivered packets on a single
+        // reader thread, hiding concurrency here. Post-#46, Transport routes
+        // via spawned children and multiple reader coroutines (one per
+        // connected peer) can each trigger a `processOutgoing` on the same
+        // target child concurrently — the old check-then-set on `writing`
+        // was racy and interleaved socket writes, corrupting resource
+        // transfers (status=CORRUPT / 7). A monitor lock is the minimum
+        // viable fix and matches Python's effective serialization via the
+        // GIL around blocking socket writes.
+        synchronized(this) {
+            try {
+                writing.set(true)
 
-        try {
-            writing.set(true)
+                val framedData = if (useKissFraming) {
+                    KISS.frame(data)
+                } else {
+                    HDLC.frame(data)
+                }
 
-            val framedData = if (useKissFraming) {
-                KISS.frame(data)
-            } else {
-                HDLC.frame(data)
+                socket.getOutputStream().write(framedData)
+                socket.getOutputStream().flush()
+
+                log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
+                txBytes.addAndGet(framedData.size.toLong())
+                parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
+
+            } catch (e: IOException) {
+                detach()
+                throw e
+            } finally {
+                writing.set(false)
             }
-
-            socket.getOutputStream().write(framedData)
-            socket.getOutputStream().flush()
-
-            log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
-            txBytes.addAndGet(framedData.size.toLong())
-            parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
-
-        } catch (e: IOException) {
-            detach()
-            throw e
-        } finally {
-            writing.set(false)
         }
     }
 
