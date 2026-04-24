@@ -73,10 +73,17 @@ class TCPServerInterface(
         network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to bindAddress,
         network.reticulum.discovery.DiscoveryConstants.PORT to bindPort,
     )
-    // Server can receive/send via its spawned client interfaces
-    // processOutgoing broadcasts to all connected clients
+    // The parent server accepts incoming connections (canReceive) but does NOT
+    // emit bytes on its own — mirrors Python TCPInterface.py:117-118 where
+    // TCPServerInterface has IN=True, OUT=False. Each spawned child is its own
+    // Transport-registered interface with OUT=True, so Transport.outbound()
+    // routes to the right peer via the correct child. Setting canSend=false
+    // here gates the parent out of Transport's retransmit / announce-emission
+    // loops and prevents double-delivery (once via parent fan-out, once via
+    // child direct emission) that caused the cross-client path invariant
+    // violations in #46.
     override val canReceive: Boolean = true
-    override val canSend: Boolean = true
+    override val canSend: Boolean = false
 
     /**
      * Called when a new client connects. Use to register the spawned interface with Transport.
@@ -206,15 +213,15 @@ class TCPServerInterface(
      * Send data to all connected clients.
      */
     override fun processOutgoing(data: ByteArray) {
-        for (client in clients) {
-            try {
-                if (client.online.value) {
-                    client.processOutgoing(data)
-                }
-            } catch (e: Exception) {
-                // Client will be cleaned up by its own error handling
-            }
-        }
+        // Intentionally a no-op — mirrors Python's TCPServerInterface.process_outgoing
+        // (RNS/Interfaces/TCPInterface.py), which is `pass`. Each spawned child is
+        // registered as its own Transport interface via `onClientConnected`, so
+        // Transport.outbound() addresses the correct child directly by iterating
+        // its `interfaces` registry. Fanning out here would duplicate Transport's
+        // per-child emission — producing the same class of path-layer invariant
+        // violations that the per-child inbound fan-out caused (see #46), and
+        // creating announce-emission loops when Transport emits on this parent
+        // interface as part of its retransmit loop.
     }
 
     /**
