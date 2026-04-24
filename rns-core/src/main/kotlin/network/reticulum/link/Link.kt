@@ -195,15 +195,32 @@ class Link private constructor(
                     Transport.registerLinkPath(link.linkId, interfaceHash, packet.hops)
                 }
 
-                // Perform handshake and send proof
+                // Perform handshake (derives crypto state) BEFORE publishing
+                // the link via Transport.registerLink. The order here is the
+                // receiver-side mirror of the sender-side fix in #53: any
+                // side-effect that makes the link visible to the peer must
+                // happen AFTER all bookkeeping the receiver needs to dispatch
+                // inbound traffic.
+                //
+                // Specifically: link.prove() sends the LRPROOF on the wire,
+                // which the sender treats as "link is up" and begins sending
+                // user DATA on. Transport.processData() looks up the receiver
+                // link in activeLinks (Transport.kt:3752); if registerLink
+                // hasn't run yet when DATA arrives, the lookup misses and
+                // the packet is dropped silently. On a fast loopback
+                // kotlin->reference->kotlin path, the sender's first DATA
+                // can race ahead of Transport.registerLink; this manifested
+                // as the residual #42 first-packet-of-burst loss surviving
+                // the sender-side fix in #53.
                 link.handshake()
-                link.prove()
-
                 link.requestTime = System.currentTimeMillis()
                 Transport.registerLink(link)
-
                 link.lastInbound = System.currentTimeMillis()
                 link.startWatchdog()
+
+                // Now safe to send LRPROOF — receiver is fully wired to
+                // accept inbound DATA on this link.
+                link.prove()
 
                 log("Link request ${link.linkId.toHexString()} accepted")
                 link
