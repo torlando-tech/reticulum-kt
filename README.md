@@ -39,7 +39,9 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | KISS Framing | Complete | Used by TCP and RNode interfaces |
 | HDLC Framing | Complete | Used by TCP, SPP, Pipe, and I2P interfaces |
 | PHY Stats | Complete | RSSI/SNR exposed via `Interface.rStatRssi` / `rStatSnr` (RNode + BLE + Nearby) |
-| Serial | Not implemented | RNode covers most serial use cases |
+| Serial | Not implemented | Direct serial port; RNode covers most serial use cases |
+| KISS Interface | Not implemented | Legacy serial TNC path; RNode covers most serial use cases |
+| AX.25 KISS Interface | Not implemented | AX.25 over KISS; specialized amateur-radio path |
 
 ### Android
 
@@ -62,6 +64,8 @@ Features that exist in the Python reference but are not yet implemented:
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
 | CLI utilities | Low | `rnstatus`, `rnpath`, `rnprobe` equivalents |
 | SerialInterface | Low | Direct serial port (RNode covers most use cases) |
+| KISSInterface | Low | Legacy serial TNC path (RNode covers most use cases) |
+| AX25KISSInterface | Low | AX.25 over KISS — specialized amateur-radio path |
 
 ### Utilities/CLI
 

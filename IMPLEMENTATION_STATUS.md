@@ -5,7 +5,7 @@
 
 ## Executive Summary
 
-The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P, Pipe) except `SerialInterface` (RNode covers most serial use cases), plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
+The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P, Pipe) except the three legacy serial-TNC paths (`SerialInterface`, `KISSInterface`, `AX25KISSInterface`) — all covered for typical use by `RNodeInterface` — plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
 
 LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
@@ -78,6 +78,8 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
 | CLI utilities (rnstatus, rnpath, rnprobe) | Low | Network diagnostic tools |
 | SerialInterface | Low | Direct serial port (RNode covers most use cases) |
+| KISSInterface | Low | Legacy serial TNC path (RNode covers most use cases) |
+| AX25KISSInterface | Low | AX.25 over KISS — specialized amateur-radio path |
 
 ---
 
@@ -135,10 +137,12 @@ Client-only mode disables routing/forwarding and eliminates the job loop, reduci
 | Pipe Interface | ✅ | ✅ | Python-parity port; HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) |
 | Blackhole | ✅ | ❌ | Identity blacklisting |
 | Remote Mgmt | ✅ | ❌ | Status/path endpoints |
-| Serial Interface | ✅ | ❌ | RNode covers most use cases |
+| Serial Interface | ✅ | ❌ | Legacy direct-serial path; RNode covers most use cases |
+| KISS Interface | ✅ | ❌ | Legacy serial TNC path; RNode covers most use cases |
+| AX.25 KISS Interface | ✅ | ❌ | Legacy AX.25 over KISS; specialized amateur-radio path |
 | CLI Utilities | ✅ | Partial | rnsd-kt complete; rnstatus/rnpath/rnprobe not started |
 
-**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships except `SerialInterface` (RNode covers most serial use cases), plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
+**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships except the three legacy serial-TNC paths (`SerialInterface`, `KISSInterface`, `AX25KISSInterface`) — all covered for typical use by `RNodeInterface` — plus four mobile/JVM-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP, Pipe). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
 
 ---
 
