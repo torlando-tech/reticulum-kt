@@ -87,6 +87,27 @@ class Link private constructor(
         private val activeWatchdogs = ConcurrentHashMap<Int, Job>()
 
         /**
+         * Test-only race inducer: when > 0, pauses for the configured number
+         * of milliseconds at named seams in the link establishment path. Used
+         * by reticulum-conformance to deterministically widen narrow race
+         * windows so a regression at a specific seam fails reliably instead
+         * of intermittently.
+         *
+         * Defaults to 0 (no-op). Production callers MUST NOT set this — it
+         * only exists for test injection via the bridge's
+         * `wire_set_race_inducer` command.
+         *
+         * Currently-instrumented seams:
+         *  - "post-prove": sleeps in `validateRequest` immediately after
+         *    `link.prove()` returns, before the function exits. Used to
+         *    verify that all bookkeeping needed for inbound DATA is
+         *    COMPLETE by the time prove() returns — the invariant fixed
+         *    in PR #54.
+         */
+        @Volatile
+        var raceInducerPostProveDelayMs: Long = 0L
+
+        /**
          * Cancel all watchdog coroutines. Used during shutdown.
          */
         internal fun cancelAllWatchdogs() {
@@ -236,6 +257,18 @@ class Link private constructor(
                     log("Link prove() failed after registration; rolling back: ${proveError.message}")
                     runCatching { link.teardown(LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED) }
                     throw proveError
+                }
+
+                // Test-only race inducer (zero in production; settable via the
+                // conformance bridge's wire_set_race_inducer command). Sleeps
+                // here to widen the post-prove window so a test can verify
+                // that any DATA arriving while we're "stuck" still gets
+                // dispatched correctly — proving that registerLink + the
+                // other bookkeeping above is sufficient for inbound DATA
+                // handling.
+                val postProveDelay = raceInducerPostProveDelayMs
+                if (postProveDelay > 0L) {
+                    Thread.sleep(postProveDelay)
                 }
 
                 log("Link request ${link.linkId.toHexString()} accepted")
