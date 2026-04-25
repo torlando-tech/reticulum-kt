@@ -26,6 +26,7 @@ import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
 import network.reticulum.transport.Transport
+import org.jetbrains.annotations.TestOnly
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -103,7 +104,15 @@ class Link private constructor(
          *    verify that all bookkeeping needed for inbound DATA is
          *    COMPLETE by the time prove() returns — the invariant fixed
          *    in PR #54.
+         *
+         * The sleep delegates to `Transport.raceInducerSleepReleasingJobsLock`
+         * so it temporarily drops `jobsLock` for the sleep duration. Without
+         * that, `validateRequest`'s caller (`Transport.ingest`) would still
+         * be holding `jobsLock`, serializing concurrently-arriving DATA
+         * packets behind the lock and defeating the test's intended race
+         * window (per Greptile review on this PR).
          */
+        @TestOnly
         @Volatile
         var raceInducerPostProveDelayMs: Long = 0L
 
@@ -266,9 +275,16 @@ class Link private constructor(
                 // dispatched correctly — proving that registerLink + the
                 // other bookkeeping above is sufficient for inbound DATA
                 // handling.
+                //
+                // We delegate to Transport.raceInducerSleepReleasingJobsLock
+                // because validateRequest is called transitively from
+                // Transport.ingest under jobsLock.withLock; a plain
+                // Thread.sleep here would serialize concurrent DATA packets
+                // behind the lock, neutralizing the race window the test is
+                // trying to expose (per Greptile review on this PR).
                 val postProveDelay = raceInducerPostProveDelayMs
                 if (postProveDelay > 0L) {
-                    Thread.sleep(postProveDelay)
+                    Transport.raceInducerSleepReleasingJobsLock(postProveDelay)
                 }
 
                 log("Link request ${link.linkId.toHexString()} accepted")
