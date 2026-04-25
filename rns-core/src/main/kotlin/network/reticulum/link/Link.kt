@@ -26,6 +26,7 @@ import network.reticulum.identity.Identity
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
 import network.reticulum.transport.Transport
+import org.jetbrains.annotations.TestOnly
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -85,6 +86,35 @@ class Link private constructor(
         // Shared coroutine scope for all link watchdogs (battery efficient on Android)
         private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val activeWatchdogs = ConcurrentHashMap<Int, Job>()
+
+        /**
+         * Test-only race inducer: when > 0, pauses for the configured number
+         * of milliseconds at named seams in the link establishment path. Used
+         * by reticulum-conformance to deterministically widen narrow race
+         * windows so a regression at a specific seam fails reliably instead
+         * of intermittently.
+         *
+         * Defaults to 0 (no-op). Production callers MUST NOT set this — it
+         * only exists for test injection via the bridge's
+         * `wire_set_race_inducer` command.
+         *
+         * Currently-instrumented seams:
+         *  - "post-prove": sleeps in `validateRequest` immediately after
+         *    `link.prove()` returns, before the function exits. Used to
+         *    verify that all bookkeeping needed for inbound DATA is
+         *    COMPLETE by the time prove() returns — the invariant fixed
+         *    in PR #54.
+         *
+         * The sleep delegates to `Transport.raceInducerSleepReleasingJobsLock`
+         * so it temporarily drops `jobsLock` for the sleep duration. Without
+         * that, `validateRequest`'s caller (`Transport.ingest`) would still
+         * be holding `jobsLock`, serializing concurrently-arriving DATA
+         * packets behind the lock and defeating the test's intended race
+         * window (per Greptile review on this PR).
+         */
+        @TestOnly
+        @Volatile
+        var raceInducerPostProveDelayMs: Long = 0L
 
         /**
          * Cancel all watchdog coroutines. Used during shutdown.
@@ -238,9 +268,57 @@ class Link private constructor(
                     throw proveError
                 }
 
+                // Test-only race inducer (zero in production; settable via the
+                // conformance bridge's wire_set_race_inducer command). Sleeps
+                // here to widen the post-prove window so a test can verify
+                // that any DATA arriving while we're "stuck" still gets
+                // dispatched correctly — proving that registerLink + the
+                // other bookkeeping above is sufficient for inbound DATA
+                // handling.
+                //
+                // We delegate to Transport.raceInducerSleepReleasingJobsLock
+                // because validateRequest is called transitively from
+                // Transport.ingest under jobsLock.withLock; a plain
+                // Thread.sleep here would serialize concurrent DATA packets
+                // behind the lock, neutralizing the race window the test is
+                // trying to expose (per Greptile review on this PR).
+                val postProveDelay = raceInducerPostProveDelayMs
+                if (postProveDelay > 0L) {
+                    try {
+                        Transport.raceInducerSleepReleasingJobsLock(postProveDelay)
+                    } catch (ie: InterruptedException) {
+                        // Mirror the proveError rollback above: registerLink +
+                        // startWatchdog have already run, so an exception that
+                        // escapes here would leave a zombie link in activeLinks
+                        // with a running watchdog. Tear down before re-throwing
+                        // so the outer `catch (e: Exception)` returns null on a
+                        // clean state (per Greptile review on this PR).
+                        log("Race inducer sleep interrupted; rolling back: ${ie.message}")
+                        runCatching { link.teardown(LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED) }
+                        Thread.currentThread().interrupt()
+                        throw ie
+                    }
+                }
+
                 log("Link request ${link.linkId.toHexString()} accepted")
                 link
             } catch (e: Exception) {
+                // If the exception is an InterruptedException, CLEAR the
+                // thread's interrupt flag here. The inner
+                // Transport.raceInducerSleepReleasingJobsLock catch
+                // re-sets it before rethrow (standard Java pattern when
+                // propagating cancellation), but at THIS layer we're
+                // intentionally swallowing the interrupt — we've handled
+                // it by aborting link establishment and returning null,
+                // and the ingest thread caller will continue its receive
+                // loop. Leaving the flag set would cause its next
+                // interruptible operation (Thread.sleep, blocking I/O,
+                // lockInterruptibly()) to throw spuriously, attributing
+                // a cancellation that was intended only for this single
+                // link-setup attempt to unrelated work in the loop.
+                // Thread.interrupted() is the JDK's check-and-clear
+                // primitive for exactly this case.
+                if (e is InterruptedException) Thread.interrupted()
                 log("Validating link request failed: ${e.message}")
                 null
             }

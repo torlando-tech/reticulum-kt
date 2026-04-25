@@ -828,6 +828,23 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         }
     }
 
+    "wire_set_race_inducer" -> {
+        // Sets named race-inducer hooks in production code (default 0L =
+        // no-op). Tests call this to deterministically widen narrow race
+        // windows so a regression at a specific seam fails reliably.
+        //
+        // Currently-instrumented seams (must match Link.kt companion):
+        //   "post-prove" — receiver-side validateRequest, sleeps after
+        //                  link.prove() returns.
+        val seam = p.str("seam")
+        val delayMs = p.get("delay_ms")?.asLong ?: 0L
+        when (seam) {
+            "post-prove" -> network.reticulum.link.Link.raceInducerPostProveDelayMs = delayMs
+            else -> throw IllegalArgumentException("Unknown race-inducer seam: $seam")
+        }
+        result("seam" to JsonPrimitive(seam), "delay_ms" to JsonPrimitive(delayMs))
+    }
+
     "wire_get_received_packets" -> {
         val sinceSeq = p.get("since_seq")?.asLong ?: 0L
         val packets = JsonArray()

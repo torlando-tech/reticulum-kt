@@ -179,6 +179,35 @@ object Transport {
     /** Lock for job execution. */
     private val jobsLock = ReentrantLock()
 
+    /**
+     * Test-only: sleep for [millis] with `jobsLock` temporarily released, then
+     * re-acquire the same hold count before returning. Used by the race-inducer
+     * hook in `Link.validateRequest` (post-prove seam) so that DATA packets
+     * arriving on other ingest threads during the widened window can actually
+     * contend on the lock and exercise the bookkeeping race, instead of being
+     * serialized behind the still-held jobsLock.
+     *
+     * If `jobsLock` is not held by the calling thread, this falls back to a
+     * plain `Thread.sleep(millis)`. Production code MUST NOT call this.
+     */
+    @org.jetbrains.annotations.TestOnly
+    internal fun raceInducerSleepReleasingJobsLock(millis: Long) {
+        if (millis <= 0L) return
+        if (!jobsLock.isHeldByCurrentThread) {
+            Thread.sleep(millis)
+            return
+        }
+        // Fully release the lock (handles reentrant holds), sleep, then re-acquire
+        // the same number of times so the caller's invariant is preserved.
+        val holdCount = jobsLock.holdCount
+        repeat(holdCount) { jobsLock.unlock() }
+        try {
+            Thread.sleep(millis)
+        } finally {
+            repeat(holdCount) { jobsLock.lock() }
+        }
+    }
+
     /** Whether jobs are currently running. */
     private val jobsRunning = AtomicBoolean(false)
 
