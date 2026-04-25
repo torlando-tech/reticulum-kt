@@ -2037,7 +2037,7 @@ class Link private constructor(
                 try {
                     callback(this)
                 } catch (e: Exception) {
-                    log("Error in link established callback: ${e.message}")
+                    log("Error in link established callback:\n${e.stackTraceToString()}")
                 }
             }
 
@@ -2045,7 +2045,7 @@ class Link private constructor(
                 try {
                     ownerDest.invokeLinkEstablished(this)
                 } catch (e: Exception) {
-                    log("Error in destination link established callback: ${e.message}")
+                    log("Error in destination link established callback:\n${e.stackTraceToString()}")
                 }
             }
         } catch (e: Exception) {
