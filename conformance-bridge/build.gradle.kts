@@ -23,11 +23,11 @@ dependencies {
 
     // LXMF-kt: the Kotlin port of LXMF. Only used by the conformance
     // bridge's lxmf_* commands (see Lxmf.kt); rns-core / rns-interfaces
-    // do not depend on LXMF. Pinned to v0.0.4 (latest published tag as
+    // do not depend on LXMF. Pinned to v0.0.8 (latest published tag as
     // of this PR). JitPack collapsed the multi-module project into the
     // root artifact, so the coordinate is the repo itself rather than
     // com.github.torlando-tech.LXMF-kt:lxmf-core.
-    implementation("com.github.torlando-tech:LXMF-kt:v0.0.4")
+    implementation("com.github.torlando-tech:LXMF-kt:v0.0.8")
 
     // Coroutines — Lxmf.kt calls LXMRouter.handleOutbound (suspend) and
     // needs runBlocking to adapt it to the synchronous bridge protocol.
