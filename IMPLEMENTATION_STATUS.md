@@ -5,7 +5,7 @@
 
 ## Executive Summary
 
-The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P, Pipe) plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
+The Kotlin implementation of Reticulum is **feature-complete** for the core protocol and fully interoperable with the Python reference implementation. Every interface type Python ships is implemented (TCP, UDP, Local, RNode, Auto, I2P, Pipe) except `SerialInterface` (RNode covers most serial use cases), plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). The Android module (`rns-android/`) provides foreground service, BLE driver, and power management components.
 
 LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
@@ -138,7 +138,7 @@ Client-only mode disables routing/forwarding and eliminates the job loop, reduci
 | Serial Interface | ✅ | ❌ | RNode covers most use cases |
 | CLI Utilities | ✅ | Partial | rnsd-kt complete; rnstatus/rnpath/rnprobe not started |
 
-**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships, plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
+**Result**: Kotlin achieves 100% core protocol compatibility and implements every interface type Python ships except `SerialInterface` (RNode covers most serial use cases), plus three mobile-specific additions (BLE Mesh, Nearby Connections, Bluetooth SPP). Remaining gaps are optional features (blackhole, remote management) and a few CLI diagnostic utilities.
 
 ---
 
