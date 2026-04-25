@@ -303,6 +303,22 @@ class Link private constructor(
                 log("Link request ${link.linkId.toHexString()} accepted")
                 link
             } catch (e: Exception) {
+                // If the exception is an InterruptedException, CLEAR the
+                // thread's interrupt flag here. The inner
+                // Transport.raceInducerSleepReleasingJobsLock catch
+                // re-sets it before rethrow (standard Java pattern when
+                // propagating cancellation), but at THIS layer we're
+                // intentionally swallowing the interrupt — we've handled
+                // it by aborting link establishment and returning null,
+                // and the ingest thread caller will continue its receive
+                // loop. Leaving the flag set would cause its next
+                // interruptible operation (Thread.sleep, blocking I/O,
+                // lockInterruptibly()) to throw spuriously, attributing
+                // a cancellation that was intended only for this single
+                // link-setup attempt to unrelated work in the loop.
+                // Thread.interrupted() is the JDK's check-and-clear
+                // primitive for exactly this case.
+                if (e is InterruptedException) Thread.interrupted()
                 log("Validating link request failed: ${e.message}")
                 null
             }
