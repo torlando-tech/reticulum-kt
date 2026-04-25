@@ -33,7 +33,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver — Kotlin-only |
 | Nearby Connections | Complete | Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover — Kotlin-only |
 | Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server modes — Kotlin-only |
-| Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Kotlin-only |
+| Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity |
 | Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections |
 | I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
 | KISS Framing | Complete | Used by TCP and RNode interfaces |
