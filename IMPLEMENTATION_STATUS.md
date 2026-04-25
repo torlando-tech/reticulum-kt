@@ -61,7 +61,7 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 
 #### Testing
 - **660+ test methods** across 86 test files, 100% passing with Python implementation
-- **15 in-repo conformance tests** in `python-bridge/conformance/` (Kotlin ↔ Python over pipe interfaces)
+- **15 in-repo conformance test files** in `python-bridge/conformance/` (65 test methods; Kotlin ↔ Python over pipe interfaces)
 - **22 cross-implementation test files** in [`torlando-tech/reticulum-conformance`](https://github.com/torlando-tech/reticulum-conformance) — wire-level and behavioral parity tests parametrized across `(sender, transport, receiver)` impl triples covering byte-level identity, transport routing, link multi-hop, resource transfer, IFAC interop, path discovery, and announce semantics
 - **Integration tests**: Links, resources, channels, tunnels, IFAC verified
 - **Python interop**: Kotlin ↔ Python communication tested across all protocol features
