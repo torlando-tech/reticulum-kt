@@ -219,8 +219,24 @@ class Link private constructor(
                 link.startWatchdog()
 
                 // Now safe to send LRPROOF — receiver is fully wired to
-                // accept inbound DATA on this link.
-                link.prove()
+                // accept inbound DATA on this link. If prove() throws after
+                // registerLink/startWatchdog have run, we must roll the link
+                // back out of activeLinks and stop the watchdog so it doesn't
+                // sit in HANDSHAKE state until the establishment timeout
+                // fires (zombie-link cleanup, per Greptile review on #54).
+                try {
+                    link.prove()
+                } catch (proveError: Exception) {
+                    // teardown(...) sets status=CLOSED, calls stopWatchdog(),
+                    // and Transport.deregisterLink(link) — the full unwind for
+                    // the partial registration we just did. Skips the close
+                    // packet send because previousStatus is HANDSHAKE (not
+                    // ACTIVE), so it won't try to encrypt with a key the
+                    // failed prove() never installed.
+                    log("Link prove() failed after registration; rolling back: ${proveError.message}")
+                    runCatching { link.teardown(LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED) }
+                    throw proveError
+                }
 
                 log("Link request ${link.linkId.toHexString()} accepted")
                 link
