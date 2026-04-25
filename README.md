@@ -15,11 +15,11 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | Identity | Complete | X25519/Ed25519, ratchets, known destinations, persistent storage |
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs |
-| Transport | ~95% | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
+| Transport | Complete | Routing, path management, tunnels, announces, announce caching, link management, IFAC, mode-based filtering |
 | Link | Complete | Establishment, encryption, channels, resources, request/response, MTU discovery |
-| Channel | ~90% | Windowed flow control, ordered delivery, retransmission, message type registry |
+| Channel | Complete | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels |
-| Resource | ~90% | Chunked transfer, BZ2 compression, progress tracking, metadata |
+| Resource | Complete | Chunked transfer, BZ2 compression, progress tracking, metadata |
 | Crypto | Complete | BouncyCastle: X25519, Ed25519, HKDF, AES-256-CBC, SHA-256/512 |
 
 ### Interfaces
@@ -30,12 +30,18 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | UDP | Complete | Unicast, broadcast, multicast |
 | Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps |
 | RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport |
-| BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver |
+| BLE Mesh | Complete | Dual-role GATT, identity handshake, fragmentation, Android driver — Kotlin-only |
+| Nearby Connections | Complete | Google Nearby Connections (WiFi Direct + BLE), dual-role advertise/discover — Kotlin-only |
+| Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server modes — Kotlin-only |
+| Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity |
 | Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections |
+| I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
 | KISS Framing | Complete | Used by TCP and RNode interfaces |
-| HDLC Framing | Complete | Used by TCP interfaces |
-| I2P | Not implemented | Stub in config factory |
-| Serial | Not implemented | RNode covers most serial use cases |
+| HDLC Framing | Complete | Used by TCP, SPP, Pipe, and I2P interfaces |
+| PHY Stats | Complete | RSSI/SNR exposed via `Interface.rStatRssi` / `rStatSnr` (RNode + BLE + Nearby) |
+| Serial | Not implemented | Direct serial port; RNode covers most serial use cases |
+| KISS Interface | Not implemented | Legacy serial TNC path; RNode covers most serial use cases |
+| AX.25 KISS Interface | Not implemented | AX.25 over KISS; specialized amateur-radio path |
 
 ### Android
 
@@ -53,14 +59,13 @@ Features that exist in the Python reference but are not yet implemented:
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
-| PHY stats on packets | Medium | Expose RSSI/SNR/Q from RNode through the Packet API |
-| Interface discovery | Medium | `InterfaceAnnouncer`/`InterfaceMonitor` for mDNS-based interface discovery |
 | Blackhole system | Medium | Identity blacklisting to block bad actors |
 | Remote management | Low | Control destinations for remote `/path` and `/status` queries |
 | RPC server | Low | Multi-process sharing of a single Reticulum instance |
 | CLI utilities | Low | `rnstatus`, `rnpath`, `rnprobe` equivalents |
 | SerialInterface | Low | Direct serial port (RNode covers most use cases) |
-| I2PInterface | Low | I2P anonymity network integration |
+| KISSInterface | Low | Legacy serial TNC path (RNode covers most use cases) |
+| AX25KISSInterface | Low | AX.25 over KISS — specialized amateur-radio path |
 
 ### Utilities/CLI
 
@@ -83,11 +88,11 @@ Features that exist in the Python reference but are not yet implemented:
 
 ```
 rns-core/        # Core protocol (Identity, Destination, Transport, Link, Channel, Resource)
-rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto)
+rns-interfaces/  # Network interfaces (TCP, UDP, Local, RNode, BLE, Auto, I2P, Nearby, SPP, Pipe)
 rns-android/     # Android-specific code (BLE driver, foreground service, power management)
 rns-cli/         # CLI utilities (rnsd-kt daemon)
 rns-test/        # Integration and interop tests
-python-bridge/   # Python bridge server for interop testing (120+ commands)
+python-bridge/   # Python bridge server for interop testing (145+ commands)
 ```
 
 ## Building
@@ -171,7 +176,7 @@ Reticulum.stop()
 
 ## Interop Testing
 
-The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 120+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
+The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 145+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, and resource transfer.
 
 Tests are started automatically - no manual setup required.
 
