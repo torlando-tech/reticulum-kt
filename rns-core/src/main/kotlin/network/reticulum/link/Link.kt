@@ -2013,28 +2013,39 @@ class Link private constructor(
             log("Link RTT measured: ${rtt}ms")
             updateKeepalive()
 
-            // Notify the Link-level callback (set via link.setLinkEstablishedCallback).
+            // Fire both the link-level and destination-level "link established"
+            // callbacks SYNCHRONOUSLY from rttPacket — matches Python RNS
+            // (RNS/Link.py:550-551 fires both inline) and closes #56's
+            // receiver-side first-packet-loss residual.
+            //
+            // The previous async-via-thread(isDaemon = true) approach raced
+            // the read loop: rttPacket returned, the read loop immediately
+            // processed the next packet (the sender's first user DATA, sent
+            // as soon as the sender saw LRPROOF and went ACTIVE), and
+            // link.processRegularData ran callbacks.packet?.let { ... } —
+            // which was still null because the daemon thread that wires it
+            // (via destination.linkEstablished -> link.setPacketCallback)
+            // hadn't run yet. The DATA was silently dropped.
+            //
+            // Synchronous invocation guarantees that by the time the read
+            // loop reads the next packet, every callback the user registered
+            // in their linkEstablished handler is wired. Trade-off: a slow
+            // user callback now blocks the receive loop for that link's
+            // interface, same risk Python carries; documented as user
+            // contract that callbacks should not block.
             callbacks.linkEstablished?.let { callback ->
-                thread(isDaemon = true) {
-                    try {
-                        callback(this)
-                    } catch (e: Exception) {
-                        log("Error in link established callback: ${e.message}")
-                    }
+                try {
+                    callback(this)
+                } catch (e: Exception) {
+                    log("Error in link established callback: ${e.message}")
                 }
             }
 
-            // Notify the owning Destination's link-established callback. Python RNS fires
-            // this from rtt_packet() once status == ACTIVE (RNS/Link.py line 550–551);
-            // firing it earlier (e.g. on LINKREQUEST) leaves link.status == HANDSHAKE, and
-            // any link.send() from the callback silently fails.
             owner?.let { ownerDest ->
-                thread(isDaemon = true) {
-                    try {
-                        ownerDest.invokeLinkEstablished(this)
-                    } catch (e: Exception) {
-                        log("Error in destination link established callback: ${e.message}")
-                    }
+                try {
+                    ownerDest.invokeLinkEstablished(this)
+                } catch (e: Exception) {
+                    log("Error in destination link established callback: ${e.message}")
                 }
             }
         } catch (e: Exception) {
