@@ -190,6 +190,7 @@ object Transport {
      * If `jobsLock` is not held by the calling thread, this falls back to a
      * plain `Thread.sleep(millis)`. Production code MUST NOT call this.
      */
+    @org.jetbrains.annotations.TestOnly
     internal fun raceInducerSleepReleasingJobsLock(millis: Long) {
         if (millis <= 0L) return
         if (!jobsLock.isHeldByCurrentThread) {

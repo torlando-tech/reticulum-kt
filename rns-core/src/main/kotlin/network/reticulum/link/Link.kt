@@ -284,7 +284,20 @@ class Link private constructor(
                 // trying to expose (per Greptile review on this PR).
                 val postProveDelay = raceInducerPostProveDelayMs
                 if (postProveDelay > 0L) {
-                    Transport.raceInducerSleepReleasingJobsLock(postProveDelay)
+                    try {
+                        Transport.raceInducerSleepReleasingJobsLock(postProveDelay)
+                    } catch (ie: InterruptedException) {
+                        // Mirror the proveError rollback above: registerLink +
+                        // startWatchdog have already run, so an exception that
+                        // escapes here would leave a zombie link in activeLinks
+                        // with a running watchdog. Tear down before re-throwing
+                        // so the outer `catch (e: Exception)` returns null on a
+                        // clean state (per Greptile review on this PR).
+                        log("Race inducer sleep interrupted; rolling back: ${ie.message}")
+                        runCatching { link.teardown(LinkConstants.TEARDOWN_REASON_DESTINATION_CLOSED) }
+                        Thread.currentThread().interrupt()
+                        throw ie
+                    }
                 }
 
                 log("Link request ${link.linkId.toHexString()} accepted")
