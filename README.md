@@ -171,7 +171,7 @@ Reticulum.stop()
 
 ## Interop Testing
 
-The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 145+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, resource transfer, and LXMF message exchange.
+The test suite validates byte-perfect compatibility with Python RNS. The Python bridge server (`python-bridge/bridge_server.py`) provides 145+ commands for cross-implementation verification covering crypto, packet formats, link encryption, channel messaging, and resource transfer.
 
 Tests are started automatically - no manual setup required.
 
