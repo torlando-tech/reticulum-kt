@@ -38,6 +38,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 | I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
 | KISS Framing | Complete | Used by TCP and RNode interfaces |
 | HDLC Framing | Complete | Used by TCP, SPP, Pipe, and I2P interfaces |
+| PHY Stats | Complete | RSSI/SNR exposed via `Interface.rStatRssi` / `rStatSnr` (RNode + BLE + Nearby) |
 | Serial | Not implemented | RNode covers most serial use cases |
 
 ### Android
