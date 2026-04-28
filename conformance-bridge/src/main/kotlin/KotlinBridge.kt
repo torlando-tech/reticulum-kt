@@ -24,8 +24,18 @@ private val gson = Gson()
 private val crypto: CryptoProvider = BouncyCastleProvider()
 
 fun main() {
-    println("READY")
-    System.out.flush()
+    val realStdout = System.out
+    realStdout.println("READY")
+    realStdout.flush()
+
+    // Hijack System.out → stderr after READY so println() from
+    // reticulum-kt internals doesn't leak onto the JSON-RPC channel
+    // (where the bridge_client filters non-JSON lines and silently
+    // drops the diagnostic). Without this, every `println(...)` in
+    // Transport / Link / Resource is invisible to anyone running the
+    // conformance suite. JSON-RPC writes below use the captured
+    // realStdout reference so the response channel still works.
+    System.setOut(java.io.PrintStream(System.err, true))
 
     val reader = System.`in`.bufferedReader()
     while (true) {
@@ -46,14 +56,14 @@ fun main() {
                     addProperty("success", true)
                     add("result", result)
                 }
-                println(gson.toJson(response))
+                realStdout.println(gson.toJson(response))
             } catch (e: Exception) {
                 val response = JsonObject().apply {
                     addProperty("id", id)
                     addProperty("success", false)
                     addProperty("error", e.message ?: "Unknown error")
                 }
-                println(gson.toJson(response))
+                realStdout.println(gson.toJson(response))
             }
         } catch (e: Exception) {
             val response = JsonObject().apply {
@@ -61,7 +71,7 @@ fun main() {
                 addProperty("success", false)
                 addProperty("error", "JSON parse error: ${e.message}")
             }
-            println(gson.toJson(response))
+            realStdout.println(gson.toJson(response))
         }
         System.out.flush()
     }
