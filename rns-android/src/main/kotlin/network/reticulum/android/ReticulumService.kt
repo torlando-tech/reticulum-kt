@@ -22,6 +22,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.android.lifecycle.StoreLifecycle
 import network.reticulum.interfaces.local.LocalServerInterface
 import java.io.File
 
@@ -253,16 +254,10 @@ class ReticulumService : LifecycleService() {
         serviceScope.cancel()
         shutdownReticulum()
 
-        // Shut down Room write executor and close database
-        dbWriteExecutor?.let { executor ->
-            executor.shutdown()
-            try {
-                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)
-            } catch (_: InterruptedException) { }
-        }
-        dbWriteExecutor = null
-
-        // Null out store references before closing DB to prevent use-after-close
+        // Null out store references BEFORE draining + closing — once nulled,
+        // no new RoomPathStore/RoomPacketHashStore/etc. saveAll(...) calls
+        // can post fresh work onto the executor. We then drain whatever's
+        // already queued before closing the database.
         network.reticulum.transport.Transport.pathStore = null
         network.reticulum.transport.Transport.packetHashStore = null
         network.reticulum.transport.Transport.tunnelStore = null
@@ -270,6 +265,32 @@ class ReticulumService : LifecycleService() {
         network.reticulum.transport.Transport.discoveryStore = null
         network.reticulum.transport.Transport.destinationRatchetStore = null
         network.reticulum.identity.Identity.identityStore = null
+
+        // Drain the Room write executor BEFORE closing the database. If
+        // we close while a queued task is still pending, the task hits
+        // a closed connection pool and throws IllegalStateException
+        // ("Cannot perform this operation because the connection pool
+        // has been closed" or "attempt to re-open an already-closed
+        // object: SQLiteDatabase"). See StoreLifecycle for the full
+        // rationale and the Sentry references (COLUMBA-8R, COLUMBA-8X).
+        //
+        // Timeouts: onDestroy runs on the Android main thread; the
+        // Service ANR window for foreground service teardown is ~20s.
+        // StoreLifecycle's defaults of 15s + 5s sit right at that
+        // cliff. Cap the drain budget at 4s + 1s = 5s total so we
+        // stay comfortably under the ANR threshold even on a slow
+        // device. Any writes that don't drain in 4s get shutdownNow'd
+        // and may be lost — acceptable trade vs. ANRing the user out.
+        dbWriteExecutor?.let { executor ->
+            val outcome =
+                StoreLifecycle(
+                    gracefulMillis = 4_000,
+                    forceMillis = 1_000,
+                    log = { msg -> Log.w(TAG, msg) },
+                ).drain(executor)
+            Log.i(TAG, "Reticulum DB executor drained on shutdown: $outcome")
+        }
+        dbWriteExecutor = null
 
         database?.close()
         database = null
