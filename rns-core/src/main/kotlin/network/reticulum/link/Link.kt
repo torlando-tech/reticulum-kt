@@ -2172,7 +2172,19 @@ class Link private constructor(
                         network.reticulum.resource.Resource.accept(
                             advertisement = advertisement,
                             link = this,
-                            callback = { res -> resourceConcluded(res) },
+                            // Do NOT pass `callback = { res -> resourceConcluded(res) }`
+                            // here — Resource.assemble() already calls
+                            // `link.resourceConcluded(this)` directly when the
+                            // transfer completes, which fires `callbacks.resourceConcluded`
+                            // on this link. Passing a per-resource callback that ALSO
+                            // calls `resourceConcluded(res)` re-fires the user-level
+                            // callback a second time, causing every received Resource
+                            // (e.g. an LXMF message in RESOURCE representation) to be
+                            // delivered twice on the receiver side. Mirrors Python
+                            // RNS, where Link.py wires the user callback directly as
+                            // the per-resource callback (Link.py:1097, 1102) and
+                            // Link.resource_concluded() is pure bookkeeping.
+                            callback = null,
                         )
                     if (resource != null) {
                         registerIncomingResource(resource)
@@ -2197,7 +2209,13 @@ class Link private constructor(
                                     network.reticulum.resource.Resource.accept(
                                         advertisement = advertisement,
                                         link = this,
-                                        callback = { res -> resourceConcluded(res) },
+                                        // See note above on the ACCEPT_ALL branch — the same
+                                        // double-fire applies here. Resource.assemble() calls
+                                        // link.resourceConcluded(this) directly when the
+                                        // transfer completes; passing a per-resource callback
+                                        // that re-calls resourceConcluded(res) here delivers
+                                        // every received Resource twice.
+                                        callback = null,
                                     )
                                 if (resource != null) {
                                     registerIncomingResource(resource)
