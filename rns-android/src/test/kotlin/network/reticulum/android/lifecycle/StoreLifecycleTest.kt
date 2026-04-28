@@ -181,16 +181,22 @@ class StoreLifecycleTest {
     @Test
     fun `drain returns Forced when graceful window expires but force completes`() {
         val taskRan = AtomicInteger(0)
+        val taskStarted = CountDownLatch(1)
         // One slow task that ignores interruption for ~30ms — long enough
         // to outlast the 1ms graceful window, short enough that
-        // shutdownNow's 200ms wait drains it.
+        // shutdownNow's 200ms wait drains it. The latch ensures the task
+        // is actually executing (not still queued) before drain() runs;
+        // otherwise shutdownNow could drop it from the queue and the
+        // taskRan==1 assertion would flake.
         executor.execute {
+            taskStarted.countDown()
             val end = System.currentTimeMillis() + 30
             while (System.currentTimeMillis() < end) {
                 // Busy-wait — InterruptedException can't end us early.
             }
             taskRan.incrementAndGet()
         }
+        assertTrue(taskStarted.await(2, TimeUnit.SECONDS))
 
         val outcome = StoreLifecycle(gracefulMillis = 1, forceMillis = 200).drain(executor)
         assertEquals(StoreLifecycle.DrainOutcome.Forced, outcome)
@@ -327,10 +333,19 @@ class StoreLifecycleTest {
     @Test
     fun `drain logs warning when graceful window expires`() {
         val logs = mutableListOf<String>()
+        val taskStarted = CountDownLatch(1)
+        // Latch confirms the task is running (not just queued) before
+        // drain() runs. Otherwise the 1ms graceful timeout might fire
+        // before the executor even picks up the task — shutdownNow would
+        // drop it from the queue without ever running it, and the
+        // warning would still fire (because graceful expired) but for
+        // the wrong reason (queue drop, not graceful overrun).
         executor.execute {
+            taskStarted.countDown()
             val end = System.currentTimeMillis() + 30
             while (System.currentTimeMillis() < end) { /* busy-wait */ }
         }
+        assertTrue(taskStarted.await(2, TimeUnit.SECONDS))
         StoreLifecycle(gracefulMillis = 1, forceMillis = 200, log = { logs += it }).drain(executor)
         assertTrue(
             "Expected a warning about not draining within the graceful window. Got: $logs",
