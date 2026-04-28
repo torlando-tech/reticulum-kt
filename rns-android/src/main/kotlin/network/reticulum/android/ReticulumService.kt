@@ -273,9 +273,19 @@ class ReticulumService : LifecycleService() {
         // has been closed" or "attempt to re-open an already-closed
         // object: SQLiteDatabase"). See StoreLifecycle for the full
         // rationale and the Sentry references (COLUMBA-8R, COLUMBA-8X).
+        //
+        // Timeouts: onDestroy runs on the Android main thread; the
+        // Service ANR window for foreground service teardown is ~20s.
+        // StoreLifecycle's defaults of 15s + 5s sit right at that
+        // cliff. Cap the drain budget at 4s + 1s = 5s total so we
+        // stay comfortably under the ANR threshold even on a slow
+        // device. Any writes that don't drain in 4s get shutdownNow'd
+        // and may be lost — acceptable trade vs. ANRing the user out.
         dbWriteExecutor?.let { executor ->
             val outcome =
                 StoreLifecycle(
+                    gracefulMillis = 4_000,
+                    forceMillis = 1_000,
                     log = { msg -> Log.w(TAG, msg) },
                 ).drain(executor)
             Log.i(TAG, "Reticulum DB executor drained on shutdown: $outcome")

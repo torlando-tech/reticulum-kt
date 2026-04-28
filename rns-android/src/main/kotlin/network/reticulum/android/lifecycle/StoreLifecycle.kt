@@ -66,8 +66,14 @@ class StoreLifecycle(
 
         /**
          * Graceful window elapsed before the queue emptied; `shutdownNow()`
-         * was called and the force-window completed cleanly. In-flight
-         * writes were interrupted; queued writes were dropped.
+         * was called and the force-window completed cleanly. Queued tasks
+         * were dropped from the executor's queue. In-flight tasks had
+         * their thread's interrupt flag set — they may have observed the
+         * interrupt and unwound, or (if they ignore interrupts, e.g. an
+         * uninterruptible busy-wait or a Room call that swallows
+         * `InterruptedException` internally) run to completion. Either
+         * way, by the time `Forced` is returned the executor is
+         * quiescent and the database can be closed safely.
          */
         Forced,
 
@@ -109,11 +115,25 @@ class StoreLifecycle(
                 }
             }
         } catch (_: InterruptedException) {
-            // Best-effort: re-assert the interrupt and abandon the wait.
-            // We still call shutdownNow so the executor's queue isn't
-            // left hanging across the rest of teardown.
-            Thread.currentThread().interrupt()
+            // The thread that called drain() was interrupted while waiting.
+            // Still need to give the executor a chance to terminate before
+            // returning — otherwise an in-flight task can be mid-write when
+            // the caller proceeds to `database.close()`, reintroducing the
+            // exact race this helper guards against.
+            //
+            // Re-assertion order matters: if we set the interrupt flag now
+            // and then call awaitTermination, awaitTermination throws
+            // InterruptedException immediately (it consumes the flag) and
+            // returns without waiting at all. So we wait first, then
+            // re-assert the interrupt right before returning.
             executor.shutdownNow()
+            try {
+                executor.awaitTermination(forceMillis, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                // Re-interrupted while waiting; nothing to do but bail.
+            } finally {
+                Thread.currentThread().interrupt()
+            }
             DrainOutcome.Interrupted
         }
     }

@@ -229,6 +229,65 @@ class StoreLifecycleTest {
         assertTrue("Executor must reject new submissions after drain()", rejected)
     }
 
+    /**
+     * If the thread that called drain() is interrupted mid-wait, drain
+     * still has to leave the executor quiescent before returning —
+     * otherwise an in-flight task can be mid-write when the caller
+     * proceeds to db.close(), reintroducing the race.
+     *
+     * Setup: run drain on a separate thread, interrupt it during the
+     * graceful wait, and verify (a) outcome is Interrupted, (b) the
+     * caller-thread's interrupt flag was re-asserted, (c) the
+     * in-flight task actually finished before drain returned.
+     */
+    @Test
+    fun `drain Interrupted path waits for in-flight task before returning`() {
+        val taskStarted = CountDownLatch(1)
+        val taskFinished = CountDownLatch(1)
+        val taskWasRunningWhenDrainReturned = AtomicBoolean(false)
+        val drainObservedInterrupt = AtomicBoolean(false)
+
+        // Long-but-finite task. Force window of 500ms is enough for it
+        // to finish; this proves drain awaits termination after
+        // shutdownNow even on the Interrupted path.
+        executor.execute {
+            taskStarted.countDown()
+            try {
+                Thread.sleep(200)
+            } catch (_: InterruptedException) {
+                // Eat the interrupt so the task runs to completion;
+                // mirrors a Room insertAll that doesn't honor interrupts.
+            }
+            taskFinished.countDown()
+        }
+        assertTrue(taskStarted.await(2, TimeUnit.SECONDS))
+
+        var outcome: StoreLifecycle.DrainOutcome? = null
+        val drainThread = Thread {
+            outcome = StoreLifecycle(
+                gracefulMillis = 60_000,
+                forceMillis = 2_000,
+            ).drain(executor)
+            taskWasRunningWhenDrainReturned.set(taskFinished.count > 0)
+            drainObservedInterrupt.set(Thread.currentThread().isInterrupted)
+        }
+        drainThread.start()
+        // Let drain enter awaitTermination, then interrupt it.
+        Thread.sleep(50)
+        drainThread.interrupt()
+        drainThread.join(5_000)
+
+        assertEquals(StoreLifecycle.DrainOutcome.Interrupted, outcome)
+        assertFalse(
+            "drain returned before task finished — would let caller race db.close() against the in-flight write",
+            taskWasRunningWhenDrainReturned.get(),
+        )
+        assertTrue(
+            "drain must re-assert the interrupt flag on its caller thread",
+            drainObservedInterrupt.get(),
+        )
+    }
+
     @Test
     fun `drain logs warning when graceful window expires`() {
         val logs = mutableListOf<String>()
