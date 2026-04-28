@@ -86,7 +86,17 @@ class StoreLifecycle(
 
         /**
          * The thread calling [drain] was interrupted while waiting.
-         * `shutdownNow()` was called and the interrupt re-asserted.
+         * `shutdownNow()` was called and the interrupt re-asserted on
+         * the caller's thread.
+         *
+         * NOTE: the executor's actual termination state is unspecified
+         * when this is returned — drain made a bounded best-effort
+         * `awaitTermination(forceMillis)` after `shutdownNow`, but if
+         * that wait also expired, the executor is in the same degraded
+         * "still running" state as [Stuck]. A "still running after
+         * shutdownNow" warning is emitted via [log] when this happens
+         * so logs reflect the degradation regardless of whether the
+         * caller-thread was interrupted en route.
          */
         Interrupted,
     }
@@ -127,12 +137,25 @@ class StoreLifecycle(
             // returns without waiting at all. So we wait first, then
             // re-assert the interrupt right before returning.
             executor.shutdownNow()
-            try {
+            val terminated = try {
                 executor.awaitTermination(forceMillis, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 // Re-interrupted while waiting; nothing to do but bail.
+                false
             } finally {
                 Thread.currentThread().interrupt()
+            }
+            if (!terminated) {
+                // Mirrors the warning emitted on the normal Stuck path —
+                // the executor is in the same degraded state, just reached
+                // via interrupt instead of force-window expiry. Without
+                // this, log scrapers monitoring "still running after
+                // shutdownNow" would silently miss the interrupted
+                // variant of the same condition.
+                log(
+                    "DB write executor still running after shutdownNow + ${forceMillis}ms wait " +
+                        "(interrupted path)",
+                )
             }
             DrainOutcome.Interrupted
         }

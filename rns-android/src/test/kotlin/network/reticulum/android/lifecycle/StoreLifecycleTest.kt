@@ -288,6 +288,42 @@ class StoreLifecycleTest {
         )
     }
 
+    /**
+     * The Interrupted path's force-wait can also expire (uninterruptible
+     * worker), leaving the executor in the same degraded state as Stuck.
+     * Without this warning, log scrapers watching for "still running
+     * after shutdownNow" would silently miss the interrupted variant.
+     */
+    @Test
+    fun `drain Interrupted path warns when executor still stuck after shutdownNow`() {
+        val taskStarted = CountDownLatch(1)
+        // Uninterruptible worker; outlives the Interrupted-path force wait.
+        executor.execute {
+            taskStarted.countDown()
+            val end = System.currentTimeMillis() + 5_000
+            while (System.currentTimeMillis() < end) { /* busy-wait */ }
+        }
+        assertTrue(taskStarted.await(1, TimeUnit.SECONDS))
+
+        val logs = mutableListOf<String>()
+        val drainThread = Thread {
+            StoreLifecycle(
+                gracefulMillis = 60_000,
+                forceMillis = 50,
+                log = { synchronized(logs) { logs += it } },
+            ).drain(executor)
+        }
+        drainThread.start()
+        Thread.sleep(50)
+        drainThread.interrupt()
+        drainThread.join(5_000)
+
+        assertTrue(
+            "Expected Interrupted-path warning about executor still running. Got: $logs",
+            logs.any { it.contains("still running") && it.contains("interrupted path") },
+        )
+    }
+
     @Test
     fun `drain logs warning when graceful window expires`() {
         val logs = mutableListOf<String>()
