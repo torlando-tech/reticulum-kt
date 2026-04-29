@@ -138,8 +138,21 @@ class Resource private constructor(
                 )
                 return null
             }
+            // Track whether initialization registered the resource so that
+            // a thrown `requestNext()` doesn't leave a zombie entry in
+            // `link.incomingResources`. `initializeFromAdvertisement` calls
+            // `link.registerIncomingResource(this)` and `startWatchdog()`
+            // before we get a chance to call `requestNext()`; a throw from
+            // there with the registration leaked would mean the dedup guard
+            // above rejects every subsequent retransmit of the same
+            // advertisement.hash for the lifetime of the link, removing the
+            // recovery path entirely. Python's accept (Resource.py:223-244)
+            // has the same shape but the failure modes there are caught by
+            // its own watchdog cancellation; we mirror that recovery
+            // explicitly via `resource.cancel()`.
+            var resource: Resource? = null
             return try {
-                val resource = Resource(link, initiator = false)
+                resource = Resource(link, initiator = false)
 
                 callback?.let { resource.callbacks.completed = it }
                 progressCallback?.let { resource.callbacks.progress = it }
@@ -150,6 +163,7 @@ class Resource private constructor(
                 resource
             } catch (e: Exception) {
                 log("Failed to accept resource: ${e.message}")
+                resource?.cancel()
                 null
             }
         }
@@ -1228,11 +1242,24 @@ class Resource private constructor(
 
     /**
      * Cancel this resource transfer.
+     *
+     * Mirrors python `RNS.Resource.cancel` (Resource.py:1079-1108): set
+     * `status = FAILED`, remove from the link's incoming/outgoing list
+     * via `link.resourceConcluded`, and notify any registered failure
+     * callback. Without the `callbacks.failed?.invoke` fire here, the
+     * watchdog timeout path would silently drop the registration but
+     * leave the message-level state stuck at SENDING/TRANSFERRING.
+     * Without `link.resourceConcluded`, the hash would remain in
+     * `incomingResources` for the lifetime of the link — every
+     * subsequent retransmit of the same `RESOURCE_ADV` would be dropped
+     * by the dedup guard inside `Resource.accept`, removing the
+     * recovery path that existed pre-dedup.
      */
     fun cancel() {
         stopWatchdog()
         status = ResourceConstants.FAILED
         link.resourceConcluded(this)
+        callbacks.failed?.invoke(this)
         log("Resource ${hash.toHexString()} cancelled")
     }
 
@@ -1345,10 +1372,20 @@ class Resource private constructor(
                 if (idleTime > timeout) {
                     retries++
                     if (retries > ResourceConstants.MAX_RETRIES) {
-                        status = ResourceConstants.FAILED
+                        // Mirrors python `Resource.py:578, 591, 628, 636, 648,
+                        // 667, 690` etc. — every retries-exhausted branch in
+                        // python's watchdog calls `self.cancel()`. Calling
+                        // cancel() (rather than the previous inline
+                        // `status = FAILED; callbacks.failed?.invoke`) ensures
+                        // `link.resourceConcluded(this)` runs, which removes
+                        // the resource from `incomingResources` so a future
+                        // RESOURCE_ADV with the same hash is no longer
+                        // dropped by the dedup guard inside
+                        // `Resource.accept`. Without this, a single
+                        // watchdog-fail leaves the hash registered for the
+                        // lifetime of the link, killing the recovery path.
                         log("Resource ${hash.toHexString()} timed out after $retries retries")
-                        callbacks.failed?.invoke(this)
-                        watchdogActive = false
+                        cancel()
                         break
                     } else {
                         log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
