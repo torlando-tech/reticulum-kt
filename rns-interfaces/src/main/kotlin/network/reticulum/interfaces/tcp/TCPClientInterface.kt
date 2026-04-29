@@ -95,7 +95,15 @@ class TCPClientInterface(
     private var socket: Socket? = null
     private val reconnecting = AtomicBoolean(false)
     private val neverConnected = AtomicBoolean(true)
-    private val writing = AtomicBoolean(false)
+
+    // Serializes concurrent writes to the socket. Was previously an
+    // AtomicBoolean check-then-set with a 10ms Thread.sleep busy-spin —
+    // that's both racy (two threads can pass the check before either sets
+    // the flag, interleaving frame bytes on the socket) and slow
+    // (concurrent writes pay 10ms minimum per turn). A ReentrantLock gives
+    // proper mutual exclusion AND wakes immediately when the prior write
+    // releases, removing the per-frame floor on concurrent send latency.
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
 
     // Debug counters
     private val framesSent = AtomicLong(0)
@@ -360,14 +368,8 @@ class TCPClientInterface(
             throw IOException("Socket not in valid state for write: $state")
         }
 
-        // Wait for any pending write to complete
-        while (writing.get()) {
-            Thread.sleep(10)
-        }
-
+        writeLock.lock()
         try {
-            writing.set(true)
-
             val framedData = if (useKissFraming) {
                 KISS.frame(data)
             } else {
@@ -417,7 +419,7 @@ class TCPClientInterface(
             teardown()
             throw e
         } finally {
-            writing.set(false)
+            writeLock.unlock()
         }
     }
 

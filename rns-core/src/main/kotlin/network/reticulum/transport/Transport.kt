@@ -3198,6 +3198,23 @@ object Transport {
     /**
      * Transmit raw data on an interface.
      * Applies IFAC masking if the interface has IFAC enabled.
+     *
+     * Releases [jobsLock] across the blocking [InterfaceRef.send] call. The lock
+     * scope of the caller (typically [outbound] or [inbound]) covers the routing
+     * decision and any state writes, both of which complete before transmit is
+     * called. The actual socket I/O may block — TCP write waiting for kernel
+     * buffer drain, AutoInterface waiting on UDP socket, etc — and holding
+     * jobsLock across that block prevents other threads from processing inbound
+     * packets, including the very acks/requests we need to make progress on
+     * resource transfers. Release+re-acquire pattern matches what
+     * [raceInducerSleepReleasingJobsLock] does for tests; here it's a perf fix.
+     *
+     * Safety: the routing decision (path lookup, link table) is committed before
+     * we get here. Concurrent transmits on the same interface are serialized
+     * inside the interface's own send path. Re-acquiring jobsLock after the
+     * write returns lets the caller's loop continue with whatever state mutated
+     * during the released window — same posture as if the inbound packet that
+     * mutated it had arrived a few microseconds later.
      */
     private fun transmit(
         interfaceRef: InterfaceRef,
@@ -3218,7 +3235,20 @@ object Transport {
                 val context = data[18].toInt() and 0xFF
                 log("TX PACKET: flags=0x${"%02x".format(flags)} hops=$hops dest=${destHash.take(16)}... ctx=0x${"%02x".format(context)} size=${data.size}")
             }
-            interfaceRef.send(transmitData)
+
+            val heldByCurrent = jobsLock.isHeldByCurrentThread
+            val holdCount = if (heldByCurrent) jobsLock.holdCount else 0
+            if (holdCount > 0) {
+                repeat(holdCount) { jobsLock.unlock() }
+            }
+            try {
+                interfaceRef.send(transmitData)
+            } finally {
+                if (holdCount > 0) {
+                    repeat(holdCount) { jobsLock.lock() }
+                }
+            }
+
             trafficTxBytes += transmitData.size
             recordTxBytes(interfaceRef, transmitData.size)
         } catch (e: Exception) {
