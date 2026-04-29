@@ -39,6 +39,20 @@ This file is the **single source of truth** for every place where reticulum-kt's
 
 ## Deviations
 
+### Optimistic identity-CAS on pathTable/linkTable updates after `transmit()` — `rns-core/.../Transport.kt::processOutbound`, transport forwarding, link forwarding
+
+**Python reference:** `RNS/Transport.py:134, 136` — python protects `path_table` and `link_table` with dedicated per-table locks (`path_table_lock`, `link_table_lock`) acquired only when the table is read or written, distinct from the main `jobs_lock` that wraps inbound/outbound entry points.
+
+**Category:** language/runtime forced.
+
+**Date:** 2026-04-29.
+
+**Tracking:** reticulum-kt#64 greptile P1 carry-over ("stale pathEntry read-modify-write on pathTable/linkTable after lock re-acquisition in transmit's callers").
+
+**Description:** kotlin's `Transport` uses a single process-wide `jobsLock` covering both inbound and outbound. After `transmit()` was changed to release `jobsLock` around blocking interface I/O (a separate deviation needed for perf — see #65), the post-transmit `pathTable[key] = pathEntry.touch()` and `linkTable[key] = linkEntry.copy(...)` patterns at `processOutbound` lines 2885-2887, 2972-2974, and 3118-3122 became read-modify-write hazards: another thread processing a fresher inbound announce on the same destination could replace the entry during the release window, and the post-transmit blind write would clobber it with a stale-derived value. Rather than introducing per-table locks (which would require restructuring all `pathTable`/`linkTable` access sites — a much larger change), kotlin uses optimistic identity-CAS at the three affected sites: re-read `pathTable[key]`/`linkTable[key]` after `transmit()` returns and only write back if the current entry is still `=== pathEntry` (or `=== linkEntry`). If a fresher entry has replaced ours during the release, we skip our touch and leave their newer state alone. Python's per-table locks achieve the same invariant via stricter exclusion; kotlin's optimistic check achieves it via "no overwrite of fresher state."
+
+**Re-evaluation:** if `Transport`'s state model is ever refactored to per-table locks (matching python's structure exactly), this can be retired. Until then, every new post-transmit `pathTable`/`linkTable` write site needs the same identity-CAS check.
+
 ### Watchdog uses Thread + interrupt() instead of flag-check job ID — `rns-core/.../Resource.kt::startWatchdog`, `stopWatchdog`, `watchdogJob`
 
 **Python reference:** `RNS/Resource.py:560-670` (`watchdog_job` / `__watchdog_job_id`). Python spawns a daemon thread that runs a `while self.status < Resource.ASSEMBLING and this_job_id == self.__watchdog_job_id` loop. Stopping a watchdog increments `__watchdog_job_id` so the next loop iteration's compare-and-exit fires; no thread interruption is involved.

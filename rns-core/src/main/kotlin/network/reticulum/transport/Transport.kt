@@ -2883,9 +2883,26 @@ object Transport {
                                 }
 
                                 transmit(outboundInterface, newRaw)
-                                val touched = pathEntry.touch()
-                                pathTable[packet.destinationHash.toKey()] = touched
-                                pathStore?.upsertPath(packet.destinationHash, touched)
+                                // Compare-by-identity before writing back the
+                                // touched timestamp: `transmit()` releases
+                                // `jobsLock` for the blocking socket I/O, so
+                                // another thread (typically `Transport.inbound`
+                                // processing a fresher announce on the same
+                                // destination) may have replaced this entry
+                                // during the release window. Only touch if the
+                                // entry is still the one we observed before
+                                // transmit; otherwise the fresher entry wins
+                                // and our touch would be a stale overwrite.
+                                // Python avoids this via per-table
+                                // `path_table_lock` (Transport.py:134); kotlin
+                                // uses optimistic identity-CAS — see
+                                // port-deviations.md.
+                                val key = packet.destinationHash.toKey()
+                                if (pathTable[key] === pathEntry) {
+                                    val touched = pathEntry.touch()
+                                    pathTable[key] = touched
+                                    pathStore?.upsertPath(packet.destinationHash, touched)
+                                }
                                 log(
                                     "Transport forwarding ${packet.packetType} for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (remaining_hops=${pathEntry.hops})",
                                 )
@@ -2970,8 +2987,13 @@ object Transport {
         val newRaw = raw.copyOf()
         newRaw[1] = packet.hops.toByte()
         transmit(outboundInterface, newRaw)
-        linkTable[packet.destinationHash.toKey()] =
-            linkEntry.copy(timestamp = System.currentTimeMillis())
+        // Optimistic identity-CAS: don't overwrite a fresher linkEntry that
+        // another thread may have written during transmit's lock release.
+        // See port-deviations.md (path/link table identity-CAS).
+        val linkKey = packet.destinationHash.toKey()
+        if (linkTable[linkKey] === linkEntry) {
+            linkTable[linkKey] = linkEntry.copy(timestamp = System.currentTimeMillis())
+        }
         log(
             "Forwarding ${packet.packetType}/${packet.context} for " +
                 "${packet.destinationHash.toHexString()} via ${outboundInterface.name}",
@@ -3116,10 +3138,17 @@ object Transport {
                 }
 
                 if (sent) {
-                    // Update path timestamp
-                    val touched = pathEntry.touch()
-                    pathTable[packet.destinationHash.toKey()] = touched
-                    pathStore?.upsertPath(packet.destinationHash, touched)
+                    // Update path timestamp. Optimistic identity-CAS: only
+                    // touch if the entry is still ours; transmit's lock
+                    // release may have allowed a fresher inbound update to
+                    // replace pathTable[key]. See port-deviations.md
+                    // (path/link table identity-CAS).
+                    val key = packet.destinationHash.toKey()
+                    if (pathTable[key] === pathEntry) {
+                        val touched = pathEntry!!.touch()
+                        pathTable[key] = touched
+                        pathStore?.upsertPath(packet.destinationHash, touched)
+                    }
                 }
             } else {
                 log("Path exists for $destHex but interface not found")

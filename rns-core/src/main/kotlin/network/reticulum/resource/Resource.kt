@@ -1256,6 +1256,16 @@ class Resource private constructor(
      * recovery path that existed pre-dedup.
      */
     fun cancel() {
+        // Idempotency guard. Mirrors python `Resource.py:1090`'s
+        // `elif self.status < Resource.COMPLETE:` check — once a resource
+        // has reached a terminal state (COMPLETE / FAILED / CORRUPT,
+        // status >= COMPLETE = 0x06), a second cancel() is a no-op.
+        // Necessary now that cancel() fires `callbacks.failed?.invoke`:
+        // without this guard, a double-cancel from application code +
+        // watchdog timeout would deliver the failed callback twice.
+        if (status >= ResourceConstants.COMPLETE) {
+            return
+        }
         stopWatchdog()
         status = ResourceConstants.FAILED
         link.resourceConcluded(this)
