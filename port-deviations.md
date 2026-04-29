@@ -39,6 +39,20 @@ This file is the **single source of truth** for every place where reticulum-kt's
 
 ## Deviations
 
+### Watchdog uses Thread + interrupt() instead of flag-check job ID — `rns-core/.../Resource.kt::startWatchdog`, `stopWatchdog`, `watchdogJob`
+
+**Python reference:** `RNS/Resource.py:560-670` (`watchdog_job` / `__watchdog_job_id`). Python spawns a daemon thread that runs a `while self.status < Resource.ASSEMBLING and this_job_id == self.__watchdog_job_id` loop. Stopping a watchdog increments `__watchdog_job_id` so the next loop iteration's compare-and-exit fires; no thread interruption is involved.
+
+**Category:** language/runtime forced.
+
+**Date:** 2026-04-29.
+
+**Tracking:** reticulum-kt#64 greptile P1 ("`cancel()` self-interrupts before `callbacks.failed`").
+
+**Description:** kotlin's watchdog uses `kotlin.concurrent.thread { ... }` + `Thread.sleep` + `Thread.interrupt()` for prompt wake-up rather than the python flag-check-after-sleep pattern. Both achieve the same end (loop exits when active=false), but the kotlin `interrupt()` call introduces a self-targeting hazard not present in python: when `cancel()` is invoked from inside `watchdogJob` itself (the new retries-exhausted branch), `stopWatchdog()` would interrupt the current thread, leaving the interrupt flag set during the subsequent `callbacks.failed?.invoke` and silently aborting any I/O the failed callback performs that uses interruptible primitives (notably `ReentrantLock.lockInterruptibly()` on TCP writes — added for shutdown responsiveness in this same PR). `stopWatchdog` therefore checks `Thread.currentThread() === watchdogThread` and skips the self-interrupt; the loop's `if (!watchdogActive) break` already handles the cooperative exit, matching python's flag-check semantics for this case.
+
+**Re-evaluation:** if kotlin coroutines replace the threaded watchdog (likely a future direction — `processingScope.launch { while (active) { delay(...); ... } }` would compose better with the rest of the rns-core async surface), the entire interrupt mechanism goes away and this deviation can be retired.
+
 ### Eager cleanup on `Resource.accept` exception — `rns-core/.../Resource.kt::accept`
 
 **Python reference:** `RNS/Resource.py:223-244`. Python's `Resource.accept` calls `link.register_incoming_resource(resource)` and then `resource.hashmap_update(0, resource.hashmap_raw)` and finally `resource.watchdog_job()`. If `hashmap_update` throws, the outer `try/except` catches it, logs, and returns None — but the resource has already been registered via `register_incoming_resource`, and the watchdog has not yet been started, so the registration leaks for the lifetime of the link with no recovery path.

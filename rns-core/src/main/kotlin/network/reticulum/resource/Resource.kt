@@ -1347,10 +1347,24 @@ class Resource private constructor(
 
     /**
      * Stop the watchdog thread.
+     *
+     * Skips the `interrupt()` call when invoked from the watchdog thread
+     * itself (via `cancel()`'s call from `watchdogJob`'s retry-exhausted
+     * branch). Setting the interrupt flag on the current thread would
+     * propagate into any subsequent callback I/O — `callbacks.failed`
+     * runs on this same thread, and a TCP send from inside the failed
+     * callback uses `ReentrantLock.lockInterruptibly()` which checks
+     * the flag on entry and immediately throws, silently aborting the
+     * send. Python's watchdog uses a `__watchdog_job_id` flag check
+     * rather than thread interruption (Resource.py:560-670), so the
+     * equivalent self-targeting issue doesn't exist there.
      */
     private fun stopWatchdog() {
         watchdogActive = false
-        watchdogThread?.interrupt()
+        val thread = watchdogThread
+        if (thread != null && thread !== Thread.currentThread()) {
+            thread.interrupt()
+        }
         watchdogThread = null
     }
 
