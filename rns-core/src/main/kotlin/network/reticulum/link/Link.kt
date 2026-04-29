@@ -2159,13 +2159,13 @@ class Link private constructor(
                 return
             }
 
-            // Dedupe duplicate advertisements. See [hasIncomingResource]
-            // for the rationale. Mirrors python `Resource.accept`'s
-            // `not has_incoming_resource(resource)` guard at Resource.py:223.
-            if (hasIncomingResource(advertisement.hash)) {
-                log("Ignoring RESOURCE_ADV ${advertisement.hash.toHexString()} — resource already transferring")
-                return
-            }
+            // Note: dedup of duplicate advertisements lives inside
+            // `Resource.accept` (mirroring python `Resource.py:223`), so
+            // all four call sites below — request, response, ACCEPT_APP,
+            // ACCEPT_ALL — are guarded uniformly. `Resource.accept`
+            // returns null on a hash that is already in
+            // `incomingResources`, and the `if (resource != null)`
+            // checks below skip registration in that case.
 
             // General resource advertisement - check strategy
             when (resourceStrategy) {

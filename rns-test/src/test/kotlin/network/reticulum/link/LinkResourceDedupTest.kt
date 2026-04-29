@@ -4,6 +4,7 @@ import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
 import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
@@ -16,6 +17,7 @@ import java.io.ByteArrayOutputStream
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -149,7 +151,47 @@ class LinkResourceDedupTest {
         assertTrue(
             link.hasIncomingResource(secondResource.hash),
             "hasIncomingResource must catch duplicate-hash from a fresh Resource instance " +
-                "(production: Link.processResourceAdv consults this before Resource.accept)",
+                "(production: Resource.accept consults this — covers all four call sites)",
+        )
+    }
+
+    @Test
+    @DisplayName("Resource.accept returns null on duplicate-hash advertisement (covers all 4 call sites)")
+    @Timeout(5)
+    fun `Resource accept returns null on duplicate-hash advertisement`() {
+        // Greptile P1 on PR #64: the dedup must live inside Resource.accept,
+        // not just at the general-strategy branch of Link.processResourceAdv.
+        // Otherwise the isRequest, isResponse, and ACCEPT_APP branches —
+        // which all call Resource.accept directly — bypass the check and
+        // double-deliver. Mirror python `Resource.py:223` exactly: the
+        // `not link.has_incoming_resource(resource)` guard sits inside
+        // accept(), so every call site benefits uniformly.
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xCD.toByte() }
+
+        // Seed the link's incomingResources with a Resource for advHash.
+        link.registerIncomingResource(makeResourceWithHash(link, advHash))
+        assertEquals(1, link.incomingResourceHashesForTest().size)
+
+        // Now build an advertisement whose `h` matches advHash — this is
+        // exactly what a sender retransmit produces. Resource.accept must
+        // detect the duplicate and return null without registering a
+        // second Resource.
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+
+        val accepted = Resource.accept(advertisement = adv, link = link)
+        assertNull(
+            accepted,
+            "Resource.accept must return null when the advertisement hash is already incoming — " +
+                "the dedup guard inside accept() is what protects the isRequest/isResponse/ACCEPT_APP " +
+                "branches that bypass the Link-layer check",
+        )
+        assertEquals(
+            1,
+            link.incomingResourceHashesForTest().size,
+            "No second Resource should be registered — the duplicate ADV must be dropped " +
+                "before any setup work runs",
         )
     }
 

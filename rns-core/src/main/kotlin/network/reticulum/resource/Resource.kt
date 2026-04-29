@@ -119,6 +119,25 @@ class Resource private constructor(
             callback: ((Resource) -> Unit)? = null,
             progressCallback: ((Resource) -> Unit)? = null
         ): Resource? {
+            // Dedupe duplicate advertisements before doing any setup work.
+            // Mirrors python `RNS.Resource.accept`'s
+            // `if not resource.link.has_incoming_resource(resource)` guard
+            // at Resource.py:223 — the check sits inside accept() so all
+            // four `Link.processResourceAdv` call sites (isRequest,
+            // isResponse, ACCEPT_APP, ACCEPT_ALL) automatically benefit.
+            // Transport's packet hashlist intentionally skips LINK-destined
+            // packets, so a sender retransmit of `RESOURCE_ADV` reaches the
+            // link layer in raw form; without this check a fresh Resource
+            // instance gets built per retransmit and assemble fires twice
+            // (observed as `Inbox sizes [N, N]` in the cross-impl
+            // conformance suite).
+            if (link.hasIncomingResource(advertisement.hash)) {
+                log(
+                    "Ignoring RESOURCE_ADV ${advertisement.hash.toHexString()} — " +
+                        "resource already transferring",
+                )
+                return null
+            }
             return try {
                 val resource = Resource(link, initiator = false)
 
