@@ -368,7 +368,14 @@ class TCPClientInterface(
             throw IOException("Socket not in valid state for write: $state")
         }
 
-        writeLock.lock()
+        // lockInterruptibly() preserves the previous behaviour: the old
+        // Thread.sleep(10) busy-spin would throw InterruptedException
+        // when the writer thread was interrupted during shutdown. A plain
+        // lock() parks uninterruptibly, which would silently swallow the
+        // interrupt until the socket gets closed via teardown(). Keeping
+        // the interrupt path lets stop()-style teardowns drain promptly
+        // even when a write is contended.
+        writeLock.lockInterruptibly()
         try {
             val framedData = if (useKissFraming) {
                 KISS.frame(data)
