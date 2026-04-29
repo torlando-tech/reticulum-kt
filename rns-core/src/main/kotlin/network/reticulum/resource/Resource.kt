@@ -119,8 +119,40 @@ class Resource private constructor(
             callback: ((Resource) -> Unit)? = null,
             progressCallback: ((Resource) -> Unit)? = null
         ): Resource? {
+            // Dedupe duplicate advertisements before doing any setup work.
+            // Mirrors python `RNS.Resource.accept`'s
+            // `if not resource.link.has_incoming_resource(resource)` guard
+            // at Resource.py:223 — the check sits inside accept() so all
+            // four `Link.processResourceAdv` call sites (isRequest,
+            // isResponse, ACCEPT_APP, ACCEPT_ALL) automatically benefit.
+            // Transport's packet hashlist intentionally skips LINK-destined
+            // packets, so a sender retransmit of `RESOURCE_ADV` reaches the
+            // link layer in raw form; without this check a fresh Resource
+            // instance gets built per retransmit and assemble fires twice
+            // (observed as `Inbox sizes [N, N]` in the cross-impl
+            // conformance suite).
+            if (link.hasIncomingResource(advertisement.hash)) {
+                log(
+                    "Ignoring RESOURCE_ADV ${advertisement.hash.toHexString()} — " +
+                        "resource already transferring",
+                )
+                return null
+            }
+            // Track whether initialization registered the resource so that
+            // a thrown `requestNext()` doesn't leave a zombie entry in
+            // `link.incomingResources`. `initializeFromAdvertisement` calls
+            // `link.registerIncomingResource(this)` and `startWatchdog()`
+            // before we get a chance to call `requestNext()`; a throw from
+            // there with the registration leaked would mean the dedup guard
+            // above rejects every subsequent retransmit of the same
+            // advertisement.hash for the lifetime of the link, removing the
+            // recovery path entirely. Python's accept (Resource.py:223-244)
+            // has the same shape but the failure modes there are caught by
+            // its own watchdog cancellation; we mirror that recovery
+            // explicitly via `resource.cancel()`.
+            var resource: Resource? = null
             return try {
-                val resource = Resource(link, initiator = false)
+                resource = Resource(link, initiator = false)
 
                 callback?.let { resource.callbacks.completed = it }
                 progressCallback?.let { resource.callbacks.progress = it }
@@ -131,6 +163,7 @@ class Resource private constructor(
                 resource
             } catch (e: Exception) {
                 log("Failed to accept resource: ${e.message}")
+                resource?.cancel()
                 null
             }
         }
@@ -1209,11 +1242,34 @@ class Resource private constructor(
 
     /**
      * Cancel this resource transfer.
+     *
+     * Mirrors python `RNS.Resource.cancel` (Resource.py:1079-1108): set
+     * `status = FAILED`, remove from the link's incoming/outgoing list
+     * via `link.resourceConcluded`, and notify any registered failure
+     * callback. Without the `callbacks.failed?.invoke` fire here, the
+     * watchdog timeout path would silently drop the registration but
+     * leave the message-level state stuck at SENDING/TRANSFERRING.
+     * Without `link.resourceConcluded`, the hash would remain in
+     * `incomingResources` for the lifetime of the link — every
+     * subsequent retransmit of the same `RESOURCE_ADV` would be dropped
+     * by the dedup guard inside `Resource.accept`, removing the
+     * recovery path that existed pre-dedup.
      */
     fun cancel() {
+        // Idempotency guard. Mirrors python `Resource.py:1090`'s
+        // `elif self.status < Resource.COMPLETE:` check — once a resource
+        // has reached a terminal state (COMPLETE / FAILED / CORRUPT,
+        // status >= COMPLETE = 0x06), a second cancel() is a no-op.
+        // Necessary now that cancel() fires `callbacks.failed?.invoke`:
+        // without this guard, a double-cancel from application code +
+        // watchdog timeout would deliver the failed callback twice.
+        if (status >= ResourceConstants.COMPLETE) {
+            return
+        }
         stopWatchdog()
         status = ResourceConstants.FAILED
         link.resourceConcluded(this)
+        callbacks.failed?.invoke(this)
         log("Resource ${hash.toHexString()} cancelled")
     }
 
@@ -1301,10 +1357,24 @@ class Resource private constructor(
 
     /**
      * Stop the watchdog thread.
+     *
+     * Skips the `interrupt()` call when invoked from the watchdog thread
+     * itself (via `cancel()`'s call from `watchdogJob`'s retry-exhausted
+     * branch). Setting the interrupt flag on the current thread would
+     * propagate into any subsequent callback I/O — `callbacks.failed`
+     * runs on this same thread, and a TCP send from inside the failed
+     * callback uses `ReentrantLock.lockInterruptibly()` which checks
+     * the flag on entry and immediately throws, silently aborting the
+     * send. Python's watchdog uses a `__watchdog_job_id` flag check
+     * rather than thread interruption (Resource.py:560-670), so the
+     * equivalent self-targeting issue doesn't exist there.
      */
     private fun stopWatchdog() {
         watchdogActive = false
-        watchdogThread?.interrupt()
+        val thread = watchdogThread
+        if (thread != null && thread !== Thread.currentThread()) {
+            thread.interrupt()
+        }
         watchdogThread = null
     }
 
@@ -1326,10 +1396,20 @@ class Resource private constructor(
                 if (idleTime > timeout) {
                     retries++
                     if (retries > ResourceConstants.MAX_RETRIES) {
-                        status = ResourceConstants.FAILED
+                        // Mirrors python `Resource.py:578, 591, 628, 636, 648,
+                        // 667, 690` etc. — every retries-exhausted branch in
+                        // python's watchdog calls `self.cancel()`. Calling
+                        // cancel() (rather than the previous inline
+                        // `status = FAILED; callbacks.failed?.invoke`) ensures
+                        // `link.resourceConcluded(this)` runs, which removes
+                        // the resource from `incomingResources` so a future
+                        // RESOURCE_ADV with the same hash is no longer
+                        // dropped by the dedup guard inside
+                        // `Resource.accept`. Without this, a single
+                        // watchdog-fail leaves the hash registered for the
+                        // lifetime of the link, killing the recovery path.
                         log("Resource ${hash.toHexString()} timed out after $retries retries")
-                        callbacks.failed?.invoke(this)
-                        watchdogActive = false
+                        cancel()
                         break
                     } else {
                         log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")

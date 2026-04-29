@@ -2159,6 +2159,14 @@ class Link private constructor(
                 return
             }
 
+            // Note: dedup of duplicate advertisements lives inside
+            // `Resource.accept` (mirroring python `Resource.py:223`), so
+            // all four call sites below — request, response, ACCEPT_APP,
+            // ACCEPT_ALL — are guarded uniformly. `Resource.accept`
+            // returns null on a hash that is already in
+            // `incomingResources`, and the `if (resource != null)`
+            // checks below skip registration in that case.
+
             // General resource advertisement - check strategy
             when (resourceStrategy) {
                 ACCEPT_NONE -> {
@@ -2576,7 +2584,12 @@ class Link private constructor(
     }
 
     /**
-     * Register an incoming resource with this link.
+     * Register an incoming resource with this link. Reference-dedup only —
+     * callers are expected to consult [hasIncomingResource] first to avoid
+     * registering a fresh Resource built from a duplicate RESOURCE_ADV. This
+     * mirrors Python `RNS.Link.register_incoming_resource` (Link.py:1308),
+     * which is also a plain append; the python `Resource.accept` does the
+     * hash-based dedup check before registration.
      */
     fun registerIncomingResource(resource: network.reticulum.resource.Resource) {
         synchronized(incomingResources) {
@@ -2586,6 +2599,38 @@ class Link private constructor(
             }
         }
     }
+
+    /**
+     * Returns true if an incoming resource with the same advertisement hash
+     * is already registered. Mirrors Python `RNS.Link.has_incoming_resource`
+     * (Link.py:1311) — the hash equality check that prevents accepting the
+     * same RESOURCE_ADV twice when the sender retransmits it.
+     *
+     * This check is load-bearing because Transport's packet hashlist
+     * intentionally skips LINK-destined packets (see Transport.processInbound's
+     * `rememberHash` calculation), so a sender retransmit reaches the link
+     * layer in raw form. Without this check, two independent Resource state
+     * machines would fill from the same parts, both `assemble()`, and the
+     * user delivery callback would fire twice (observed as `Inbox sizes
+     * [N, N]` in the cross-impl conformance suite when `jobsLock` was
+     * released around blocking I/O — the timing change exposed the latent
+     * race).
+     */
+    fun hasIncomingResource(advertisementHash: ByteArray): Boolean =
+        synchronized(incomingResources) {
+            incomingResources.any { it.hash.contentEquals(advertisementHash) }
+        }
+
+    /**
+     * Test-only: snapshot of the current incoming resource hashes.
+     * Used by `LinkResourceDedupTest` (in `rns-test`, a separate module —
+     * Kotlin `internal` would not cross the module boundary, hence `public`)
+     * to verify dedup behavior. Production code should NOT depend on this
+     * surface.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    fun incomingResourceHashesForTest(): List<ByteArray> =
+        synchronized(incomingResources) { incomingResources.map { it.hash } }
 
     /**
      * Called when a resource transfer concludes (successfully or with failure).

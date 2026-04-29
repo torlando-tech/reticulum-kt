@@ -2883,9 +2883,26 @@ object Transport {
                                 }
 
                                 transmit(outboundInterface, newRaw)
-                                val touched = pathEntry.touch()
-                                pathTable[packet.destinationHash.toKey()] = touched
-                                pathStore?.upsertPath(packet.destinationHash, touched)
+                                // Compare-by-identity before writing back the
+                                // touched timestamp: `transmit()` releases
+                                // `jobsLock` for the blocking socket I/O, so
+                                // another thread (typically `Transport.inbound`
+                                // processing a fresher announce on the same
+                                // destination) may have replaced this entry
+                                // during the release window. Only touch if the
+                                // entry is still the one we observed before
+                                // transmit; otherwise the fresher entry wins
+                                // and our touch would be a stale overwrite.
+                                // Python avoids this via per-table
+                                // `path_table_lock` (Transport.py:134); kotlin
+                                // uses optimistic identity-CAS — see
+                                // port-deviations.md.
+                                val key = packet.destinationHash.toKey()
+                                if (pathTable[key] === pathEntry) {
+                                    val touched = pathEntry.touch()
+                                    pathTable[key] = touched
+                                    pathStore?.upsertPath(packet.destinationHash, touched)
+                                }
                                 log(
                                     "Transport forwarding ${packet.packetType} for ${packet.destinationHash.toHexString()} via ${outboundInterface.name} (remaining_hops=${pathEntry.hops})",
                                 )
@@ -2970,8 +2987,13 @@ object Transport {
         val newRaw = raw.copyOf()
         newRaw[1] = packet.hops.toByte()
         transmit(outboundInterface, newRaw)
-        linkTable[packet.destinationHash.toKey()] =
-            linkEntry.copy(timestamp = System.currentTimeMillis())
+        // Optimistic identity-CAS: don't overwrite a fresher linkEntry that
+        // another thread may have written during transmit's lock release.
+        // See port-deviations.md (path/link table identity-CAS).
+        val linkKey = packet.destinationHash.toKey()
+        if (linkTable[linkKey] === linkEntry) {
+            linkTable[linkKey] = linkEntry.copy(timestamp = System.currentTimeMillis())
+        }
         log(
             "Forwarding ${packet.packetType}/${packet.context} for " +
                 "${packet.destinationHash.toHexString()} via ${outboundInterface.name}",
@@ -3116,10 +3138,17 @@ object Transport {
                 }
 
                 if (sent) {
-                    // Update path timestamp
-                    val touched = pathEntry.touch()
-                    pathTable[packet.destinationHash.toKey()] = touched
-                    pathStore?.upsertPath(packet.destinationHash, touched)
+                    // Update path timestamp. Optimistic identity-CAS: only
+                    // touch if the entry is still ours; transmit's lock
+                    // release may have allowed a fresher inbound update to
+                    // replace pathTable[key]. See port-deviations.md
+                    // (path/link table identity-CAS).
+                    val key = packet.destinationHash.toKey()
+                    if (pathTable[key] === pathEntry) {
+                        val touched = pathEntry!!.touch()
+                        pathTable[key] = touched
+                        pathStore?.upsertPath(packet.destinationHash, touched)
+                    }
                 }
             } else {
                 log("Path exists for $destHex but interface not found")
@@ -3198,6 +3227,23 @@ object Transport {
     /**
      * Transmit raw data on an interface.
      * Applies IFAC masking if the interface has IFAC enabled.
+     *
+     * Releases [jobsLock] across the blocking [InterfaceRef.send] call. The lock
+     * scope of the caller (typically [outbound] or [inbound]) covers the routing
+     * decision and any state writes, both of which complete before transmit is
+     * called. The actual socket I/O may block — TCP write waiting for kernel
+     * buffer drain, AutoInterface waiting on UDP socket, etc — and holding
+     * jobsLock across that block prevents other threads from processing inbound
+     * packets, including the very acks/requests we need to make progress on
+     * resource transfers. Release+re-acquire pattern matches what
+     * [raceInducerSleepReleasingJobsLock] does for tests; here it's a perf fix.
+     *
+     * Safety: the routing decision (path lookup, link table) is committed before
+     * we get here. Concurrent transmits on the same interface are serialized
+     * inside the interface's own send path. Re-acquiring jobsLock after the
+     * write returns lets the caller's loop continue with whatever state mutated
+     * during the released window — same posture as if the inbound packet that
+     * mutated it had arrived a few microseconds later.
      */
     private fun transmit(
         interfaceRef: InterfaceRef,
@@ -3218,7 +3264,20 @@ object Transport {
                 val context = data[18].toInt() and 0xFF
                 log("TX PACKET: flags=0x${"%02x".format(flags)} hops=$hops dest=${destHash.take(16)}... ctx=0x${"%02x".format(context)} size=${data.size}")
             }
-            interfaceRef.send(transmitData)
+
+            val heldByCurrent = jobsLock.isHeldByCurrentThread
+            val holdCount = if (heldByCurrent) jobsLock.holdCount else 0
+            if (holdCount > 0) {
+                repeat(holdCount) { jobsLock.unlock() }
+            }
+            try {
+                interfaceRef.send(transmitData)
+            } finally {
+                if (holdCount > 0) {
+                    repeat(holdCount) { jobsLock.lock() }
+                }
+            }
+
             trafficTxBytes += transmitData.size
             recordTxBytes(interfaceRef, transmitData.size)
         } catch (e: Exception) {
