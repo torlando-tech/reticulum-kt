@@ -73,7 +73,7 @@ fun main() {
             }
             realStdout.println(gson.toJson(response))
         }
-        System.out.flush()
+        realStdout.flush()
     }
 }
 
