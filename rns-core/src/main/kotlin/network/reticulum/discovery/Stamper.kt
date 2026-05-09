@@ -9,6 +9,7 @@ import kotlinx.coroutines.yield
 import network.reticulum.crypto.Hashes
 import org.msgpack.core.MessagePack
 import java.math.BigInteger
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Mac
@@ -96,6 +97,21 @@ object Stamper {
         val found = AtomicReference<ByteArray?>(null)
         val roundCounters = LongArray(numWorkers)
 
+        // Performance optimisation: pre-feed the (large) workblock into a
+        // SHA-256 digest once, then per attempt clone the digest and finalise
+        // with just the 32-byte stamp. Avoids re-hashing the workblock and
+        // allocating a `workblock + stamp` byte array every round, which made
+        // cost=16 stamps take 20s+ on phones (GC pressure + redundant SHA).
+        // Result is byte-for-byte identical to `Hashes.fullHash(workblock + stamp)`.
+        val primedDigest = MessageDigest.getInstance("SHA-256").apply { update(workblock) }
+        val primedClonable = try {
+            primedDigest.clone()
+            true
+        } catch (_: CloneNotSupportedException) {
+            false
+        }
+
+        val genStartMs = System.currentTimeMillis()
         val jobs = (0 until numWorkers).map { workerId ->
             async(Dispatchers.Default) {
                 val localRandom = SecureRandom()
@@ -106,7 +122,19 @@ object Stamper {
                     localRandom.nextBytes(stamp)
                     localRounds++
 
-                    if (stampValid(stamp, stampCost, workblock)) {
+                    val hash = if (primedClonable) {
+                        val md = primedDigest.clone() as MessageDigest
+                        md.update(stamp)
+                        md.digest()
+                    } else {
+                        // Fallback for SHA-256 providers that don't support clone()
+                        val md = MessageDigest.getInstance("SHA-256")
+                        md.update(workblock)
+                        md.update(stamp)
+                        md.digest()
+                    }
+
+                    if (hashLeadingZeroBits(hash) >= stampCost) {
                         found.compareAndSet(null, stamp.copyOf())
                         break
                     }
@@ -126,6 +154,27 @@ object Stamper {
         val value = if (resultStamp != null) stampValue(workblock, resultStamp) else 0
 
         StampResult(resultStamp, value, totalRounds)
+    }
+
+    /**
+     * Count leading zero bits in a hash byte array. Replaces the per-attempt
+     * BigInteger comparison `BigInteger(1, hash) <= 1<<(256-cost)` — the BigInt
+     * allocation dominated the hot loop. The bit count semantics are identical:
+     * `hash <= 1<<(256-cost)` iff `hash` has ≥ `cost` leading zero bits.
+     */
+    private fun hashLeadingZeroBits(hash: ByteArray): Int {
+        var bits = 0
+        for (b in hash) {
+            val v = b.toInt() and 0xFF
+            if (v == 0) {
+                bits += 8
+                continue
+            }
+            // Numberofleadingzeros on a 32-bit int that has only the low byte
+            // populated gives 24 + actual leading zeros within that byte.
+            return bits + (Integer.numberOfLeadingZeros(v) - 24)
+        }
+        return bits
     }
 
     /**
