@@ -157,4 +157,49 @@ class StamperTest {
         Stamper.computeStampHash(template, workblock, stamp1) shouldBe Hashes.fullHash(workblock + stamp1)
         Stamper.computeStampHash(template, workblock, stamp2) shouldBe Hashes.fullHash(workblock + stamp2)
     }
+
+    // ===== generateStamp coverage: high-cost path triggers yield() =====
+
+    @Test
+    @DisplayName("generateStamp at higher cost exercises the per-1000-rounds yield()")
+    fun `generateStamp many rounds triggers yield`() = runBlocking {
+        // cost=14: 2^14 = 16384 expected attempts; with 8 workers, each worker
+        // averages ~2k rounds, comfortably above the 1000-round yield threshold.
+        // Bounds: cost=14 should still complete in < 5s on any test host.
+        val workblock = Stamper.generateWorkblock("yield-test".toByteArray(), 5)
+        val result = Stamper.generateStamp(workblock, 14)
+        result.stamp shouldNotBe null
+        assertTrue(result.value >= 14, "Stamp value should be >= 14, was ${result.value}")
+        assertTrue(result.rounds >= 1000, "Should have crossed at least one yield boundary, was ${result.rounds}")
+    }
+
+    // ===== StampResult equality =====
+
+    @Test
+    @DisplayName("StampResult equals/hashCode treats content-equal byte arrays as equal")
+    fun `StampResult equality`() {
+        val a = Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 100L)
+        val b = Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 100L)
+        val c = Stamper.StampResult(byteArrayOf(1, 2, 4), 8, 100L)
+        val d = Stamper.StampResult(null, 0, 0L)
+        val e = Stamper.StampResult(null, 0, 0L)
+        // Reflexive
+        a shouldBe a
+        // Content-equal arrays → equal
+        a shouldBe b
+        a.hashCode() shouldBe b.hashCode()
+        // Different content → not equal
+        (a == c) shouldBe false
+        // Both null stamp → equal
+        d shouldBe e
+        // One null vs not — not equal (both directions)
+        (a == d) shouldBe false
+        (d == a) shouldBe false
+        // Different value/rounds → not equal
+        (a == Stamper.StampResult(byteArrayOf(1, 2, 3), 9, 100L)) shouldBe false
+        (a == Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 101L)) shouldBe false
+        // Different type
+        @Suppress("EqualsBetweenInconvertibleTypes")
+        (a.equals("not a stamp")) shouldBe false
+    }
 }
