@@ -111,15 +111,23 @@ object Stamper {
             false
         }
 
+        // Pre-clone all per-worker templates sequentially on the parent thread.
+        // MessageDigest is not thread-safe per JCA spec, so concurrent clone()
+        // calls on the shared primedDigest from worker threads would be a
+        // formal JMM violation. Producing the clones here, before any async
+        // dispatch, makes the source-state reads strictly sequential; the
+        // structured-concurrency dispatch then publishes each clone safely
+        // to its worker (happens-before via coroutineScope { async }).
+        val workerTemplates: Array<MessageDigest>? = if (primedClonable) {
+            Array(numWorkers) { primedDigest.clone() as MessageDigest }
+        } else null
+
         val jobs = (0 until numWorkers).map { workerId ->
             async(Dispatchers.Default) {
                 val localRandom = SecureRandom()
                 var localRounds = 0L
                 val stamp = ByteArray(STAMP_SIZE)
-                // Per-worker template clone: avoids concurrent clone() on the
-                // shared primedDigest. MessageDigest is not thread-safe per JCA
-                // spec, so even read-only clone() across threads is undefined.
-                val workerTemplate = if (primedClonable) primedDigest.clone() as MessageDigest else null
+                val workerTemplate = workerTemplates?.get(workerId)
 
                 while (found.get() == null && isActive) {
                     localRandom.nextBytes(stamp)
