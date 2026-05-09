@@ -133,17 +133,7 @@ object Stamper {
                     localRandom.nextBytes(stamp)
                     localRounds++
 
-                    val hash = if (workerTemplate != null) {
-                        val md = workerTemplate.clone() as MessageDigest
-                        md.update(stamp)
-                        md.digest()
-                    } else {
-                        // Fallback for SHA-256 providers that don't support clone()
-                        val md = MessageDigest.getInstance("SHA-256")
-                        md.update(workblock)
-                        md.update(stamp)
-                        md.digest()
-                    }
+                    val hash = computeStampHash(workerTemplate, workblock, stamp)
 
                     if (hashLeadingZeroBits(hash) >= stampCost) {
                         found.compareAndSet(null, stamp.copyOf())
@@ -168,6 +158,30 @@ object Stamper {
     }
 
     /**
+     * Compute SHA-256(workblock || stamp). Uses the pre-fed workerTemplate
+     * (cloned per attempt) when available; falls back to a fresh digest when
+     * the JCA provider doesn't support `MessageDigest.clone()`. Internal
+     * visibility lets tests cover both branches without spinning up a custom
+     * provider.
+     */
+    internal fun computeStampHash(
+        workerTemplate: MessageDigest?,
+        workblock: ByteArray,
+        stamp: ByteArray,
+    ): ByteArray {
+        return if (workerTemplate != null) {
+            val md = workerTemplate.clone() as MessageDigest
+            md.update(stamp)
+            md.digest()
+        } else {
+            val md = MessageDigest.getInstance("SHA-256")
+            md.update(workblock)
+            md.update(stamp)
+            md.digest()
+        }
+    }
+
+    /**
      * Count leading zero bits in a hash byte array. Replaces the per-attempt
      * BigInteger comparison `BigInteger(1, hash) <= 1<<(256-cost)` — the BigInt
      * allocation dominated the hot loop. For all hashes except one — exactly
@@ -177,7 +191,7 @@ object Stamper {
      * form accepts; consequence is theoretical only, since hitting the exact
      * boundary requires generating one specific 32-byte SHA-256 output.
      */
-    private fun hashLeadingZeroBits(hash: ByteArray): Int {
+    internal fun hashLeadingZeroBits(hash: ByteArray): Int {
         var bits = 0
         for (b in hash) {
             val v = b.toInt() and 0xFF
