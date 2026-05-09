@@ -3,9 +3,11 @@ package network.reticulum.discovery
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import kotlinx.coroutines.runBlocking
+import network.reticulum.crypto.Hashes
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
+import java.security.MessageDigest
 
 @DisplayName("Stamper (PoW)")
 class StamperTest {
@@ -78,5 +80,131 @@ class StamperTest {
     fun `packInt produces valid msgpack`() {
         Stamper.packInt(0) shouldBe byteArrayOf(0x00)
         Stamper.packInt(127) shouldBe byteArrayOf(0x7f)
+    }
+
+    // ===== hashLeadingZeroBits =====
+
+    @Test
+    @DisplayName("hashLeadingZeroBits returns 256 for all-zero hash (the only fully-zero loop case)")
+    fun `leading zero bits all zero`() {
+        val allZero = ByteArray(32) { 0 }
+        Stamper.hashLeadingZeroBits(allZero) shouldBe 256
+    }
+
+    @Test
+    @DisplayName("hashLeadingZeroBits returns 0 when first byte has high bit set")
+    fun `leading zero bits first byte high bit`() {
+        val hash = ByteArray(32).also { it[0] = 0x80.toByte() }
+        Stamper.hashLeadingZeroBits(hash) shouldBe 0
+    }
+
+    @Test
+    @DisplayName("hashLeadingZeroBits counts within first non-zero byte")
+    fun `leading zero bits within first byte`() {
+        // First byte 0x01 = 7 leading zeros within the byte
+        val hash = ByteArray(32).also { it[0] = 0x01 }
+        Stamper.hashLeadingZeroBits(hash) shouldBe 7
+        // First byte 0x10 = 3 leading zeros within the byte
+        val hash2 = ByteArray(32).also { it[0] = 0x10 }
+        Stamper.hashLeadingZeroBits(hash2) shouldBe 3
+    }
+
+    @Test
+    @DisplayName("hashLeadingZeroBits accumulates across leading zero bytes")
+    fun `leading zero bits accumulates across bytes`() {
+        // Two zero bytes, then 0x80 → exactly 16 leading zero bits.
+        val hash = ByteArray(32).also { it[2] = 0x80.toByte() }
+        Stamper.hashLeadingZeroBits(hash) shouldBe 16
+        // Three zero bytes, then 0x40 → 24 + 1 = 25 leading zero bits.
+        val hash2 = ByteArray(32).also { it[3] = 0x40 }
+        Stamper.hashLeadingZeroBits(hash2) shouldBe 25
+    }
+
+    // ===== computeStampHash =====
+
+    @Test
+    @DisplayName("computeStampHash with template clones primed digest and matches SHA-256(workblock+stamp)")
+    fun `computeStampHash via clone matches reference`() {
+        val workblock = "wbX".toByteArray()
+        val stamp = ByteArray(32) { 0xAA.toByte() }
+        val template = MessageDigest.getInstance("SHA-256").apply { update(workblock) }
+        val expected = Hashes.fullHash(workblock + stamp)
+
+        val out = Stamper.computeStampHash(template, workblock, stamp)
+        out shouldBe expected
+    }
+
+    @Test
+    @DisplayName("computeStampHash null-template fallback path matches SHA-256(workblock+stamp)")
+    fun `computeStampHash fallback matches reference`() {
+        val workblock = "wbY".toByteArray()
+        val stamp = ByteArray(32) { 0x55.toByte() }
+        val expected = Hashes.fullHash(workblock + stamp)
+
+        val out = Stamper.computeStampHash(null, workblock, stamp)
+        out shouldBe expected
+    }
+
+    @Test
+    @DisplayName("computeStampHash template can be reused across many attempts (clone is non-destructive)")
+    fun `computeStampHash template reusable`() {
+        val workblock = ByteArray(64) { it.toByte() }
+        val template = MessageDigest.getInstance("SHA-256").apply { update(workblock) }
+        // First call mutates the clone, not the template — second call must match
+        // SHA-256(workblock + stamp2), proving the template was not consumed.
+        val stamp1 = ByteArray(32) { 0x11.toByte() }
+        val stamp2 = ByteArray(32) { 0x22.toByte() }
+        Stamper.computeStampHash(template, workblock, stamp1) shouldBe Hashes.fullHash(workblock + stamp1)
+        Stamper.computeStampHash(template, workblock, stamp2) shouldBe Hashes.fullHash(workblock + stamp2)
+    }
+
+    // ===== generateStamp coverage: higher-cost end-to-end path =====
+
+    @Test
+    @DisplayName("generateStamp at cost=14 returns a valid stamp with at least the requested value")
+    fun `generateStamp at cost 14 returns valid stamp`() = runBlocking {
+        // cost=14 (~16384 expected attempts across 8 workers) gives the
+        // multi-round, multi-worker async path real exercise without making
+        // the test slow. Most runs will also cross the per-worker 1000-round
+        // yield() boundary, but we don't assert that: result.rounds is the
+        // sum across workers and the early-exit race when one worker hits a
+        // valid stamp can drive the total well below 1000 with non-trivial
+        // probability — flake-prone in CI. result.value >= cost already
+        // proves the inner loop ran correctly.
+        val workblock = Stamper.generateWorkblock("yield-test".toByteArray(), 5)
+        val result = Stamper.generateStamp(workblock, 14)
+        result.stamp shouldNotBe null
+        assertTrue(result.value >= 14, "Stamp value should be >= 14, was ${result.value}")
+        assertTrue(result.rounds >= 1, "Should have tried at least 1 round, was ${result.rounds}")
+    }
+
+    // ===== StampResult equality =====
+
+    @Test
+    @DisplayName("StampResult equals/hashCode treats content-equal byte arrays as equal")
+    fun `StampResult equality`() {
+        val a = Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 100L)
+        val b = Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 100L)
+        val c = Stamper.StampResult(byteArrayOf(1, 2, 4), 8, 100L)
+        val d = Stamper.StampResult(null, 0, 0L)
+        val e = Stamper.StampResult(null, 0, 0L)
+        // Reflexive
+        a shouldBe a
+        // Content-equal arrays → equal
+        a shouldBe b
+        a.hashCode() shouldBe b.hashCode()
+        // Different content → not equal
+        (a == c) shouldBe false
+        // Both null stamp → equal
+        d shouldBe e
+        // One null vs not — not equal (both directions)
+        (a == d) shouldBe false
+        (d == a) shouldBe false
+        // Different value/rounds → not equal
+        (a == Stamper.StampResult(byteArrayOf(1, 2, 3), 9, 100L)) shouldBe false
+        (a == Stamper.StampResult(byteArrayOf(1, 2, 3), 8, 101L)) shouldBe false
+        // Different type
+        @Suppress("EqualsBetweenInconvertibleTypes")
+        (a.equals("not a stamp")) shouldBe false
     }
 }

@@ -9,6 +9,7 @@ import kotlinx.coroutines.yield
 import network.reticulum.crypto.Hashes
 import org.msgpack.core.MessagePack
 import java.math.BigInteger
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Mac
@@ -96,17 +97,45 @@ object Stamper {
         val found = AtomicReference<ByteArray?>(null)
         val roundCounters = LongArray(numWorkers)
 
+        // Performance optimisation: pre-feed the (large) workblock into a
+        // SHA-256 digest once, then per attempt clone the digest and finalise
+        // with just the 32-byte stamp. Avoids re-hashing the workblock and
+        // allocating a `workblock + stamp` byte array every round, which made
+        // cost=16 stamps take 20s+ on phones (GC pressure + redundant SHA).
+        // Result is byte-for-byte identical to `Hashes.fullHash(workblock + stamp)`.
+        val primedDigest = MessageDigest.getInstance("SHA-256").apply { update(workblock) }
+        val primedClonable = try {
+            primedDigest.clone()
+            true
+        } catch (_: CloneNotSupportedException) {
+            false
+        }
+
+        // Pre-clone all per-worker templates sequentially on the parent thread.
+        // MessageDigest is not thread-safe per JCA spec, so concurrent clone()
+        // calls on the shared primedDigest from worker threads would be a
+        // formal JMM violation. Producing the clones here, before any async
+        // dispatch, makes the source-state reads strictly sequential; the
+        // structured-concurrency dispatch then publishes each clone safely
+        // to its worker (happens-before via coroutineScope { async }).
+        val workerTemplates: Array<MessageDigest>? = if (primedClonable) {
+            Array(numWorkers) { primedDigest.clone() as MessageDigest }
+        } else null
+
         val jobs = (0 until numWorkers).map { workerId ->
             async(Dispatchers.Default) {
                 val localRandom = SecureRandom()
                 var localRounds = 0L
                 val stamp = ByteArray(STAMP_SIZE)
+                val workerTemplate = workerTemplates?.get(workerId)
 
                 while (found.get() == null && isActive) {
                     localRandom.nextBytes(stamp)
                     localRounds++
 
-                    if (stampValid(stamp, stampCost, workblock)) {
+                    val hash = computeStampHash(workerTemplate, workblock, stamp)
+
+                    if (hashLeadingZeroBits(hash) >= stampCost) {
                         found.compareAndSet(null, stamp.copyOf())
                         break
                     }
@@ -126,6 +155,55 @@ object Stamper {
         val value = if (resultStamp != null) stampValue(workblock, resultStamp) else 0
 
         StampResult(resultStamp, value, totalRounds)
+    }
+
+    /**
+     * Compute SHA-256(workblock || stamp). Uses the pre-fed workerTemplate
+     * (cloned per attempt) when available; falls back to a fresh digest when
+     * the JCA provider doesn't support `MessageDigest.clone()`. Internal
+     * visibility lets tests cover both branches without spinning up a custom
+     * provider.
+     */
+    internal fun computeStampHash(
+        workerTemplate: MessageDigest?,
+        workblock: ByteArray,
+        stamp: ByteArray,
+    ): ByteArray {
+        return if (workerTemplate != null) {
+            val md = workerTemplate.clone() as MessageDigest
+            md.update(stamp)
+            md.digest()
+        } else {
+            val md = MessageDigest.getInstance("SHA-256")
+            md.update(workblock)
+            md.update(stamp)
+            md.digest()
+        }
+    }
+
+    /**
+     * Count leading zero bits in a hash byte array. Replaces the per-attempt
+     * BigInteger comparison `BigInteger(1, hash) <= 1<<(256-cost)` — the BigInt
+     * allocation dominated the hot loop. For all hashes except one — exactly
+     * `1<<(256-cost)`, probability 2^-256 — the bit-count form `>= cost`
+     * agrees with the BigInteger `<= 1<<(256-cost)` form. At that single
+     * boundary value, this rejects (cost-1 leading zeros) where the BigInt
+     * form accepts; consequence is theoretical only, since hitting the exact
+     * boundary requires generating one specific 32-byte SHA-256 output.
+     */
+    internal fun hashLeadingZeroBits(hash: ByteArray): Int {
+        var bits = 0
+        for (b in hash) {
+            val v = b.toInt() and 0xFF
+            if (v == 0) {
+                bits += 8
+                continue
+            }
+            // Numberofleadingzeros on a 32-bit int that has only the low byte
+            // populated gives 24 + actual leading zeros within that byte.
+            return bits + (Integer.numberOfLeadingZeros(v) - 24)
+        }
+        return bits
     }
 
     /**
