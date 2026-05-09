@@ -158,19 +158,24 @@ class StamperTest {
         Stamper.computeStampHash(template, workblock, stamp2) shouldBe Hashes.fullHash(workblock + stamp2)
     }
 
-    // ===== generateStamp coverage: high-cost path triggers yield() =====
+    // ===== generateStamp coverage: higher-cost end-to-end path =====
 
     @Test
-    @DisplayName("generateStamp at higher cost exercises the per-1000-rounds yield()")
-    fun `generateStamp many rounds triggers yield`() = runBlocking {
-        // cost=14: 2^14 = 16384 expected attempts; with 8 workers, each worker
-        // averages ~2k rounds, comfortably above the 1000-round yield threshold.
-        // Bounds: cost=14 should still complete in < 5s on any test host.
+    @DisplayName("generateStamp at cost=14 returns a valid stamp with at least the requested value")
+    fun `generateStamp at cost 14 returns valid stamp`() = runBlocking {
+        // cost=14 (~16384 expected attempts across 8 workers) gives the
+        // multi-round, multi-worker async path real exercise without making
+        // the test slow. Most runs will also cross the per-worker 1000-round
+        // yield() boundary, but we don't assert that: result.rounds is the
+        // sum across workers and the early-exit race when one worker hits a
+        // valid stamp can drive the total well below 1000 with non-trivial
+        // probability — flake-prone in CI. result.value >= cost already
+        // proves the inner loop ran correctly.
         val workblock = Stamper.generateWorkblock("yield-test".toByteArray(), 5)
         val result = Stamper.generateStamp(workblock, 14)
         result.stamp shouldNotBe null
         assertTrue(result.value >= 14, "Stamp value should be >= 14, was ${result.value}")
-        assertTrue(result.rounds >= 1000, "Should have crossed at least one yield boundary, was ${result.rounds}")
+        assertTrue(result.rounds >= 1, "Should have tried at least 1 round, was ${result.rounds}")
     }
 
     // ===== StampResult equality =====
