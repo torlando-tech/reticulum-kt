@@ -111,19 +111,22 @@ object Stamper {
             false
         }
 
-        val genStartMs = System.currentTimeMillis()
         val jobs = (0 until numWorkers).map { workerId ->
             async(Dispatchers.Default) {
                 val localRandom = SecureRandom()
                 var localRounds = 0L
                 val stamp = ByteArray(STAMP_SIZE)
+                // Per-worker template clone: avoids concurrent clone() on the
+                // shared primedDigest. MessageDigest is not thread-safe per JCA
+                // spec, so even read-only clone() across threads is undefined.
+                val workerTemplate = if (primedClonable) primedDigest.clone() as MessageDigest else null
 
                 while (found.get() == null && isActive) {
                     localRandom.nextBytes(stamp)
                     localRounds++
 
-                    val hash = if (primedClonable) {
-                        val md = primedDigest.clone() as MessageDigest
+                    val hash = if (workerTemplate != null) {
+                        val md = workerTemplate.clone() as MessageDigest
                         md.update(stamp)
                         md.digest()
                     } else {
@@ -159,8 +162,12 @@ object Stamper {
     /**
      * Count leading zero bits in a hash byte array. Replaces the per-attempt
      * BigInteger comparison `BigInteger(1, hash) <= 1<<(256-cost)` — the BigInt
-     * allocation dominated the hot loop. The bit count semantics are identical:
-     * `hash <= 1<<(256-cost)` iff `hash` has ≥ `cost` leading zero bits.
+     * allocation dominated the hot loop. For all hashes except one — exactly
+     * `1<<(256-cost)`, probability 2^-256 — the bit-count form `>= cost`
+     * agrees with the BigInteger `<= 1<<(256-cost)` form. At that single
+     * boundary value, this rejects (cost-1 leading zeros) where the BigInt
+     * form accepts; consequence is theoretical only, since hitting the exact
+     * boundary requires generating one specific 32-byte SHA-256 output.
      */
     private fun hashLeadingZeroBits(hash: ByteArray): Int {
         var bits = 0
