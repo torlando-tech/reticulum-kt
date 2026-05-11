@@ -363,11 +363,31 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         // The master MUST be started first; otherwise the connect will fail
         // (no listener) and we surface a clear error instead of silently
         // becoming a standalone Reticulum.
+        //
+        // Two attach codepaths, selected by the `auto_attach` param:
+        //
+        //   auto_attach=false (default, "manual"):
+        //     construct LocalClientInterface, wire onPacketReceived → Transport.inbound,
+        //     call sharedClient.start() and Transport.registerInterface(sharedClient.toRef()).
+        //     This matches the conformance-bridge's historical behaviour and the bridge in
+        //     rns-cli's PipePeer manual-mode.
+        //
+        //   auto_attach=true:
+        //     call Reticulum.setLocalClientFactory + Reticulum.setInterfaceRegistrar, then
+        //     Reticulum.start(connectToSharedInstance=true). rns-core itself constructs the
+        //     LocalClientInterface (via the factory) and hands it back through the registrar,
+        //     which is the only place onPacketReceived gets wired and Transport.registerInterface
+        //     gets called. This codepath is what rns-android.ReticulumService uses on real
+        //     devices (Eridanus, Caelum) — and is the path that lost packets silently when the
+        //     registrar was missing (regression fixed by reticulum-kt#68). Without an
+        //     auto_attach-mode test in canonical CI, any future regression here would only
+        //     surface on hardware again.
         val sharedInstancePortParam = p.get("shared_instance_port")?.asInt
             ?: throw IllegalArgumentException(
                 "wire_start_local_client requires shared_instance_port (the " +
                     "master's TCP port from wire_start_tcp_server's response)",
             )
+        val autoAttach = p.get("auto_attach")?.asBoolean ?: false
         // instance_control_port and rpc_key are Python-only (Reticulum.py
         // brings up an RPC control listener for shared instances; reticulum-kt
         // doesn't). Accept them for cross-impl plumbing parity but ignore.
@@ -378,16 +398,6 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_wire_localclient_").toFile()
         try {
-            // enableTransport=false matches Python's behavior at
-            // Reticulum.py:418: clients of a shared instance never act as
-            // transport routers — the master owns transport.
-            val rns = Reticulum.start(
-                configDir = configDir.absolutePath,
-                enableTransport = false,
-                shareInstance = false,
-                connectToSharedInstance = false,
-            )
-
             if (!Reticulum.isSharedInstanceRunning(sharedInstancePortParam)) {
                 throw IllegalStateException(
                     "wire_start_local_client expected a shared-instance master " +
@@ -397,23 +407,82 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 )
             }
 
-            val sharedClient = LocalClientInterface(
-                name = "Wire LocalClient",
-                tcpPort = sharedInstancePortParam,
-            )
-            // Wire inbound dispatch BEFORE start() so the read loop can't
-            // observe a null callback for a frame arriving in the gap
-            // between start() and the .toRef() call below (which would
-            // otherwise lazily install a default Transport.inbound dispatch
-            // via InterfaceAdapter.init). Matches the explicit pattern used
-            // by server/sharedServer/client in this same file, and removes
-            // a startup race even if a master sends a frame the moment the
-            // socket is accepted.
-            sharedClient.onPacketReceived = { data, iface ->
-                Transport.inbound(data, iface.toRef())
+            // enableTransport=false matches Python's behavior at
+            // Reticulum.py:418: clients of a shared instance never act as
+            // transport routers — the master owns transport.
+            val rns: Reticulum
+            val sharedClient: LocalClientInterface
+
+            if (autoAttach) {
+                // Auto-attach path: wire the factory + registrar before start()
+                // so rns-core's tryConnectToSharedInstance can construct and
+                // register the LocalClientInterface itself. The registrar is
+                // where onPacketReceived gets wired and Transport.registerInterface
+                // is called — both load-bearing for packet flow.
+                val pendingClient = arrayOfNulls<LocalClientInterface>(1)
+                Reticulum.setLocalClientFactory { port, host ->
+                    LocalClientInterface(
+                        name = "Wire LocalClient (auto-attach)",
+                        tcpPort = port,
+                        tcpHost = host,
+                    ).also { pendingClient[0] = it }
+                }
+                Reticulum.setInterfaceRegistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        Transport.registerInterface(iface.toRef())
+                    }
+                }
+
+                rns = Reticulum.start(
+                    configDir = configDir.absolutePath,
+                    enableTransport = false,
+                    shareInstance = false,
+                    connectToSharedInstance = true,
+                    sharedInstancePort = sharedInstancePortParam,
+                )
+
+                sharedClient = pendingClient[0]
+                    ?: throw IllegalStateException(
+                        "auto-attach path: LocalClientInterface factory was never " +
+                            "invoked by Reticulum.start(connectToSharedInstance=true). " +
+                            "rns-core's tryConnectToSharedInstance may have short-circuited.",
+                    )
+
+                // Defensive cross-check: post-conditions of the auto-attach contract.
+                check(rns.isConnectedToSharedInstance) {
+                    "auto-attach path: Reticulum.start returned without flipping " +
+                        "isConnectedToSharedInstance — tryConnectToSharedInstance probably " +
+                        "failed silently. Inspect rns-core logs."
+                }
+            } else {
+                // Manual path: same as before reticulum-kt#69. Kept as the default
+                // for backward-compat with existing tests; new shared-instance tests
+                // should opt into auto_attach=true to cover the rns-android codepath.
+                rns = Reticulum.start(
+                    configDir = configDir.absolutePath,
+                    enableTransport = false,
+                    shareInstance = false,
+                    connectToSharedInstance = false,
+                )
+
+                sharedClient = LocalClientInterface(
+                    name = "Wire LocalClient",
+                    tcpPort = sharedInstancePortParam,
+                )
+                // Wire inbound dispatch BEFORE start() so the read loop can't
+                // observe a null callback for a frame arriving in the gap
+                // between start() and the .toRef() call below (which would
+                // otherwise lazily install a default Transport.inbound dispatch
+                // via InterfaceAdapter.init). Matches the explicit pattern used
+                // by server/sharedServer/client in this same file, and removes
+                // a startup race even if a master sends a frame the moment the
+                // socket is accepted.
+                sharedClient.onPacketReceived = { data, iface ->
+                    Transport.inbound(data, iface.toRef())
+                }
+                sharedClient.start()
+                Transport.registerInterface(sharedClient.toRef())
             }
-            sharedClient.start()
-            Transport.registerInterface(sharedClient.toRef())
 
             val identityHash = Transport.identity?.hash
                 ?: throw IllegalStateException("Transport started without an identity")
@@ -432,6 +501,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             result(
                 "handle" to JsonPrimitive(handle),
                 "identity_hash" to hexVal(identityHash),
+                "auto_attach" to JsonPrimitive(autoAttach),
             )
         } catch (t: Throwable) {
             runCatching { Reticulum.stop() }
