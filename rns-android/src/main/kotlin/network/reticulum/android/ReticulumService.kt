@@ -383,6 +383,23 @@ class ReticulumService : LifecycleService() {
                 // Check if another shared instance is already running
                 val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
 
+                // Wire the LocalClientInterface factory before Reticulum.start
+                // so its connect-to-shared-instance path has something to call.
+                // Without this, `Reticulum.tryConnectToSharedInstance` logs
+                // "LocalClientInterface factory not set, cannot connect to
+                // shared instance" and silently falls back to standalone
+                // — even when sharedInstanceExists=true. The factory is
+                // applied via the companion's pending-factory mechanism,
+                // which Reticulum.start() picks up between Reticulum(...)
+                // construction and rns.initialize().
+                Reticulum.setLocalClientFactory { port, host ->
+                    network.reticulum.interfaces.local.LocalClientInterface(
+                        name = "SharedInstanceClient",
+                        tcpPort = port,
+                        tcpHost = host,
+                    )
+                }
+
                 reticulum = Reticulum.start(
                     configDir = configDir,
                     enableTransport = config.enableTransport,
