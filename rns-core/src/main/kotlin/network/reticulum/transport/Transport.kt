@@ -830,7 +830,28 @@ object Transport {
             localClientInterfaces.add(interfaceRef)
             log("Registered local client interface: ${interfaceRef.name}")
         } else if (interfaceRef.isConnectedToSharedInstance) {
-            // Client connecting TO shared instance (not spawned BY server)
+            // Client connecting TO shared instance (not spawned BY server).
+            //
+            // Flip the global Transport.isConnectedToSharedInstance flag here so
+            // that callers who instantiate a LocalClientInterface directly
+            // (e.g. Carina's ReticulumService, Eridanus' shared-instance
+            // attach, the conformance wire bridge) get the same behavior as
+            // the factory-driven Reticulum.start(connectToSharedInstance=true)
+            // path. Without this, processOutbound's `hops == 1 +
+            // isConnectedToSharedInstance + isHeader1` branch (line ~3088)
+            // never fires for manually-constructed clients, the outbound
+            // LINKREQUEST is sent as HEADER_1 instead of HEADER_2 with the
+            // master's identity as transport_id, and the master is forced
+            // to compensate with the H1→H2 raw mutation — which then
+            // produces a divergent link_id (see reticulum-kt issue catalogued
+            // in reticulum-conformance test_link_via_shared_master.py).
+            // Python's equivalent flag (Reticulum.py:417
+            // is_connected_to_shared_instance = True) lives on the
+            // Reticulum singleton and is set inside __start_local_interface
+            // regardless of how the interface was instantiated; pinning the
+            // kotlin flag at registerInterface time gives us the same
+            // implementation-agnostic guarantee.
+            isConnectedToSharedInstance = true
             log("Registered interface connected to shared instance: ${interfaceRef.name}")
         } else {
             log("Registered interface: ${interfaceRef.name}")
@@ -850,6 +871,19 @@ object Transport {
         interfaceStats.remove(interfaceHash)
         interfaceAnnounceQueues.remove(interfaceHash)
         interfaceAnnounceAllowedAt.remove(interfaceHash)
+
+        // Symmetric with registerInterface: if the deregistered interface was
+        // our last shared-instance client attachment, clear the global flag.
+        // Python clears equivalent state on the failure paths in
+        // __start_local_interface (Reticulum.py:425-427, 433-435); the kotlin
+        // analog runs when an app explicitly tears down its shared-instance
+        // client interface (e.g. Carina toggling between hosting / consuming
+        // the shared instance on the same process).
+        if (interfaceRef.isConnectedToSharedInstance &&
+            interfaces.none { it.isConnectedToSharedInstance }
+        ) {
+            isConnectedToSharedInstance = false
+        }
 
         log("Deregistered interface: ${interfaceRef.name}")
     }
@@ -2760,38 +2794,33 @@ object Transport {
             packet.transportId = identity?.hash
         }
 
-        // Server-side defense: when a local client sends a HEADER_1 packet for a
-        // REMOTE destination (not forLocalClient), inject transport headers so the
-        // existing forwarding logic can handle it. Python clients always send HEADER_2
-        // for hops >= 1 (Transport.py:993-1011), but if a client omits transport
-        // headers, the shared instance must still be able to forward the packet.
-        if (fromLocalClient &&
-            packet.transportId == null &&
-            !forLocalClient &&
-            packet.packetType != PacketType.ANNOUNCE &&
-            packet.context != PacketContext.LRPROOF
-        ) {
-            val destPathEntry = pathTable[packet.destinationHash.toKey()]
-            if (destPathEntry != null) {
-                val myHash = identity?.hash
-                val packetRaw = packet.raw
-                if (myHash != null && packetRaw != null) {
-                    // Convert HEADER_1 raw to HEADER_2 by inserting transport_id
-                    val newFlags =
-                        (HeaderType.HEADER_2.value shl 6) or
-                            (TransportType.TRANSPORT.value shl 4) or
-                            (packetRaw[0].toInt() and 0x0F)
-                    val newRaw = ByteArray(packetRaw.size + RnsConstants.TRUNCATED_HASH_BYTES)
-                    newRaw[0] = newFlags.toByte()
-                    newRaw[1] = packetRaw[1]
-                    System.arraycopy(myHash, 0, newRaw, 2, RnsConstants.TRUNCATED_HASH_BYTES)
-                    System.arraycopy(packetRaw, 2, newRaw, 2 + RnsConstants.TRUNCATED_HASH_BYTES, packetRaw.size - 2)
-                    packet.raw = newRaw
-                    packet.transportId = myHash
-                    log("Injected transport headers for HEADER_1 packet from local client to remote dest ${packet.destinationHash.toHexString()}")
-                }
-            }
-        }
+        // Note: the previous "Server-side defense" block that mutated
+        // packet.raw to upgrade a HEADER_1 inbound from a local client to
+        // HEADER_2 has been removed. The mutation broke the
+        // packet.raw ↔ packet.headerType invariant relied on by
+        // Packet.getHashablePart(): headerType is `val`, set at unpack
+        // time, and getHashablePart() slicing branches on it; mutating
+        // raw without refreshing headerType caused the inserted
+        // transport_id to land inside the hashable slice and produced a
+        // divergent link_id (LRPROOFs returning from the destination then
+        // missed the master's link_table and were silently dropped).
+        //
+        // The defense was only needed because kotlin shared-instance
+        // clients packed HEADER_1 outbound — they failed to set
+        // Transport.isConnectedToSharedInstance for manually-constructed
+        // LocalClientInterface registrations, so the outbound branch at
+        // processOutbound's `hops == 1 && isConnectedToSharedInstance &&
+        // isHeader1 && !isLink` never fired. That's now fixed at the
+        // source: registerInterface widens the global flag whenever a
+        // shared-instance client attaches, matching python's
+        // single-entry-point guarantee at Reticulum.py:417. Kotlin
+        // clients now pack HEADER_2 with master's identity as
+        // transport_id on the same code path as python
+        // (Transport.py:1097-1108), so this server-side compensation is
+        // unreachable for well-behaved clients and removing it brings
+        // the master back into line with python (Transport.py:1488-1489
+        // sets packet.transport_id only for for_local_client and only as
+        // a field — never mutates raw). See port-deviations.md.
 
         // General transport handling (Python Transport.py:1404-1510)
         // This runs for ALL packet types (LINKREQUEST, DATA, PROOF) before type-specific handling.
