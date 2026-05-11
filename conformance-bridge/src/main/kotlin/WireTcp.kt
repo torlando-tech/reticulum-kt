@@ -41,6 +41,8 @@ import network.reticulum.common.DestinationType
 import network.reticulum.common.InterfaceMode
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.local.LocalClientInterface
+import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
@@ -73,6 +75,14 @@ private class WireInstance(
     val port: Int,
     val serverIface: TCPServerInterface? = null,
     val clientIface: TCPClientInterface? = null,
+    // Shared-instance plumbing for wire_start_tcp_server share_instance=true
+    // (sharedServer is a LocalServerInterface listening on TCP loopback so
+    // wire_start_local_client peers can attach as the master's clients) and
+    // wire_start_local_client (sharedClient is a LocalClientInterface
+    // connected to a master process's sharedServer port).
+    val sharedServer: network.reticulum.interfaces.local.LocalServerInterface? = null,
+    val sharedClient: network.reticulum.interfaces.local.LocalClientInterface? = null,
+    val sharedInstancePort: Int? = null,
     val destinations: MutableList<Pair<Identity, Destination>> = mutableListOf(),
     // Link bookkeeping — used by wire_listen / wire_link_* commands below.
     val listeners: ConcurrentHashMap<String, Listener> = ConcurrentHashMap(),
@@ -193,6 +203,8 @@ private fun resetWireState() {
     for (inst in stale) {
         runCatching { inst.serverIface?.detach() }
         runCatching { inst.clientIface?.detach() }
+        runCatching { inst.sharedClient?.detach() }
+        runCatching { inst.sharedServer?.detach() }
         runCatching { inst.configDir.deleteRecursively() }
     }
     runCatching { Reticulum.stop() }
@@ -205,6 +217,18 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val bindPortReq = p.get("bind_port")?.asInt ?: 0
         val bindPort = if (bindPortReq == 0) allocateFreePort() else bindPortReq
         val desiredMode = parseInterfaceMode(p.get("mode")?.asString)
+        val shareInstanceParam = p.get("share_instance")?.asBoolean ?: false
+        val shareInstanceTypeParam = p.get("share_instance_type")?.asString?.lowercase()
+        if (shareInstanceParam && shareInstanceTypeParam != null && shareInstanceTypeParam != "tcp") {
+            throw IllegalArgumentException(
+                "Kotlin bridge only supports share_instance_type=tcp (got " +
+                    "$shareInstanceTypeParam). Reticulum-kt's LocalServerInterface" +
+                    " has TCP and Unix-socket constructors, but the cross-impl" +
+                    " interop path the conformance suite relies on is TCP loopback.",
+            )
+        }
+        val sharedInstancePort: Int? =
+            if (shareInstanceParam) allocateFreePort() else null
 
         // Clear any prior wire state (detach interfaces, drop handles,
         // stop the RNS singleton) so this call starts clean and no stale
@@ -267,6 +291,32 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 Transport.inbound(data, iface.toRef())
             }
 
+            // Optional shared-instance master: stand up a LocalServerInterface
+            // on a separate loopback port. wire_start_local_client peers will
+            // attach as TCP clients there, and the existing TCPServerInterface
+            // forwarding logic still handles remote (TCP) clients on bindPort.
+            //
+            // Mirrors what app/ReticulumService.kt does manually for production
+            // use (line 418+ in eridanus' rns-android service): construct,
+            // wire onPacketReceived → Transport.inbound, start, register.
+            // Cannot use Reticulum.start(shareInstance=true) directly because
+            // the bridge's wire_* commands assume the post-start Transport
+            // identity is already final, and the factory-based path in
+            // Reticulum.startLocalServer requires a pre-set factory which the
+            // bridge doesn't have plumbed in.
+            var sharedServer: LocalServerInterface? = null
+            if (sharedInstancePort != null) {
+                sharedServer = LocalServerInterface(
+                    name = "Wire SharedInstance",
+                    tcpPort = sharedInstancePort,
+                )
+                sharedServer.onPacketReceived = { data, fromInterface ->
+                    Transport.inbound(data, fromInterface.toRef())
+                }
+                sharedServer.start()
+                Transport.registerInterface(sharedServer.toRef())
+            }
+
             val identityHash = Transport.identity?.hash
                 ?: throw IllegalStateException("Transport started without an identity")
 
@@ -278,16 +328,101 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 role = "server",
                 port = bindPort,
                 serverIface = server,
+                sharedServer = sharedServer,
+                sharedInstancePort = sharedInstancePort,
+            )
+
+            val resultEntries = mutableListOf(
+                "handle" to (JsonPrimitive(handle) as com.google.gson.JsonElement),
+                "port" to JsonPrimitive(bindPort),
+                "identity_hash" to hexVal(identityHash),
+            )
+            if (sharedInstancePort != null) {
+                resultEntries += "shared_instance_port" to JsonPrimitive(sharedInstancePort)
+                resultEntries += "share_instance_type" to JsonPrimitive("tcp")
+            }
+            result(*resultEntries.toTypedArray())
+        } catch (t: Throwable) {
+            // Partial setup — roll back RNS and the temp dir so we don't
+            // leak them for the remainder of the bridge process's lifetime.
+            runCatching { Reticulum.stop() }
+            runCatching { configDir.deleteRecursively() }
+            throw t
+        }
+    }
+
+    "wire_start_local_client" -> {
+        // Spin up an RNS instance that attaches to an already-running
+        // shared-instance master (another bridge process running
+        // wire_start_tcp_server with share_instance=true). No TCP/UDP
+        // interface is added — the only attachment is the LocalClientInterface
+        // pointing at the master's `shared_instance_port`. Mirrors what an
+        // Eridanus or Sideband client does on a phone hosting Carina/Sideband
+        // as the shared instance.
+        //
+        // The master MUST be started first; otherwise the connect will fail
+        // (no listener) and we surface a clear error instead of silently
+        // becoming a standalone Reticulum.
+        val sharedInstancePortParam = p.get("shared_instance_port")?.asInt
+            ?: throw IllegalArgumentException(
+                "wire_start_local_client requires shared_instance_port (the " +
+                    "master's TCP port from wire_start_tcp_server's response)",
+            )
+        // instance_control_port and rpc_key are Python-only (Reticulum.py
+        // brings up an RPC control listener for shared instances; reticulum-kt
+        // doesn't). Accept them for cross-impl plumbing parity but ignore.
+        p.get("instance_control_port")
+        p.get("rpc_key")
+
+        resetWireState()
+
+        val configDir = java.nio.file.Files.createTempDirectory("rns_wire_localclient_").toFile()
+        try {
+            // enableTransport=false matches Python's behavior at
+            // Reticulum.py:418: clients of a shared instance never act as
+            // transport routers — the master owns transport.
+            val rns = Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = false,
+                shareInstance = false,
+                connectToSharedInstance = false,
+            )
+
+            if (!Reticulum.isSharedInstanceRunning(sharedInstancePortParam)) {
+                throw IllegalStateException(
+                    "wire_start_local_client expected a shared-instance master " +
+                        "listening on TCP 127.0.0.1:$sharedInstancePortParam, but " +
+                        "nothing is bound there. Start the master via " +
+                        "wire_start_tcp_server with share_instance=true first.",
+                )
+            }
+
+            val sharedClient = LocalClientInterface(
+                name = "Wire LocalClient",
+                tcpPort = sharedInstancePortParam,
+            )
+            sharedClient.start()
+            Transport.registerInterface(sharedClient.toRef())
+
+            val identityHash = Transport.identity?.hash
+                ?: throw IllegalStateException("Transport started without an identity")
+
+            val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            wireInstances[handle] = WireInstance(
+                rns = rns,
+                identityHash = identityHash,
+                configDir = configDir,
+                role = "local_client",
+                port = sharedInstancePortParam,
+                sharedClient = sharedClient,
+                sharedInstancePort = sharedInstancePortParam,
             )
 
             result(
                 "handle" to JsonPrimitive(handle),
-                "port" to JsonPrimitive(bindPort),
                 "identity_hash" to hexVal(identityHash),
             )
         } catch (t: Throwable) {
-            // Partial setup — roll back RNS and the temp dir so we don't
-            // leak them for the remainder of the bridge process's lifetime.
             runCatching { Reticulum.stop() }
             runCatching { configDir.deleteRecursively() }
             throw t
@@ -785,8 +920,12 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         // tests where introspecting internal state (announce_table,
         // discovery_path_requests) is sensitive to impl-specific
         // held/restore timing.
-        val primary = inst.serverIface ?: inst.clientIface
-        val total = primary?.txBytes?.get() ?: 0L
+        //
+        // For local-client peers (wire_start_local_client), the only
+        // interface is the sharedClient — fall back to it so tests that
+        // observe "did this peer send anything?" work cross-role.
+        val total = (inst.serverIface ?: inst.clientIface ?: inst.sharedClient)
+            ?.txBytes?.get() ?: 0L
         result("tx_bytes" to JsonPrimitive(total))
     }
 
@@ -867,6 +1006,8 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         if (inst != null) {
             try { inst.serverIface?.detach() } catch (_: Throwable) {}
             try { inst.clientIface?.detach() } catch (_: Throwable) {}
+            try { inst.sharedClient?.detach() } catch (_: Throwable) {}
+            try { inst.sharedServer?.detach() } catch (_: Throwable) {}
             try { Reticulum.stop() } catch (_: Throwable) {}
             try { inst.configDir.deleteRecursively() } catch (_: Throwable) {}
             result("stopped" to boolVal(true))
