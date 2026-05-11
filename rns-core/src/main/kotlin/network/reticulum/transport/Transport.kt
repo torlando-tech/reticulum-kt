@@ -159,6 +159,7 @@ object Transport {
         private set
 
     /** Whether this instance is connected to a local shared instance (Python: Transport.owner.is_connected_to_shared_instance). */
+    @Volatile
     var isConnectedToSharedInstance: Boolean = false
 
     /** Optional network identity for discovery encryption. */
@@ -312,6 +313,23 @@ object Transport {
 
     /** Registered interfaces. */
     private val interfaces = CopyOnWriteArrayList<InterfaceRef>()
+
+    /**
+     * Monitor guarding compound mutations of [isConnectedToSharedInstance]
+     * together with the `interfaces` collection scan that decides whether
+     * to clear it. The `interfaces` list itself is a `CopyOnWriteArrayList`
+     * (individual add/remove are atomic), but `deregisterInterface`'s
+     * "remove this ref, then scan to see if any other shared-instance
+     * interface remains" is a compound action that races with a concurrent
+     * `registerInterface` setting the flag back to `true` between the two
+     * steps. Python sets/clears the equivalent flag only at single-threaded
+     * `Reticulum.__init__` time (Reticulum.py:417, 425-435) and so doesn't
+     * face this race — kotlin allows runtime register/deregister churn
+     * (Carina toggling host/consume on one process), so we serialize the
+     * flag-flip sites here. JVM-memory-model category (a) deviation,
+     * documented in port-deviations.md.
+     */
+    private val sharedInstanceFlagLock = Any()
 
     /** Registered destinations. */
     private val destinations = CopyOnWriteArrayList<Destination>()
@@ -851,7 +869,12 @@ object Transport {
             // regardless of how the interface was instantiated; pinning the
             // kotlin flag at registerInterface time gives us the same
             // implementation-agnostic guarantee.
-            isConnectedToSharedInstance = true
+            //
+            // Serialize the flag write against deregisterInterface's
+            // compound check-then-clear; see sharedInstanceFlagLock kdoc.
+            synchronized(sharedInstanceFlagLock) {
+                isConnectedToSharedInstance = true
+            }
             log("Registered interface connected to shared instance: ${interfaceRef.name}")
         } else {
             log("Registered interface: ${interfaceRef.name}")
@@ -879,10 +902,22 @@ object Transport {
         // analog runs when an app explicitly tears down its shared-instance
         // client interface (e.g. Carina toggling between hosting / consuming
         // the shared instance on the same process).
-        if (interfaceRef.isConnectedToSharedInstance &&
-            interfaces.none { it.isConnectedToSharedInstance }
-        ) {
-            isConnectedToSharedInstance = false
+        //
+        // The check-then-clear pair is compound (interfaces.remove above and
+        // the interfaces.none scan below are two separate operations on a
+        // CopyOnWriteArrayList), so serialize against registerInterface's
+        // matching flag-set under sharedInstanceFlagLock. Without this, a
+        // concurrent registerInterface that adds a new shared-instance
+        // interface and sets the flag true between `interfaces.remove(...)`
+        // and the `interfaces.none {...}` scan could be clobbered by the
+        // trailing `isConnectedToSharedInstance = false` — exactly the
+        // false-negative-flag state this PR was originally fixing.
+        if (interfaceRef.isConnectedToSharedInstance) {
+            synchronized(sharedInstanceFlagLock) {
+                if (interfaces.none { it.isConnectedToSharedInstance }) {
+                    isConnectedToSharedInstance = false
+                }
+            }
         }
 
         log("Deregistered interface: ${interfaceRef.name}")

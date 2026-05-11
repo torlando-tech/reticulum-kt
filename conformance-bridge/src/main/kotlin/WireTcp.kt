@@ -401,6 +401,17 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 name = "Wire LocalClient",
                 tcpPort = sharedInstancePortParam,
             )
+            // Wire inbound dispatch BEFORE start() so the read loop can't
+            // observe a null callback for a frame arriving in the gap
+            // between start() and the .toRef() call below (which would
+            // otherwise lazily install a default Transport.inbound dispatch
+            // via InterfaceAdapter.init). Matches the explicit pattern used
+            // by server/sharedServer/client in this same file, and removes
+            // a startup race even if a master sends a frame the moment the
+            // socket is accepted.
+            sharedClient.onPacketReceived = { data, iface ->
+                Transport.inbound(data, iface.toRef())
+            }
             sharedClient.start()
             Transport.registerInterface(sharedClient.toRef())
 
