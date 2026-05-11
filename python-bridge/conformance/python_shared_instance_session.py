@@ -124,6 +124,7 @@ class PythonSharedInstanceSession:
         client_env_key="PIPE_PEER_SHARED_PORT",
         app_name="pipetest",
         aspects="routing",
+        client_extra_env=None,
     ):
         """
         Start the session.
@@ -138,6 +139,9 @@ class PythonSharedInstanceSession:
                            Kotlin uses PIPE_PEER_SHARED_CLIENT_PORT (LocalClientInterface).
             app_name: RNS app name for destinations
             aspects: RNS aspects for destinations
+            client_extra_env: Optional dict of extra env vars to set on the client
+                              subprocess only (not hub or shared-instance server).
+                              Used to flip client-side modes like PIPE_PEER_AUTO_ATTACH.
         """
         project_root = self._find_project_root()
         py_peer_cmd = f"python3 {os.path.join(project_root, 'python-bridge/pipe_peer.py')}"
@@ -198,6 +202,8 @@ class PythonSharedInstanceSession:
         client_env[client_env_key] = str(self.tcp_port)
         if "PYTHON_RNS_PATH" not in client_env:
             client_env["PYTHON_RNS_PATH"] = self.rns_path
+        if client_extra_env:
+            client_env.update(client_extra_env)
 
         self.client = _Subprocess(client_cmd, client_env)
         self.client.start()

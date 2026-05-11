@@ -9,6 +9,7 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.pipe.PipeInterface
@@ -35,6 +36,13 @@ import java.nio.file.Files
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
  *   PIPE_PEER_MODE:      interface mode: full | ap | roaming | boundary | gateway | p2p
  *   PIPE_PEER_SHARED_CLIENT_PORT: TCP port to connect to as LocalClientInterface client
+ *   PIPE_PEER_AUTO_ATTACH:     true | false (default: false). When true, connect to the
+ *                              shared instance via Reticulum.start(connectToSharedInstance=true)
+ *                              + the setLocalClientFactory / setInterfaceRegistrar setters
+ *                              instead of constructing LocalClientInterface manually. This
+ *                              exercises the same auto-attach codepath that rns-android's
+ *                              ReticulumService uses on Android — the only production caller
+ *                              of that codepath today. Requires PIPE_PEER_SHARED_CLIENT_PORT.
  *   PIPE_PEER_NUM_IFACES:      number of fd-pair interfaces (0 = use stdin/stdout)
  *   PIPE_PEER_IFACE_{n}_FD_IN:  read fd for interface n
  *   PIPE_PEER_IFACE_{n}_FD_OUT: write fd for interface n
@@ -130,6 +138,11 @@ fun main() {
     val modeStr = System.getenv("PIPE_PEER_MODE") ?: "full"
     val sharedPort = System.getenv("PIPE_PEER_SHARED_PORT")?.toIntOrNull() ?: 0
     val sharedClientPort = System.getenv("PIPE_PEER_SHARED_CLIENT_PORT")?.toIntOrNull() ?: 0
+    val autoAttach = System.getenv("PIPE_PEER_AUTO_ATTACH")?.lowercase() == "true"
+
+    require(!autoAttach || sharedClientPort > 0) {
+        "PIPE_PEER_AUTO_ATTACH=true requires PIPE_PEER_SHARED_CLIENT_PORT to be set"
+    }
 
     val mode = when (modeStr.lowercase()) {
         "ap", "access_point" -> InterfaceMode.ACCESS_POINT
@@ -144,11 +157,33 @@ fun main() {
     val configDir = Files.createTempDirectory("rns-kt-pipe-peer-").toFile()
 
     try {
-        // Start Reticulum
-        Reticulum.start(
-            configDir = configDir.absolutePath,
-            enableTransport = enableTransport
-        )
+        if (autoAttach) {
+            // Auto-attach codepath: mirror exactly what rns-android.ReticulumService
+            // does on Android. The factory and registrar setters are codependent — if
+            // either is missing, packets are silently dropped despite "Connected to
+            // shared instance" logging. This branch exists to keep that contract
+            // exercised in CI; rns-android is otherwise the only production caller.
+            Reticulum.setLocalClientFactory { port, host ->
+                LocalClientInterface(name = "AutoAttachClient", tcpPort = port, tcpHost = host)
+            }
+            Reticulum.setInterfaceRegistrar { iface ->
+                if (iface is Interface) {
+                    Transport.registerInterface(iface.toRef())
+                }
+            }
+
+            Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport,
+                connectToSharedInstance = true,
+                sharedInstancePort = sharedClientPort
+            )
+        } else {
+            Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport
+            )
+        }
 
         // Create interfaces: shared instance server and/or pipe-based.
         // These are NOT mutually exclusive — a target can serve as both a
@@ -161,7 +196,9 @@ fun main() {
         }
 
         // Connect as client to an existing shared instance (e.g., Python rnsd)
-        if (sharedClientPort > 0) {
+        // Skipped when autoAttach=true — Reticulum.start() already created and
+        // registered the LocalClientInterface via the factory+registrar path.
+        if (sharedClientPort > 0 && !autoAttach) {
             val client = LocalClientInterface(
                 name = "SharedClient",
                 tcpPort = sharedClientPort
