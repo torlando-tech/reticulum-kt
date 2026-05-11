@@ -265,6 +265,28 @@ class Reticulum private constructor(
         }
 
         /**
+         * Clear any pending local-client / local-server / interface-registrar
+         * factories previously installed via the `set*Factory` / `setInterfaceRegistrar`
+         * setters. Intended for test harnesses (e.g. the conformance bridge) that
+         * may re-enter `start()` with different topology assumptions across
+         * back-to-back invocations and need to avoid carrying a stale lambda
+         * (and any objects it captured) into the next session.
+         *
+         * Production callers (`rns-android.ReticulumService`, `rns-cli.PipePeer`)
+         * re-set their factories before every `start()`, so this method is a
+         * no-op for them — but calling it is harmless and idempotent.
+         *
+         * Does not touch the live `instance`'s factory state; only resets the
+         * pre-start static slots used to seed the next `start()`. Call after
+         * `stop()` (or wherever a clean factory baseline is desired).
+         */
+        fun clearPendingFactories() {
+            pendingLocalClientFactory = null
+            pendingLocalServerFactory = null
+            pendingInterfaceRegistrar = null
+        }
+
+        /**
          * Get the default configuration directory.
          */
         private fun getDefaultConfigDir(): String {

@@ -208,6 +208,16 @@ private fun resetWireState() {
         runCatching { inst.configDir.deleteRecursively() }
     }
     runCatching { Reticulum.stop() }
+    // Drop any pre-start factory / registrar lambdas the previous call may have
+    // installed on the Reticulum companion (auto_attach mode does this — see
+    // wire_start_local_client). Without this, the captured `pendingClient`
+    // array and any other closure state from a prior session would survive
+    // across resets and could be applied to the next Reticulum.start() that
+    // happened to consult them (e.g. another auto_attach=true call that
+    // re-set the lambdas anyway — overwritten, fine — but also any path that
+    // unexpectedly hits tryConnectToSharedInstance or startLocalServer with
+    // stale state).
+    runCatching { Reticulum.clearPendingFactories() }
 }
 
 fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (command) {
