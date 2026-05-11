@@ -110,6 +110,13 @@ def main():
             f.write("  share_instance = Yes\n")
             f.write(f"  shared_instance_port = {shared_port}\n")
             f.write("  shared_instance_type = tcp\n")
+            # Pin the RPC port off the shared port (instead of the 37429
+            # default) so we don't collide with any rnsd the developer happens
+            # to be running locally. Only the elected shared-instance server
+            # actually binds it (Reticulum.py:339-343), but config it on all
+            # peers so the elected one picks the right port regardless of
+            # which subprocess wins the race.
+            f.write(f"  instance_control_port = {shared_port + 1}\n")
         else:
             f.write("  share_instance = No\n")
         f.write("\n[interfaces]\n")
