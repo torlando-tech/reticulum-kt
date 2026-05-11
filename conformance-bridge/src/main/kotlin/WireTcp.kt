@@ -515,6 +515,12 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             )
         } catch (t: Throwable) {
             runCatching { Reticulum.stop() }
+            // Symmetric with resetWireState(): if start() succeeded but a
+            // post-condition check (e.g. isConnectedToSharedInstance) threw,
+            // the factory + registrar are still installed on the Reticulum
+            // companion. Drop them so the next Reticulum.start() doesn't
+            // inherit closures referencing this failed session's pendingClient.
+            runCatching { Reticulum.clearPendingFactories() }
             runCatching { configDir.deleteRecursively() }
             throw t
         }
