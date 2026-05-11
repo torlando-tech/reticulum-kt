@@ -383,6 +383,43 @@ class ReticulumService : LifecycleService() {
                 // Check if another shared instance is already running
                 val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
 
+                // Wire the LocalClientInterface factory before Reticulum.start
+                // so its connect-to-shared-instance path has something to call.
+                // Without this, `Reticulum.tryConnectToSharedInstance` logs
+                // "LocalClientInterface factory not set, cannot connect to
+                // shared instance" and silently falls back to standalone
+                // — even when sharedInstanceExists=true. The factory is
+                // applied via the companion's pending-factory mechanism,
+                // which Reticulum.start() picks up between Reticulum(...)
+                // construction and rns.initialize().
+                Reticulum.setLocalClientFactory { port, host ->
+                    network.reticulum.interfaces.local.LocalClientInterface(
+                        name = "SharedInstanceClient",
+                        tcpPort = port,
+                        tcpHost = host,
+                    )
+                }
+
+                // Wire the interface registrar so Transport can send/receive
+                // packets through the shared-instance connection. Without
+                // this, tryConnectToSharedInstance logs "No interface
+                // registrar set, packets will not be processed" — the TCP
+                // socket connects, but every packet arriving from the daemon
+                // is silently dropped (onPacketReceived is never wired) and
+                // Transport never routes outbound packets to the shared
+                // instance. Matches the python ref's behavior at
+                // RNS/Reticulum.py:414 — `RNS.Transport.interfaces.append(interface)`.
+                // The cast to network.reticulum.interfaces.Interface is safe
+                // since the factory above only produces LocalClientInterface,
+                // which extends Interface; the `Any` return type on the
+                // factory exists to keep rns-core decoupled from rns-interfaces.
+                Reticulum.setInterfaceRegistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        val ref = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(iface)
+                        network.reticulum.transport.Transport.registerInterface(ref)
+                    }
+                }
+
                 reticulum = Reticulum.start(
                     configDir = configDir,
                     enableTransport = config.enableTransport,
