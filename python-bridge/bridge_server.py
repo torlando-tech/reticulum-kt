@@ -3023,6 +3023,8 @@ def cmd_lxmf_validate_message_stamp(params):
 
     lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
     target_cost = int(params['target_cost'])
+    if not (1 <= target_cost <= 254):
+        raise ValueError(f"target_cost must be between 1 and 254, got {target_cost}")
 
     # `LXMessage.unpack_from_bytes()` calls `RNS.Identity.recall()`, which
     # in turn calls `RNS.Reticulum.get_instance()._used_destination_data()`.
@@ -3093,6 +3095,8 @@ def cmd_lxmf_validate_message_stamp_with_tickets(params):
 
     lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
     target_cost = int(params['target_cost'])
+    if not (1 <= target_cost <= 254):
+        raise ValueError(f"target_cost must be between 1 and 254, got {target_cost}")
     ticket_hexes = params.get('tickets') or []
     if isinstance(ticket_hexes, str):
         ticket_hexes = [ticket_hexes]
