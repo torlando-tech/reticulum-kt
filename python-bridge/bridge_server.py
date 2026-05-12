@@ -2953,6 +2953,180 @@ def cmd_lxmf_stamp_valid(params):
     }
 
 
+def cmd_lxmf_remember_identity(params):
+    """Register an identity in Python's RNS Identity cache so that
+    subsequent unpack_from_bytes() calls can validate signatures from this
+    source without needing a live Reticulum instance to receive an announce.
+
+    params:
+        destination_hash (hex): Destination hash (16 bytes), e.g. an LXMF
+            delivery destination's hash.
+        public_key (hex): Identity public key (64 bytes: X25519 + Ed25519).
+
+    Returns:
+        remembered (bool): Always True on success.
+    """
+    RNS = _get_full_rns()
+    # Identity.remember() reaches into Transport state, which assumes a live
+    # Reticulum instance. Lazy-init one and stub out the shared-instance RPC
+    # path so subsequent recall() calls don't blow up — see the same pattern
+    # in cmd_lxmf_validate_message_stamp for the full rationale.
+    _instance = RNS.Reticulum.get_instance()
+    _stub_needed = _instance is None
+    if _stub_needed:
+        import tempfile
+        _configdir = tempfile.mkdtemp(prefix='lxmf_remember_')
+        _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
+    # Only stub when we just lazy-created the instance, or when an existing
+    # instance somehow lacks the attribute. If a live router (e.g. from
+    # cmd_lxmf_start_router) is already on the shared instance, leave its
+    # destination-data tracking intact so its periodic LRU touches still RPC
+    # through to the host rnsd.
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
+    dest_hash = hex_to_bytes(params['destination_hash'])
+    public_key = hex_to_bytes(params['public_key'])
+    # remember(packet_hash, dest_hash, pub_key, app_data) — packet_hash is
+    # used as a dedup key for the announce; any 32-byte value works for tests.
+    RNS.Identity.remember(b'\x00' * 32, dest_hash, public_key, None)
+    return {'remembered': True}
+
+
+def cmd_lxmf_validate_message_stamp(params):
+    """Reproduce Sideband's stamp-enforcement code path on raw wire bytes.
+
+    Runs the EXACT Python `LXMF.LXMessage.unpack_from_bytes()` →
+    `validate_stamp(target_cost)` sequence. This is what `LXMRouter.lxmf_delivery`
+    uses (LXMRouter.py:1752-1772) to decide whether to drop a message before
+    invoking the application delivery callback. Bridge tests use this to corner
+    "Columba sends, Sideband drops" failures without needing a live RNS link.
+
+    params:
+        lxmf_bytes (hex): Full packed wire bytes (dest_hash + source_hash +
+            signature + msgpack payload [+ stamp]).
+        target_cost (int): Required stamp cost in leading zero bits, matching
+            Sideband's `delivery_destination.stamp_cost`.
+
+    Returns:
+        unpacked (bool): Whether unpack_from_bytes succeeded
+        signature_validated (bool): Result of source-identity signature check
+        stamp_present (bool): Whether the wire contained a stamp slot
+        stamp_valid (bool): Result of validate_stamp(target_cost)
+        stamp_value (int|None): Leading-zero-bit value of the stamp, when valid
+        message_hash (hex|None): Hash the receiver computed (i.e. the value the
+            stamp was validated against). When this differs from the sender's
+            self.hash, the bug is in serialization round-trip; when it matches
+            but stamp_valid is False, the bug is in stamp generation.
+    """
+    RNS = _get_full_rns()
+    import LXMF
+
+    lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
+    target_cost = int(params['target_cost'])
+    if not (1 <= target_cost <= 254):
+        raise ValueError(f"target_cost must be between 1 and 254, got {target_cost}")
+
+    # `LXMessage.unpack_from_bytes()` calls `RNS.Identity.recall()`, which
+    # in turn calls `RNS.Reticulum.get_instance()._used_destination_data()`.
+    # That fails with AttributeError if no Reticulum instance has ever been
+    # constructed in this process — and if one HAS been constructed but it
+    # auto-attached to a host-level rnsd shared instance (Tyler's typical
+    # dev setup), `_used_destination_data` will try to RPC to that shared
+    # instance and fail with AuthenticationError because we don't share
+    # the rpc_key. Either way we don't actually need the destination-data
+    # bookkeeping for stamp validation — null it out so recall() succeeds
+    # cheaply and Sideband's exact validate_stamp path can run.
+    _instance = RNS.Reticulum.get_instance()
+    _stub_needed = _instance is None
+    if _stub_needed:
+        import tempfile
+        _configdir = tempfile.mkdtemp(prefix='lxmf_validate_')
+        _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
+    # Make `_used_destination_data` a no-op (stamp validation doesn't depend
+    # on destination-data tracking; this just keeps recall() from blowing up).
+    # Only stub when we lazy-created the instance — if a live router was
+    # started earlier in this process, leave its tracking intact.
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
+
+    message = LXMF.LXMessage.unpack_from_bytes(lxmf_bytes)
+    if message is None:
+        return {
+            'unpacked': False,
+            'signature_validated': False,
+            'stamp_present': False,
+            'stamp_valid': False,
+            'stamp_value': None,
+            'message_hash': None,
+        }
+
+    stamp_present = message.stamp is not None
+    # validate_stamp() reads self.message_id (which was set to self.hash in
+    # unpack_from_bytes from the receiver-recomputed hash) and computes the
+    # workblock fresh — same path Sideband's enforcing router takes.
+    stamp_valid = bool(message.validate_stamp(target_cost))
+
+    return {
+        'unpacked': True,
+        'signature_validated': bool(message.signature_validated),
+        'stamp_present': stamp_present,
+        'stamp_valid': stamp_valid,
+        'stamp_value': getattr(message, 'stamp_value', None),
+        'message_hash': bytes_to_hex(message.hash) if message.hash else None,
+    }
+
+
+def cmd_lxmf_validate_message_stamp_with_tickets(params):
+    """Same as `lxmf_validate_message_stamp` but also passes a `tickets` list
+    to `LXMessage.validate_stamp()`, so the receiver can accept ticket-style
+    16-byte stamps. Mirrors `LXMRouter.lxmf_delivery` line 1754:
+
+        destination_tickets = self.get_inbound_tickets(message.source_hash)
+        if message.validate_stamp(required_stamp_cost, tickets=destination_tickets):
+
+    params:
+        lxmf_bytes (hex): Wire bytes (4 or 5 element payload).
+        target_cost (int): Required PoW cost for the fall-through path.
+        tickets (list[hex]): Inbound tickets the receiver should consider for
+            the truncated-hash ticket-match branch.
+    """
+    RNS = _get_full_rns()
+    import LXMF
+
+    lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
+    target_cost = int(params['target_cost'])
+    if not (1 <= target_cost <= 254):
+        raise ValueError(f"target_cost must be between 1 and 254, got {target_cost}")
+    ticket_hexes = params.get('tickets') or []
+    if isinstance(ticket_hexes, str):
+        ticket_hexes = [ticket_hexes]
+    tickets = [hex_to_bytes(t) for t in ticket_hexes]
+
+    _instance = RNS.Reticulum.get_instance()
+    _stub_needed = _instance is None
+    if _stub_needed:
+        import tempfile
+        _configdir = tempfile.mkdtemp(prefix='lxmf_validate_')
+        _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
+
+    message = LXMF.LXMessage.unpack_from_bytes(lxmf_bytes)
+    if message is None:
+        return {'unpacked': False, 'signature_validated': False,
+                'stamp_present': False, 'stamp_valid': False,
+                'stamp_value': None, 'message_hash': None}
+
+    return {
+        'unpacked': True,
+        'signature_validated': bool(message.signature_validated),
+        'stamp_present': message.stamp is not None,
+        'stamp_valid': bool(message.validate_stamp(target_cost, tickets=tickets)),
+        'stamp_value': getattr(message, 'stamp_value', None),
+        'message_hash': bytes_to_hex(message.hash) if message.hash else None,
+    }
+
+
 def cmd_lxmf_stamp_generate(params):
     """Generate stamp meeting target cost.
 
@@ -3128,6 +3302,11 @@ def cmd_lxmf_start_router(params):
     params:
         identity_hex (str, optional): 64-byte private key hex (X25519 + Ed25519)
         display_name (str, optional): Display name for announcements
+        stamp_cost (int, optional): Required inbound stamp cost (1-254). When set,
+            the router calls register_delivery_identity(..., stamp_cost=N) and
+            enforce_stamps() — mirroring Sideband's "lxmf_require_stamps" config.
+            Inbound messages with missing/invalid stamps are dropped before
+            reaching the delivery callback.
 
     Returns:
         identity_hash (hex): Hash of the router identity
@@ -3139,6 +3318,11 @@ def cmd_lxmf_start_router(params):
 
     identity_hex = params.get('identity_hex')
     display_name = params.get('display_name')
+    stamp_cost = params.get('stamp_cost')
+    if stamp_cost is not None:
+        stamp_cost = int(stamp_cost)
+        if not (1 <= stamp_cost <= 254):
+            raise ValueError(f"stamp_cost must be between 1 and 254, got {stamp_cost}")
 
     RNS = _get_full_rns()
     import LXMF
@@ -3159,11 +3343,16 @@ def cmd_lxmf_start_router(params):
         storagepath=storage_path
     )
 
-    # Register delivery identity
+    # Register delivery identity. When stamp_cost is set, mirror Sideband:
+    # the destination demands a stamp of at least N bits and the router
+    # drops messages with invalid/missing stamps before our callback fires.
     _lxmf_destination = _lxmf_router.register_delivery_identity(
         _lxmf_identity,
-        display_name=display_name
+        display_name=display_name,
+        stamp_cost=stamp_cost,
     )
+    if stamp_cost is not None:
+        _lxmf_router.enforce_stamps()
 
     # Clear received messages
     _received_messages = []
@@ -3177,8 +3366,20 @@ def cmd_lxmf_start_router(params):
             'content': message.content.decode('utf-8') if isinstance(message.content, bytes) else message.content,
             'title': message.title.decode('utf-8') if isinstance(message.title, bytes) else message.title,
             'timestamp': message.timestamp,
-            'fields': {}
+            'fields': {},
+            # Surface stamp + signature state so tests can distinguish
+            # "delivered but stamp invalid (allowed because enforce_stamps off)"
+            # from "delivered with valid stamp". When enforce_stamps is on, the
+            # router drops stamp-invalid messages before this callback ever fires
+            # — so an entry appearing here at all is itself a signal.
+            'stamp_valid': bool(getattr(message, 'stamp_valid', False)),
+            'stamp_checked': bool(getattr(message, 'stamp_checked', False)),
+            'stamp_value': getattr(message, 'stamp_value', None),
+            'signature_validated': bool(getattr(message, 'signature_validated', False)),
         }
+        stamp_bytes = getattr(message, 'stamp', None)
+        if isinstance(stamp_bytes, (bytes, bytearray)):
+            msg_data['stamp'] = bytes_to_hex(bytes(stamp_bytes))
         if hasattr(message, 'hash') and message.hash:
             msg_data['hash'] = bytes_to_hex(message.hash)
         if hasattr(message, 'fields') and message.fields:
@@ -4890,6 +5091,9 @@ COMMANDS = {
     'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
     'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
     'lxmf_stamp_generate': cmd_lxmf_stamp_generate,
+    'lxmf_validate_message_stamp': cmd_lxmf_validate_message_stamp,
+    'lxmf_validate_message_stamp_with_tickets': cmd_lxmf_validate_message_stamp_with_tickets,
+    'lxmf_remember_identity': cmd_lxmf_remember_identity,
     # Live Reticulum/LXMF networking
     'rns_start': cmd_rns_start,
     'rns_stop': cmd_rns_stop,
