@@ -2972,11 +2972,18 @@ def cmd_lxmf_remember_identity(params):
     # path so subsequent recall() calls don't blow up — see the same pattern
     # in cmd_lxmf_validate_message_stamp for the full rationale.
     _instance = RNS.Reticulum.get_instance()
-    if _instance is None:
+    _stub_needed = _instance is None
+    if _stub_needed:
         import tempfile
         _configdir = tempfile.mkdtemp(prefix='lxmf_remember_')
         _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
-    _instance._used_destination_data = lambda _h: None
+    # Only stub when we just lazy-created the instance, or when an existing
+    # instance somehow lacks the attribute. If a live router (e.g. from
+    # cmd_lxmf_start_router) is already on the shared instance, leave its
+    # destination-data tracking intact so its periodic LRU touches still RPC
+    # through to the host rnsd.
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
     dest_hash = hex_to_bytes(params['destination_hash'])
     public_key = hex_to_bytes(params['public_key'])
     # remember(packet_hash, dest_hash, pub_key, app_data) — packet_hash is
@@ -3028,13 +3035,17 @@ def cmd_lxmf_validate_message_stamp(params):
     # bookkeeping for stamp validation — null it out so recall() succeeds
     # cheaply and Sideband's exact validate_stamp path can run.
     _instance = RNS.Reticulum.get_instance()
-    if _instance is None:
+    _stub_needed = _instance is None
+    if _stub_needed:
         import tempfile
         _configdir = tempfile.mkdtemp(prefix='lxmf_validate_')
         _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
     # Make `_used_destination_data` a no-op (stamp validation doesn't depend
     # on destination-data tracking; this just keeps recall() from blowing up).
-    _instance._used_destination_data = lambda _h: None
+    # Only stub when we lazy-created the instance — if a live router was
+    # started earlier in this process, leave its tracking intact.
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
 
     message = LXMF.LXMessage.unpack_from_bytes(lxmf_bytes)
     if message is None:
@@ -3088,11 +3099,13 @@ def cmd_lxmf_validate_message_stamp_with_tickets(params):
     tickets = [hex_to_bytes(t) for t in ticket_hexes]
 
     _instance = RNS.Reticulum.get_instance()
-    if _instance is None:
+    _stub_needed = _instance is None
+    if _stub_needed:
         import tempfile
         _configdir = tempfile.mkdtemp(prefix='lxmf_validate_')
         _instance = RNS.Reticulum(_configdir, loglevel=RNS.LOG_CRITICAL)
-    _instance._used_destination_data = lambda _h: None
+    if _stub_needed or not hasattr(_instance, '_used_destination_data') or _instance._used_destination_data is None:
+        _instance._used_destination_data = lambda _h: None
 
     message = LXMF.LXMessage.unpack_from_bytes(lxmf_bytes)
     if message is None:
@@ -3304,6 +3317,8 @@ def cmd_lxmf_start_router(params):
     stamp_cost = params.get('stamp_cost')
     if stamp_cost is not None:
         stamp_cost = int(stamp_cost)
+        if not (1 <= stamp_cost <= 254):
+            raise ValueError(f"stamp_cost must be between 1 and 254, got {stamp_cost}")
 
     RNS = _get_full_rns()
     import LXMF
