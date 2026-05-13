@@ -359,6 +359,18 @@ class LocalServerInterface : Interface {
             log("Could not register spawned interface with Transport: ${e.message}")
             clients.remove(clientInterface)
             spawnedInterfaces?.remove(clientInterface)
+            // Without start(), no read loop runs and detach() is never reached,
+            // so the accepted socket would stay open until GC. Python's
+            // socketserver framework closes the socket when the handler thread
+            // unwinds from an exception (LocalInterface.py:501-507 wraps the
+            // append+read_loop sequence in BaseRequestHandler.handle, which
+            // BaseServer.shutdown_request finalizes); the kotlin accept loop
+            // manages sockets manually, so close it explicitly here.
+            try {
+                socket.close()
+            } catch (closeEx: Exception) {
+                log("Could not close socket after registration failure: ${closeEx.message}")
+            }
             false
         }
 
