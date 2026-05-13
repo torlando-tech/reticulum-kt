@@ -1,10 +1,13 @@
 package network.reticulum.interfaces.local
 
+import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -241,6 +244,54 @@ class LocalInterfaceTest {
             // Unix sockets detected but not fully supported by JVM implementation
             println("Unix sockets partially supported, skipping: ${e.message}")
         }
+    }
+
+    /**
+     * Regression: transient probe-style connections (open + immediate close,
+     * the shape that `Reticulum.isSharedInstanceRunning(port)` produces on
+     * every shared-instance auto-recovery poll) should not leave stale entries
+     * in `Transport.localClientInterfaces`. Python's `LocalInterface.teardown()`
+     * at `RNS/Interfaces/LocalInterface.py:353-354` removes the spawned interface
+     * from `Transport.local_client_interfaces` via `in` + `remove` — identity
+     * equality on the same `spawned_interface` object that was appended at
+     * `LocalInterface.py:462`. The kotlin port relies on the same identity
+     * invariant via the `InterfaceAdapter.getOrCreate` cache; this test fails
+     * loudly if that invariant ever breaks (e.g. via the read-loop / register
+     * ordering race fixed in this commit).
+     */
+    @Test
+    fun `transient probe connections do not leak Transport localClientInterfaces entries`() {
+        val tcpPort = 37434
+        val numProbes = 10
+        val baseline = Transport.localClientCount()
+
+        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server!!.start()
+
+        repeat(numProbes) {
+            Socket().use { probe ->
+                probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+                // Immediately close — mimics a watchdog probe.
+            }
+            Thread.sleep(20)
+        }
+
+        // Poll until the server has reaped all transient spawned children.
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline && server!!.clientCount() > 0) {
+            Thread.sleep(50)
+        }
+
+        assertEquals(
+            0,
+            server!!.clientCount(),
+            "Server still reports live spawned children after probes closed; LocalClientInterface.readLoop / detach path did not run",
+        )
+        assertEquals(
+            baseline,
+            Transport.localClientCount(),
+            "Transport.localClientInterfaces accumulated stale entries after $numProbes transient probe connects (expected baseline=$baseline)",
+        )
     }
 
     @Test

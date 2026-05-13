@@ -337,13 +337,19 @@ class LocalServerInterface : Interface {
             onPacketReceived?.invoke(data, iface)
         }
 
-        clientInterface.start()
-
+        // Python parity: register with Transport BEFORE the read loop runs
+        // (LocalInterface.py:461-462 append vs :480 read_loop). In python the
+        // read_loop is synchronous so order is implicit; here `start()` launches
+        // it on ioScope, so an immediately-disconnecting probe socket could
+        // otherwise race detach() ahead of registerInterface() and leak the
+        // entry into Transport.localClientInterfaces forever.
         try {
             Transport.registerInterface(clientInterface.toRef())
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
         }
+
+        clientInterface.start()
 
         log("Client connected: $clientName (total: ${clients.size})")
     }
