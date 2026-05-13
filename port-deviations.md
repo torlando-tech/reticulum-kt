@@ -148,3 +148,26 @@ To restore the python invariant ("the flag is true iff we're a shared-instance c
 With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` outbound on the same code path as python, so the master receives `packet.transportId != null` and no compensation is required. The compensation block is removed; the master's processing now mirrors python's exactly.
 
 **Re-evaluation:** the removal is a strict re-convergence with the python reference — there's nothing to re-evaluate unless a future kotlin downstream consumer reintroduces a code path that bypasses both `Reticulum.tryConnectToSharedInstance` and `Transport.registerInterface`'s flag widening (which would be a separate bug to fix at the new bypass site, not here).
+
+### `Transport.registerInterface` failure swallowed + collection rollback on spawned-client setup — `rns-interfaces/.../LocalServerInterface.kt::handleNewClient`
+
+**Python reference:** `RNS/Interfaces/LocalInterface.py:477-480` — python calls `RNS.Transport.interfaces.append(spawned_interface)` and `RNS.Transport.local_client_interfaces.append(spawned_interface)` unguarded, then `self.clients += 1`, then `spawned_interface.read_loop()`. If any of those raise, the exception propagates to the SocketServer handler thread; `read_loop` never runs and `self.clients` never increments.
+
+**Category:** language/runtime forced (with bounded scope).
+
+**Date:** 2026-05-12.
+
+**Tracking:** reticulum-kt PR #74 (the read-loop / register ordering fix), original `try/catch` introduced in commit 75acf9f (2026-02-05, "feat(local): register spawned interfaces with Transport for shared instance routing").
+
+**Description:** the kotlin port wraps `Transport.registerInterface(clientInterface.toRef())` in `try/catch` and logs on failure, where python lets the exception propagate. The catch was originally added to keep an accept-thread coroutine from crashing the whole server on transient registration errors — a JVM/coroutine pragmatic, since python's per-connection handler thread can die without taking the server down but the kotlin equivalent can't be that liberal with uncaught coroutine exceptions hitting the parent scope.
+
+Independently, the kotlin's bookkeeping uses two `CopyOnWriteArrayList` collections (`clients`, `spawnedInterfaces`) that the python reference doesn't need (python tracks a simple `self.clients` integer counter — no list to "clean up"). On registration failure, the kotlin's collections would otherwise hold an interface that Transport never registered, and `clientInterface.start()` would launch a read loop coroutine for a ghost interface that's invisible to Transport for its entire lifetime (`clientDisconnected()` would then call `Transport.deregisterInterface()` as a no-op).
+
+To minimize the residual divergence from python while keeping the JVM-pragmatic catch, the catch block now:
+1. Removes the interface from `clients` and `spawnedInterfaces` (matching python's "counter doesn't increment on failure" invariant in spirit — the collections only ever hold Transport-registered interfaces).
+2. Gates `clientInterface.start()` on successful registration (matching python's "read_loop only runs after the appends succeed" implicit ordering).
+3. Closes the accepted socket explicitly. Python's `LocalInterfaceHandler` (`LocalInterface.py:501-507`) extends `socketserver.BaseRequestHandler`, and the framework's `BaseServer.shutdown_request` finalizes the socket when the handler's `handle()` method returns or raises — so on python's registration failure, the socket IS closed, just by the framework rather than user code. The kotlin accept loop manages sockets manually, so the close has to be explicit to preserve this net behavior. Without it, the failed-registration socket would stay open until GC of the `LocalClientInterface` (whose `detach()` is the only path that calls `socket?.close()`, and which is only reached via the read loop launched by `start()`).
+
+The net behavior: on the happy path, kotlin and python are identical (register → bookkeep → start read loop). On the failure path, kotlin logs and continues serving (instead of python's propagate-up-and-die-this-handler), the failed interface is fully cleaned up so no ghost state leaks, and the socket is closed eagerly — matching python's framework-level cleanup.
+
+**Re-evaluation:** if `Transport.registerInterface` is ever made non-throwing (it's currently just `CopyOnWriteArrayList.add` + synchronized flag flips, which realistically don't throw under normal load) the catch can be retired and this entry deleted. Alternatively, if the accept loop is restructured to let a single bad client kill its own coroutine without taking down the server (e.g. via a per-client `SupervisorJob` wrapping both registration and read-loop), the catch could be moved up to that scope — also a python-parity win, since python's per-handler-thread isolation gives equivalent fault containment naturally.
