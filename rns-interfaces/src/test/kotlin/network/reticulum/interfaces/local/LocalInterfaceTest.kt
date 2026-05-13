@@ -5,9 +5,12 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -241,6 +244,81 @@ class LocalInterfaceTest {
             // Unix sockets detected but not fully supported by JVM implementation
             println("Unix sockets partially supported, skipping: ${e.message}")
         }
+    }
+
+    /**
+     * Stress regression for the spawned-child read loop. On Android, real-world
+     * Carina-as-shared-instance soak (>30 min uptime) has been observed to wedge
+     * a long-lived spawned child's read loop — inbound bytes stop draining even
+     * though the socket remains ESTABLISHED and outbound bytes still flow. The
+     * suspected interaction was a redundant `withContext(Dispatchers.IO)` inside
+     * the read loop (already running on `ioScope`'s IO dispatcher), which this
+     * commit removes to match python's direct synchronous `socket.recv(4096)`
+     * pattern at `RNS/Interfaces/LocalInterface.py:302`.
+     *
+     * The wedge is not deterministically reproducible on a desktop JVM, so this
+     * test does not assert "wedge is fixed" — it asserts "long-lived spawned
+     * child keeps draining inbound bytes under aggressive sibling probe churn",
+     * which is the regression guard for any future change that disturbs the
+     * read loop body.
+     */
+    @Test
+    fun `long-lived spawned child keeps draining inbound bytes under sibling probe churn`() {
+        val tcpPort = 37435
+        val numRounds = 50
+        val probesPerRound = 5
+        val packetData = "Long-lived client packet >>>".toByteArray()
+
+        val receivedCount = AtomicInteger(0)
+
+        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server!!.onPacketReceived = { data, _ ->
+            if (data.contentEquals(packetData)) {
+                receivedCount.incrementAndGet()
+            }
+        }
+        server!!.start()
+
+        val client = LocalClientInterface(name = "LongLivedClient", tcpPort = tcpPort)
+        clients.add(client)
+        client.start()
+        Thread.sleep(200)
+        assertEquals(1, server!!.clientCount())
+
+        repeat(numRounds) { round ->
+            // Send one packet from the long-lived client.
+            client.processOutgoing(packetData)
+
+            // Churn transient sibling probes (open + immediate close), mimicking
+            // the watchdog-probe shape that `Reticulum.isSharedInstanceRunning`
+            // produces on every shared-instance auto-recovery poll.
+            repeat(probesPerRound) {
+                Socket().use { probe ->
+                    probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+                }
+            }
+
+            // Give the server's spawned children time to settle.
+            Thread.sleep(20)
+
+            assertTrue(
+                client.online.value,
+                "Long-lived client went offline at round $round under sibling churn",
+            )
+        }
+
+        // Wait for last packet to drain.
+        val deadline = System.currentTimeMillis() + 2000
+        while (System.currentTimeMillis() < deadline && receivedCount.get() < numRounds) {
+            Thread.sleep(50)
+        }
+
+        assertEquals(
+            numRounds,
+            receivedCount.get(),
+            "Long-lived client sent $numRounds packets, server received ${receivedCount.get()}. " +
+                "Read loop may have wedged under sibling churn.",
+        )
     }
 
     @Test
