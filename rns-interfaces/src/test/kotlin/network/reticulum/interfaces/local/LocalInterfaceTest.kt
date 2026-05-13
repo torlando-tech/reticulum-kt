@@ -298,8 +298,12 @@ class LocalInterfaceTest {
                 }
             }
 
-            // Give the server's spawned children time to settle.
-            Thread.sleep(20)
+            // Give the server's spawned children time to settle. The per-round
+            // settle is only there so the inline `client.online.value` check
+            // below isn't racing the probe-spawn detach machinery on slow
+            // runners; the load-bearing assertion is the terminal
+            // `receivedCount == numRounds` check which has its own 2 s drain.
+            Thread.sleep(50)
 
             assertTrue(
                 client.online.value,
