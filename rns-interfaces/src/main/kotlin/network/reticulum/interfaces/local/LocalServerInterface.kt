@@ -343,13 +343,28 @@ class LocalServerInterface : Interface {
         // it on ioScope, so an immediately-disconnecting probe socket could
         // otherwise race detach() ahead of registerInterface() and leak the
         // entry into Transport.localClientInterfaces forever.
-        try {
+        //
+        // The kotlin port wraps registerInterface in try/catch (a pre-existing
+        // deviation from python — python lets the exception propagate and
+        // therefore never reaches read_loop). To keep the failure-path
+        // behavior consistent with python's invariants (read loop only runs
+        // for a Transport-registered interface; bookkeeping collections only
+        // hold registered interfaces), we gate `start()` on successful
+        // registration and roll back the prior `clients` / `spawnedInterfaces`
+        // adds if registration fails.
+        val registered = try {
             Transport.registerInterface(clientInterface.toRef())
+            true
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
+            clients.remove(clientInterface)
+            spawnedInterfaces?.remove(clientInterface)
+            false
         }
 
-        clientInterface.start()
+        if (registered) {
+            clientInterface.start()
+        }
 
         log("Client connected: $clientName (total: ${clients.size})")
     }
