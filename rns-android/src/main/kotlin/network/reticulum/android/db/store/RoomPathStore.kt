@@ -33,12 +33,12 @@ class RoomPathStore(
             failureCount = entry.failureCount,
             randomBlobs = blobsCsv
         )
-        writeExecutor.execute { dao.upsert(entity) }
+        writeExecutor.submitWriteThrough("path.upsert") { dao.upsert(entity) }
     }
 
     override fun removePath(destHash: ByteArray) {
         val hash = destHash.copyOf()
-        writeExecutor.execute { dao.deleteByHash(hash) }
+        writeExecutor.submitWriteThrough("path.deleteByHash") { dao.deleteByHash(hash) }
     }
 
     override fun loadAllPaths(): Map<ByteArrayKey, PathEntry> {
@@ -78,6 +78,6 @@ class RoomPathStore(
     }
 
     override fun removeExpiredBefore(timestampMs: Long) {
-        writeExecutor.execute { dao.deleteExpiredBefore(timestampMs) }
+        writeExecutor.submitWriteThrough("path.deleteExpiredBefore") { dao.deleteExpiredBefore(timestampMs) }
     }
 }
