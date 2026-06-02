@@ -14,7 +14,7 @@ class RoomPacketHashStore(
 
     override fun saveAll(hashes: Set<ByteArrayKey>, generation: Int) {
         val entities = hashes.map { PacketHashEntity(hash = it.bytes, generation = generation) }
-        writeExecutor.execute {
+        writeExecutor.submitWriteThrough("packetHash.saveAll") {
             dao.deleteByGeneration(generation)
             // Insert in batches to avoid SQLite variable limit
             entities.chunked(500).forEach { batch ->
@@ -30,6 +30,6 @@ class RoomPacketHashStore(
     }
 
     override fun clear() {
-        writeExecutor.execute { dao.deleteAll() }
+        writeExecutor.submitWriteThrough("packetHash.deleteAll") { dao.deleteAll() }
     }
 }

@@ -17,7 +17,7 @@ class RoomAnnounceStore(
             raw = raw.copyOf(),
             interfaceName = interfaceName
         )
-        writeExecutor.execute { dao.upsert(entity) }
+        writeExecutor.submitWriteThrough("cacheAnnounce") { dao.upsert(entity) }
     }
 
     override fun getAnnounce(packetHash: ByteArray): Pair<ByteArray, String?>? {
@@ -27,11 +27,11 @@ class RoomAnnounceStore(
 
     override fun removeAnnounce(packetHash: ByteArray) {
         val hash = packetHash.copyOf()
-        writeExecutor.execute { dao.deleteByHash(hash) }
+        writeExecutor.submitWriteThrough("removeAnnounce") { dao.deleteByHash(hash) }
     }
 
     override fun removeAllExcept(activeHashes: Set<ByteArrayKey>) {
-        writeExecutor.execute {
+        writeExecutor.submitWriteThrough("removeAllExcept") {
             // Fetch all hashes from DB, compute which to delete, then delete in chunks.
             // This avoids the SQLite 999-variable limit on NOT IN clauses.
             val allHashes = dao.getAllHashes()
