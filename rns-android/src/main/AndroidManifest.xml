@@ -12,8 +12,17 @@
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="32" />
+    <!--
+        BLE scanning on API <= 30 requires ACCESS_FINE_LOCATION, but this
+        library intentionally does NOT declare it. ACCESS_FINE_LOCATION is a
+        dangerous, app-scoped permission; declaring it here with an
+        android:maxSdkVersion cap merges that cap onto the consuming app's own
+        FINE permission and silently strips precise location on newer API
+        levels (no "Use precise location" toggle, GPS unavailable). Consumers
+        that need legacy (API <= 30) BLE scanning must declare and request
+        ACCESS_FINE_LOCATION themselves — BleScanner.hasScanPermission() only
+        checks it at runtime; a library cannot request it.
+    -->
 
     <!-- BLE hardware feature (not required; graceful degradation if unavailable) -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
