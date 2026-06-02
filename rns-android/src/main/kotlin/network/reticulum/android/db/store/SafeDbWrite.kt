@@ -39,8 +39,16 @@ private const val TAG = "RoomStore"
  * are the crashes above. Swallow + log at WARN instead; the dropped write
  * is rebuilt from the next announce.
  *
- * Deliberately narrow: only DB-state / SQLite / rejection failures are
- * swallowed, so a genuine logic bug in [block] still surfaces.
+ * [IllegalStateException] is caught broadly on purpose. The close race
+ * surfaces as several different framework messages — "no current
+ * transaction" / "connection pool has been closed" / "already-closed
+ * object", and (COLUMBA-B7 was itself a late-discovered variant of 8X/8R)
+ * plausibly others — so matching on message text would risk missing a
+ * variant and reintroducing the crash. The trade-off is that an
+ * [IllegalStateException] from a genuine logic error would also be
+ * swallowed, so each [block] is kept to plain DAO calls with no
+ * `check`/`error`/`require` and no main-thread DB access — there is no such
+ * error here to mask. Keep them that way.
  *
  * @param op short operation label for the dropped-write log line.
  */

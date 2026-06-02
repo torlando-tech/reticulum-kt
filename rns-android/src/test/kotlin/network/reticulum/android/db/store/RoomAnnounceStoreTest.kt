@@ -9,9 +9,6 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.util.concurrent.AbstractExecutorService
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.TimeUnit
 
 /**
  * Regression tests for Sentry COLUMBA-B7 and its siblings (COLUMBA-8X/8R).
@@ -97,22 +94,6 @@ class RoomAnnounceStoreTest {
 
         // The guard must not change normal pruning behavior.
         assertEquals(listOf(inactive.toList()), dao.deleted.map { it.toList() })
-    }
-
-    /** Inline executor so write tasks run deterministically on the test thread. */
-    private class DirectExecutorService : AbstractExecutorService() {
-        @Volatile private var shutdown = false
-
-        override fun execute(command: Runnable) {
-            if (shutdown) throw RejectedExecutionException("executor shut down")
-            command.run()
-        }
-
-        override fun shutdown() { shutdown = true }
-        override fun shutdownNow(): MutableList<Runnable> { shutdown = true; return mutableListOf() }
-        override fun isShutdown(): Boolean = shutdown
-        override fun isTerminated(): Boolean = shutdown
-        override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = true
     }
 
     private class FakeAnnounceCacheDao(
