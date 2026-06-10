@@ -438,7 +438,16 @@ class Link private constructor(
 
     // Timestamps
     private var requestTime: Long = 0
-    private var activatedAt: Long = 0
+
+    /**
+     * Wall-clock time the link was activated (status reached [LinkConstants.ACTIVE]),
+     * or 0 if it never activated. Exposed read-only so LXMF-kt's direct-delivery
+     * CLOSED-link handling can distinguish "was active, closed unexpectedly" from
+     * "never activated" — Python LXMF reads `direct_link.activated_at != None`
+     * (`LXMRouter.py` direct-delivery branch).
+     */
+    var activatedAt: Long = 0
+        private set
     var lastInbound: Long = 0
         private set
     var lastOutbound: Long = 0

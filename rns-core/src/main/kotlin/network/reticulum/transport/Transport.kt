@@ -1199,11 +1199,13 @@ object Transport {
      * If the link was removed from [pendingLinks] (i.e. it never activated) and was
      * torn down due to establishment timeout, and we are an endpoint (not a transport
      * node), expire the path to the destination and kick off a fresh path request.
-     * Mirrors Python `Transport.py:472-494`: if a leaf node can't establish a link
+     * Mirrors Python `Transport.py:498-522`: if a leaf node can't establish a link
      * over its cached path, the path is almost certainly stale, so invalidate it and
-     * rediscover. [requestPath] internally rate-limits via
-     * [TransportConstants.PATH_REQUEST_MI] so repeat failures on the same destination
-     * don't spam the network.
+     * rediscover. The path is expired unconditionally; the rediscovery [requestPath]
+     * is rate-limited via [TransportConstants.PATH_REQUEST_MI] here at the call site
+     * (Python guards it at `Transport.py:516`) so repeat failures on the same
+     * destination don't spam the network. [requestPath] itself now sends
+     * unconditionally for Python parity, so the throttle must live here.
      *
      * Transport nodes skip path expiry: they forward for unrelated clients and
      * shouldn't churn their path table on downstream failures (Python guard at
@@ -1225,7 +1227,16 @@ object Transport {
                     "expiring path and requesting rediscovery",
             )
             expirePath(destHash)
-            requestPath(destHash)
+            // requestPath no longer self-throttles (Python parity); apply the
+            // PATH_REQUEST_MI rate-limit for this automated rediscovery here at the
+            // call site, matching the jobloop pending-link handler
+            // (Python Transport.py:505-520).
+            val lastRequest = pathRequests[destHash.toKey()]
+            if (lastRequest == null ||
+                System.currentTimeMillis() - lastRequest > TransportConstants.PATH_REQUEST_MI
+            ) {
+                requestPath(destHash)
+            }
         }
     }
 
@@ -1283,11 +1294,29 @@ object Transport {
     // ===== Path Table Operations =====
 
     /**
-     * Check if a path exists to a destination.
+     * True when [entry]'s receiving interface no longer exists while other
+     * interfaces are registered — i.e. a restored path pointing at a dead
+     * interface. Such an entry is not usable and must not satisfy [hasPath],
+     * [hopsTo] or [nextHop]. Mirrors Python's load-time interface validation
+     * (`Transport.py:284-298`, "the interface is no longer available"); kotlin
+     * restores persisted paths eagerly and validates lazily (see
+     * `port-deviations.md`).
+     *
+     * Guarded on [interfaces].isNotEmpty() to preserve the
+     * restore-before-interfaces-register window — the same guard [savePathTable]
+     * uses, mirroring `Transport.py:2905-2910`. This check is non-destructive;
+     * [cullTables] prunes dangling entries after the startup grace period.
+     */
+    private fun isDanglingPath(entry: PathEntry): Boolean =
+        interfaces.isNotEmpty() && findInterfaceByHash(entry.receivingInterfaceHash) == null
+
+    /**
+     * Check if a usable path exists to a destination.
      */
     fun hasPath(destinationHash: ByteArray): Boolean {
         val entry = pathTable[destinationHash.toKey()] ?: return false
-        return !entry.isExpired()
+        if (entry.isExpired()) return false
+        return !isDanglingPath(entry)
     }
 
     /**
@@ -1304,18 +1333,19 @@ object Transport {
         discoveryPathRequests.containsKey(destinationHash.toKey())
 
     /**
-     * Unconditionally emit a path-request packet for `destinationHash`,
-     * bypassing [requestPath]'s Kotlin-only early-skip guards (existing
-     * path / too-recent). Mirrors Python `RNS.Transport.request_path`
-     * (RNS/Transport.py:2541), which also sends unconditionally.
+     * Emit a path-request packet for `destinationHash`.
      *
-     * Exposed primarily for the conformance bridge so tests can observe
-     * a fresh PR on the wire even when this peer already has a path or
-     * recently requested one; production callers should use [requestPath]
-     * and benefit from the guards.
+     * Retained as a source-compatible alias for the conformance bridge.
+     * [requestPath] now sends unconditionally (Python parity — the early-skip
+     * guards it used to carry were a deviation and have been removed), so the
+     * two are equivalent; new callers should use [requestPath] directly.
      */
+    @Deprecated(
+        "requestPath now sends unconditionally (Python parity); call it directly.",
+        ReplaceWith("requestPath(destinationHash)"),
+    )
     fun sendPathRequestUnconditional(destinationHash: ByteArray) {
-        requestPathInternal(destinationHash)
+        requestPath(destinationHash)
     }
 
     /**
@@ -1326,6 +1356,7 @@ object Transport {
     fun hopsTo(destinationHash: ByteArray): Int? {
         val entry = pathTable[destinationHash.toKey()] ?: return null
         if (entry.isExpired()) return null
+        if (isDanglingPath(entry)) return null
         return entry.hops
     }
 
@@ -1337,6 +1368,7 @@ object Transport {
     fun nextHop(destinationHash: ByteArray): ByteArray? {
         val entry = pathTable[destinationHash.toKey()] ?: return null
         if (entry.isExpired()) return null
+        if (isDanglingPath(entry)) return null
         return entry.nextHop.copyOf()
     }
 
@@ -2182,6 +2214,15 @@ object Transport {
      * This broadcasts a path request packet. If another node on the network
      * knows a path, it will respond with an announce.
      *
+     * Sends **unconditionally**, mirroring Python `RNS.Transport.request_path`
+     * (RNS/Transport.py:2541): it neither short-circuits when a path already
+     * exists nor rate-limits locally-originated requests. Stale-path refresh
+     * depends on this — a cached-but-dangling path must not suppress a fresh
+     * request. The [TransportConstants.PATH_REQUEST_MI] throttle that previously
+     * lived here now sits at the sole automated re-request site that needs it
+     * ([deregisterLink], Python Transport.py:486-492). The [started] guard is a
+     * Kotlin lifecycle necessity with no Python equivalent at this call site.
+     *
      * @param destinationHash The destination to find a path to
      * @param onInterface Optional specific interface to send request on
      * @param callback Optional callback when path is found
@@ -2192,21 +2233,6 @@ object Transport {
         callback: ((Boolean) -> Unit)? = null,
     ) {
         if (!started.get()) {
-            callback?.invoke(false)
-            return
-        }
-
-        // Check if we already have a path
-        if (hasPath(destinationHash)) {
-            callback?.invoke(true)
-            return
-        }
-
-        // Check if request was made too recently
-        val lastRequest = pathRequests[destinationHash.toKey()]
-        val now = System.currentTimeMillis()
-        if (lastRequest != null && now - lastRequest < TransportConstants.PATH_REQUEST_MI) {
-            log("Skipping path request for ${destinationHash.toHexString()} (too recent)")
             callback?.invoke(false)
             return
         }
@@ -2257,7 +2283,7 @@ object Transport {
             }
 
         if (sent) {
-            pathRequests[destinationHash.toKey()] = now
+            pathRequests[destinationHash.toKey()] = System.currentTimeMillis()
             log("Sent path request for ${destinationHash.toHexString()}")
 
             // Set up timeout callback if provided
@@ -4909,6 +4935,18 @@ object Transport {
         // The old global queue is no longer used - announces are now queued per-interface
         // and processed asynchronously via scheduleAnnounceQueueProcessing()
         // This method is kept empty for compatibility with the job loop
+    }
+
+    /** Test seam: run the periodic table cull synchronously. */
+    internal fun cullTablesNow() = cullTables()
+
+    /**
+     * Test seam: backdate [startTime] so the startup grace period
+     * ([TransportConstants.STARTUP_GRACE_PERIOD]) has elapsed, allowing
+     * [cullTables] to exercise its dangling-interface prune.
+     */
+    internal fun setStartTimeForTest(timeMs: Long) {
+        startTime = timeMs
     }
 
     private fun cullTables() {

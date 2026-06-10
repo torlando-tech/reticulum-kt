@@ -148,3 +148,25 @@ To restore the python invariant ("the flag is true iff we're a shared-instance c
 With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` outbound on the same code path as python, so the master receives `packet.transportId != null` and no compensation is required. The compensation block is removed; the master's processing now mirrors python's exactly.
 
 **Re-evaluation:** the removal is a strict re-convergence with the python reference — there's nothing to re-evaluate unless a future kotlin downstream consumer reintroduces a code path that bypasses both `Reticulum.tryConnectToSharedInstance` and `Transport.registerInterface`'s flag widening (which would be a separate bug to fix at the new bypass site, not here).
+
+### Eager client-side path persistence with deferred (lazy) interface validation — `rns-core/.../Transport.kt::loadPersistedDataFromStorage`, `hasPath`/`hopsTo`/`nextHop`/`isDanglingPath`, `cullTables`
+
+**Python reference:** `RNS/Transport.py:255-300` (`__init__` load of `destination_table` from `destination_table` cache). Python loads the persisted path table **only when `Reticulum.transport_enabled()`** is true (leaf clients never persist or restore paths), and validates each entry **at load time**: an entry is dropped if its `receiving_interface` no longer resolves to a registered interface ("The interface is no longer available") or if no cached announce backs it. After load, `has_path`/`hops_to`/`next_hop` can therefore trust that every table entry references a live interface.
+
+**Category:** new feature (client-side path persistence) + language/runtime forced (lazy validation timing).
+
+**Date:** 2026-06-09.
+
+**Tracking:** columba#1004 (D5). See also `columba` memory `issue-1004-path-requests-direct-delivery`.
+
+**Description:** Columba persists the path table on *plain clients* (phones) via a Room-backed [PathStore] — an intentional improvement over python, where only transport nodes persist paths, so that a freshly-opened app can reach recently-known destinations without waiting for a fresh announce ([path-persistence-improvement]). Two deviations follow from this:
+
+1. **Eager load (feature).** `loadPersistedDataFromStorage` restores `pathTable` unconditionally, omitting python's `transport_enabled()` gate. This is the persistence feature itself and must not be "fixed" back to the python gate.
+
+2. **Lazy interface validation (runtime-forced).** Python validates interfaces at load time because, in python, all configured interfaces are constructed and registered *before* `Transport` loads the table. On Android, interfaces (TCP, BLE, RNode) register **asynchronously after** `Transport.start()`, so a load-time validation would wrongly drop every restored entry during the startup window before its interface comes up. Instead, validation is deferred and split:
+   - `hasPath`/`hopsTo`/`nextHop` apply a **non-destructive** `isDanglingPath` check: a restored entry whose `receivingInterfaceHash` resolves to no registered interface is treated as absent, *but only once at least one interface has registered* (`interfaces.isNotEmpty()` — the same guard `savePathTable` uses, mirroring `Transport.py:2905-2910`). This preserves python's invariant ("a usable path references a live interface") at the read APIs without racing async registration.
+   - `cullTables` performs the **destructive** prune (removing the entry and calling `pathStore.removePath`) but only after `STARTUP_GRACE_PERIOD` past `startTime`, which is the kotlin equivalent of python's load-time "interface no longer available" drop (`Transport.py:284-298`), shifted later to accommodate async registration.
+
+   Net effect: once interfaces are up, kotlin's read APIs and table contents converge on exactly what python would have after its load-time validation.
+
+**Re-evaluation:** if Android interface registration is ever made synchronous-before-`Transport.start()` (matching python's construct-then-load order), the lazy split can collapse back into a single load-time validation in `loadPersistedDataFromStorage`, and the `interfaces.isNotEmpty()` guard plus the grace-period cull become unnecessary. The eager-load feature (item 1) is independent and stays regardless, as long as Columba wants client-side path persistence.

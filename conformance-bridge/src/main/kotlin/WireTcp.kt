@@ -913,13 +913,11 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        // `Transport.requestPath` adds Kotlin-only early-skip guards
-        // (already has path / too recent) that would make this a no-op in
-        // the path-discovery tests — the whole point is to issue a fresh
-        // request even for destinations we already know / have recently
-        // requested. `sendPathRequestUnconditional` bypasses those guards,
-        // matching Python's `RNS.Transport.request_path` behaviour.
-        Transport.sendPathRequestUnconditional(destHash)
+        // `Transport.requestPath` now sends unconditionally, matching Python's
+        // `RNS.Transport.request_path` — it issues a fresh request even for
+        // destinations we already know / have recently requested, which is
+        // exactly what the path-discovery tests need.
+        Transport.requestPath(destHash)
         result("sent" to boolVal(true))
     }
 

@@ -157,6 +157,17 @@ class TcpIntegrationTest {
 
         // Create server
         server = TCPServerInterface("test-server", "127.0.0.1", testPort)
+
+        // Register each spawned per-connection child with Transport, exactly as
+        // real consumers do (conformance-bridge WireTcp.kt:280, rns-android).
+        // TCPServerInterface delegates child registration to the consumer via
+        // onClientConnected (see TCPServerInterface.kt:83), and Python registers
+        // the spawned interface itself (TCPInterface.py:633). Without this, the
+        // receiving interface for a client-sourced announce isn't in
+        // Transport.interfaces, so the learned path correctly reads as dangling.
+        server.onClientConnected = { spawnedChild ->
+            Transport.registerInterface(spawnedChild.toRef())
+        }
         server.start()
 
         // Start transport and register server interface
