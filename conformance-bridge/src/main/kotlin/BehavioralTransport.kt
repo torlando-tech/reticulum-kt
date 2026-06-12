@@ -719,7 +719,103 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         result("handler_id" to strVal(handlerId), "registered" to boolVal(true))
     }
 
+    // ===== Blackhole (11 commands, LIVE) =====
+
+    "behavioral_blackhole_identity" -> {
+        inst(p)
+        // The reference passes `until` as an epoch-SECONDS float; kotlin stores
+        // millis, so convert at the boundary.
+        val untilMs = p.get("until")?.takeIf { !it.isJsonNull }?.let { (it.asDouble * 1000).toLong() }
+        val r = Transport.blackholeIdentity(p.hex("identity_hash"), untilMs, p.strOpt("reason"))
+        result("blackholed" to boolVal(r == true))
+    }
+
+    "behavioral_unblackhole_identity" -> {
+        inst(p)
+        val r = Transport.unblackholeIdentity(p.hex("identity_hash"))
+        result("lifted" to boolVal(r == true))
+    }
+
+    "behavioral_read_blackhole_table" -> {
+        inst(p)
+        result(
+            "count" to intVal(Transport.blackholedIdentities.size),
+            "entries" to blackholeEntriesJson(Transport.blackholedIdentities),
+        )
+    }
+
+    "behavioral_blackhole_list_handler" -> {
+        inst(p)
+        val table = Transport.blackholeListHandler()
+        result(
+            "is_blackhole_table" to boolVal(table === Transport.blackholedIdentities),
+            "count" to intVal(table.size),
+            "entries" to blackholeEntriesJson(table),
+        )
+    }
+
+    "behavioral_blackhole_reload" -> {
+        inst(p)
+        Transport.reloadBlackhole()
+        result("count" to intVal(Transport.blackholedIdentities.size))
+    }
+
+    "behavioral_blackhole_clear" -> {
+        inst(p)
+        Transport.clearBlackholeTable()
+        result("cleared" to boolVal(true))
+    }
+
+    "behavioral_blackhole_storage_files" -> {
+        inst(p)
+        val dir = Transport.blackholeStorageDirForTest()
+        val files = JsonArray()
+        java.io.File(dir).listFiles()?.filter { it.isFile }?.sortedBy { it.name }?.forEach {
+            files.add(JsonObject().apply { addProperty("name", it.name); addProperty("size", it.length()) })
+        }
+        result("dir" to strVal(dir), "files" to files)
+    }
+
+    "behavioral_blackhole_clear_storage" -> {
+        inst(p)
+        var removed = 0
+        java.io.File(Transport.blackholeStorageDirForTest()).listFiles()?.filter { it.isFile }?.forEach {
+            if (it.delete()) removed++
+        }
+        result("removed" to intVal(removed))
+    }
+
+    "behavioral_blackhole_rename_storage" -> {
+        inst(p)
+        val dir = Transport.blackholeStorageDirForTest()
+        val ok = java.io.File(dir, p.str("src")).renameTo(java.io.File(dir, p.str("dst")))
+        result("renamed" to boolVal(ok))
+    }
+
+    "behavioral_blackhole_set_sources" -> {
+        inst(p)
+        Transport.blackholeSources.clear()
+        for (el in p.get("sources").asJsonArray) Transport.blackholeSources.add(el.asString.fromHex())
+        result("count" to intVal(Transport.blackholeSources.size))
+    }
+
     else -> throw IllegalArgumentException("Unknown behavioral command: $command")
+}
+
+/** Serialize the blackhole table to the reference's entry schema. */
+private fun blackholeEntriesJson(table: Map<network.reticulum.common.ByteArrayKey, network.reticulum.transport.BlackholeEntry>): JsonArray {
+    val arr = JsonArray()
+    for ((key, e) in table) {
+        arr.add(JsonObject().apply {
+            addProperty("identity_hash", key.bytes.toHex())
+            addProperty("source", e.source.toHex())
+            // millis -> the epoch-seconds float the python-style test expects.
+            val until = e.until
+            if (until == null) add("until", JsonNull.INSTANCE) else addProperty("until", until / 1000.0)
+            if (e.reason == null) add("reason", JsonNull.INSTANCE) else addProperty("reason", e.reason)
+        })
+    }
+    return arr
 }
 
 /** Resolve the instance for a command, or throw. */
