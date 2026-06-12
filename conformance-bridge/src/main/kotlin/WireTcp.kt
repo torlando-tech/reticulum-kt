@@ -2359,5 +2359,168 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    // ===== Phase 5c batch 4: link adversarial / payload validation =====
+
+    "wire_link_signalling_bytes" -> {
+        // Delegate to the static Link.signallingBytes(mtu, mode): the 3-byte
+        // field for an ENABLED mode, or raised=true for a non-enabled mode.
+        val mtu = p.int("mtu")
+        val mode = p.int("mode")
+        var raised = false
+        var signalling: ByteArray? = null
+        try {
+            signalling = Link.signallingBytes(mtu, mode)
+        } catch (e: IllegalArgumentException) {
+            raised = true
+        }
+        val enabledModes = JsonArray().apply { LinkConstants.ENABLED_MODES.forEach { add(it) } }
+        result(
+            "mtu" to intVal(mtu),
+            "mode" to intVal(mode),
+            "signalling_bytes" to (signalling?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "raised" to boolVal(raised),
+            "mtu_bytemask" to intVal(LinkConstants.MTU_BYTEMASK),
+            "mode_bytemask" to intVal(LinkConstants.MODE_BYTEMASK),
+            "enabled_modes" to enabledModes,
+            "mode_default" to intVal(LinkConstants.MODE_DEFAULT),
+            "link_mtu_size" to intVal(LinkConstants.LINK_MTU_SIZE),
+        )
+    }
+
+    "wire_link_request_payload" -> {
+        // Capture a genuine initiator LINKREQUEST payload WITHOUT sending it:
+        // pub(32) || sigPub(32) || signalling(3) = ECPUBSIZE(64) + LINK_MTU_SIZE(3).
+        val handle = p.str("handle")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val rd = Link.buildInitiatorRequestDataForTest()
+        val ecpubsize = LinkConstants.ECPUBSIZE
+        result(
+            "request_data_hex" to hexVal(rd.requestData),
+            "pub_bytes" to hexVal(rd.pubBytes),
+            "sig_pub_bytes" to hexVal(rd.sigPubBytes),
+            "signalling_bytes" to hexVal(rd.requestData.copyOfRange(ecpubsize, rd.requestData.size)),
+            "mtu" to intVal(rd.mtu),
+            "mode" to intVal(rd.mode),
+            "len" to intVal(rd.requestData.size),
+            "ecpubsize" to intVal(ecpubsize),
+            "link_mtu_size" to intVal(LinkConstants.LINK_MTU_SIZE),
+            "reticulum_mtu" to intVal(network.reticulum.common.RnsConstants.MTU),
+        )
+    }
+
+    "wire_inject_crafted_link_request" -> {
+        // Adversarial LINKREQUEST payload-validation injector: feed a crafted
+        // LINKREQUEST of `variant` through the real Link.validateRequest and
+        // report whether an inbound link was created. Only 64/67-byte payloads
+        // yield a link; bad_mode's reserved signalling mode is rejected.
+        val handle = p.str("handle")
+        val variant = p.str("variant")
+        val hops = p.get("hops")?.asInt ?: 0
+        val appName = p.get("app_name")?.asString ?: "conformance"
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: arrayOf("lr-validate")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val ownerIdentity = Identity.create()
+        val owner = Destination.create(ownerIdentity, DestinationDirection.IN, DestinationType.SINGLE, appName, *aspects)
+        val base = Link.buildInitiatorRequestDataForTest().requestData
+        val ecpubsize = LinkConstants.ECPUBSIZE
+        val data: ByteArray = when (variant) {
+            "valid64" -> base.copyOfRange(0, ecpubsize)
+            "valid67" -> base
+            "size_63" -> base.copyOfRange(0, 63)
+            "size_66" -> base.copyOfRange(0, 66)
+            "size_0" -> ByteArray(0)
+            "bad_mode" -> base.copyOf().also { it[ecpubsize] = 0x60.toByte() } // reserved mode 3
+            else -> throw IllegalArgumentException("unknown link-request variant: $variant")
+        }
+
+        // Craft a genuine LINKREQUEST packet carrying `data`, addressed to the
+        // owner's hash, then re-parse it as a received packet.
+        val outOwner = Destination.create(ownerIdentity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val pkt = Packet.createRaw(
+            destinationHash = outOwner.hash,
+            data = data,
+            packetType = network.reticulum.common.PacketType.LINKREQUEST,
+            destinationType = DestinationType.SINGLE,
+        )
+        val raw = pkt.pack()
+        val rx = Packet.unpack(raw)
+            ?: throw IllegalStateException("could not unpack crafted link request packet")
+        rx.hops = hops
+        val iface = (inst.serverIface ?: inst.clientIface)
+        rx.setReceivingInterfaceHashForTest(iface?.getHash())
+
+        val link = runCatching { Link.validateRequest(owner, rx.data, rx) }.getOrNull()
+        val accepted = link != null
+        var establishmentTimeout: Long? = null
+        var mode: Int? = null
+        var mtu: Int? = null
+        if (link != null) {
+            establishmentTimeout = link.establishmentTimeout
+            mode = link.mode
+            mtu = link.mtu
+            runCatching { link.teardown() }
+        }
+        result(
+            "variant" to strVal(variant),
+            "data_len" to intVal(data.size),
+            "accepted" to boolVal(accepted),
+            "inbound_link_created" to boolVal(accepted),
+            "establishment_timeout" to (establishmentTimeout?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+            "mode" to (mode?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "mtu" to (mtu?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "establishment_timeout_per_hop" to intVal((LinkConstants.ESTABLISHMENT_TIMEOUT_PER_HOP / 1000L).toInt()),
+            "keepalive" to intVal((LinkConstants.KEEPALIVE / 1000L).toInt()),
+        )
+    }
+
+    "wire_link_accept_gate" -> {
+        // Pin the link-accept gate: an inbound LINKREQUEST yields a link only
+        // when the destination accepts links. kotlin enforces this gate in
+        // Transport (Transport.kt:4559 `if (!destination.acceptLinkRequests)`
+        // skip, then Link.validateRequest), NOT in Destination.receive (whose
+        // LINKREQUEST branch is a callback stub). So drive the genuine gate
+        // value (acceptsLinks) and the genuine validateRequest exactly as
+        // Transport sequences them.
+        val handle = p.str("handle")
+        val accepts = p.get("accepts").asBoolean
+        val appName = p.get("app_name")?.asString ?: "conformance"
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: arrayOf("accept-gate")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val ownerIdentity = Identity.create()
+        val owner = Destination.create(ownerIdentity, DestinationDirection.IN, DestinationType.SINGLE, appName, *aspects)
+        owner.acceptLinkRequests = accepts
+
+        val data = Link.buildInitiatorRequestDataForTest().requestData
+        val outOwner = Destination.create(ownerIdentity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val pkt = Packet.createRaw(
+            destinationHash = outOwner.hash,
+            data = data,
+            packetType = network.reticulum.common.PacketType.LINKREQUEST,
+            destinationType = DestinationType.SINGLE,
+        )
+        val rx = Packet.unpack(pkt.pack())
+            ?: throw IllegalStateException("could not unpack crafted link request packet")
+        rx.setReceivingInterfaceHashForTest((inst.serverIface ?: inst.clientIface)?.getHash())
+
+        val linksBefore = 0
+        // Transport's gate: validate only when the destination accepts links.
+        val link = if (owner.acceptsLinks()) runCatching { Link.validateRequest(owner, rx.data, rx) }.getOrNull() else null
+        val linksAfter = if (link != null) 1 else 0
+        runCatching { link?.teardown() }
+        result(
+            "accepts" to boolVal(accepts),
+            "links_before" to intVal(linksBefore),
+            "links_after" to intVal(linksAfter),
+            "link_created" to boolVal(linksAfter > linksBefore),
+        )
+    }
+
     else -> throw IllegalArgumentException("Unknown wire command: $command")
 }
