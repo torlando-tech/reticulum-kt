@@ -1180,7 +1180,17 @@ class Destination private constructor(
                 val token = groupToken ?: throw IllegalStateException(
                     "Cannot decrypt for GROUP destination without private key. Call createKeys() or loadPrivateKey() first."
                 )
-                token.decrypt(ciphertext)
+                // python Destination.decrypt swallows a GROUP Token auth/format
+                // failure and returns None rather than propagating (Destination.py
+                // :644-651) — a member holding the WRONG key for the group must
+                // get None, never garbage and never a raised ValueError.
+                // Token.decrypt raises on HMAC mismatch, so catch it here to
+                // match the reference contract.
+                try {
+                    token.decrypt(ciphertext)
+                } catch (e: Exception) {
+                    null
+                }
             }
 
             DestinationType.LINK -> {
