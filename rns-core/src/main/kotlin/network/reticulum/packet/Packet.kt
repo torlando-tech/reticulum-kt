@@ -82,6 +82,18 @@ class Packet private constructor(
     var receivingInterfaceHash: ByteArray? = null
         internal set
 
+    /**
+     * Conformance test seam: stamp the receiving-interface hash on a crafted
+     * inbound packet, the kotlin equivalent of the reference setting
+     * `rx.receiving_interface = <iface>` before feeding a hand-built packet to
+     * Link.validateRequest / link.receive (reticulum-conformance reference/
+     * wire_tcp.py). The setter is internal so the separate-module bridge needs
+     * this seam. No port logic — just exposes the existing field.
+     */
+    fun setReceivingInterfaceHashForTest(hash: ByteArray?) {
+        receivingInterfaceHash = hash
+    }
+
     /** Physical layer signal stats from receiving interface. */
     var rssi: Int? = null
         internal set

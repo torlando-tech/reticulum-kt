@@ -379,6 +379,39 @@ class Link private constructor(
             )
         }
 
+        /**
+         * Conformance test seam: build a genuine initiator LINKREQUEST payload
+         * (pub_bytes || sig_pub_bytes || signalling_bytes) with freshly-generated
+         * ephemeral X25519/Ed25519 keys, WITHOUT putting it on the wire. This is
+         * the kotlin equivalent of the reference bridge patching Packet.send off
+         * during _build_initiator_request_data (reticulum-conformance reference/
+         * wire_tcp.py): initializeAsInitiator() bundles the genuine assembly with
+         * the wire send, so this re-runs ONLY the assembly via the same crypto +
+         * signallingBytes() the handshake uses, at the default MTU (Reticulum.MTU,
+         * the value a no-MTU-discovery next hop yields). No port logic — pure
+         * read-only assembly for the link-request adversarial commands.
+         */
+        /** Result holder for [buildInitiatorRequestDataForTest]. */
+        class InitiatorRequestDataForTest(
+            val requestData: ByteArray,
+            val pubBytes: ByteArray,
+            val sigPubBytes: ByteArray,
+            val mtu: Int,
+            val mode: Int,
+        )
+
+        fun buildInitiatorRequestDataForTest(
+            mode: Int = LinkConstants.MODE_DEFAULT,
+        ): InitiatorRequestDataForTest {
+            val crypto = defaultCryptoProvider()
+            val x = crypto.generateX25519KeyPair()
+            val ed = crypto.generateEd25519KeyPair()
+            val mtu = RnsConstants.MTU
+            val signalling = signallingBytes(mtu, mode)
+            val requestData = x.publicKey + ed.publicKey + signalling
+            return InitiatorRequestDataForTest(requestData, x.publicKey, ed.publicKey, mtu, mode)
+        }
+
         private fun log(message: String) {
             val timestamp =
                 java.time.LocalDateTime.now().format(
