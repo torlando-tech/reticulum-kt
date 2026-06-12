@@ -94,7 +94,16 @@ class BouncyCastleProvider : CryptoProvider {
     }
 
     override fun ed25519KeyPairFromSeed(seed: ByteArray): Ed25519KeyPair {
-        require(seed.size == 32) { "Ed25519 seed must be 32 bytes" }
+        // python pure25519 SigningKey accepts a 32-byte seed or a 64-byte
+        // seed||pubkey string and rejects every other length
+        // (ed25519_oop.py:105-110). For the 64-byte form the embedded pubkey
+        // (last 32) is taken verbatim, exactly as pure25519's vk_s = sk_s[32:].
+        require(seed.size == 32 || seed.size == 64) {
+            "SigningKey takes 32-byte seed or 64-byte string, got ${seed.size}"
+        }
+        if (seed.size == 64) {
+            return Ed25519KeyPair(seed, seed.copyOfRange(32, 64))
+        }
 
         val privateParams = Ed25519PrivateKeyParameters(seed, 0)
         val publicParams = privateParams.generatePublicKey()
@@ -106,7 +115,12 @@ class BouncyCastleProvider : CryptoProvider {
     }
 
     override fun ed25519PublicFromPrivate(privateKey: ByteArray): ByteArray {
-        require(privateKey.size == 32) { "Ed25519 private key must be 32 bytes" }
+        // Same 32|64 acceptance as pure25519 SigningKey; the 64-byte form's
+        // embedded pubkey is returned verbatim (vk_s = sk_s[32:]).
+        require(privateKey.size == 32 || privateKey.size == 64) {
+            "SigningKey takes 32-byte seed or 64-byte string, got ${privateKey.size}"
+        }
+        if (privateKey.size == 64) return privateKey.copyOfRange(32, 64)
 
         val privateParams = Ed25519PrivateKeyParameters(privateKey, 0)
         val publicParams = privateParams.generatePublicKey()
@@ -117,10 +131,16 @@ class BouncyCastleProvider : CryptoProvider {
     }
 
     override fun ed25519Sign(privateKey: ByteArray, message: ByteArray): ByteArray {
-        require(privateKey.size == 32) { "Ed25519 private key must be 32 bytes" }
+        // pure25519 signs with the seed half: _ed25519.signature(m, sk_s[:32], ...)
+        // — so the 64-byte seed||pubkey form is accepted and its first 32 bytes
+        // used as the signing seed (ed25519_oop.py:105-111,138-141).
+        require(privateKey.size == 32 || privateKey.size == 64) {
+            "SigningKey takes 32-byte seed or 64-byte string, got ${privateKey.size}"
+        }
+        val seed = if (privateKey.size == 64) privateKey.copyOfRange(0, 32) else privateKey
 
         try {
-            val privateParams = Ed25519PrivateKeyParameters(privateKey, 0)
+            val privateParams = Ed25519PrivateKeyParameters(seed, 0)
             val signer = Ed25519Signer()
             signer.init(true, privateParams)
             signer.update(message, 0, message.size)
@@ -177,6 +197,8 @@ class BouncyCastleProvider : CryptoProvider {
 
     override fun hkdf(length: Int, ikm: ByteArray, salt: ByteArray?, info: ByteArray?): ByteArray {
         // HKDF implementation matching Python's RNS/Cryptography/HKDF.py
+        // python: `if length == None or length < 1: raise ValueError(...)` (HKDF.py:41-42)
+        require(length >= 1) { "Invalid output key length" }
         val actualSalt = salt ?: ByteArray(32) // Default to 32 zero bytes
         val actualInfo = info ?: ByteArray(0)
 
@@ -252,6 +274,46 @@ class BouncyCastleProvider : CryptoProvider {
             len += cipher.doFinal(output, len)
 
             return output.copyOf(len)
+        } catch (e: Exception) {
+            throw CryptoException("AES decryption failed", e)
+        }
+    }
+
+    override fun aesEncryptNoPadding(plaintext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray {
+        require(key.size == mode.keySize) { "Key must be ${mode.keySize} bytes for $mode" }
+        require(iv.size == 16) { "IV must be 16 bytes" }
+        require(plaintext.size % 16 == 0) { "Plaintext must be a multiple of the 16-byte AES block size" }
+
+        try {
+            val cipher = CBCBlockCipher.newInstance(AESEngine.newInstance())
+            cipher.init(true, ParametersWithIV(KeyParameter(key), iv))
+            val output = ByteArray(plaintext.size)
+            var offset = 0
+            while (offset < plaintext.size) {
+                cipher.processBlock(plaintext, offset, output, offset)
+                offset += cipher.blockSize
+            }
+            return output
+        } catch (e: Exception) {
+            throw CryptoException("AES encryption failed", e)
+        }
+    }
+
+    override fun aesDecryptNoPadding(ciphertext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray {
+        require(key.size == mode.keySize) { "Key must be ${mode.keySize} bytes for $mode" }
+        require(iv.size == 16) { "IV must be 16 bytes" }
+        require(ciphertext.size % 16 == 0) { "Ciphertext must be a multiple of the 16-byte AES block size" }
+
+        try {
+            val cipher = CBCBlockCipher.newInstance(AESEngine.newInstance())
+            cipher.init(false, ParametersWithIV(KeyParameter(key), iv))
+            val output = ByteArray(ciphertext.size)
+            var offset = 0
+            while (offset < ciphertext.size) {
+                cipher.processBlock(ciphertext, offset, output, offset)
+                offset += cipher.blockSize
+            }
+            return output
         } catch (e: Exception) {
             throw CryptoException("AES decryption failed", e)
         }

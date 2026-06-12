@@ -50,7 +50,8 @@ object RnsConstants {
     const val LINK_ESTABLISHMENT_TIMEOUT_PER_HOP = 6_000L  // 6 seconds per hop
     const val LINK_KEEPALIVE = 360_000L              // 360 seconds in ms
     const val LINK_STALE_TIME = 288_000L             // 288 seconds in ms
-    const val LINK_MDU = 325                         // Approximate link MDU
+    // NOTE: link MDU lives in LinkConstants.MDU (computed, 431) — a stale
+    // duplicate here (325) was removed 2026-06-12; it matched no python value.
 
     // Ratchet
     const val RATCHET_SIZE = 32                      // 256 bits

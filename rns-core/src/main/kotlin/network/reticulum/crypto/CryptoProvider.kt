@@ -186,6 +186,36 @@ interface CryptoProvider {
     fun aesDecrypt(ciphertext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray
 
     /**
+     * Encrypt data with raw AES-CBC — NO padding.
+     *
+     * The bare block cipher, matching Python RNS's AES layer (AES.py), where
+     * padding lives only in the Token layer. The plaintext must already be a
+     * multiple of the 16-byte AES block size; the ciphertext is exactly the
+     * same length as the plaintext.
+     *
+     * @param plaintext Block-aligned data to encrypt
+     * @param key Encryption key (16 or 32 bytes depending on mode)
+     * @param iv 16-byte initialization vector
+     * @param mode AES_128_CBC or AES_256_CBC
+     * @return Ciphertext, same length as plaintext
+     */
+    fun aesEncryptNoPadding(plaintext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray
+
+    /**
+     * Decrypt data with raw AES-CBC — NO unpadding.
+     *
+     * Returns the raw decrypted blocks verbatim. Round-trips
+     * [aesEncryptNoPadding] byte-for-byte.
+     *
+     * @param ciphertext Block-aligned data to decrypt
+     * @param key Decryption key (16 or 32 bytes depending on mode)
+     * @param iv 16-byte initialization vector
+     * @param mode AES_128_CBC or AES_256_CBC
+     * @return Plaintext blocks, same length as ciphertext
+     */
+    fun aesDecryptNoPadding(ciphertext: ByteArray, key: ByteArray, iv: ByteArray, mode: AesMode): ByteArray
+
+    /**
      * Generate cryptographically secure random bytes.
      *
      * @param length Number of bytes to generate

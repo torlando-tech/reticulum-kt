@@ -46,6 +46,8 @@ class TCPServerInterface(
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
+        /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:454). */
+        const val DEFAULT_IFAC_SIZE = 16
     }
 
     // IFAC credentials - derived lazily from network name/passphrase

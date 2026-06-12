@@ -170,3 +170,47 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
    Net effect: once interfaces are up, kotlin's read APIs and table contents converge on exactly what python would have after its load-time validation.
 
 **Re-evaluation:** if Android interface registration is ever made synchronous-before-`Transport.start()` (matching python's construct-then-load order), the lazy split can collapse back into a single load-time validation in `loadPersistedDataFromStorage`, and the `interfaces.isNotEmpty()` guard plus the grace-period cull become unnecessary. The eager-load feature (item 1) is independent and stays regardless, as long as Columba wants client-side path persistence.
+
+### Adaptive multicast announce interval + Doze throttle — `rns-interfaces/.../auto/AutoInterface.kt::startAnnouncementLoop`, `updateAnnounceInterval`, `resetAnnounceInterval`, `throttleMultiplier`
+
+**Python reference:** `RNS/Interfaces/AutoInterface.py:62` (`ANNOUNCE_INTERVAL = 1.6`), `:472-475` (`announce_handler`: `while True: peer_announce(ifname); time.sleep(1.6)` — a fixed 1.6s multicast discovery transmission, per adopted interface, forever). Python constants that interact with this deviation: `:61` (`PEERING_TIMEOUT = 22.0`), `:371-381` (`peer_jobs` expires peers not heard within the timeout and tears down their spawned interfaces), `:614` (`AutoInterfacePeer.process_incoming` refreshes `last_heard` on inbound data, not just announces).
+
+**Category:** new feature (mobile power optimization). **Rule caveat:** as written above, reason 2 requires that kotlin-only behavior "not change semantics of any code path that does exist in python" — this deviation *does* change the announce cadence of a python-existing path. It landed 2026-04-05 without an entry here; documented retroactively 2026-06-11. Owner should confirm the justification stands (process rule 3), especially given the hazard below.
+
+**Date:** code 2026-04-05 (`9b0d21a` adaptive interval, `59db315` Doze throttle); entry 2026-06-11.
+
+**Tracking:** columba `docs/battery-optimization-opportunities.md` item 1 (announce-loop wakeup mechanics) and its parity note.
+
+**Description:** python transmits a multicast discovery announce every 1.6 seconds per adopted interface, unconditionally — ~54,000 multicast TX/day per interface, which on a phone keeps the WiFi radio out of power-save indefinitely. kotlin replaces the fixed cadence with an adaptive ramp (`AutoInterface.kt:57-70, 536-552`): announces start at the python-compatible 1.6s (`minAnnounceIntervalMs = ANNOUNCE_INTERVAL_MS`), and over the 60s following the last peer-topology change (`rampUpDurationMs`) the interval ramps linearly to `maxAnnounceIntervalMs = 120_000` (2 minutes). Any peer add/remove calls `resetAnnounceInterval()`, snapping back to 1.6s so new or changed peers are discovered at python speed. An additional `throttleMultiplier` (default 1.0) scales the effective max; rns-android's Doze plumbing raises it when the device idles. Receiving-side behavior is unchanged: like python, kotlin discovers announcing peers regardless of its own TX rate, and refreshes `lastHeard` on both announces (`addPeer`→`refreshPeer`, `AutoInterface.kt:700`) and inbound data (`AutoInterface.kt:465`), matching python's `:614`.
+
+**Known hazard — steady-state interval exceeds PEERING_TIMEOUT (owner decision needed):** both implementations expire peers not heard for 22s (`PEERING_TIMEOUT`; kotlin `peerJobs`, `AutoInterface.kt:661-676`). Data traffic refreshes peers on both sides, so *active* links are unaffected. But for an **idle** pair, announces are the only refresh source, and the ramped announce gap (→120s, larger still under the Doze multiplier) blows through the 22s timeout: once the ramp produces a gap >22s (roughly 10–30s after the last peer change), the remote side expires us — and expiry is disruptive, not cosmetic: kotlin's `removePeer` deregisters the spawned peer interface from `Transport` (`AutoInterface.kt:751-762`); python tears down its spawned interface likewise (`:381+`). Expiry also fires `resetAnnounceInterval()`, so the pair re-peers within seconds and starts ramping again — an add→expire→re-add flap cycle on the order of once per minute at idle, with Transport interface churn each cycle, against both python and kotlin remotes. Two consequences: (1) the nominal "~75x fewer announces" steady state is never actually reached against a live peer — the effective announce rate oscillates between 1.6s and roughly the timeout; (2) inbound delivery via AutoInterface during an expired window can be dropped on the remote (no spawned interface exists for us until our next announce). Mitigation options: (a) cap `effectiveMax` at ~15–18s — safely inside `PEERING_TIMEOUT` with jitter margin, still ~10x fewer TX than python; (b) keep slow multicast announces but add a unicast keepalive to *established* peers at <22s cadence (python's `reverse_announce`, `:477-489`, is precedent; kotlin currently has no unicast announce path); (c) a negotiated/longer peering timeout — not viable against fixed python remotes. Until one of these lands, AutoInterface peer flapping in idle-device logs is this deviation, not a network bug. Related dead code: `AutoInterfaceConstants.kt:52` defines `ANDROID_PEERING_TIMEOUT = 27.5` but nothing references it.
+
+**Re-evaluation:** if the announce cadence is capped ≤ `PEERING_TIMEOUT` (option a), the hazard paragraph retires and the deviation becomes a strict improvement; if upstream python ever adopts adaptive announces, converge on its constants instead. The columba battery-doc item 1 (replacing the announce loop's 1s flag-poll wakeup with a channel signal) is orthogonal wakeup mechanics and folds into this entry whenever it lands.
+
+### remember() malformed-key gate raises IllegalArgumentException, not TypeError — `rns-core/.../identity/Identity.kt::remember`
+
+**Python reference:** `RNS/Identity.py:100-101` (1.1.3) / `:102-103` (1.3.1) — `remember()` raises `TypeError` when `len(public_key) != Identity.KEYSIZE//8` (64 bytes), so a corrupt announce can never plant an unusable key.
+
+**Category:** language/runtime forced (exception-type idiom only; the gate condition and placement mirror python exactly).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance-suite `identity_remember` bridge command (reticulum-conformance `reference/bridge_server.py::cmd_identity_remember`).
+
+**Description:** kotlin's `remember()` previously had NO length gate (silent divergence — any key size was stored). The gate is now added to match python. Python raises `TypeError`; kotlin throws `IllegalArgumentException`, the JVM-idiomatic equivalent for an invalid argument (kotlin reserves its `TypeCastException`-family for actual cast failures, so `TypeError` has no faithful counterpart). Callers that need python parity should treat `IllegalArgumentException` from `remember()` as python's `TypeError`.
+
+**Re-evaluation:** none needed — permanent idiom mapping. NOTE (pre-existing, undocumented divergence spotted during this change, NOT introduced by it): python 1.3.1's `remember()` additionally takes `known_destinations_lock`, stores 5-element entries, and on an already-known destination UPDATES timestamp/packet_hash/public_key/app_data in place (`Identity.py:105-117`); kotlin unconditionally overwrites with a fresh `IdentityData` and has no 5th element. Functionally close but not identical (the 1.3.1 5th element survives updates). Needs its own entry or a port fix when the `remember-update-refreshes-existing-entry` conformance behavior gets exercised.
+
+### optimiseMtu as companion function, not instance mutator — `rns-interfaces/.../Interface.kt::Companion.optimiseMtu`
+
+**Python reference:** `RNS/Interfaces/Interface.py:140-163` (1.1.3) / `:198-221` (1.3.1) — `optimise_mtu(self)` mutates `self.HW_MTU` from a bitrate tier table, gated on `self.AUTOCONFIGURE_MTU`.
+
+**Category:** language/runtime forced.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `interface_optimise_mtu` bridge command.
+
+**Description:** kotlin's `Interface.hwMtu` is an immutable `open val` (subclass-declared), so python's in-place `self.HW_MTU = ...` mutation pattern cannot be expressed. The tier mapping is ported byte-for-byte (every threshold, comparator, and value identical, including the `>= 1 Gbps` top tier vs `>` elsewhere and the `None`/null bottom tier) as a pure companion function `optimiseMtu(bitrate): Int?`; callers apply python's `AUTOCONFIGURE_MTU` gate themselves and assign the result wherever their MTU state lives.
+
+**Re-evaluation:** if `hwMtu` ever becomes mutable interface state, this can return to an instance method with the gate inside, matching python's shape exactly.

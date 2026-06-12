@@ -229,6 +229,28 @@ abstract class Interface(
             InterfaceMode.GATEWAY,
             InterfaceMode.ROAMING
         )
+
+        /**
+         * Python RNS's Interface.optimise_mtu bitrate→HW_MTU tier mapping
+         * (Interface.py:140-163 in 1.1.3, :198-221 in 1.3.1 — identical).
+         * Returns the HW_MTU python assigns for [bitrate] (bps), or null for
+         * the lowest tier (python sets HW_MTU = None). Python gates the whole
+         * mapping on AUTOCONFIGURE_MTU; callers apply their equivalent gate
+         * before calling, exactly as python's `if self.AUTOCONFIGURE_MTU`.
+         */
+        fun optimiseMtu(bitrate: Long): Int? = when {
+            bitrate >= 1_000_000_000L -> 524288
+            bitrate > 750_000_000L -> 262144
+            bitrate > 400_000_000L -> 131072
+            bitrate > 200_000_000L -> 65536
+            bitrate > 100_000_000L -> 32768
+            bitrate > 10_000_000L -> 16384
+            bitrate > 5_000_000L -> 8192
+            bitrate > 2_000_000L -> 4096
+            bitrate > 1_000_000L -> 2048
+            bitrate > 62_500L -> 1024
+            else -> null
+        }
     }
 
     /**

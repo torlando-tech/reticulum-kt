@@ -64,7 +64,11 @@ class Token(
     fun encryptWithIv(plaintext: ByteArray, iv: ByteArray): ByteArray {
         require(iv.size == 16) { "IV must be 16 bytes" }
 
-        val ciphertext = crypto.aesEncrypt(plaintext, encryptionKey, iv, mode)
+        // python Token.encrypt: ciphertext = mode.encrypt(PKCS7.pad(data), ...)
+        // — padding belongs to the Token layer, the AES layer is the bare
+        // block cipher (Token.py:86-95). Byte-identical to a padded cipher on
+        // encrypt; split out so decrypt can use python's LAX unpad.
+        val ciphertext = crypto.aesEncryptNoPadding(PKCS7.pad(plaintext), encryptionKey, iv, mode)
 
         // signed_parts = IV + ciphertext
         val signedParts = iv + ciphertext
@@ -78,11 +82,18 @@ class Token(
     /**
      * Verify the HMAC of a token.
      *
+     * python Token.verify_hmac (Token.py:76-83): a token of 32 bytes or
+     * fewer cannot carry both an HMAC and a body and is REJECTED by raise,
+     * not by returning false.
+     *
      * @param token The token to verify
      * @return true if HMAC is valid
+     * @throws CryptoException if the token is 32 bytes or fewer
      */
     fun verifyHmac(token: ByteArray): Boolean {
-        if (token.size <= 32) return false
+        if (token.size <= 32) {
+            throw CryptoException("Cannot verify HMAC on token of only ${token.size} bytes")
+        }
 
         val receivedHmac = token.copyOfRange(token.size - 32, token.size)
         val dataToVerify = token.copyOfRange(0, token.size - 32)
@@ -92,28 +103,27 @@ class Token(
     }
 
     /**
-     * Decrypt a token.
+     * Decrypt a token, mirroring python Token.decrypt (Token.py:98-114):
+     * authenticate FIRST (verifyHmac, which raises on a <=32-byte token),
+     * then bare-AES decrypt and python's LAX PKCS7 unpad; any failure in
+     * that stage raises "Could not decrypt token".
      *
      * @param token Token: IV (16) || ciphertext || HMAC (32)
      * @return Decrypted plaintext
      * @throws CryptoException if HMAC verification fails or decryption fails
      */
     fun decrypt(token: ByteArray): ByteArray {
-        if (token.size < TOKEN_OVERHEAD + 16) {  // Minimum: IV + 1 block + HMAC
-            throw CryptoException("Token too short: ${token.size} bytes")
-        }
-
         if (!verifyHmac(token)) {
-            throw CryptoException("Token HMAC verification failed")
+            throw CryptoException("Token HMAC was invalid")
         }
 
         val iv = token.copyOfRange(0, 16)
         val ciphertext = token.copyOfRange(16, token.size - 32)
 
         return try {
-            crypto.aesDecrypt(ciphertext, encryptionKey, iv, mode)
+            PKCS7.unpad(crypto.aesDecryptNoPadding(ciphertext, encryptionKey, iv, mode))
         } catch (e: Exception) {
-            throw CryptoException("Token decryption failed", e)
+            throw CryptoException("Could not decrypt token: ${e.message}", e)
         }
     }
 

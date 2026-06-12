@@ -57,6 +57,8 @@ class TCPClientInterface(
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
+        /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:77). */
+        const val DEFAULT_IFAC_SIZE = 16
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
 
         @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
