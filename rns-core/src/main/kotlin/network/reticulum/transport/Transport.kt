@@ -67,6 +67,15 @@ fun interface AnnounceHandler {
  * — the same approach Python uses (Transport.py:1895-1896).
  */
 interface RichAnnounceHandler : AnnounceHandler {
+    /**
+     * Whether this handler wants PATH_RESPONSE-context announces. Mirrors
+     * python's `hasattr(handler, "receive_path_responses") and
+     * handler.receive_path_responses == True` gate (Transport.py:2050-2052):
+     * a handler without it (the default) is skipped for path responses but
+     * still receives live announces.
+     */
+    val receivePathResponses: Boolean get() = false
+
     fun handleAnnounceWithContext(
         destinationHash: ByteArray,
         announcedIdentity: Identity,
@@ -74,13 +83,16 @@ interface RichAnnounceHandler : AnnounceHandler {
         hops: Int,
         receivingInterfaceName: String?,
         matchedAspect: String?,
+        /** The 32-byte announce packet hash (python's 4-param dispatch arm,
+         * Transport.py:2063-2069). Null when unknown. */
+        announcePacketHash: ByteArray? = null,
     ): Boolean
 
     override fun handleAnnounce(
         destinationHash: ByteArray,
         announcedIdentity: Identity,
         appData: ByteArray?,
-    ): Boolean = handleAnnounceWithContext(destinationHash, announcedIdentity, appData, 0, null, null)
+    ): Boolean = handleAnnounceWithContext(destinationHash, announcedIdentity, appData, 0, null, null, null)
 }
 
 /**
@@ -3646,7 +3658,10 @@ object Transport {
         log("Learned path to ${destHash.toHexString()} via ${interfaceRef.name} (${packet.hops} hops)")
 
         // Notify announce handlers
-        notifyAnnounceHandlers(destHash, identity, appData, packet.hops, interfaceRef.qualifiedName)
+        notifyAnnounceHandlers(
+            destHash, identity, appData, packet.hops, interfaceRef.qualifiedName,
+            packet.packetHash, packet.context == PacketContext.PATH_RESPONSE,
+        )
 
         // Cache the announce packet for later path request responses
         // Python Transport.py:1867 — cache pre-increment raw announce to disk
@@ -3684,14 +3699,19 @@ object Transport {
         appData: ByteArray?,
         hops: Int,
         interfaceName: String?,
+        announcePacketHash: ByteArray? = null,
+        isPathResponse: Boolean = false,
     ) {
         var resolvedAspect: String? = null // cached for multiple null-filter handlers
         var aspectResolved = false
+        // python dispatches to EVERY matching handler (Transport.py:2035-2087):
+        // the handler return value is ignored — there is no "first handler wins"
+        // short-circuit — and per-handler exceptions are isolated.
         for (registered in announceHandlers) {
             try {
                 val handler = registered.handler
 
-                // Aspect filtering (Python Transport.py:1890-1896)
+                // Aspect filtering (Python Transport.py:2045-2047)
                 val matchedAspect: String?
                 if (registered.aspectFilter != null) {
                     val expectedHash =
@@ -3715,20 +3735,28 @@ object Transport {
                             null
                         }
                 }
-                val handled =
-                    if (handler is RichAnnounceHandler) {
-                        handler.handleAnnounceWithContext(
-                            destHash,
-                            identity,
-                            appData,
-                            hops,
-                            interfaceName,
-                            matchedAspect,
-                        )
-                    } else {
-                        handler.handleAnnounce(destHash, identity, appData)
-                    }
-                if (handled) break
+
+                // PATH_RESPONSE gate (Transport.py:2049-2053): a path response
+                // reaches a handler ONLY if it opts in via receivePathResponses;
+                // a plain (non-Rich) handler never opts in, so it is skipped.
+                if (isPathResponse) {
+                    val wants = (handler as? RichAnnounceHandler)?.receivePathResponses == true
+                    if (!wants) continue
+                }
+
+                if (handler is RichAnnounceHandler) {
+                    handler.handleAnnounceWithContext(
+                        destHash,
+                        identity,
+                        appData,
+                        hops,
+                        interfaceName,
+                        matchedAspect,
+                        announcePacketHash,
+                    )
+                } else {
+                    handler.handleAnnounce(destHash, identity, appData)
+                }
             } catch (e: Exception) {
                 log("Announce handler error: ${e.message}")
             }
@@ -4951,6 +4979,74 @@ object Transport {
         startTime = timeMs
     }
 
+    // ===== Conformance test seams =====
+    // The behavioral conformance bridge needs to observe and drive Transport
+    // state the way python's reference bridge sets RNS.Transport module
+    // attributes. These seams keep that surface out of the public API.
+
+    /**
+     * Force a synchronous cull pass with the startup grace elapsed — the
+     * kotlin analogue of the reference's `tables_last_culled = 0; jobs()`.
+     * Seeded entries already aged past their timeouts are evicted; fresh
+     * ones survive.
+     */
+    fun forceCullForTest() {
+        val savedStart = startTime
+        startTime = 0L
+        try {
+            cullTables()
+        } finally {
+            startTime = savedStart
+        }
+    }
+
+    /** Read the per-destination announce-rate timestamps, or null if absent. */
+    fun announceRateTimestampsForTest(destHash: ByteArray): List<Long>? =
+        announceRateTable[destHash.toKey()]?.toList()
+
+    /** Snapshot the live tunnel table. */
+    fun tunnelInfosForTest(): List<TunnelInfo> = tunnels.values.toList()
+
+    /** Size of the active packet hashlist (excludes the rotated-out prev set). */
+    fun packetHashlistSizeForTest(): Int = packetHashlist.size
+
+    /** Whether a packet hash is currently remembered (active or prev set). */
+    fun packetHashlistContainsForTest(hash: ByteArray): Boolean {
+        val key = hash.toKey()
+        return packetHashlist.contains(key) || packetHashlistPrev.contains(key)
+    }
+
+    /** Run the real duplicate/replay filter gate on a packet (no side effects). */
+    fun packetFilterForTest(packet: Packet, receivingInterface: InterfaceRef): Boolean =
+        packetFilter(packet, receivingInterface)
+
+    /** Record a packet hash so a subsequent identical packet is filtered. */
+    fun addPacketHashForTest(hash: ByteArray) = addPacketHash(hash)
+
+    /** Drive the real outbound transmit (applies IFAC masking) on an interface. */
+    fun transmitForTest(interfaceRef: InterfaceRef, raw: ByteArray) =
+        transmit(interfaceRef, raw)
+
+    /** Replace path_table[dest]'s timestamp (epoch millis), copying the entry. */
+    fun setPathTimestampForTest(destHash: ByteArray, timestampMs: Long): Boolean {
+        val key = destHash.toKey()
+        val entry = pathTable[key] ?: return false
+        pathTable[key] = entry.copy(timestamp = timestampMs)
+        return true
+    }
+
+    /** Replace path_table[dest]'s expires (epoch millis), copying the entry. */
+    fun setPathExpiresForTest(destHash: ByteArray, expiresMs: Long): Boolean {
+        val key = destHash.toKey()
+        val entry = pathTable[key] ?: return false
+        pathTable[key] = entry.copy(expires = expiresMs)
+        return true
+    }
+
+    /** Resolve a registered interface by its hash (table-entry decomposition). */
+    fun findInterfaceByHashForTest(hash: ByteArray): InterfaceRef? =
+        findInterfaceByHash(hash)
+
     private fun cullTables() {
         val now = System.currentTimeMillis()
         val withinStartupGrace = now - startTime < TransportConstants.STARTUP_GRACE_PERIOD
@@ -5042,8 +5138,13 @@ object Transport {
                 return null
             }
 
-        // Get interface hash (32 bytes)
-        val interfaceHash = interface_.getInterfaceHash()
+        // Get interface hash (32 bytes). python uses iface.get_hash() — the
+        // SAME hash the interface is registered under — for the tunnel_id
+        // derivation (Transport.py:2283). kotlin's `hash` is that value
+        // (fullHash of toString()); getInterfaceHash() (fullHash of name) is a
+        // divergent second definition that made the emitted tunnel_id
+        // inconsistent with the registered interface hash.
+        val interfaceHash = interface_.hash
 
         // Get public key (64 bytes: 32 X25519 + 32 Ed25519)
         val publicKey = transportIdentity.getPublicKey()
@@ -5479,8 +5580,9 @@ object Transport {
                 packer.packBinaryHeader(tunnel.tunnelId.size)
                 packer.writePayload(tunnel.tunnelId)
 
-                // interface_hash (or nil if no interface)
-                val interfaceHash = tunnel.interface_?.getInterfaceHash()
+                // interface_hash (or nil if no interface) — use the registered
+                // interface hash, consistent with synthesizeTunnel and python.
+                val interfaceHash = tunnel.interface_?.hash
                 if (interfaceHash != null) {
                     packer.packBinaryHeader(interfaceHash.size)
                     packer.writePayload(interfaceHash)

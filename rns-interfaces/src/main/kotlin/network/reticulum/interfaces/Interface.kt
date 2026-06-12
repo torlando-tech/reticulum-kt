@@ -212,9 +212,17 @@ abstract class Interface(
     private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, HeldAnnounce>()
 
     companion object {
-        /** How many samples for announce frequency calculation. */
-        const val IA_FREQ_SAMPLES = 6
-        const val OA_FREQ_SAMPLES = 6
+        /** Announce-frequency deque length (python Interface.py:58-59 = 48). */
+        const val IA_FREQ_SAMPLES = 48
+        const val OA_FREQ_SAMPLES = 48
+
+        /**
+         * Minimum samples in the frequency deque before a burst may activate or
+         * deactivate (python IC_BURST_MIN_SAMPLES, Interface.py:84). Without
+         * this gate the ingress limiter trips on as few as 2 announces, holding
+         * legitimate distinct announces that python would process.
+         */
+        const val IC_BURST_MIN_SAMPLES = 6
 
         /** Maximum held announces. */
         const val MAX_HELD_ANNOUNCES = 256
@@ -369,16 +377,24 @@ abstract class Interface(
         val freqThreshold = if (age() < IC_NEW_TIME) IC_BURST_FREQ_NEW else IC_BURST_FREQ
         val iaFreq = incomingAnnounceFrequency()
 
+        val sampleCount = incomingAnnounceTimestamps.size
         if (burstActive.get()) {
+            // python Interface.py:151-152 — deactivate only once the burst hold
+            // has elapsed AND at least IC_BURST_MIN_SAMPLES are in the deque.
+            // (python does NOT touch ic_held_release in this arm.)
             if (iaFreq < freqThreshold && System.currentTimeMillis() > burstActivatedAt + IC_BURST_HOLD) {
-                burstActive.set(false)
-                heldReleaseAt = System.currentTimeMillis() + IC_BURST_PENALTY
+                if (sampleCount >= IC_BURST_MIN_SAMPLES) burstActive.set(false)
             }
             return true
         } else {
-            if (iaFreq > freqThreshold) {
+            // python Interface.py:155-160 — activate only when over threshold
+            // AND the deque holds at least IC_BURST_MIN_SAMPLES samples. The
+            // min-samples gate is what stops 2 distinct announces from tripping
+            // the limiter.
+            if (iaFreq > freqThreshold && sampleCount >= IC_BURST_MIN_SAMPLES) {
                 burstActive.set(true)
                 burstActivatedAt = System.currentTimeMillis()
+                heldReleaseAt = System.currentTimeMillis() + IC_BURST_PENALTY
                 return true
             }
             return false
@@ -448,6 +464,19 @@ abstract class Interface(
      * Number of announces currently held on this interface.
      */
     fun heldAnnounceCount(): Int = heldAnnounces.size
+
+    /** Destination hashes of the currently-held announces (conformance seam). */
+    fun heldAnnounceDestinations(): List<ByteArray> =
+        heldAnnounces.values.map { it.destinationHash.copyOf() }
+
+    /**
+     * Open the held-announce release gate deterministically (conformance seam) —
+     * the kotlin analogue of the reference bridge backdating `ic_held_release`
+     * to 0 so `process_held_announces()` can release without a real sleep.
+     */
+    fun openHeldReleaseGateForTest() {
+        heldReleaseAt = 0
+    }
 
     /**
      * Get the effective MTU for this interface.

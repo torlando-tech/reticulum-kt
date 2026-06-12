@@ -268,3 +268,17 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Tracking:** conformance discovery_* bridge commands; tests/test_discovery_*.py.
 
 **Re-evaluation:** when kotlin grows a config layer, switch the allowlist to a live read; revisit the executable branch only if a sandboxed design is approved by the owner.
+
+### announce_rate_table is a timestamp list, not python's dict — `rns-core/.../transport/Transport.kt::announceRateTable`
+
+**Python reference:** `RNS/Transport.py:1830-1860` — `announce_rate_table[dest]` is a dict `{"last", "rate_violations", "blocked_until", "timestamps":[...]}`.
+
+**Category:** new feature divergence (simplified model) — flagged for follow-up.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `behavioral_read_announce_rate`; announce-rate ENFORCEMENT is LIMITS-class per CONFORMANCE_COMPLETENESS_V2 §, so only the timestamp history is observably pinned today.
+
+**Description:** kotlin stores only the per-destination announce timestamp history (`Map<ByteArrayKey, MutableList<Long>>`), not python's full rate-limiter record with `last`/`rate_violations`/`blocked_until`. The conformance read surfaces `timestamps` faithfully and derives `last = max(timestamps)`; `rate_violations`/`blocked_until` are reported as 0 because kotlin does not yet implement the grace-counter/penalty-window enforcement. This is a genuine feature gap, not just a representation choice.
+
+**Re-evaluation:** when kotlin implements per-destination announce-rate enforcement (target rate + grace + penalty window), port python's full record and remove this entry.
