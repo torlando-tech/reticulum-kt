@@ -128,6 +128,33 @@ data class LinkEntry(
 }
 
 /**
+ * A blackholed-identity record, mirroring python's
+ * `Transport.blackholed_identities[hash]` dict
+ * `{"source", "until", "reason"}` (RNS/Transport.py:3417).
+ */
+data class BlackholeEntry(
+    /** Identity hash that blackholed this one (own hash for local entries). */
+    val source: ByteArray,
+    /** Optional expiry as an epoch-millis timestamp; null = permanent. */
+    val until: Long?,
+    /** Optional human-readable reason. */
+    val reason: String?,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is BlackholeEntry) return false
+        return source.contentEquals(other.source) && until == other.until && reason == other.reason
+    }
+
+    override fun hashCode(): Int {
+        var result = source.contentHashCode()
+        result = 31 * result + (until?.hashCode() ?: 0)
+        result = 31 * result + (reason?.hashCode() ?: 0)
+        return result
+    }
+}
+
+/**
  * Entry in the reverse table, used to route proofs back to senders.
  *
  * When a packet is forwarded, an entry is made so proofs can be

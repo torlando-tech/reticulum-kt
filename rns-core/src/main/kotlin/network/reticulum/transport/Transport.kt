@@ -395,6 +395,22 @@ object Transport {
     /** Per-interface announce allowed timestamps. */
     private val interfaceAnnounceAllowedAt = ConcurrentHashMap<ByteArrayKey, Long>()
 
+    // ===== Blackhole (port of RNS/Transport.py:3406-3538) =====
+
+    /** Blackholed identities: identity-hash -> {source, until(ms)?, reason?}. */
+    val blackholedIdentities = ConcurrentHashMap<ByteArrayKey, BlackholeEntry>()
+
+    /** Trusted remote blackhole-source identity hashes (python
+     * Reticulum.blackhole_sources(); kotlin has no config layer, so this list
+     * is the source of truth, mutated by config / the conformance bridge). */
+    val blackholeSources = CopyOnWriteArrayList<ByteArray>()
+
+    @Volatile private var blackholeLastChecked: Long = 0
+    private val blackholeCheckIntervalMs = 60_000L
+
+    /** Storage dir for blackhole persistence (python Reticulum.blackholepath). */
+    private val blackholePath: String get() = "$storagePath/blackhole"
+
     // ===== Tunnels =====
 
     /** Active tunnels: tunnel_id -> TunnelInfo. */
@@ -463,6 +479,9 @@ object Transport {
 
         // Load path table and packet hashlist from storage
         loadPersistedDataFromStorage()
+
+        // Load persisted blackhole entries (python Transport.start:239)
+        try { reloadBlackhole() } catch (e: Exception) { log("blackhole reload failed: ${e.message}") }
 
         // Start background job loop
         // On Android with coroutine scope provided, use coroutines
@@ -552,6 +571,10 @@ object Transport {
         activeLinks.clear()
         tunnels.clear()
         tunnelInterfaces.clear()
+        // Blackhole state must not leak across instances (singleton reset).
+        blackholedIdentities.clear()
+        blackholeSources.clear()
+        blackholeLastChecked = 0
 
         // Stop discovery
         interfaceAnnouncer?.stop()
@@ -4882,6 +4905,9 @@ object Transport {
             receiptsLastChecked = now
         }
 
+        // Expire blackhole entries past their `until` (python Transport.py:971-995)
+        expireBlackholeEntries(now)
+
         // Cull stale table entries (expensive, use battery-adjusted interval)
         val tablesCullInterval = customTablesCullIntervalMs ?: TransportConstants.TABLES_CULL_INTERVAL
         if (now - tablesLastCulled > tablesCullInterval) {
@@ -5046,6 +5072,200 @@ object Transport {
     /** Resolve a registered interface by its hash (table-entry decomposition). */
     fun findInterfaceByHashForTest(hash: ByteArray): InterfaceRef? =
         findInterfaceByHash(hash)
+
+    // ===== Blackhole API (port of RNS/Transport.py:3406-3538) =====
+
+    /**
+     * Blackhole an identity (python Transport.blackhole_identity:3407-3428).
+     * @return true if newly added, null if already present, false on error.
+     * [until] is an epoch-millis expiry (null = permanent).
+     */
+    fun blackholeIdentity(identityHash: ByteArray, until: Long? = null, reason: String? = null): Boolean? {
+        return try {
+            val key = identityHash.toKey()
+            if (!blackholedIdentities.containsKey(key)) {
+                blackholedIdentities[key] = BlackholeEntry(
+                    source = identity?.hash ?: ByteArray(0), until = until, reason = reason)
+                persistBlackhole()
+                removeBlackholedPaths()
+                true
+            } else null
+        } catch (e: Exception) {
+            log("Error while blackholing identity: ${e.message}")
+            false
+        }
+    }
+
+    /** Lift a blackhole (python unblackhole_identity:3432-3443). */
+    fun unblackholeIdentity(identityHash: ByteArray): Boolean? {
+        return try {
+            val key = identityHash.toKey()
+            if (blackholedIdentities.containsKey(key)) {
+                blackholedIdentities.remove(key)
+                persistBlackhole()
+                true
+            } else null
+        } catch (e: Exception) {
+            log("Error while unblackholing identity: ${e.message}")
+            false
+        }
+    }
+
+    /** Whether an identity hash is currently blackholed. */
+    fun isBlackholed(identityHash: ByteArray): Boolean =
+        blackholedIdentities.containsKey(identityHash.toKey())
+
+    /** The /list response generator (python blackhole_list_handler:3514). */
+    fun blackholeListHandler(): Map<ByteArrayKey, BlackholeEntry> = blackholedIdentities
+
+    /**
+     * Reload blackhole entries from the storage blackhole dir (python
+     * reload_blackhole:3453-3490): 'local' is own identity, other files are
+     * hex source-identity hashes that must be a trusted source; expired
+     * (until < now) entries are skipped; a locally-sourced entry is never
+     * overwritten. Then drops blackhole-associated paths.
+     */
+    fun reloadBlackhole() {
+        val now = System.currentTimeMillis()
+        val destLen = (RnsConstants.TRUNCATED_HASH_BYTES) * 2
+        val dir = java.io.File(blackholePath)
+        if (dir.isDirectory) {
+            for (file in dir.listFiles() ?: emptyArray()) {
+                try {
+                    val filename = file.name
+                    val sourceIdentityHash: ByteArray = if (filename == "local") {
+                        identity?.hash ?: continue
+                    } else {
+                        if (filename.length != destLen) {
+                            throw IllegalArgumentException("Invalid blackhole source filename length: $filename")
+                        }
+                        val src = filename.hexToBytesOrNull() ?: continue
+                        if (blackholeSources.none { it.contentEquals(src) }) continue
+                        src
+                    }
+                    val sourceList = unpackBlackholeFile(file.readBytes())
+                    for ((idHash, se) in sourceList) {
+                        if (idHash.size != RnsConstants.TRUNCATED_HASH_BYTES) continue
+                        val key = idHash.toKey()
+                        val existing = blackholedIdentities[key]
+                        if (existing != null && identity != null && existing.source.contentEquals(identity!!.hash)) {
+                            continue // never overwrite a locally-sourced entry
+                        }
+                        val until = se.until
+                        if (until == null || now < until) {
+                            blackholedIdentities[key] = BlackholeEntry(sourceIdentityHash, until, se.reason)
+                        }
+                    }
+                } catch (e: Exception) {
+                    log("Could not load blackholed identities from ${file.name}: ${e.message}")
+                }
+            }
+        }
+        removeBlackholedPaths()
+    }
+
+    /** Drop path-table entries whose recalled identity is blackholed
+     * (python remove_blackholed_paths:3492-3512). */
+    fun removeBlackholedPaths() {
+        if (blackholedIdentities.isEmpty()) return
+        val drop = mutableListOf<ByteArrayKey>()
+        for (destKey in pathTable.keys.toList()) {
+            try {
+                val id = Identity.recall(destKey.bytes)
+                if (id != null && blackholedIdentities.containsKey(id.hash.toKey())) {
+                    drop.add(destKey)
+                }
+            } catch (e: Exception) {
+                log("Error enumerating blackhole-associated destinations: ${e.message}")
+            }
+        }
+        for (k in drop) pathTable.remove(k)
+        if (drop.isNotEmpty()) {
+            log("Removed ${drop.size} destination(s) associated with blackholed identities from path table")
+        }
+    }
+
+    /** Persist the locally-sourced blackhole entries to <storage>/blackhole/local
+     * atomically (python persist_blackhole:3523-3538). */
+    fun persistBlackhole() {
+        try {
+            val ownHash = identity?.hash ?: return
+            val dir = java.io.File(blackholePath).apply { mkdirs() }
+            val local = blackholedIdentities.filterValues { it.source.contentEquals(ownHash) }
+            val packed = packBlackholeEntries(local)
+            val localFile = java.io.File(dir, "local")
+            val tmp = java.io.File(dir, "local.tmp")
+            tmp.writeBytes(packed)
+            if (localFile.isFile) localFile.delete()
+            tmp.renameTo(localFile)
+        } catch (e: Exception) {
+            log("Error while persisting blackhole list: ${e.message}")
+        }
+    }
+
+    /** Clear in-memory blackhole state (own + reloaded). */
+    fun clearBlackholeTable() = blackholedIdentities.clear()
+
+    /** The blackhole storage directory (conformance file-ops seam). */
+    fun blackholeStorageDirForTest(): String = blackholePath
+
+    /** Expire blackhole entries whose `until` has passed; called from runJobs. */
+    private fun expireBlackholeEntries(now: Long) {
+        if (now <= blackholeLastChecked + blackholeCheckIntervalMs) return
+        blackholeLastChecked = now
+        val stale = blackholedIdentities.filter { (_, e) -> e.until != null && now > e.until }.keys
+        for (k in stale) blackholedIdentities.remove(k)
+    }
+
+    /** Force the blackhole-expiry pass synchronously (conformance seam). */
+    fun expireBlackholeNow() {
+        blackholeLastChecked = 0
+        expireBlackholeEntries(System.currentTimeMillis())
+    }
+
+    private fun packBlackholeEntries(entries: Map<ByteArrayKey, BlackholeEntry>): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val packer = org.msgpack.core.MessagePack.newDefaultPacker(out)
+        packer.packMapHeader(entries.size)
+        for ((key, e) in entries) {
+            packer.packBinaryHeader(key.bytes.size); packer.writePayload(key.bytes)
+            packer.packMapHeader(3)
+            packer.packString("source"); packer.packBinaryHeader(e.source.size); packer.writePayload(e.source)
+            packer.packString("until"); if (e.until == null) packer.packNil() else packer.packLong(e.until)
+            packer.packString("reason"); if (e.reason == null) packer.packNil() else packer.packString(e.reason)
+        }
+        packer.close()
+        return out.toByteArray()
+    }
+
+    private fun unpackBlackholeFile(data: ByteArray): Map<ByteArray, BlackholeEntry> {
+        val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(data)
+        val n = unpacker.unpackMapHeader()
+        val out = LinkedHashMap<ByteArray, BlackholeEntry>(n)
+        repeat(n) {
+            val keyLen = unpacker.unpackBinaryHeader()
+            val key = unpacker.readPayload(keyLen)
+            val fields = unpacker.unpackMapHeader()
+            var source = ByteArray(0); var until: Long? = null; var reason: String? = null
+            repeat(fields) {
+                when (unpacker.unpackString()) {
+                    "source" -> {
+                        val l = unpacker.unpackBinaryHeader(); source = unpacker.readPayload(l)
+                    }
+                    "until" -> if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.NIL) unpacker.unpackNil() else until = unpacker.unpackLong()
+                    "reason" -> if (unpacker.nextFormat.valueType == org.msgpack.value.ValueType.NIL) unpacker.unpackNil() else reason = unpacker.unpackString()
+                    else -> unpacker.skipValue()
+                }
+            }
+            out[key] = BlackholeEntry(source, until, reason)
+        }
+        unpacker.close()
+        return out
+    }
+
+    private fun String.hexToBytesOrNull(): ByteArray? = try {
+        check(length % 2 == 0); chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    } catch (e: Exception) { null }
 
     private fun cullTables() {
         val now = System.currentTimeMillis()

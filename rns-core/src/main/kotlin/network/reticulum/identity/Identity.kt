@@ -497,8 +497,17 @@ class Identity private constructor(
                 // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
                 val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
 
-                // Create identity from public key and validate signature
+                // Create identity from public key
                 val announcedIdentity = fromPublicKey(publicKey)
+
+                // Blackhole gate (python Identity.py:566-569): an announce from a
+                // blackholed identity is invalidated and dropped BEFORE signature
+                // validation, so it learns no path.
+                if (network.reticulum.transport.Transport.blackholedIdentities.isNotEmpty() &&
+                    network.reticulum.transport.Transport.isBlackholed(announcedIdentity.hash)
+                ) {
+                    return null
+                }
 
                 if (!announcedIdentity.validate(signature, signedData)) {
                     return null // Invalid signature
