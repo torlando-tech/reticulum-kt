@@ -2222,5 +2222,142 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         }
     }
 
+    // ===== Phase 5c batch 3: link gates / key material / phy stats =====
+
+    "wire_link_type_gate" -> {
+        // Pin Link's SINGLE-only construction rule: Link.create raises for
+        // PLAIN/GROUP destinations (kotlin IllegalArgumentException; python
+        // TypeError). SINGLE is the positive control. Mirrors cmd_wire_link_type_gate.
+        val handle = p.str("handle")
+        val appName = p.get("app_name")?.asString ?: "conformance"
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: arrayOf("link-type-gate")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        fun attempt(dest: Destination): JsonObject {
+            var link: Link? = null
+            var raised: String? = null
+            try {
+                link = Link.create(dest)
+            } catch (e: IllegalArgumentException) {
+                raised = e.message
+            }
+            link?.let { runCatching { it.teardown() } }
+            return result(
+                "raised" to boolVal(raised != null),
+                "error" to (raised?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                "link_created" to boolVal(link != null),
+            )
+        }
+
+        val single = Destination.create(Identity.create(), DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val plain = Destination.create(null, DestinationDirection.OUT, DestinationType.PLAIN, appName, *aspects)
+        val group = Destination.create(Identity.create(), DestinationDirection.OUT, DestinationType.GROUP, appName, *aspects)
+        result(
+            "single" to attempt(single),
+            "plain" to attempt(plain),
+            "group" to attempt(group),
+        )
+    }
+
+    "wire_link_phy_stats_gate" -> {
+        // Pin phy-stats gating: getRssi/getSnr/getQ return stored values only
+        // when track_phy_stats is enabled; off -> null regardless. Mirrors
+        // cmd_wire_link_phy_stats_gate.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkById(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val rssi = -42; val snr = 7f; val q = 83f
+        fun read(): JsonObject = result(
+            "rssi" to (link.getRssi()?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "snr" to (link.getSnr()?.let { doubleVal(it.toDouble()) } ?: JsonNull.INSTANCE),
+            "q" to (link.getQ()?.let { doubleVal(it.toDouble()) } ?: JsonNull.INSTANCE),
+        )
+        // Tracking off by default — stored values must gate to null.
+        link.setPhyStatsForTest(rssi, snr, q)
+        val off = read()
+        link.trackPhyStats(true)
+        link.setPhyStatsForTest(rssi, snr, q)
+        val on = read()
+        link.trackPhyStats(false)
+        link.setPhyStatsForTest(rssi, snr, q)
+        val offAgain = read()
+        result(
+            "stored" to result("rssi" to intVal(rssi), "snr" to doubleVal(snr.toDouble()), "q" to doubleVal(q.toDouble())),
+            "off" to off,
+            "on" to on,
+            "off_again" to offAgain,
+        )
+    }
+
+    "wire_link_key_material" -> {
+        // Report which ephemeral-key fields the link holds. An ACTIVE link holds
+        // prv/pub/shared/derived; after teardown the purge nulls them all.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkById(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val presence = link.keyMaterialPresenceForTest() // [prv, pub, shared, derived]
+        result(
+            "status" to intVal(link.status),
+            "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "derived_key_present" to boolVal(presence[3]),
+            "shared_key_present" to boolVal(presence[2]),
+            "prv_present" to boolVal(presence[0]),
+            "pub_present" to boolVal(presence[1]),
+        )
+    }
+
+    "wire_link_identify_pending" -> {
+        // Call identify() on a PENDING (pre-ACTIVE) link and assert it is a
+        // no-op: identify only acts when initiator && status==ACTIVE, so on
+        // PENDING it returns false, emits no LINKIDENTIFY, doesn't crash.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val privateKey = p.hex("private_key")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; ensure an announce was received first.",
+            )
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val ident = Identity.fromBytes(privateKey)
+            ?: throw IllegalArgumentException("Identity.fromBytes rejected the private key")
+
+        val link = Link.create(outDest)
+        // Force PENDING so identify's ACTIVE-only guard is deterministically hit.
+        link.setStatusForTest(LinkConstants.PENDING)
+        var crashed = false
+        var sent = false
+        try {
+            // identify() returns true only if it actually emitted a LINKIDENTIFY
+            // (Transport.outbound succeeded); on PENDING it returns false early.
+            sent = link.identify(ident)
+        } catch (e: Exception) {
+            crashed = true
+        }
+        val statusAfter = link.status
+        runCatching { link.teardown() }
+        result(
+            "crashed" to boolVal(crashed),
+            "identify_packet_sent" to boolVal(sent),
+            "status" to intVal(statusAfter),
+            "status_name" to (LINK_STATUS_NAMES[statusAfter]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "initiator" to boolVal(link.initiator),
+        )
+    }
+
     else -> throw IllegalArgumentException("Unknown wire command: $command")
 }
