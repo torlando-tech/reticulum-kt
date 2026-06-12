@@ -1409,6 +1409,16 @@ class Link private constructor(
 
         Transport.deregisterLink(this)
 
+        // Purge the ephemeral key material, mirroring python link_closed()
+        // (Link.py:728-733: prv/pub/pub_bytes/shared_key/derived_key = None).
+        // This is the forward-secrecy guarantee — once a link closes, its
+        // ephemeral private key and derived link key must not linger in memory
+        // where a later compromise could recover past traffic.
+        prv = null
+        pub = null
+        sharedKey = null
+        derivedKey = null
+
         callbacks.linkClosed?.let { callback ->
             try {
                 callback(this)
@@ -3089,6 +3099,27 @@ class Link private constructor(
      *
      * @return MTU if link is active, null otherwise
      */
+    // ===== Conformance test seams (separate-module bridge can't read private state) =====
+    /** [prv, pub, sharedKey, derivedKey] presence — pins forward-secret
+     *  ephemeral-key purge on close (reference wire_link_key_material). */
+    fun keyMaterialPresenceForTest(): BooleanArray =
+        booleanArrayOf(prv != null, pub != null, sharedKey != null, derivedKey != null)
+
+    /** Plant sentinel physical-layer stats so the track_phy_stats gating in
+     *  getRssi/getSnr/getQ is observable (reference wire_link_phy_stats_gate). */
+    fun setPhyStatsForTest(rssiValue: Int?, snrValue: Float?, qValue: Float?) {
+        phyRssi = rssiValue
+        phySnr = snrValue
+        phyQ = qValue
+    }
+
+    /** Force the link lifecycle status (status has a private setter). Mirrors
+     *  the reference's `link.status = Link.PENDING` to deterministically hit
+     *  identify()'s ACTIVE-only guard (reference wire_link_identify_pending). */
+    fun setStatusForTest(newStatus: Int) {
+        status = newStatus
+    }
+
     fun getMtu(): Int? = if (status == LinkConstants.ACTIVE) mtu else null
 
     /**
