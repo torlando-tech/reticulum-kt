@@ -94,6 +94,14 @@ enum class ContextFlag(val value: Int) {
  * Packet context types.
  */
 enum class PacketContext(val value: Int) {
+    /**
+     * Carrier for a wire context byte with no named code point. python keeps
+     * the context as a raw int, so packets with unknown contexts parse fine
+     * and simply match no dispatch branch (forward compatibility); kotlin
+     * mirrors that via this sentinel plus Packet.contextRaw, which preserves
+     * the actual wire byte for byte-exact repacking.
+     */
+    UNKNOWN(-1),
     NONE(0x00),
     RESOURCE(0x01),
     RESOURCE_ADV(0x02),

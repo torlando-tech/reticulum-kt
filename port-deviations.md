@@ -214,3 +214,45 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Description:** kotlin's `Interface.hwMtu` is an immutable `open val` (subclass-declared), so python's in-place `self.HW_MTU = ...` mutation pattern cannot be expressed. The tier mapping is ported byte-for-byte (every threshold, comparator, and value identical, including the `>= 1 Gbps` top tier vs `>` elsewhere and the `None`/null bottom tier) as a pure companion function `optimiseMtu(bitrate): Int?`; callers apply python's `AUTOCONFIGURE_MTU` gate themselves and assign the result wherever their MTU state lives.
 
 **Re-evaluation:** if `hwMtu` ever becomes mutable interface state, this can return to an instance method with the gate inside, matching python's shape exactly.
+
+### WallClock pinning seam for protocol timestamps — `rns-core/.../common/WallClock.kt`, consulted by `Destination.generateAnnounceData`/`cachePathResponse`/`cleanStalePathResponses`
+
+**Python reference:** none directly — the python *conformance bridge* pins `time.time()` by monkeypatching around single `announce()` calls (reticulum-conformance `reference/bridge_server.py::cmd_announce_build`, `cmd_destination_path_response_cache`); the library itself reads the real clock.
+
+**Category:** new feature (test seam), forced by the JVM's inability to patch `System.currentTimeMillis()`.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance kotlin-bridge command surface work (announce_build emission_ts, destination_path_response_cache, Phase-3 behavioral time control).
+
+**Description:** protocol code paths whose wall-clock reads are observable behavior (announce random-hash timestamp embed, path-response PR_TAG_WINDOW bookkeeping; later transport-table ages) read `WallClock.nowMs()` instead of `System.currentTimeMillis()`. With `overrideMs == null` (always, in production) this is byte-for-byte `System.currentTimeMillis()`; the override exists solely so the conformance bridge can pin the clock the way the python bridge pins `time.time()`. No python-visible semantics change.
+
+**Re-evaluation:** if a general clock-injection design ever lands (e.g. kotlinx-datetime Clock plumbed through constructors), fold this into it.
+
+### Blanket: python TypeError/ValueError argument guards → kotlin IllegalArgumentException — port-wide
+
+**Python reference:** recurring pattern — e.g. `Destination.py:128` (`hash`: "Invalid material supplied..."), `:365-366` (`set_proof_strategy`: "Unsupported proof strategy"), `Identity.py:101-102` (`remember`).
+
+**Category:** language/runtime forced (exception-type idiom only).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance kotlin-bridge surface work.
+
+**Description:** python uses TypeError/ValueError interchangeably for invalid-argument guards; kotlin's idiomatic equivalent for both is IllegalArgumentException (via `require` or explicit throw). Wherever the port adds or corrects such a guard, the CONDITION and MESSAGE mirror python exactly and only the exception class maps to IAE. This blanket entry covers all such sites (each carries a code comment citing its python line); per-site entries are only written when more than the exception class differs.
+
+**Re-evaluation:** none — permanent idiom mapping.
+
+### Packet context as enum + contextRaw; createRaw pass-through pack() — `rns-core/.../packet/Packet.kt`
+
+**Python reference:** `RNS/Packet.py:186-238` (pack: encrypt-at-pack branch table, HEADER_2 announce-only assembly, IOError on missing transport id), `:246-252` (unpack: context is a raw int — any wire byte parses and simply matches no dispatch branch).
+
+**Category:** language/runtime forced (representation), plus one pre-existing kotlin-only construct documented retroactively.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance packet_build/packet_build_raw_header2/packet_resend_observe arms; conformance tests test_packet*.py.
+
+**Description:** (1) python's `Packet.context` is a bare int; kotlin's typed `PacketContext` enum cannot carry unnamed code points, so `contextRaw: Int` is the wire source of truth (pack writes it, unpack stores it) and `PacketContext.UNKNOWN(-1)` is the named view for unknown bytes — matching python's accept-and-match-nothing forward compatibility byte-for-byte. (2) python encrypts inside pack() (fresh ephemeral/IV per pack, which is what makes resend() re-encrypt); kotlin previously encrypted at Packet.create — now moved into pack() with python's exact unencrypted-class branch table and HEADER_2 announce-only rule (python error text preserved; IOError/AttributeError → IllegalStateException per the blanket idiom entry). (3) kotlin-only `Packet.createRaw` (no python counterpart — python transport splices raw bytes instead of re-packing) passes `data` through pack() untouched; that pass-through is its documented contract and is unreachable from python-mirrored code paths.
+
+**Re-evaluation:** if PacketContext is ever refactored to a value-class over Int, UNKNOWN/contextRaw collapse into it.
