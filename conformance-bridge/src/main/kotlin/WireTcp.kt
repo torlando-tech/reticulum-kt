@@ -162,6 +162,40 @@ private fun findLinkById(inst: WireInstance, linkIdHex: String): Link? {
     return null
 }
 
+/** The listener whose accepted inbound links include this link id, or null
+ *  (the injector must run on the RECEIVER peer that owns the link's handler). */
+private fun findListenerForLink(inst: WireInstance, linkIdHex: String): Listener? =
+    inst.listeners.values.firstOrNull { l -> l.inboundLinks.any { it.linkId.toHex() == linkIdHex } }
+
+/** Poll for a link to appear by id. The receiver-side inbound link is captured
+ *  by an establishment callback on a background thread, so an injector running
+ *  immediately after the initiator's link_open returns can race it. */
+private fun findLinkByIdWaiting(inst: WireInstance, linkIdHex: String, timeoutMs: Long = 3000): Link? {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (true) {
+        findLinkById(inst, linkIdHex)?.let { return it }
+        if (System.currentTimeMillis() >= deadline) return null
+        Thread.sleep(50)
+    }
+}
+
+/** Build the raw wire bytes of a genuine DATA/LINKCLOSE packet encrypted to a
+ *  live link, mirroring Link.sendWithReceipt (encrypt then createRaw — pack does
+ *  NOT re-encrypt for LINK destinations). The caller may corrupt the returned
+ *  bytes before feeding them through link.receive. */
+private fun buildLinkPacketRaw(link: Link, plaintext: ByteArray, context: network.reticulum.common.PacketContext): ByteArray {
+    val encrypted = link.encrypt(plaintext)
+    val pkt = Packet.createRaw(
+        destinationHash = link.linkId,
+        data = encrypted,
+        packetType = network.reticulum.common.PacketType.DATA,
+        destinationType = DestinationType.LINK,
+        context = context,
+        mtu = link.mtu,
+    )
+    return pkt.pack()
+}
+
 /** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
  *  keepalive_s/stale_time_s/rtt cross the boundary in SECONDS (kotlin millis). */
 private fun linkStatusDict(link: Link): JsonObject {
@@ -2519,6 +2553,127 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "links_before" to intVal(linksBefore),
             "links_after" to intVal(linksAfter),
             "link_created" to boolVal(linksAfter > linksBefore),
+        )
+    }
+
+    // ===== Phase 5c batch 4b: link-traffic adversarial injectors =====
+
+    "wire_send_forged_link_close" -> {
+        // Inject a LINKCLOSE carrying a forged link_id over an established link;
+        // teardown_packet only closes when the decrypted payload == the link's
+        // own link_id, so a forged id is ignored (link stays ACTIVE). Passing
+        // the real link_id is the positive control. Run on the link's own iface.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val forgedId = p.hex("forged_id")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val statusBefore = link.status
+        val raw = buildLinkPacketRaw(link, forgedId, network.reticulum.common.PacketContext.LINKCLOSE)
+        val rx = Packet.unpack(raw)
+            ?: throw IllegalStateException("could not unpack crafted LINKCLOSE packet")
+        rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+        link.receive(rx)
+        val statusAfter = link.status
+        result(
+            "torn_down" to boolVal(statusAfter == LinkConstants.CLOSED),
+            "status_before" to intVal(statusBefore),
+            "status_after" to intVal(statusAfter),
+            "status_name_after" to (LINK_STATUS_NAMES[statusAfter]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "forged_id" to hexVal(forgedId),
+            "real_link_id" to hexVal(link.linkId),
+        )
+    }
+
+    "wire_inject_tampered_link_data" -> {
+        // Build a real DATA packet encrypted to an ACTIVE link, optionally
+        // corrupt it, feed through link.receive, and report whether the
+        // decrypted message reached the link's packet handler. The link Token
+        // verifies its HMAC before decrypting, so any tamper -> dropped.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val corruption = p.get("corruption")?.asString ?: "none"
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val listener = findListenerForLink(inst, linkIdHex)
+            ?: throw IllegalArgumentException(
+                "link_id $linkIdHex is not an inbound link of any listener on this peer (run on the RECEIVER peer)",
+            )
+        val before = listener.recvBuffer.size
+
+        var raw = buildLinkPacketRaw(link, payload, network.reticulum.common.PacketContext.NONE)
+        // HEADER_1 link packet: flags(1)+hops(1)+link_id(16)+context(1)=19, then
+        // the encrypted token (IV(16)||ciphertext||HMAC(32)). Damage one byte.
+        val payloadOff = 19
+        raw = when (corruption) {
+            "ciphertext" -> raw.copyOf().also { it[payloadOff + 4] = ((it[payloadOff + 4].toInt() + 1) and 0xFF).toByte() }
+            "hmac" -> raw.copyOf().also { it[it.size - 1] = ((it[it.size - 1].toInt() + 1) and 0xFF).toByte() }
+            "truncate" -> raw.copyOf(raw.size - 1)
+            "none", "foreign_interface" -> raw
+            else -> throw IllegalArgumentException("unknown corruption: $corruption")
+        }
+        val rx = Packet.unpack(raw)
+        val unpacked = rx != null
+        if (rx != null) {
+            if (corruption == "foreign_interface") {
+                // Present on an interface that is NOT the link's attached one,
+                // so the interface-bind check rejects an otherwise-valid packet.
+                rx.setReceivingInterfaceHashForTest(network.reticulum.crypto.Hashes.fullHash("foreign-iface".toByteArray()))
+            } else {
+                rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+            }
+            link.receive(rx)
+        }
+        Thread.sleep(50)
+        val after = listener.recvBuffer.size
+        result(
+            "corruption" to strVal(corruption),
+            "unpacked" to boolVal(unpacked),
+            "delivered" to boolVal(after > before),
+            "link_active" to boolVal(link.status == LinkConstants.ACTIVE),
+            "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_inject_closed_link_data" -> {
+        // Pin that a CLOSED link silently drops all link traffic. Build a
+        // PRISTINE DATA packet while the link is ACTIVE (key still present),
+        // cache it, tear down, then replay — receive() returns immediately once
+        // status==CLOSED, so the packet is never delivered.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+            ?: network.reticulum.crypto.Hashes.fullHash("closed-link-probe".toByteArray()).copyOf(16)
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val listener = findListenerForLink(inst, linkIdHex)
+            ?: throw IllegalArgumentException(
+                "link_id $linkIdHex is not an inbound link of any listener on this peer (run on the RECEIVER peer)",
+            )
+        // Build + pack while ACTIVE — the key is purged on close.
+        val cachedRaw = buildLinkPacketRaw(link, payload, network.reticulum.common.PacketContext.NONE)
+        val before = listener.recvBuffer.size
+        runCatching { link.teardown() }
+        Thread.sleep(50)
+        val rx = Packet.unpack(cachedRaw)
+        if (rx != null) {
+            rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+            link.receive(rx)
+        }
+        Thread.sleep(50)
+        val after = listener.recvBuffer.size
+        result(
+            "delivered_before" to boolVal(false),
+            "delivered" to boolVal(after > before),
+            "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "link_closed" to boolVal(link.status == LinkConstants.CLOSED),
         )
     }
 
