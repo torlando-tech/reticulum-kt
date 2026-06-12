@@ -2284,6 +2284,8 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                 handleWireCommand(command, p)
             } else if (command.startsWith("lxmf_")) {
                 handleLxmfCommand(command, p)
+            } else if (command.startsWith("discovery_")) {
+                handleDiscoveryCommand(command, p)
             } else {
                 throw IllegalArgumentException("Unknown command: $command")
             }
