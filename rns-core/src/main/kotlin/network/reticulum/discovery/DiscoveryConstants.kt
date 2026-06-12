@@ -56,15 +56,32 @@ object DiscoveryConstants {
     const val DETACH_THRESHOLD = 12L
 
     // Interface types that support discovery
+    // python Discovery.py:37-38 — all seven discoverable types.
     val DISCOVERABLE_INTERFACE_TYPES =
         setOf(
+            "BackboneInterface",
             "TCPServerInterface",
             "TCPClientInterface",
-            "BackboneInterface",
             "RNodeInterface",
+            "WeaveInterface",
             "I2PInterface",
+            "KISSInterface",
         )
 
     // Interface types that support auto-connect (Python: BackboneInterface + TCPServerInterface)
     val AUTOCONNECT_TYPES = setOf("BackboneInterface", "TCPServerInterface")
+
+    // STORAGE-acceptance whitelist (python InterfaceDiscovery.DISCOVERABLE_TYPES,
+    // Discovery.py:377) — note this is a SEPARATE, narrower list than the
+    // handler-level DISCOVERABLE_INTERFACE_TYPES: it EXCLUDES TCPClientInterface,
+    // so a TCPClient announce is received but never written to disk.
+    val STORAGE_DISCOVERABLE_TYPES =
+        setOf(
+            "BackboneInterface",
+            "TCPServerInterface",
+            "I2PInterface",
+            "RNodeInterface",
+            "WeaveInterface",
+            "KISSInterface",
+        )
 }

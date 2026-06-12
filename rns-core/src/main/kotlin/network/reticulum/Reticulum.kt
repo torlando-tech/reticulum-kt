@@ -115,6 +115,25 @@ class Reticulum private constructor(
          */
         const val DEFAULT_SHARED_INSTANCE_PORT = 37428
 
+        /**
+         * Interface-discovery master gate (python __discover_interfaces,
+         * Reticulum.py:259 — default OFF; config `discover_interfaces`).
+         */
+        @Volatile var discoverInterfaces: Boolean = false
+
+        /**
+         * Autoconnect-discovered-interfaces knob (python
+         * __autoconnect_discovered_interfaces, Reticulum.py:260,592-595 —
+         * default off; a configured value > 0 is the max autoconnect count).
+         */
+        @Volatile var autoconnectDiscoveredInterfaces: Int = 0
+
+        /** python Reticulum.should_autoconnect_discovered_interfaces(). */
+        fun shouldAutoconnectDiscoveredInterfaces(): Boolean = autoconnectDiscoveredInterfaces > 0
+
+        /** python Reticulum.max_autoconnected_interfaces(). */
+        fun maxAutoconnectedInterfaces(): Int = autoconnectDiscoveredInterfaces
+
         @Volatile
         private var instance: Reticulum? = null
         private val started = AtomicBoolean(false)

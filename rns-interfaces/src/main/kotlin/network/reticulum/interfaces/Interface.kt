@@ -128,6 +128,10 @@ abstract class Interface(
     /** Interface type name for discovery announces. */
     open val discoveryInterfaceType: String = "Interface"
 
+    /** Whether this interface uses KISS framing (python: interface.kiss_framing,
+     * read by the discovery announce builder's TCPClient/KISS rules). */
+    open val kissFraming: Boolean = false
+
     /** Type-specific discovery data. */
     open fun getDiscoveryData(): Map<Int, Any>? = null
 

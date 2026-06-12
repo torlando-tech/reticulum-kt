@@ -256,3 +256,15 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Description:** (1) python's `Packet.context` is a bare int; kotlin's typed `PacketContext` enum cannot carry unnamed code points, so `contextRaw: Int` is the wire source of truth (pack writes it, unpack stores it) and `PacketContext.UNKNOWN(-1)` is the named view for unknown bytes — matching python's accept-and-match-nothing forward compatibility byte-for-byte. (2) python encrypts inside pack() (fresh ephemeral/IV per pack, which is what makes resend() re-encrypt); kotlin previously encrypted at Packet.create — now moved into pack() with python's exact unencrypted-class branch table and HEADER_2 announce-only rule (python error text preserved; IOError/AttributeError → IllegalStateException per the blanket idiom entry). (3) kotlin-only `Packet.createRaw` (no python counterpart — python transport splices raw bytes instead of re-packing) passes `data` through pack() untouched; that pass-through is its documented contract and is unreachable from python-mirrored code paths.
 
 **Re-evaluation:** if PacketContext is ever refactored to a value-class over Int, UNKNOWN/contextRaw collapse into it.
+
+### Discovery: polymorphic type-field sourcing; no executable reachable_on; injected source allowlist — `rns-core/.../discovery/{InterfaceAnnouncer,InterfaceAnnounceHandler,DiscoveryUtil}.kt`
+
+**Python reference:** `RNS/Discovery.py:96-186` (builder: per-type fields AND rules centralized; the reachable_on-from-executable subprocess branch at :117-131), `:214-362` (received_announce), `:216` (sources read live from Reticulum config), `:769-790` (validators/san_map).
+
+**Category:** mixed — (a) language/structure: per-type announce FIELDS are sourced polymorphically via `Interface.getDiscoveryData()` (kotlin's typed interfaces can't be duck-probed for arbitrary attributes), while every RULE (TCPClient-without-KISS abort, Backbone/TCPServer reachable_on validation+abort, KISS rewrite, IFAC publication, insertion order via LinkedHashMap) is centralized in the builder exactly as python's; (b) deliberate omission: the reachable_on-from-executable branch (python runs a user-configured executable and parses stdout) is NOT ported — running config-supplied executables is rejected on JVM/Android; an executable path therefore fails the IP/hostname validation and aborts the announce (python's failure mode for a broken script). (c) the receiver's source allowlist is constructor-injected instead of read live from Reticulum config (kotlin has no INI config layer yet); empty/null disables gating exactly like python's falsy check. Receiver validation core (hard type gates, whitelist, sanitize_name/san_map, config_entry strings, callback(None) on missing INTERFACE_TYPE) is a line-for-line port.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance discovery_* bridge commands; tests/test_discovery_*.py.
+
+**Re-evaluation:** when kotlin grows a config layer, switch the allowlist to a live read; revisit the executable branch only if a sandboxed design is approved by the owner.

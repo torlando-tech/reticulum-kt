@@ -213,7 +213,24 @@ class InterfaceDiscovery(
         return results
     }
 
+    /**
+     * Store a discovered-interface record, mirroring python
+     * InterfaceDiscovery.interface_discovered (Discovery.py:450-495):
+     * STORAGE-acceptance type whitelist gate (narrower than the handler's),
+     * then dedup-by-discovery-hash with heard_count increment. Exposed for
+     * tests/tooling that need to drive the storage path directly with a
+     * controlled record; the live receive path calls it via the callback.
+     */
+    fun interfaceDiscovered(info: DiscoveredInterface) = onInterfaceDiscovered(info)
+
     private fun onInterfaceDiscovered(info: DiscoveredInterface) {
+        // python: `if not discovered_type in self.DISCOVERABLE_TYPES: return`
+        // (Discovery.py:457) — TCPClientInterface is accepted by the handler
+        // but NOT stored.
+        if (info.type !in DiscoveryConstants.STORAGE_DISCOVERABLE_TYPES) {
+            log("Discovered ${info.type} is not in the storage whitelist, not persisting")
+            return
+        }
         try {
             val filename = info.discoveryHash.toHexString()
 

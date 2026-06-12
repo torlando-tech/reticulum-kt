@@ -150,13 +150,15 @@ object Transport {
 
     // ===== State =====
 
-    /** Transport identity for this node. */
+    /** Transport identity for this node. Public-settable, as python's
+     * `RNS.Transport.identity` module attribute is (the conformance bridge
+     * injects it exactly as the python reference bridge does). */
     var identity: Identity? = null
-        private set
 
-    /** Whether transport is enabled (routing for other nodes). */
+    /** Whether transport is enabled (routing for other nodes). Public-settable,
+     * as python's `Reticulum.__transport_enabled` is via the reference
+     * bridge's setattr injection. */
     var transportEnabled: Boolean = false
-        private set
 
     /** Whether this instance is connected to a local shared instance (Python: Transport.owner.is_connected_to_shared_instance). */
     @Volatile
@@ -5982,6 +5984,10 @@ interface InterfaceRef {
 
     /** The interface type name as it appears in discovery announces. */
     val discoveryInterfaceType: String get() = "Interface"
+
+    /** Whether this interface uses KISS framing (python: interface.kiss_framing,
+     * read by the discovery announce builder's TCPClient/KISS rules). */
+    val kissFraming: Boolean get() = false
 
     /** Python-style qualified name: "TCPClientInterface[homelab]". Used for interface type detection. */
     val qualifiedName: String get() = "$discoveryInterfaceType[$name]"
