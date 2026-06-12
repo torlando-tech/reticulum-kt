@@ -139,6 +139,54 @@ private fun currentRatchetIdVal(ratchets: List<ByteArray>): com.google.gson.Json
 private fun previousRatchetIdVal(ratchets: List<ByteArray>): com.google.gson.JsonElement =
     if (ratchets.size < 2) JsonNull.INSTANCE else JsonPrimitive(ratchetIdHex(ratchets[1]))
 
+private val LINK_STATUS_NAMES = mapOf(
+    LinkConstants.PENDING to "PENDING",
+    LinkConstants.HANDSHAKE to "HANDSHAKE",
+    LinkConstants.ACTIVE to "ACTIVE",
+    LinkConstants.STALE to "STALE",
+    LinkConstants.CLOSED to "CLOSED",
+)
+private val LINK_TEARDOWN_NAMES = mapOf(
+    LinkConstants.TEARDOWN_REASON_TIMEOUT to "TIMEOUT",
+    LinkConstants.INITIATOR_CLOSED to "INITIATOR_CLOSED",
+    LinkConstants.DESTINATION_CLOSED to "DESTINATION_CLOSED",
+)
+
+/** Find a link by id across both outbound (initiator) links and the inbound
+ *  links accepted by any listener on this handle (reference: _find_link_by_id). */
+private fun findLinkById(inst: WireInstance, linkIdHex: String): Link? {
+    inst.outLinks[linkIdHex]?.let { return it }
+    for (listener in inst.listeners.values) {
+        listener.inboundLinks.firstOrNull { it.linkId.toHex() == linkIdHex }?.let { return it }
+    }
+    return null
+}
+
+/** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
+ *  keepalive_s/stale_time_s/rtt cross the boundary in SECONDS (kotlin millis). */
+private fun linkStatusDict(link: Link): JsonObject {
+    val now = System.currentTimeMillis()
+    val lastInbound = link.lastInbound
+    val lastKeepalive = link.lastKeepalive
+    val remoteIdentity = link.getRemoteIdentity()
+    return result(
+        "status" to intVal(link.status),
+        "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+        "teardown_reason" to intVal(link.teardownReason),
+        "teardown_reason_name" to (LINK_TEARDOWN_NAMES[link.teardownReason]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+        "no_inbound_for_ms" to (if (lastInbound > 0) intVal(maxOf(0L, now - lastInbound).toInt()) else JsonNull.INSTANCE),
+        "last_keepalive_ago_ms" to (if (lastKeepalive > 0) intVal(maxOf(0L, now - lastKeepalive).toInt()) else JsonNull.INSTANCE),
+        "keepalive_s" to doubleVal(link.keepalive / 1000.0),
+        "stale_time_s" to doubleVal(link.staleTime / 1000.0),
+        "rtt" to (link.rtt?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+        "mtu" to (link.getMtu()?.let { intVal(it) } ?: JsonNull.INSTANCE),
+        "mdu" to (link.getMdu()?.let { intVal(it) } ?: JsonNull.INSTANCE),
+        "mode" to intVal(link.mode),
+        "remote_identity_hash" to (remoteIdentity?.hash?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+        "remote_identified" to boolVal(remoteIdentity != null),
+    )
+}
+
 /**
  * Locate a ratchet-ENABLED SINGLE destination by hash, or throw. Mirrors the
  * reference's `_ratchet_dest_or_raise`: the destination must have been created
@@ -166,6 +214,10 @@ private class Listener(
     val identity: Identity,
     val recvBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
     val resourceBuffer: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
+    // Inbound (receiver-side) links this destination has accepted, in arrival
+    // order — lets wire_listener_link_status observe teardown_reason on the
+    // side that did NOT initiate the close.
+    val inboundLinks: ConcurrentLinkedDeque<Link> = ConcurrentLinkedDeque(),
 )
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
@@ -766,6 +818,9 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         // the listener's buffers.
         destination.setLinkEstablishedCallback { linkObj ->
             val link = linkObj as? Link ?: return@setLinkEstablishedCallback
+            // Track the accepted inbound link so wire_listener_link_status can
+            // observe its lifecycle (e.g. teardown_reason after the initiator closes).
+            listener.inboundLinks.add(link)
             link.setPacketCallback { data, _packet ->
                 listener.recvBuffer.add(data.copyOf())
             }
@@ -2049,6 +2104,122 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "response_max_grace_time" to intVal(ResourceConstants.RESPONSE_MAX_GRACE_TIME),
             "explicit_timeout" to (explicitTimeoutMs?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
         )
+    }
+
+    // ===== Phase 5c batch 2: link introspection (LIVE reads) =====
+
+    "wire_link_status" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        linkStatusDict(link)
+    }
+
+    "wire_link_await_status" -> {
+        // Block until the link reaches at least target_status (int or name) on
+        // the PENDING<HANDSHAKE<ACTIVE<STALE<CLOSED ordering, or timeout.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 15000
+        val targetEl = p.get("target_status")
+        val targetInt = if (targetEl.asJsonPrimitive.isString) {
+            val name = targetEl.asString.uppercase()
+            LINK_STATUS_NAMES.entries.firstOrNull { it.value == name }?.key
+                ?: throw IllegalArgumentException("Unknown target_status name: $name")
+        } else {
+            targetEl.asInt
+        }
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var reached = false
+        while (System.currentTimeMillis() < deadline) {
+            if (link.status >= targetInt) { reached = true; break }
+            Thread.sleep(50)
+        }
+        linkStatusDict(link).apply { addProperty("reached", reached) }
+    }
+
+    "wire_link_set_watchdog" -> {
+        // Compress keepalive/stale timings so the watchdog path is observable
+        // in a test timeout. Seconds on the wire; kotlin stores millis.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val keepaliveS = p.get("keepalive_s")?.takeIf { !it.isJsonNull }?.asDouble
+        val staleTimeS = p.get("stale_time_s")?.takeIf { !it.isJsonNull }?.asDouble
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        if (keepaliveS != null) link.keepalive = (keepaliveS * 1000).toLong()
+        if (staleTimeS != null) link.staleTime = (staleTimeS * 1000).toLong()
+        result(
+            "keepalive_s" to doubleVal(link.keepalive / 1000.0),
+            "stale_time_s" to doubleVal(link.staleTime / 1000.0),
+        )
+    }
+
+    "wire_link_teardown" -> {
+        // Gracefully tear down an outbound link; the peer observes CLOSED with
+        // teardown_reason=INITIATOR_CLOSED (via wire_listener_link_status).
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        link.teardown()
+        result("torn_down" to boolVal(true))
+    }
+
+    "wire_link_mtu" -> {
+        // Read the negotiated MTU/MDU/mode of an established link (initiator OR
+        // a listener-accepted inbound link). Reads the raw .mtu/.mdu fields
+        // (always populated post-establishment), plus status to gate on ACTIVE.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkById(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        result(
+            "mtu" to intVal(link.mtu),
+            "mdu" to intVal(link.mdu),
+            "mode" to intVal(link.mode),
+            "status" to intVal(link.status),
+            "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_listener_link_status" -> {
+        // Observe the receiver-side (inbound) link a wire_listen destination
+        // accepted, by destination_hash. Optionally polls for the inbound link
+        // to appear (establishment is async).
+        val handle = p.str("handle")
+        val destHashHex = p.hex("destination_hash").toHex()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 0
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=$destHashHex")
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (listener.inboundLinks.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50)
+        }
+        val links = listener.inboundLinks.toList()
+        if (links.isEmpty()) {
+            result("found" to boolVal(false), "link_count" to intVal(0))
+        } else {
+            linkStatusDict(links.last()).apply {
+                addProperty("found", true)
+                addProperty("link_count", links.size)
+            }
+        }
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")
