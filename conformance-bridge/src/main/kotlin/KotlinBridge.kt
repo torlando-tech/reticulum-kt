@@ -451,8 +451,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "truncated_hash" -> {
+            // Reference also returns full_hash (Identity.full_hash) alongside the
+            // truncated digest, so nothing about the length is hardcoded caller-side.
             val data = p.hex("data")
-            result("hash" to hexVal(Hashes.truncatedHash(data)))
+            result(
+                "hash" to hexVal(Hashes.truncatedHash(data)),
+                "full_hash" to hexVal(Hashes.fullHash(data)),
+            )
         }
 
         // === 3. Crypto — Key Derivation ===
@@ -2044,6 +2049,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                 identity, DestinationDirection.IN, DestinationType.SINGLE,
                 p.str("app_name"), *aspects.toTypedArray(),
             )
+            // Destination.create auto-registers IN destinations on the (single)
+            // Transport singleton. The python reference bridge builds announces
+            // on a SEPARATE minimal-RNS module, so they never pollute a
+            // behavioral instance's destination map; deregister here to match
+            // that — otherwise an injected announce for this destination would
+            // be treated as local and skipped.
+            try { network.reticulum.transport.Transport.deregisterDestination(dest) } catch (_: Exception) {}
             if (p.boolOpt("enable_ratchets") == true) {
                 val rdir = java.nio.file.Files.createTempDirectory("rns_announce_ratchets_").toFile()
                 dest.enableRatchets(java.io.File(rdir, "ratchets.bin").absolutePath)
