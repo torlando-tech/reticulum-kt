@@ -48,6 +48,7 @@ import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.link.RequestReceipt
 import network.reticulum.packet.Packet
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceConstants
@@ -170,6 +171,14 @@ private class Listener(
 private val wireInstances = mutableMapOf<String, WireInstance>()
 
 /**
+ * Request-handler invocation log, keyed "$handle|$destHex|$path" — mirrors the
+ * reference bridge's _request_handler_log. The response generator appends one
+ * JSON entry per request that reached the handler; wire_get_request_log drains
+ * it. Cleared in resetWireState so it can't leak across tests sharing the JVM.
+ */
+private val wireRequestHandlerLog = ConcurrentHashMap<String, MutableList<JsonObject>>()
+
+/**
  * Inbound tap — every packet that the bridge hands to Transport.inbound is
  * recorded here. Tests query this buffer (via `wire_get_received_packets`)
  * to prove that a hub node does not fan packets out to peers that shouldn't
@@ -270,6 +279,7 @@ private fun allocateFreePort(): Int {
 private fun resetWireState() {
     val stale = wireInstances.values.toList()
     wireInstances.clear()
+    wireRequestHandlerLog.clear()
     for (inst in stale) {
         runCatching { inst.serverIface?.detach() }
         runCatching { inst.clientIface?.detach() }
@@ -1830,6 +1840,215 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 "ratchet_id" to hexVal(Identity.ratchetIdFor(ratchetPublic)),
             )
         }
+    }
+
+    // ===== Phase 5c: link lifecycle — request handlers + link request =====
+
+    "wire_reannounce" -> {
+        // Re-announce an already-registered SINGLE IN destination. For a
+        // ratchet-enabled dest, announce() rotates (gated); rotate_ago_s
+        // backdates latest_ratchet_time so the gate opens for a genuinely NEW
+        // ratchet. Mirrors cmd_wire_reannounce.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appData = p.get("app_data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+        val rotateAgoS = p.get("rotate_ago_s")?.takeIf { !it.isJsonNull }?.asDouble
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = findDestinationByHash(inst, destHash)
+            ?: throw IllegalArgumentException(
+                "No registered destination with hash ${destHash.toHex()} on handle $handle.",
+            )
+        if (rotateAgoS != null && destination.ratchetsEnabledForTest()) {
+            destination.lastRatchetRotationForTest = System.currentTimeMillis() - (rotateAgoS * 1000).toLong()
+        }
+        destination.announce(appData = appData)
+        result(
+            "announced" to boolVal(true),
+            "current_ratchet_id" to currentRatchetIdVal(destination.ratchetsSnapshotForTest()),
+        )
+    }
+
+    "wire_register_request_handler" -> {
+        // Register a fixed-response request handler. The generator logs each
+        // invocation and returns the configured response (null for response_none).
+        // allow: "all"|"list"(+allowed_identity_hashes)|"none". Mirrors
+        // cmd_wire_register_request_handler.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val path = p.str("path")
+        val responseNone = p.get("response_none")?.asBoolean ?: false
+        val response = p.get("response")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        // kotlin's response generator returns ByteArray? only — it cannot return
+        // python's (file, metadata) tuple, so the streamed-file response branch
+        // is unsupported. Surface that clearly rather than silently mis-answering.
+        if (p.get("response_file") != null && !p.get("response_file").isJsonNull) {
+            throw IllegalArgumentException(
+                "wire_register_request_handler: response_file (streamed file + metadata " +
+                    "response) is not supported by the kotlin Destination request API " +
+                    "(its generator returns ByteArray only).",
+            )
+        }
+        val allowParam = p.get("allow")?.asString ?: "all"
+        val allowedListHex = p.get("allowed_identity_hashes")?.asJsonArray?.map { it.asString } ?: emptyList()
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = findDestinationByHash(inst, destHash)
+            ?: throw IllegalArgumentException(
+                "No registered destination with hash ${destHash.toHex()} on handle $handle; call wire_listen first.",
+            )
+
+        val allow: Int
+        val allowedList: List<ByteArray>?
+        when (allowParam) {
+            "all" -> { allow = network.reticulum.destination.RequestPolicy.ALLOW_ALL; allowedList = null }
+            "list" -> { allow = network.reticulum.destination.RequestPolicy.ALLOW_LIST; allowedList = allowedListHex.map { it.fromHex() } }
+            "none" -> { allow = network.reticulum.destination.RequestPolicy.ALLOW_NONE; allowedList = null }
+            else -> throw IllegalArgumentException("unsupported allow: $allowParam (use 'all', 'list' or 'none')")
+        }
+
+        val logKey = "$handle|${destHash.toHex()}|$path"
+        wireRequestHandlerLog.getOrPut(logKey) { java.util.Collections.synchronizedList(mutableListOf()) }
+        destination.registerRequestHandler(
+            path,
+            responseGenerator = { _, data, requestId, linkId, remoteIdentity, requestedAt ->
+                val entry = JsonObject().apply {
+                    addProperty("data", (data ?: ByteArray(0)).toHex())
+                    addProperty("request_id", requestId.toHex())
+                    addProperty("link_id", linkId.toHex())
+                    if (remoteIdentity != null) addProperty("remote_identity_hash", remoteIdentity.hash.toHex())
+                    else add("remote_identity_hash", JsonNull.INSTANCE)
+                    // python requested_at is epoch seconds; kotlin passes millis.
+                    addProperty("requested_at", requestedAt / 1000.0)
+                }
+                wireRequestHandlerLog[logKey]?.add(entry)
+                if (responseNone) null else response
+            },
+            allow = allow,
+            allowedList = allowedList,
+        )
+        result("registered" to boolVal(true))
+    }
+
+    "wire_deregister_request_handler" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val path = p.str("path")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = findDestinationByHash(inst, destHash)
+            ?: throw IllegalArgumentException(
+                "No registered destination with hash ${destHash.toHex()} on handle $handle.",
+            )
+        val removed = destination.deregisterRequestHandler(path)
+        result("deregistered" to boolVal(removed))
+    }
+
+    "wire_get_request_log" -> {
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val path = p.str("path")
+        val logKey = "$handle|${destHash.toHex()}|$path"
+        val entries = wireRequestHandlerLog[logKey] ?: mutableListOf()
+        val arr = JsonArray()
+        synchronized(entries) { entries.forEach { arr.add(it) } }
+        result("count" to intVal(arr.size()), "entries" to arr)
+    }
+
+    "wire_link_identify" -> {
+        // Identify the link initiator to the remote peer (Link.identify).
+        // Required for ALLOW_LIST handlers — remote_identity is null unless the
+        // requester identifies first.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val privateKey = p.hex("private_key")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val identity = Identity.fromBytes(privateKey)
+            ?: throw IllegalArgumentException("Identity.fromBytes rejected the private key")
+        link.identify(identity)
+        result("identified" to boolVal(true), "identity_hash" to hexVal(identity.hash))
+    }
+
+    "wire_link_request", "wire_link_request_large" -> {
+        // Issue a request over an established outbound Link, wait for the
+        // response. Polls RequestReceipt.status until READY/FAILED/timeout.
+        // The _large variant just uses a larger default timeout for >MDU
+        // resource-backed responses. Mirrors cmd_wire_link_request.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val path = p.str("path")
+        val data = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+        val defaultTimeout = if (command == "wire_link_request_large") 30000 else 10000
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: defaultTimeout
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val receipt = link.request(path, data = data, timeout = timeoutMs.toLong())
+            ?: throw IllegalStateException("Link.request returned null (link not active / REQUEST not sent)")
+        // +500ms slack so the receipt's own internal timeout fires first.
+        val deadline = System.currentTimeMillis() + timeoutMs + 500
+        var out: JsonObject? = null
+        while (System.currentTimeMillis() < deadline) {
+            when (receipt.status) {
+                RequestReceipt.READY -> {
+                    val resp = receipt.getResponseCopy()
+                    val meta = receipt.metadata
+                    out = result(
+                        "status" to strVal("ready"),
+                        "response" to (resp?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                        "response_metadata" to (meta?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                        "response_time_s" to (receipt.getResponseTime()?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+                    )
+                }
+                RequestReceipt.FAILED -> {
+                    out = result(
+                        "status" to strVal("failed"),
+                        "response" to JsonNull.INSTANCE,
+                        "response_metadata" to JsonNull.INSTANCE,
+                    )
+                }
+            }
+            if (out != null) break
+            Thread.sleep(50)
+        }
+        out ?: result(
+            "status" to strVal("timeout"),
+            "response" to JsonNull.INSTANCE,
+            "response_metadata" to JsonNull.INSTANCE,
+        )
+    }
+
+    "wire_link_request_timeout" -> {
+        // Issue Link.request and read back the RequestReceipt's computed timeout
+        // WITHOUT waiting. With no explicit timeout, RNS derives rtt*6 + 11.25s.
+        // Timestamps cross the boundary in seconds (kotlin stores millis).
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val path = p.str("path")
+        val data = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+        val explicitTimeoutMs = p.get("timeout_ms")?.takeIf { !it.isJsonNull }?.asInt
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val receipt = link.request(path, data = data, timeout = explicitTimeoutMs?.toLong())
+            ?: throw IllegalStateException("Link.request returned null (REQUEST packet not sent)")
+        result(
+            "receipt_timeout" to doubleVal(receipt.timeout / 1000.0),
+            "rtt" to (link.rtt?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+            "traffic_timeout_factor" to intVal(link.trafficTimeoutFactor),
+            "response_max_grace_time" to intVal(ResourceConstants.RESPONSE_MAX_GRACE_TIME),
+            "explicit_timeout" to (explicitTimeoutMs?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+        )
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")
