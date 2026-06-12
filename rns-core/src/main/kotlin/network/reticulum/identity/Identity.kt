@@ -999,6 +999,21 @@ class Identity private constructor(
         }
 
         /**
+         * Conformance test seam: drop the in-memory ratchet cache entry for a
+         * destination so the next getRatchet() must load from the on-disk store
+         * (the conformance bridge is a separate module and can't touch the
+         * private destinationRatchets map). Mirrors the reference bridge's
+         * `Identity.known_ratchets.pop(dest_hash, None)` (reticulum-conformance
+         * reference/wire_tcp.py cmd_wire_identity_ratchet_persist), which forces
+         * the disk-load path. Read-only on disk; no port logic.
+         */
+        fun dropRatchetCacheForTest(destHash: ByteArray) {
+            synchronized(destinationRatchets) {
+                destinationRatchets.remove(destHash.toKey())
+            }
+        }
+
+        /**
          * Get the ratchet ID for the current ratchet of a destination.
          * The ratchet ID is the first 10 bytes of the SHA-256 hash of the ratchet public key.
          *

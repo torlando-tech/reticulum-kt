@@ -301,6 +301,53 @@ class Destination private constructor(
      */
     fun ratchetCount(): Int = ratchets.size
 
+    // ===== Conformance test seams (ratchet introspection) =====
+    // The conformance bridge is a separate gradle module and cannot read the
+    // private ratchet state these expose. They mirror the python attribute
+    // access the reference bridge uses (reticulum-conformance reference/
+    // wire_tcp.py cmd_wire_read_ratchets / rotate_ratchet / set_retained_ratchets
+    // / ratchet_file_roundtrip). Pure read-only / hook accessors — no port logic.
+
+    /** Snapshot of the in-memory ratchet PRIVATE keys, newest first. */
+    fun ratchetsSnapshotForTest(): List<ByteArray> = ratchets.map { it.copyOf() }
+
+    /** Whether enableRatchets() has been called on this destination. */
+    fun ratchetsEnabledForTest(): Boolean = ratchetsEnabled
+
+    /** The on-disk ratchet store path (null when ratchets disabled). */
+    fun ratchetsPathForTest(): String? = ratchetsPath
+
+    /** The retained-ratchets cap (Destination.retained_ratchets). */
+    fun retainedRatchetsForTest(): Int = retainedRatchets
+
+    /**
+     * latest_ratchet_time in python is an epoch-SECONDS attribute; kotlin
+     * stores it as lastRatchetRotation in MILLIS. The bridge converts at the
+     * boundary. Backdating it (reference: destination.latest_ratchet_time =
+     * time.time() - ago_s) deterministically opens/shuts the rotation gate.
+     */
+    var lastRatchetRotationForTest: Long
+        get() = lastRatchetRotation
+        set(value) { lastRatchetRotation = value }
+
+    /** Force a signed write of the ratchet store (reference: _persist_ratchets). */
+    fun persistRatchetsForTest() = persistRatchets()
+
+    /**
+     * Clear the in-memory ratchet list and reload from the signed on-disk
+     * store, mirroring the reference's `destination.ratchets = None;
+     * _reload_ratchets(path)`. Returns reloadRatchets()'s success flag.
+     */
+    fun reloadRatchetsFromDiskForTest(): Boolean {
+        ratchets.clear()
+        return reloadRatchets()
+    }
+
+    /** Append a raw ratchet private key (reference pad: ratchets.append(...)). */
+    fun addRatchetForTest(ratchetPrivate: ByteArray) {
+        ratchets.add(ratchetPrivate.copyOf())
+    }
+
     /**
      * Set the ratchet public key for encryption to this destination.
      * This is called when receiving an announce with a ratchet.
@@ -1516,10 +1563,14 @@ class Destination private constructor(
             ratchet = ratchetPub
             hasRatchet = true
 
-            // NOTE: Do not store the ratchet public key under our own hash!
-            // The ratchet public key should only be stored by REMOTE parties who receive our announce.
-            // We keep the private keys in our ratchets list for decryption.
-            // Storing the public key under our own hash would confuse the encryption logic.
+            // Store our OWN current ratchet public key under our own hash, exactly
+            // as python announce() does (RNS.Identity._remember_ratchet(self.hash,
+            // ratchet), Destination.py:287). Destination.encrypt selects its ratchet
+            // via this same lookup (get_ratchet(self.hash), Destination.py:596) and
+            // records latest_ratchet_id; without the store, encrypt falls back to
+            // the static key and latest_ratchet_id never gets set for our own
+            // outbound messages — a divergence from the reference.
+            setRatchetForDestination(hash, ratchetPub)
         } else {
             ratchet = byteArrayOf()
             hasRatchet = false
