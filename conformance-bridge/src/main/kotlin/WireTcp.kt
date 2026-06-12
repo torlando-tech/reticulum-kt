@@ -123,6 +123,42 @@ private fun ifacInterfaceOrThrow(inst: WireInstance): network.reticulum.interfac
     return iface
 }
 
+/** The 10-byte ratchet id of a ratchet PRIVATE key, hex (reference:
+ *  _ratchet_id_hex -> _get_ratchet_id(_ratchet_public_bytes(prv))). */
+private fun ratchetIdHex(ratchetPrivate: ByteArray): String {
+    val pub = network.reticulum.crypto.defaultCryptoProvider().x25519PublicFromPrivate(ratchetPrivate)
+    return Identity.ratchetIdFor(pub).toHex()
+}
+
+/** Hex id of the newest (index 0) ratchet, or JSON null. */
+private fun currentRatchetIdVal(ratchets: List<ByteArray>): com.google.gson.JsonElement =
+    if (ratchets.isEmpty()) JsonNull.INSTANCE else JsonPrimitive(ratchetIdHex(ratchets[0]))
+
+/** Hex id of the second-newest (index 1) ratchet, or JSON null. */
+private fun previousRatchetIdVal(ratchets: List<ByteArray>): com.google.gson.JsonElement =
+    if (ratchets.size < 2) JsonNull.INSTANCE else JsonPrimitive(ratchetIdHex(ratchets[1]))
+
+/**
+ * Locate a ratchet-ENABLED SINGLE destination by hash, or throw. Mirrors the
+ * reference's `_ratchet_dest_or_raise`: the destination must have been created
+ * with enable_ratchets=true (kotlin's ratchetsEnabled flag is the analog of
+ * python's `destination.ratchets is not None`).
+ */
+private fun ratchetDestOrThrow(inst: WireInstance, destHash: ByteArray, handle: String): Destination {
+    val destination = findDestinationByHash(inst, destHash)
+        ?: throw IllegalArgumentException(
+            "No registered destination with hash ${destHash.toHex()} on handle $handle; " +
+                "call wire_announce(enable_ratchets=true) first.",
+        )
+    if (!destination.ratchetsEnabledForTest()) {
+        throw IllegalArgumentException(
+            "Destination ${destHash.toHex()} does not have ratchets enabled; " +
+                "call wire_announce(enable_ratchets=true).",
+        )
+    }
+    return destination
+}
+
 /** Per-destination receive buffer for incoming link data + resources. */
 private class Listener(
     val destination: Destination,
@@ -625,6 +661,8 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
         val appDataHex = p.get("app_data")?.asString ?: ""
 
+        val enableRatchets = p.get("enable_ratchets")?.asBoolean ?: false
+
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
@@ -636,14 +674,29 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             appName = appName,
             aspects = aspects,
         )
+        // Enable per-destination ratchets BEFORE announcing so the announce
+        // carries the latest ratchet public key (context flag set) and the
+        // destination tracks a ratchet store — the "A enables ratchets +
+        // announces" precondition for the ratchet observables.
+        if (enableRatchets) {
+            val ratchetsFile = File(inst.configDir, "ratchets_${destination.hash.toHex()}_${UUID.randomUUID().toString().take(8)}")
+            destination.enableRatchets(ratchetsFile.absolutePath)
+        }
         val appData: ByteArray? = if (appDataHex.isNotEmpty()) appDataHex.fromHex() else null
         destination.announce(appData = appData)
         inst.destinations.add(identity to destination)
 
-        result(
+        val entries = mutableListOf<Pair<String, com.google.gson.JsonElement>>(
             "destination_hash" to hexVal(destination.hash),
             "identity_hash" to hexVal(identity.hash),
         )
+        if (enableRatchets) {
+            val ratchets = destination.ratchetsSnapshotForTest()
+            entries += "ratchets_enabled" to boolVal(destination.ratchetsEnabledForTest())
+            entries += "current_ratchet_id" to currentRatchetIdVal(ratchets)
+            entries += "ratchet_count" to intVal(ratchets.size)
+        }
+        result(*entries.toTypedArray())
     }
 
     "wire_poll_path" -> {
@@ -677,6 +730,8 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val aspectsJson = p.get("aspects")?.asJsonArray
         val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
 
+        val enableRatchets = p.get("enable_ratchets")?.asBoolean ?: false
+
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
@@ -688,6 +743,13 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             appName = appName,
             aspects = aspects,
         )
+        // Enable per-destination ratchets on the IN destination before its
+        // immediate announce, mirroring cmd_wire_listen enable_ratchets, so the
+        // destination-level ratchet observables operate on a ratchet-bearing dest.
+        if (enableRatchets) {
+            val ratchetsFile = File(inst.configDir, "ratchets_${destination.hash.toHex()}_${UUID.randomUUID().toString().take(8)}")
+            destination.enableRatchets(ratchetsFile.absolutePath)
+        }
 
         val listener = Listener(destination, identity)
         // On link established, wire both packet and resource callbacks into
@@ -1538,6 +1600,236 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "entry_len_after_load" to intVal(if (reloaded != null) 4 else 0),
             "table_size_after_load" to intVal(Identity.knownDestinationCount()),
         )
+    }
+
+    // ===== Phase 5b: destination-level ratchets (LIVE) =====
+
+    "wire_read_ratchets" -> {
+        // Read the ratchet state of a ratchet-enabled destination. ratchet_interval
+        // and latest_ratchet_time are SECONDS on the wire (python attrs); kotlin
+        // stores them as MILLIS, converted here. Mirrors cmd_wire_read_ratchets.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+        val ratchets = destination.ratchetsSnapshotForTest()
+        result(
+            "ratchet_count" to intVal(ratchets.size),
+            "current_ratchet_id" to currentRatchetIdVal(ratchets),
+            "previous_ratchet_id" to previousRatchetIdVal(ratchets),
+            "ratchet_interval" to intVal((destination.ratchetInterval / 1000L).toInt()),
+            "retained_ratchets" to intVal(destination.retainedRatchetsForTest()),
+            "latest_ratchet_id" to (destination.latestRatchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "latest_ratchet_time" to doubleVal(destination.lastRatchetRotationForTest / 1000.0),
+        )
+    }
+
+    "wire_set_ratchet_interval" -> {
+        // Set the minimum ratchet-rotation interval (python SECONDS -> kotlin
+        // MILLIS). ok is false for a non-positive value (rejected, unchanged).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val seconds = p.get("seconds").asLong
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+        // A non-positive seconds value stays non-positive in millis, so kotlin's
+        // setRatchetInterval rejects it exactly as python does.
+        val ok = destination.setRatchetInterval(seconds * 1000L)
+        result(
+            "ok" to boolVal(ok),
+            "ratchet_interval" to intVal((destination.ratchetInterval / 1000L).toInt()),
+        )
+    }
+
+    "wire_rotate_ratchet" -> {
+        // Trigger a rotation and observe the interval gate without a real wait.
+        // last_rotation_ago_s backdates latest_ratchet_time (kotlin: lastRatchetRotation,
+        // millis) so the gate opens (ago > interval) or stays shut (ago < interval).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val agoS = p.get("last_rotation_ago_s")?.takeIf { !it.isJsonNull }?.asDouble
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+
+        if (agoS != null) {
+            destination.lastRatchetRotationForTest = System.currentTimeMillis() - (agoS * 1000).toLong()
+        }
+        val before = destination.ratchetsSnapshotForTest()
+        val beforeCurrent = currentRatchetIdVal(before)
+        destination.rotateRatchets()
+        val after = destination.ratchetsSnapshotForTest()
+        result(
+            "rotated" to boolVal(after.size > before.size),
+            "before_count" to intVal(before.size),
+            "after_count" to intVal(after.size),
+            "before_current_id" to beforeCurrent,
+            "current_ratchet_id" to currentRatchetIdVal(after),
+            "previous_ratchet_id" to previousRatchetIdVal(after),
+            "ratchet_interval" to intVal((destination.ratchetInterval / 1000L).toInt()),
+            "latest_ratchet_time" to doubleVal(destination.lastRatchetRotationForTest / 1000.0),
+        )
+    }
+
+    "wire_set_retained_ratchets" -> {
+        // Set the retained-ratchets cap and observe truncation. pad_to inflates
+        // the list with N real fresh ratchets first so the cap is observable.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val n = p.get("n").asInt
+        val padTo = p.get("pad_to")?.takeIf { !it.isJsonNull }?.asInt
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+
+        if (padTo != null) {
+            val crypto = network.reticulum.crypto.defaultCryptoProvider()
+            while (destination.ratchetsSnapshotForTest().size < padTo) {
+                destination.addRatchetForTest(crypto.generateX25519KeyPair().privateKey)
+            }
+        }
+        val ok = destination.setRetainedRatchets(n)
+        result(
+            "ok" to boolVal(ok),
+            "retained_ratchets" to intVal(destination.retainedRatchetsForTest()),
+            "ratchet_count" to intVal(destination.ratchetsSnapshotForTest().size),
+            "ratchet_count_cap" to intVal(Destination.RATCHET_COUNT),
+        )
+    }
+
+    "wire_ratchet_file_roundtrip" -> {
+        // Persist + reload a destination's signed ratchet store and confirm it
+        // round-trips. The bridge does NOT parse the on-disk format — reloadRatchets
+        // validates the embedded signature and only repopulates on success.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+        if (destination.ratchetsPathForTest() == null) {
+            throw IllegalArgumentException(
+                "Destination ${destHash.toHex()} has no ratchets_path; enable ratchets " +
+                    "with a file path (wire_announce enable_ratchets=true).",
+            )
+        }
+        val before = destination.ratchetsSnapshotForTest()
+        val idsBefore = before.map { ratchetIdHex(it) }
+        destination.persistRatchetsForTest()
+        val reloadOk = try {
+            destination.reloadRatchetsFromDiskForTest()
+        } catch (e: Exception) {
+            false
+        }
+        val after = destination.ratchetsSnapshotForTest()
+        val idsAfter = after.map { ratchetIdHex(it) }
+        val idsArr = JsonArray().apply { idsAfter.forEach { add(it) } }
+        result(
+            "ratchets_path_set" to boolVal(true),
+            "reload_ok" to boolVal(reloadOk),
+            "ratchet_count_before" to intVal(before.size),
+            "ratchet_count_after" to intVal(after.size),
+            "roundtrip_match" to boolVal(idsBefore == idsAfter && before.size == after.size),
+            "ratchet_ids" to idsArr,
+        )
+    }
+
+    "wire_identity_ratchet_persist" -> {
+        // Persist + reload a RECEIVED ratchet through the Identity-side store
+        // (rememberRatchet -> getRatchet) and exercise cleanRatchets housekeeping.
+        // The bridge does NOT build/parse the on-disk msgpack — the library does.
+        val handle = p.str("handle")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = network.reticulum.crypto.defaultCryptoProvider()
+        // A random, never-announced dest hash: absent from known_destinations
+        // and from the ratchet cache.
+        val destHash = crypto.randomBytes(network.reticulum.common.RnsConstants.TRUNCATED_HASH_BYTES)
+        val ratchet = crypto.generateX25519KeyPair().privateKey // 32 genuine ratchet bytes
+
+        val ratchetDir = File(Identity.storagePath, "ratchets")
+        val hexHash = destHash.toHex()
+        val finalFile = File(ratchetDir, hexHash)
+        val outFile = File(ratchetDir, "$hexHash.out")
+
+        Identity.rememberRatchet(destHash, ratchet)
+        // rememberRatchet persists synchronously; poll briefly for safety.
+        val deadline = System.currentTimeMillis() + 5000
+        while (!finalFile.isFile && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        val fileWritten = finalFile.isFile
+        val tmpLeftover = outFile.exists()
+
+        // Force the on-disk LOAD path: drop the in-memory cache entry, read back.
+        Identity.dropRatchetCacheForTest(destHash)
+        val reloaded = Identity.getRatchet(destHash)
+        val reloadMatch = reloaded != null && reloaded.contentEquals(ratchet)
+        val acceptedSize = network.reticulum.common.RnsConstants.KEY_SIZE
+
+        // Housekeeping: dest is not in known_destinations -> python _clean_ratchets
+        // removes its file (not-in-use branch). kotlin cleanRatchets only removes
+        // EXPIRED ratchets (a documented divergence), so cleaned_removed reflects
+        // the genuine kotlin behavior.
+        Identity.cleanRatchets()
+        val cleanedRemoved = !finalFile.isFile
+        Identity.dropRatchetCacheForTest(destHash)
+
+        result(
+            "dest_hash" to hexVal(destHash),
+            "ratchet_len" to intVal(ratchet.size),
+            "file_written" to boolVal(fileWritten),
+            "tmp_leftover" to boolVal(tmpLeftover),
+            "reload_match" to boolVal(reloadMatch),
+            "reloaded_len" to (reloaded?.let { intVal(it.size) } ?: JsonNull.INSTANCE),
+            "accepted_size" to intVal(acceptedSize),
+            "cleaned_removed" to boolVal(cleanedRemoved),
+        )
+    }
+
+    "wire_destination_latest_ratchet_id" -> {
+        // Drive a real Destination.encrypt + decrypt round-trip and expose
+        // latest_ratchet_id (encrypt sets it to the current ratchet's id;
+        // decrypt re-derives it). Mirrors cmd_wire_destination_latest_ratchet_id.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val probe = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: "ratchet-probe".toByteArray()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = ratchetDestOrThrow(inst, destHash, handle)
+
+        val ciphertext = destination.encrypt(probe)
+        val encId = destination.latestRatchetId
+        val plaintext = destination.decrypt(ciphertext)
+        val decId = destination.latestRatchetId
+        result(
+            "decrypted" to boolVal(plaintext != null && plaintext.contentEquals(probe)),
+            "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "latest_ratchet_id" to (decId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "encrypt_ratchet_id" to (encId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "current_ratchet_id" to currentRatchetIdVal(destination.ratchetsSnapshotForTest()),
+            "match" to boolVal(encId != null && decId != null && encId.contentEquals(decId)),
+            "ratchet_count" to intVal(destination.ratchetsSnapshotForTest().size),
+        )
+    }
+
+    "wire_get_adopted_ratchet" -> {
+        // Report the ratchet this peer ADOPTED for a REMOTE destination after
+        // hearing its ratcheted announce (Identity.getRatchet / ratchetIdFor).
+        val destHash = p.hex("destination_hash")
+        val ratchetPublic = Identity.getRatchet(destHash)
+        if (ratchetPublic == null) {
+            result(
+                "found" to boolVal(false),
+                "ratchet_public" to JsonNull.INSTANCE,
+                "ratchet_id" to JsonNull.INSTANCE,
+            )
+        } else {
+            result(
+                "found" to boolVal(true),
+                "ratchet_public" to hexVal(ratchetPublic),
+                "ratchet_id" to hexVal(Identity.ratchetIdFor(ratchetPublic)),
+            )
+        }
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")
