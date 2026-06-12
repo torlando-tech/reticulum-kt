@@ -1367,9 +1367,13 @@ class Link private constructor(
      */
     private fun calculateRequestTimeout(): Long {
         val linkRtt = rtt ?: LinkConstants.KEEPALIVE_MAX
-        // Python: timeout = self.rtt * self.traffic_timeout_factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125
-        // For simplicity, use RTT * 6 + 5 seconds
-        return linkRtt * trafficTimeoutFactor + 5000L
+        // python Link.request: timeout = self.rtt * self.traffic_timeout_factor +
+        // RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125 (Link.py:493-494). rtt is in
+        // MILLIS here; RESPONSE_MAX_GRACE_TIME (10) is SECONDS, so 10*1.125 s =
+        // 11250 ms. (The previous +5000 ms was an admitted approximation that
+        // diverged from the reference.)
+        val graceMs = (network.reticulum.resource.ResourceConstants.RESPONSE_MAX_GRACE_TIME * 1125L)
+        return linkRtt * trafficTimeoutFactor + graceMs
     }
 
     /**
