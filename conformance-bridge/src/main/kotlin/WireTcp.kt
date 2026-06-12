@@ -84,10 +84,44 @@ private class WireInstance(
     val sharedClient: network.reticulum.interfaces.local.LocalClientInterface? = null,
     val sharedInstancePort: Int? = null,
     val destinations: MutableList<Pair<Identity, Destination>> = mutableListOf(),
+    // GROUP destinations keyed by hash hex — mirrors the python bridge's
+    // inst["group_dests"] (wire_tcp.py cmd_wire_group_create). A GROUP
+    // destination has no identity (symmetric key only), so it can't live in
+    // `destinations` alongside the SINGLE ones; keep it in its own map.
+    val groupDests: ConcurrentHashMap<String, Destination> = ConcurrentHashMap(),
     // Link bookkeeping — used by wire_listen / wire_link_* commands below.
     val listeners: ConcurrentHashMap<String, Listener> = ConcurrentHashMap(),
     val outLinks: ConcurrentHashMap<String, Link> = ConcurrentHashMap(),
 )
+
+/**
+ * Find a registered SINGLE destination on this handle by its hash. Mirrors
+ * the python bridge's `_find_destination_by_hash` — searches the strong-ref
+ * `destinations` list and the listener-owned destinations. Returns null when
+ * no local destination matches.
+ */
+private fun findDestinationByHash(inst: WireInstance, destHash: ByteArray): Destination? {
+    inst.destinations.firstOrNull { it.second.hash.contentEquals(destHash) }?.let { return it.second }
+    inst.listeners.values.firstOrNull { it.destination.hash.contentEquals(destHash) }?.let { return it.destination }
+    return null
+}
+
+/**
+ * Locate the live IFAC-configured interface on this handle, mirroring the
+ * python bridge's `_interfaces_matching_handle(...)` scan for the first iface
+ * with a non-null ifac_identity. A single wire handle hosts exactly one
+ * declared interface (server XOR client), so there is no ambiguity.
+ */
+private fun ifacInterfaceOrThrow(inst: WireInstance): network.reticulum.interfaces.Interface {
+    val iface = inst.serverIface ?: inst.clientIface
+    if (iface?.ifacIdentity == null) {
+        throw IllegalStateException(
+            "No IFAC-configured interface on this handle. Start the peer with " +
+                "network_name + passphrase so RNS derives an ifac_identity.",
+        )
+    }
+    return iface
+}
 
 /** Per-destination receive buffer for incoming link data + resources. */
 private class Listener(
@@ -716,6 +750,9 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         result(
             "destination_hash" to hexVal(destination.hash),
             "identity_hash" to hexVal(identity.hash),
+            // public_key lets recall tests assert the recalled key is
+            // byte-identical to the announced one, not merely the right length.
+            "public_key" to hexVal(identity.getPublicKey()),
         )
     }
 
@@ -1109,6 +1146,398 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         } else {
             result("stopped" to boolVal(false))
         }
+    }
+
+    // ===== Phase 5a: crypto / identity / group (LIVE, mostly delegating) =====
+
+    "wire_group_create" -> {
+        // Create a real GROUP Destination and either generate or load its
+        // symmetric key (Destination.createKeys / loadPrivateKey). GROUP
+        // crypto is symmetric and identity-independent; the returned key is
+        // shared out-of-band. Mirrors cmd_wire_group_create (wire_tcp.py:5034).
+        val handle = p.str("handle")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val keyHex = p.get("key")?.asString?.takeIf { it.isNotEmpty() }
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val destination = Destination.create(
+            identity = null,
+            direction = DestinationDirection.IN,
+            type = DestinationType.GROUP,
+            appName = appName,
+            aspects = aspects,
+        )
+        if (keyHex != null) {
+            destination.loadPrivateKey(keyHex.fromHex())
+        } else {
+            destination.createKeys()
+        }
+        inst.groupDests[destination.hash.toHex()] = destination
+        // Strong ref so it isn't GC'd (identity slot is null for GROUP).
+        inst.destinations.add(Identity.create() to destination)
+
+        result(
+            "destination_hash" to hexVal(destination.hash),
+            "key" to hexVal(destination.getPrivateKey()),
+        )
+    }
+
+    "wire_group_encrypt" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.hex("destination_hash").toHex()
+        val plaintext = p.get("plaintext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = inst.groupDests[destHashHex]
+            ?: throw IllegalArgumentException("No GROUP destination $destHashHex on handle $handle")
+        result("ciphertext" to hexVal(destination.encrypt(plaintext)))
+    }
+
+    "wire_group_decrypt" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.hex("destination_hash").toHex()
+        val ciphertext = p.get("ciphertext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = inst.groupDests[destHashHex]
+            ?: throw IllegalArgumentException("No GROUP destination $destHashHex on handle $handle")
+        val plaintext = destination.decrypt(ciphertext)
+        result(
+            "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "decrypted" to boolVal(plaintext != null),
+        )
+    }
+
+    "wire_identity_keypair" -> {
+        // Pure RNS crypto — no started wire instance required.
+        val identity = Identity.create()
+        result(
+            "private_key" to hexVal(identity.getPrivateKey()),
+            "public_key" to hexVal(identity.getPublicKey()),
+            "hash" to hexVal(identity.hash),
+        )
+    }
+
+    "wire_ratchet_keypair" -> {
+        // Fresh X25519 ratchet keypair (Cryptography.X25519). public ->
+        // wire_identity_encrypt(ratchet_pub=...); private -> wire_identity_decrypt(ratchets=[...]).
+        val crypto = network.reticulum.crypto.defaultCryptoProvider()
+        val kp = crypto.generateX25519KeyPair()
+        result(
+            "private_key" to hexVal(kp.privateKey),
+            "public_key" to hexVal(kp.publicKey),
+        )
+    }
+
+    "wire_identity_encrypt" -> {
+        // Encrypt for an identity's public key (real Identity.encrypt). When
+        // ratchet_pub is supplied, encrypt to that ratchet public key.
+        val publicKey = p.hex("public_key")
+        val plaintext = p.get("plaintext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val ratchetPub = p.get("ratchet_pub")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+        val identity = Identity.fromPublicKey(publicKey)
+        result("ciphertext" to hexVal(identity.encrypt(plaintext, ratchetPub)))
+    }
+
+    "wire_identity_decrypt" -> {
+        // Decrypt for an identity's private key with ratchet-enforcement
+        // support (real Identity.decrypt). With enforce_ratchets=true, a
+        // ciphertext that no supplied ratchet can decrypt is REJECTED even
+        // though the base key could — the forward-secrecy guarantee.
+        val privateKey = p.hex("private_key")
+        val ciphertext = p.hex("ciphertext")
+        val ratchetsJson = p.get("ratchets")?.asJsonArray
+        val ratchets: List<ByteArray>? = ratchetsJson?.map { it.asString.fromHex() }?.takeIf { it.isNotEmpty() }
+        val enforce = p.get("enforce_ratchets")?.asBoolean ?: false
+        val identity = Identity.fromBytes(privateKey)
+            ?: throw IllegalArgumentException("Identity.fromBytes rejected the private key")
+        val plaintext = identity.decrypt(ciphertext, ratchets, enforce)
+        result(
+            "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "decrypted" to boolVal(plaintext != null),
+        )
+    }
+
+    "wire_identity_recall" -> {
+        // Recall an Identity by destination hash (or identity hash) from this
+        // instance's received-announces table (real Identity.recall /
+        // recallByIdentityHash). Optionally polls until the announce has been
+        // received. Mirrors cmd_wire_identity_recall (wire_tcp.py:1054).
+        val handle = p.str("handle")
+        val targetHash = p.hex("destination_hash")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 0
+        val fromIdentityHash = p.get("from_identity_hash")?.asBoolean ?: false
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var identity: Identity?
+        while (true) {
+            identity = if (fromIdentityHash) {
+                Identity.recallByIdentityHash(targetHash)
+            } else {
+                Identity.recall(targetHash)
+            }
+            if (identity != null || System.currentTimeMillis() >= deadline) break
+            Thread.sleep(50)
+        }
+
+        if (identity == null) {
+            result("found" to boolVal(false), "app_data" to JsonNull.INSTANCE)
+        } else {
+            // app_data is the last-heard app_data for the destination
+            // (recallAppData). For the identity-hash path the destination hash
+            // is resolved via the reverse index inside recallByIdentityHash;
+            // recallAppData keys on the destination hash, so for that path we
+            // surface it only when the queried hash is itself the dest hash.
+            val appData = if (fromIdentityHash) null else Identity.recallAppData(targetHash)
+            result(
+                "found" to boolVal(true),
+                "public_key" to hexVal(identity.getPublicKey()),
+                "hash" to hexVal(identity.hash),
+                "app_data" to (appData?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            )
+        }
+    }
+
+    "wire_plain_encrypt" -> {
+        // PLAIN-destination encrypt: a no-op passthrough (Destination.encrypt
+        // returns plaintext unchanged for PLAIN). Returns {ciphertext, passthrough}.
+        val handle = p.str("handle")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val plaintext = p.get("plaintext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val dest = Destination.create(null, DestinationDirection.OUT, DestinationType.PLAIN, appName, *aspects)
+        inst.destinations.add(Identity.create() to dest)
+        val ciphertext = dest.encrypt(plaintext)
+        result(
+            "ciphertext" to hexVal(ciphertext),
+            "passthrough" to boolVal(ciphertext.contentEquals(plaintext)),
+        )
+    }
+
+    "wire_plain_decrypt" -> {
+        val handle = p.str("handle")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val ciphertext = p.get("ciphertext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val dest = Destination.create(null, DestinationDirection.OUT, DestinationType.PLAIN, appName, *aspects)
+        inst.destinations.add(Identity.create() to dest)
+        val plaintext = dest.decrypt(ciphertext) ?: ciphertext
+        result(
+            "plaintext" to hexVal(plaintext),
+            "passthrough" to boolVal(plaintext.contentEquals(ciphertext)),
+        )
+    }
+
+    "wire_ifac_compute" -> {
+        // Compute the IFAC access code RNS.Transport.transmit would prepend,
+        // using the live interface's RNS-derived ifac_identity / ifac_key.
+        // Ed25519 sign is deterministic, so this reproduces the on-wire tag
+        // RNS itself produces. Mirrors cmd_wire_ifac_compute (wire_tcp.py:5192).
+        val handle = p.str("handle")
+        val packetData = p.hex("packet_data")
+        val ifacSizeOverride = p.get("ifac_size")?.takeIf { !it.isJsonNull }?.asInt
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val iface = ifacInterfaceOrThrow(inst)
+        val size = ifacSizeOverride ?: iface.ifacSize
+        val signature = iface.ifacIdentity!!.sign(packetData)
+        result(
+            "ifac_key" to hexVal(iface.ifacKey!!),
+            "ifac_size" to intVal(size),
+            "signature" to hexVal(signature),
+            "ifac" to hexVal(signature.copyOfRange(signature.size - size, signature.size)),
+        )
+    }
+
+    "wire_ifac_signature" -> {
+        // The live interface's IFAC identifier signature: the Ed25519 signature
+        // over full_hash(ifac_key) RNS produced at Reticulum.py:916. Ed25519 is
+        // deterministic, so signing full_hash(ifac_key) with the live
+        // ifac_identity reproduces it byte-for-byte. default_ifac_size is the
+        // per-type class default (TCP{Server,Client}Interface.DEFAULT_IFAC_SIZE == 16).
+        val handle = p.str("handle")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val iface = ifacInterfaceOrThrow(inst)
+        val signature = iface.ifacIdentity!!.sign(network.reticulum.crypto.Hashes.fullHash(iface.ifacKey!!))
+        val defaultIfacSize = when (iface) {
+            is TCPServerInterface -> TCPServerInterface.DEFAULT_IFAC_SIZE
+            is TCPClientInterface -> TCPClientInterface.DEFAULT_IFAC_SIZE
+            else -> 16
+        }
+        result(
+            "ifac_signature" to hexVal(signature),
+            "ifac_key" to hexVal(iface.ifacKey!!),
+            "ifac_size" to intVal(iface.ifacSize),
+            "default_ifac_size" to intVal(defaultIfacSize),
+        )
+    }
+
+    "wire_known_key_validate" -> {
+        // Validate a genuinely-signed announce against a planted known public
+        // key for the same destination hash (Identity.validateAnnounce
+        // known-key guard). The same announce flips accept/reject solely on the
+        // stored key. Mirrors cmd_wire_known_key_validate (wire_tcp.py:6068).
+        val handle = p.str("handle")
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val plant = (p.get("plant")?.asString ?: "mismatch").lowercase()
+        if (plant !in setOf("mismatch", "match", "none")) {
+            throw IllegalArgumentException("plant must be 'mismatch', 'match' or 'none' (got $plant)")
+        }
+        val appData = p.get("app_data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity, DestinationDirection.IN, DestinationType.SINGLE, appName, *aspects,
+        )
+        // Don't let the auto-registered local destination satisfy the recall
+        // fallback — validateAnnounce keys on knownDestinations, not Transport,
+        // so this is belt-and-suspenders to keep the planted-key check honest.
+        runCatching { Transport.deregisterDestination(destination) }
+        val realPub = identity.getPublicKey()
+        val destHash = destination.hash
+
+        // Build a genuine signed announce and re-parse it as a received packet.
+        val announcePacket = destination.announce(appData = appData, send = false)
+            ?: throw IllegalStateException("announce(send=false) returned no packet")
+        val raw = announcePacket.pack()
+        val rx = Packet.unpack(raw)
+            ?: throw IllegalStateException("could not unpack crafted announce packet")
+
+        val planted: ByteArray? = when (plant) {
+            "match" -> realPub
+            "mismatch" -> Identity.create().getPublicKey() // a different, valid key
+            else -> null
+        }
+        if (planted != null) {
+            Identity.remember(rx.packetHash, destHash, planted, appData)
+        }
+
+        val validated = Identity.validateAnnounce(rx) != null
+        // Keep refs alive until validation finished.
+        inst.destinations.add(identity to destination)
+        result(
+            "validated" to boolVal(validated),
+            "destination_hash" to hexVal(destHash),
+            "public_key" to hexVal(realPub),
+            "planted_public_key" to (planted?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "plant" to strVal(plant),
+        )
+    }
+
+    "wire_encrypt_to_remote" -> {
+        // Encrypt to a REMOTE destination, auto-selecting the ratchet this peer
+        // ADOPTED from that destination's announce — the same target-key choice
+        // Destination.encrypt makes — via Identity.recall + getRatchet +
+        // Identity.encrypt(ratchet=...). Mirrors cmd_wire_encrypt_to_remote (5737).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val plaintext = p.get("plaintext")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val useRatchet = p.get("use_ratchet")?.asBoolean ?: true
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; ensure an announce for " +
+                    "this destination was received first.",
+            )
+        val ratchetPublic = if (useRatchet) Identity.getRatchet(destHash) else null
+        val ciphertext = identity.encrypt(plaintext, ratchetPublic)
+        val ratchetId = ratchetPublic?.let { Identity.ratchetIdFor(it) }
+        result(
+            "ciphertext" to hexVal(ciphertext),
+            "used_ratchet" to boolVal(ratchetPublic != null),
+            "ratchet_id" to (ratchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "ratchet_public" to (ratchetPublic?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_destination_decrypt" -> {
+        // Decrypt a ciphertext on a local SINGLE destination, exposing WHICH
+        // ratchet (if any) decrypted it (real Destination.decrypt sets
+        // latestRatchetId via the ratchet_id_receiver contract). Mirrors
+        // cmd_wire_destination_decrypt (wire_tcp.py:5777).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val ciphertext = p.hex("ciphertext")
+
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = findDestinationByHash(inst, destHash)
+            ?: throw IllegalArgumentException(
+                "No registered destination with hash ${destHash.toHex()} on handle $handle.",
+            )
+        // Destination.decrypt re-sets latestRatchetId on every successful
+        // decrypt (to the winning ratchet's id, or null when the static key
+        // was used), so read it only on success to avoid surfacing a stale id
+        // from a prior call when decryption fails.
+        val plaintext = destination.decrypt(ciphertext)
+        val latest = if (plaintext != null) destination.latestRatchetId else null
+        result(
+            "decrypted" to boolVal(plaintext != null),
+            "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "latest_ratchet_id" to (latest?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_known_destinations_roundtrip" -> {
+        // Save -> clear -> reload the on-disk known_destinations table and
+        // confirm a previously-known destination round-trips (real
+        // Identity.saveKnownDestinations / loadKnownDestinations). The bridge
+        // does NOT build or parse the on-disk msgpack — the library does.
+        // Mirrors cmd_wire_known_destinations_roundtrip (wire_tcp.py:5591).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val presentBefore = Identity.isKnown(destHash)
+        Identity.saveKnownDestinations()
+        Identity.clearKnownDestinations()
+        val afterClear = Identity.recall(destHash)
+        Identity.loadKnownDestinations()
+        val reloaded = Identity.recall(destHash)
+        val appDataAfter = Identity.recallAppData(destHash)
+        result(
+            "present_before_save" to boolVal(presentBefore),
+            "recall_after_clear_found" to boolVal(afterClear != null),
+            "recall_after_load_found" to boolVal(reloaded != null),
+            "app_data_after_load" to (appDataAfter?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            // kotlin's known_destinations record is the 4-field IdentityData
+            // (timestamp, packet_hash, public_key, app_data). RNS 1.3.1 stores a
+            // 5-element entry with a trailing `used` LRU marker
+            // (Identity.py:107/:252-254). kotlin does not track that marker —
+            // a genuine divergence flagged for the Phase 6 triage; report the
+            // honest kotlin field count rather than faking a 5th element.
+            "entry_len_after_load" to intVal(if (reloaded != null) 4 else 0),
+            "table_size_after_load" to intVal(Identity.knownDestinationCount()),
+        )
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")
