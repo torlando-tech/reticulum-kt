@@ -42,6 +42,16 @@ class PacketReceipt internal constructor(
         // Proof lengths
         val EXPL_LENGTH = RnsConstants.FULL_HASH_BYTES + RnsConstants.SIGNATURE_SIZE
         val IMPL_LENGTH = RnsConstants.SIGNATURE_SIZE
+
+        /**
+         * Conformance test seam: construct a PacketReceipt over an already-packed
+         * packet (the constructor is internal, so the separate-module bridge can't
+         * call it). Mirrors the reference's `RNS.PacketReceipt(base_packet)` for
+         * the proof-injection commands (wire_inject_crafted_proof / _link_proof),
+         * which need a receipt with a genuine packet hash to validate proofs
+         * against. No port logic.
+         */
+        fun forPacketForTest(packet: Packet): PacketReceipt = PacketReceipt(packet)
     }
 
     /** The full hash of the packet. */

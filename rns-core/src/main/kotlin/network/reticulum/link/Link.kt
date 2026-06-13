@@ -3158,6 +3158,19 @@ class Link private constructor(
         status = newStatus
     }
 
+    /** This link's own ephemeral X25519 / Ed25519 public bytes (reference
+     *  wire_capture_lrproof_frame reads link.pub_bytes / link.sig_pub_bytes). */
+    fun pubBytesForTest(): ByteArray? = pub?.copyOf()
+    fun sigPubBytesForTest(): ByteArray? = sigPub?.copyOf()
+
+    /** Point the peer signing key at this link's OWN sig pub so a real
+     *  link.sign() yields a signature real validation accepts — the reference's
+     *  `link.peer_sig_pub = link.sig_pub` self-consistent-signing setup for
+     *  wire_inject_crafted_link_proof (no cross-process key needed). */
+    fun makeSelfConsistentSigningForTest() {
+        peerSigPub = sigPub?.copyOf()
+    }
+
     fun getMtu(): Int? = if (status == LinkConstants.ACTIVE) mtu else null
 
     /**
