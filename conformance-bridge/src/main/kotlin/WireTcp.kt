@@ -43,6 +43,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
+import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
@@ -76,6 +77,15 @@ private class WireInstance(
     val port: Int,
     val serverIface: TCPServerInterface? = null,
     val clientIface: TCPClientInterface? = null,
+    // Phase 5h: PipeInterface leaf/relay plumbing for wire_start_pipe_peer and
+    // wire_start_pipe_tcp_relay. The pipe is subprocess-backed (a `bash -c
+    // 'cat … & cat > …'` child whose stdin/stdout are ordinary pipes) so the
+    // command never blocks on a FIFO open — mirroring Python's PipeInterface
+    // subprocess model (reference/wire_tcp.py:779-793 _pipe_command). The
+    // process is held so teardown can detach the interface then kill the bash
+    // child and release the FIFO fds.
+    val pipeIface: PipeInterface? = null,
+    val pipeProcess: Process? = null,
     // Shared-instance plumbing for wire_start_tcp_server share_instance=true
     // (sharedServer is a LocalServerInterface listening on TCP loopback so
     // wire_start_local_client peers can attach as the master's clients) and
@@ -414,6 +424,12 @@ private fun resetWireState() {
         runCatching { inst.clientIface?.detach() }
         runCatching { inst.sharedClient?.detach() }
         runCatching { inst.sharedServer?.detach() }
+        // Phase 5h: detach the PipeInterface (closes its stream ends → the
+        // bash subprocess's stdin/stdout close → cat exits) THEN destroy the
+        // subprocess so the bash child and FIFO fds don't leak across the
+        // JVM's lifetime. Symmetric with serverIface/clientIface above.
+        runCatching { inst.pipeIface?.detach() }
+        runCatching { inst.pipeProcess?.destroy() }
         runCatching { inst.configDir.deleteRecursively() }
     }
     runCatching { Reticulum.stop() }
@@ -1344,6 +1360,9 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             try { inst.clientIface?.detach() } catch (_: Throwable) {}
             try { inst.sharedClient?.detach() } catch (_: Throwable) {}
             try { inst.sharedServer?.detach() } catch (_: Throwable) {}
+            // Phase 5h: tear down the pipe interface + its bash subprocess.
+            try { inst.pipeIface?.detach() } catch (_: Throwable) {}
+            try { inst.pipeProcess?.destroy() } catch (_: Throwable) {}
             try { Reticulum.stop() } catch (_: Throwable) {}
             try { inst.configDir.deleteRecursively() } catch (_: Throwable) {}
             result("stopped" to boolVal(true))
@@ -3060,6 +3079,187 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "response" to (responseHex?.let { strVal(it) } ?: JsonNull.INSTANCE),
             "captured" to arr,
         )
+    }
+
+    "wire_start_pipe_peer" -> {
+        // Bring up RNS with a SINGLE PipeInterface — the leaf "A" end of the
+        // mixed pipe<->TCP relay topology. enable_transport defaults False (a
+        // leaf host, not a transport node); no TCP block. Returns
+        // {handle, identity_hash}. Mirrors cmd_wire_start_pipe_peer
+        // (reference/wire_tcp.py:854-894).
+        val readFifo = p.str("read_fifo")
+        val writeFifo = p.str("write_fifo")
+        // network_name/passphrase are accepted for parity with the reference
+        // and the conftest helper, but reticulum-kt's PipeInterface has no
+        // IFAC constructor params (PipeInterface.kt:30-36 → ifacSize 0,
+        // Interface.kt:42-43) so IFAC cannot be applied over the pipe — see
+        // RISK 2. The only consuming test passes both empty, so this is inert
+        // there; a non-empty value would silently NOT be IFAC-masked.
+        val networkName = p.get("network_name")?.asString ?: ""
+        val passphrase = p.get("passphrase")?.asString ?: ""
+        // Reference default: enable_transport=False (wire_tcp.py:867).
+        val enableTransport = p.get("enable_transport")?.asBoolean ?: false
+
+        resetWireState()
+        val configDir = java.nio.file.Files.createTempDirectory("rns_wire_pipe_").toFile()
+        try {
+            val rns = Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport,
+                shareInstance = false,
+                connectToSharedInstance = false,
+            )
+
+            // FIFO wiring (RISK 3): do NOT open the FIFOs directly — a named
+            // FIFO open blocks until the other end opens, which would hang the
+            // synchronous command loop (and deadlock the symmetric peer).
+            // Instead spawn the exact same `bash -c 'cat read & cat > write'`
+            // subprocess Python's PipeInterface uses (reference _pipe_command,
+            // wire_tcp.py:779-793): its stdin/stdout are ordinary pipes (open
+            // instantly), and the blocking FIFO opens happen inside the bash
+            // child off the bridge's thread. PipeInterface then reads the
+            // subprocess STDOUT (→ RNS incoming) and writes RNS outgoing to the
+            // subprocess STDIN — byte-identical to the reference.
+            val proc = ProcessBuilder("bash", "-c", "cat $readFifo & cat > $writeFifo")
+                .redirectErrorStream(false)
+                .start()
+            val pipe = PipeInterface(
+                name = "Wire Pipe Peer",
+                inputStream = proc.inputStream,
+                outputStream = proc.outputStream,
+            )
+            // Mirror the TCP-server inbound wiring (WireTcp.kt:508-511): record
+            // into the wire_get_received_packets tap and route to Transport.
+            pipe.onPacketReceived = { data, iface ->
+                recordInboundPacket(data, iface.name)
+                Transport.inbound(data, iface.toRef())
+            }
+            pipe.start()
+            Transport.registerInterface(pipe.toRef())
+
+            val identityHash = Transport.identity?.hash
+                ?: throw IllegalStateException("Transport started without an identity")
+
+            val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            wireInstances[handle] = WireInstance(
+                rns = rns,
+                identityHash = identityHash,
+                configDir = configDir,
+                role = "pipe_peer",
+                port = 0,
+                pipeIface = pipe,
+                pipeProcess = proc,
+            )
+            result(
+                "handle" to strVal(handle),
+                "identity_hash" to hexVal(identityHash),
+            )
+        } catch (t: Throwable) {
+            runCatching { Reticulum.stop() }
+            runCatching { configDir.deleteRecursively() }
+            throw t
+        }
+    }
+
+    "wire_start_pipe_tcp_relay" -> {
+        // Bring up RNS as the transport relay "B": a PipeInterface (to A) PLUS
+        // a TCPServerInterface (to C) in one instance. enable_transport
+        // defaults True (it MUST forward); bind_port 0 → allocate a free port.
+        // Returns {handle, port, identity_hash}. Mirrors
+        // cmd_wire_start_pipe_tcp_relay (reference/wire_tcp.py:897-948).
+        val readFifo = p.str("read_fifo")
+        val writeFifo = p.str("write_fifo")
+        // See RISK 2 note in wire_start_pipe_peer: applied to the TCP block via
+        // the TCPServerInterface IFAC params, but NOT to the pipe block (kotlin
+        // PipeInterface has no IFAC support). Reference applies them to both.
+        val networkName = p.get("network_name")?.asString?.takeIf { it.isNotEmpty() }
+        val passphrase = p.get("passphrase")?.asString?.takeIf { it.isNotEmpty() }
+        // Reference default: enable_transport=True (wire_tcp.py:914).
+        val enableTransport = p.get("enable_transport")?.asBoolean ?: true
+        val bindPortReq = p.get("bind_port")?.asInt ?: 0
+        val bindPort = if (bindPortReq == 0) allocateFreePort() else bindPortReq
+
+        resetWireState()
+        val configDir = java.nio.file.Files.createTempDirectory("rns_wire_piperelay_").toFile()
+        try {
+            val rns = Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport,
+                shareInstance = false,
+                connectToSharedInstance = false,
+            )
+
+            // TCP server (to C). Register spawned client children with Transport
+            // (RISK 4) so path/link responses addressed to a spawned child are
+            // not dropped — same guard as wire_start_tcp_server
+            // (WireTcp.kt:489-501).
+            val server = TCPServerInterface(
+                name = "Wire Pipe Relay TCP",
+                bindAddress = "127.0.0.1",
+                bindPort = bindPort,
+                ifacNetname = networkName,
+                ifacNetkey = passphrase,
+            )
+            server.onClientConnected = { spawnedChild ->
+                runCatching { Transport.registerInterface(spawnedChild.toRef()) }
+                    .onFailure { e ->
+                        System.err.println(
+                            "[WireTcp] Failed to register spawned relay client ${spawnedChild.name}: $e",
+                        )
+                    }
+            }
+            server.start()
+            Transport.registerInterface(server.toRef())
+            server.onPacketReceived = { data, iface ->
+                recordInboundPacket(data, iface.name)
+                Transport.inbound(data, iface.toRef())
+            }
+
+            // Pipe (to A) — subprocess-backed, exactly as wire_start_pipe_peer
+            // (RISK 3): never blocks the command loop.
+            val proc = ProcessBuilder("bash", "-c", "cat $readFifo & cat > $writeFifo")
+                .redirectErrorStream(false)
+                .start()
+            val pipe = PipeInterface(
+                name = "Wire Pipe Relay",
+                inputStream = proc.inputStream,
+                outputStream = proc.outputStream,
+            )
+            pipe.onPacketReceived = { data, iface ->
+                recordInboundPacket(data, iface.name)
+                Transport.inbound(data, iface.toRef())
+            }
+            pipe.start()
+            Transport.registerInterface(pipe.toRef())
+
+            val identityHash = Transport.identity?.hash
+                ?: throw IllegalStateException("Transport started without an identity")
+
+            val handle = UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+            // Carry the TCP server on serverIface so the existing wire_listen /
+            // IFAC / mode / detach logic (which resolves inst.serverIface ?:
+            // inst.clientIface) keeps working for the relay's TCP side; the pipe
+            // rides on the new pipeIface/pipeProcess fields.
+            wireInstances[handle] = WireInstance(
+                rns = rns,
+                identityHash = identityHash,
+                configDir = configDir,
+                role = "pipe_tcp_relay",
+                port = bindPort,
+                serverIface = server,
+                pipeIface = pipe,
+                pipeProcess = proc,
+            )
+            result(
+                "handle" to strVal(handle),
+                "port" to intVal(bindPort),
+                "identity_hash" to hexVal(identityHash),
+            )
+        } catch (t: Throwable) {
+            runCatching { Reticulum.stop() }
+            runCatching { configDir.deleteRecursively() }
+            throw t
+        }
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")
