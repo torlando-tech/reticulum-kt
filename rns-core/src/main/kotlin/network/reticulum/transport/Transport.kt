@@ -3134,9 +3134,24 @@ object Transport {
      * @param packet Packet to send
      * @return true if sent successfully
      */
+    /**
+     * Conformance test seam: a tap invoked for every packet handed to outbound,
+     * letting the bridge capture the on-wire packets a link emits during
+     * receive/prove/teardown (LINKCLOSE, the 0xFE keepalive answer, LRPROOF, ...).
+     * This is the kotlin equivalent of the reference bridge wrapping
+     * RNS.Packet.send (reticulum-conformance reference/wire_tcp.py). Set around a
+     * synchronous operation and cleared after; null in normal operation. The tap
+     * receives the live packet — read context/destinationHash/data (or call
+     * pack()) inside the tap, as the packet may be mutated by processOutbound.
+     */
+    @Volatile
+    var outboundTapForTest: ((Packet) -> Unit)? = null
+
     fun outbound(packet: Packet): Boolean {
         if (!started.get()) return false
         if (paused.get()) return false
+
+        outboundTapForTest?.let { tap -> runCatching { tap(packet) } }
 
         return jobsLock.withLock {
             try {
