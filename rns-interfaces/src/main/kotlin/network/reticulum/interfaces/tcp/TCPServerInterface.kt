@@ -344,7 +344,9 @@ class TCPServerClientInterface internal constructor(
         processIncoming(data)
     }
 
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
+    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
+    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
         processIncoming(data)
     }
 

@@ -189,7 +189,9 @@ class TCPClientInterface(
         processIncoming(data)
     }
 
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
+    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
+    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
