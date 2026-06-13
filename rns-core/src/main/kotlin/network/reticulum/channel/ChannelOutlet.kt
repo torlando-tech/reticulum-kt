@@ -60,4 +60,12 @@ interface ChannelOutlet {
      * Get an identifier for a packet.
      */
     fun getPacketId(packet: Any): Any
+
+    /**
+     * Notify the outlet that the channel has exhausted its retransmission
+     * budget for an envelope. Mirrors python RNS LinkChannelOutlet.timed_out()
+     * (Channel.py:707-708), which tears the underlying Link down. The default
+     * is a no-op so non-Link outlets (test stubs) need not implement it.
+     */
+    fun notifyTimedOut() {}
 }

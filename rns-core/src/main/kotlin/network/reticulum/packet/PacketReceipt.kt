@@ -272,6 +272,11 @@ class PacketReceipt internal constructor(
      * @return true if the proof is valid
      */
     fun validateLinkProof(proof: ByteArray, link: Link, proofPacket: Packet? = null): Boolean {
+        // Conformance test seam (wire_channel_send drop_acks): when the link is
+        // flagged, the proof never validates — mirrors the reference neutering
+        // packet.receipt.validate_proof so the Channel retransmits to exhaustion.
+        if (link.failProofValidationForTest) return false
+
         // For now, only handle explicit proofs
         if (proof.size == EXPL_LENGTH) {
             // Extract proof components
@@ -312,6 +317,9 @@ class PacketReceipt internal constructor(
      * @return true if the proof is valid
      */
     fun validateProof(proof: ByteArray, proofPacket: Packet? = null): Boolean {
+        // Conformance test seam (wire_channel_send drop_acks): see validateLinkProof.
+        if (link?.failProofValidationForTest == true) return false
+
         when (proof.size) {
             EXPL_LENGTH -> {
                 // Explicit proof

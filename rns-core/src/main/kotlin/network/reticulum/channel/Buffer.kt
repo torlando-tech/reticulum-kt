@@ -6,6 +6,7 @@ import org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.LinkedBlockingQueue
@@ -32,6 +33,21 @@ class StreamDataMessage : MessageBase() {
         // In Python: RNS.Link.MDU - OVERHEAD
         // Link.MDU is typically 431 bytes for default case
         val MAX_DATA_LEN = LinkConstants.MDU - OVERHEAD
+
+        /**
+         * Conformance test seam: bz2-compress [data] with the same codec
+         * StreamDataMessage/RawChannelWriter use, so the wire bridge can craft a
+         * genuine compressed bomb chunk (wire_buffer_stream bomb=true) without
+         * needing commons-compress on its own classpath. Mirrors python
+         * `bz2.compress(bytes(N))`. No port logic.
+         */
+        fun compressForTest(data: ByteArray): ByteArray {
+            val outputStream = ByteArrayOutputStream()
+            val bz2Stream = BZip2CompressorOutputStream(outputStream)
+            bz2Stream.write(data)
+            bz2Stream.close()
+            return outputStream.toByteArray()
+        }
     }
 
     override val msgType = SystemMessageTypes.SMT_STREAM_DATA
@@ -82,8 +98,27 @@ class StreamDataMessage : MessageBase() {
     }
 
     private fun decompressBZ2(data: ByteArray): ByteArray {
+        // Mirror python RNS StreamDataMessage.unpack (Buffer.py:94-97): bound the
+        // decompression to MAX_CHUNK_LEN and raise IOError if the bz2 stream would
+        // inflate past it (the bz2-bomb guard). Previously kotlin decompressed any
+        // size unbounded, silently accepting a bomb and never aborting the reader.
+        val maxLen = RawChannelWriter.MAX_CHUNK_LEN
         val inputStream = BZip2CompressorInputStream(ByteArrayInputStream(data))
-        return inputStream.readBytes()
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(4096)
+        var total = 0
+        while (total < maxLen) {
+            val r = inputStream.read(buf, 0, minOf(buf.size, maxLen - total))
+            if (r < 0) break
+            out.write(buf, 0, r)
+            total += r
+        }
+        // If any decompressed byte remains beyond MAX_CHUNK_LEN, the chunk is
+        // over-bound (python: `if not decompressor.eof: raise IOError(...)`).
+        if (inputStream.read() >= 0) {
+            throw IOException("Decompressed buffer chunk exceeds maximum legitimate size")
+        }
+        return out.toByteArray()
     }
 }
 
@@ -106,9 +141,14 @@ class RawChannelReader(
     private val listeners = mutableListOf<(Int) -> Unit>()
 
     init {
-        // Register stream data message type if not already registered
+        // Register stream data message type if not already registered.
+        // Mirror python RNS RawChannelReader.__init__ (Buffer.py:127): the
+        // SMT_STREAM_DATA type is in the system-reserved band (0xFF00 >= 0xF000),
+        // so it MUST be registered with isSystemType=true — otherwise
+        // registerMessageType raises "system-reserved" and the factory is never
+        // installed, so inbound StreamDataMessages fail to unpack (ME_NOT_REGISTERED).
         try {
-            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() })
+            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() }, isSystemType = true)
         } catch (e: ChannelException) {
             // Already registered - OK
         }
@@ -201,6 +241,14 @@ class RawChannelReader(
 
     override fun available(): Int = buffer.size
 
+    /** Conformance test seam: whether the EOF marker was received (private
+     *  `eofReceived`). Drives wire_buffer_received's eof field. */
+    fun isEofForTest(): Boolean = eofReceived.get()
+
+    /** Conformance test seam: the Channel this reader is bound to (private ctor
+     *  val), mirroring the reference's `reader._channel`. */
+    fun channelForTest(): Channel = channel
+
     fun readable(): Boolean = true
     fun writable(): Boolean = false
     fun seekable(): Boolean = false
@@ -237,9 +285,11 @@ class RawChannelWriter(
     private val mdu = channel.mdu - StreamDataMessage.OVERHEAD
 
     init {
-        // Register stream data message type if not already registered
+        // Register stream data message type if not already registered.
+        // SMT_STREAM_DATA is system-reserved (0xFF00) and must register with
+        // isSystemType=true (see RawChannelReader.init / python Buffer.py:127).
         try {
-            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() })
+            channel.registerMessageType(SystemMessageTypes.SMT_STREAM_DATA, MessageFactory { StreamDataMessage() }, isSystemType = true)
         } catch (e: ChannelException) {
             // Already registered - OK
         }
@@ -311,6 +361,19 @@ class RawChannelWriter(
             }
         }
         return 0
+    }
+
+    /** Conformance test seam: run one chunked write and return the processed
+     *  length the public OutputStream.write swallows (it returns Unit). Mirrors
+     *  the per-write() return RawChannelWriter.write exposes in python. Used by
+     *  wire_buffer_stream's write loop. */
+    fun writeChunkForTest(bytes: ByteArray): Int = writeInternal(bytes)
+
+    /** Conformance test seam: set the private EOF flag so the NEXT
+     *  writeChunkForTest emits an EOF-flagged StreamDataMessage (eof_with_data /
+     *  default empty-EOF paths). */
+    fun flagEofForTest() {
+        eofSent.set(true)
     }
 
     fun writable(): Boolean = true

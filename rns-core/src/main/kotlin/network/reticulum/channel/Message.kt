@@ -145,16 +145,65 @@ class Envelope(
             "No factory registered for message type ${String.format("0x%04X", msgType)}"
         )
 
-        // Create and unpack message
+        // Create and unpack message. Mirror python RNS Channel.Envelope.unpack
+        // (Channel.py:180-181): the on-wire length field is parsed for the header
+        // layout but NEVER consulted on receive — the payload is always raw[6:].
+        // (Previously this truncated to raw[6:6+length], diverging from python and
+        // dropping bytes when a crafted frame advertised a too-short length.)
+        @Suppress("UNUSED_VARIABLE") val declaredLength = length
         val msg = factory.create()
-        if (data.size >= 6 + length) {
-            msg.unpack(data.copyOfRange(6, 6 + length))
-        } else {
-            msg.unpack(data.copyOfRange(6, data.size))
-        }
+        msg.unpack(data.copyOfRange(6, data.size))
 
         message = msg
         unpacked = true
         return msg
     }
+
+    companion object {
+        /**
+         * Conformance test seam: pack an Envelope wrapping an ad-hoc message
+         * whose msgType/pack() are supplied, without needing a real
+         * ChannelOutlet. Envelope.pack reads only `message`, never the outlet,
+         * so a no-op outlet stub is safe. Mirrors the reference's
+         * `Envelope(outlet=None, message=_PackMessage(data), sequence=seq).pack()`
+         * (wire_tcp.py cmd_wire_channel_envelope_pack). No port logic.
+         */
+        fun packForTest(msgType: Int, sequence: Int, data: ByteArray): ByteArray {
+            val msg = object : MessageBase() {
+                override val msgType = msgType
+                override fun pack() = data
+                override fun unpack(raw: ByteArray) {}
+            }
+            return Envelope(NoopOutletForTest, msg, sequence = sequence).pack()
+        }
+
+        /**
+         * Conformance test seam: pack an Envelope with no message, exercising the
+         * ME_NO_MSG_TYPE guard (Channel.py:193-194 raises when the wrapped message
+         * lacks a MSGTYPE). Kotlin has no nullable msgType, so a null `message`
+         * triggers the same guard ("No message to pack"). Used by
+         * wire_channel_register(kind="envelope_pack_no_msgtype").
+         */
+        fun packNullMessageForTest(): ByteArray =
+            Envelope(NoopOutletForTest, message = null, sequence = 0).pack()
+    }
+}
+
+/**
+ * A no-op [ChannelOutlet] used only by Envelope pack-only test seams
+ * ([Envelope.packForTest] / [Envelope.packNullMessageForTest]). Envelope.pack
+ * never reads the outlet, so every member is an inert stub. Internal so it
+ * cannot leak into production code paths.
+ */
+internal object NoopOutletForTest : ChannelOutlet {
+    override fun send(raw: ByteArray): Any? = null
+    override fun resend(packet: Any): Any? = null
+    override val mdu: Int get() = 0xFFFF
+    override val rtt: Long? get() = null
+    override val isUsable: Boolean get() = false
+    override val timedOut: Boolean get() = false
+    override fun getPacketState(packet: Any): Int = MessageState.FAILED
+    override fun setPacketTimeoutCallback(packet: Any, callback: ((Any) -> Unit)?, timeout: Long?) {}
+    override fun setPacketDeliveredCallback(packet: Any, callback: ((Any) -> Unit)?) {}
+    override fun getPacketId(packet: Any): Any = packet
 }

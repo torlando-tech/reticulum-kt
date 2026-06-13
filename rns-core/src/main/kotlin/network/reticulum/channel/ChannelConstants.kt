@@ -60,7 +60,13 @@ enum class ChannelExceptionType {
     ME_INVALID_MSG_TYPE,
     ME_ALREADY_REGISTERED,
     ME_LINK_NOT_READY,
-    ME_WINDOW_FULL
+    ME_WINDOW_FULL,
+
+    // Mirrors python RNS Channel.CEType.ME_TOO_BIG (Channel.py:114). Raised by
+    // Channel.send when the packed envelope exceeds outlet.mdu — distinct from
+    // ME_INVALID_MSG_TYPE so callers (and the conformance bridge) can map it to
+    // the python literal 5. Added for parity; see Channel.send size guard.
+    ME_TOO_BIG
 }
 
 /**

@@ -442,6 +442,30 @@ class Link private constructor(
     // Timing
     var rtt: Long? = null
         private set
+
+    /**
+     * Conformance test seam: set the measured RTT (milliseconds). Python's
+     * `RNS.Link.rtt` is a freely-mutable public attribute; kotlin keeps the
+     * setter private, so the wire bridge's wire_link_set_rtt / wire_channel_
+     * profile / wire_channel_timeout_formula commands use this to drive the
+     * Channel rate-promotion bands (which read outlet.rtt == link.rtt live).
+     * Mirrors the reference's `link.rtt = rtt`. No port logic beyond the assign.
+     */
+    fun setRttForTest(rttMs: Long?) {
+        rtt = rttMs
+    }
+
+    /**
+     * Conformance test seam: when true, every PacketReceipt validation on this
+     * link's packets returns false (the proof never validates), even across
+     * resends that build fresh receipts. Mirrors the reference neutering
+     * `packet.receipt.validate_proof` for wire_channel_send(drop_acks=true) so
+     * the Channel retransmits to _max_tries and tears the link down. Honored in
+     * PacketReceipt.validateProof / validateLinkProof. Not used in production.
+     */
+    @Volatile
+    var failProofValidationForTest: Boolean = false
+
     var mtu: Int = RnsConstants.MTU
         private set
     var mdu: Int = LinkConstants.calculateMdu()
@@ -1022,6 +1046,16 @@ class Link private constructor(
     }
 
     /**
+     * Conformance test seam: build a fresh, NON-cached Channel over a real
+     * LinkChannelOutlet on this link, mirroring the reference's
+     * `Channel(LinkChannelOutlet(link))` throwaway used by wire_channel_profile /
+     * wire_channel_timeout_formula / wire_channel_handler_chain. LinkChannelOutlet
+     * is a private inner class, so this factory must live on Link. It does NOT
+     * touch the cached `_channel` (the live channel is untouched).
+     */
+    fun newThrowawayChannelForTest(): Channel = Channel(LinkChannelOutlet(this))
+
+    /**
      * ChannelOutlet implementation that wraps a Link.
      * Provides the transport layer for Channel message delivery.
      */
@@ -1035,15 +1069,32 @@ class Link private constructor(
             get() = link.rtt
 
         override val isUsable: Boolean
-            get() = link.status == LinkConstants.ACTIVE
+            // Mirror python RNS LinkChannelOutlet.is_usable (Channel.py:709-710),
+            // which returns True unconditionally ("had issues looking at
+            // Link.status"). Channel.is_ready_to_send therefore does NOT gate on
+            // link status; readiness is governed solely by the tx-ring window, and
+            // a send on a non-ACTIVE link instead fails via the no-receipt branch
+            // (Channel.send -> ME_LINK_NOT_READY) because send() below only
+            // actually transmits when ACTIVE.
+            get() = true
 
         override val timedOut: Boolean
             get() =
                 link.status == LinkConstants.CLOSED &&
                     link.teardownReason == LinkConstants.TEARDOWN_REASON_TIMEOUT
 
+        override fun notifyTimedOut() {
+            // Mirror python LinkChannelOutlet.timed_out (Channel.py:707-708):
+            // tear the Link down when the Channel exhausts its retransmissions.
+            link.teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
+        }
+
         override fun send(raw: ByteArray): Any? {
-            if (!isUsable) return null
+            // Mirror python LinkChannelOutlet.send (Channel.py:669-672): only
+            // actually transmit when the link is ACTIVE; otherwise return null so
+            // the packet has no receipt and Channel.send restores the reserved
+            // sequence and raises ME_LINK_NOT_READY (the dead-channel send path).
+            if (link.status != LinkConstants.ACTIVE) return null
 
             val encrypted = link.encrypt(raw)
             val packet =
@@ -2593,7 +2644,10 @@ class Link private constructor(
             return
         }
 
-        // Prove receipt of the channel packet (Python: Link.py:1173)
+        // Prove receipt of the channel packet (Python: Link.py:1173). The
+        // proveTapForTest seam fires inside provePacket() (which packet.prove()
+        // routes to for a link packet), so the channel-proof context is logged
+        // there — no separate tap call here (it would double-count).
         packet.link = this
         packet.prove()
 

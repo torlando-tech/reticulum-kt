@@ -55,6 +55,16 @@ import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.tcp.TCPClientInterface
 import network.reticulum.interfaces.tcp.TCPServerInterface
 import network.reticulum.interfaces.toRef
+import network.reticulum.channel.Channel
+import network.reticulum.channel.ChannelException
+import network.reticulum.channel.ChannelExceptionType
+import network.reticulum.channel.Envelope
+import network.reticulum.channel.MessageBase
+import network.reticulum.channel.MessageFactory
+import network.reticulum.channel.RawChannelReader
+import network.reticulum.channel.RawChannelWriter
+import network.reticulum.channel.StreamDataMessage
+import network.reticulum.channel.SystemMessageTypes
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.link.RequestReceipt
@@ -124,6 +134,19 @@ private class WireInstance(
     // reference bridge's inst["out_resources"] (wire_tcp.py cmd_wire_resource_send /
     // cmd_wire_resource_cancel).
     val outResources: ConcurrentHashMap<String, Resource> = ConcurrentHashMap(),
+    // Initiator-side per-link channel state — mirrors the reference's
+    // inst["channels"] (_ensure_channel_state). Keyed by link_id hex.
+    val channelStates: ConcurrentHashMap<String, ChannelState> = ConcurrentHashMap(),
+)
+
+/**
+ * Initiator-side channel recording state (mirror of the reference
+ * inst["channels"][link_id]): the link's real Channel plus the in-order
+ * payloads its recording handler delivered. Drained by wire_channel_received.
+ */
+private class ChannelState(
+    val channel: Channel,
+    val received: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
 )
 
 /**
@@ -216,6 +239,73 @@ private fun findLinkByIdWaiting(inst: WireInstance, linkIdHex: String, timeoutMs
         if (System.currentTimeMillis() >= deadline) return null
         Thread.sleep(50)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Channel / Buffer helpers (mirror reference/wire_tcp.py channel/buffer cmds).
+// ---------------------------------------------------------------------------
+
+/** The Channel MSGTYPE the wire harness registers (reference _WIRE_CHANNEL_MSGTYPE). */
+private const val WIRE_CHANNEL_MSGTYPE = 0x0101
+
+/** Fixed default stream id for Buffer streaming (reference _WIRE_BUFFER_STREAM_ID). */
+private const val WIRE_BUFFER_STREAM_ID = 0
+
+/** Bridge MessageBase carrying opaque bytes — mirrors the reference
+ *  _WireChannelMessage (pack()=data, unpack stores raw). */
+private class WireChannelMessage(var data: ByteArray = ByteArray(0)) : MessageBase() {
+    override val msgType = WIRE_CHANNEL_MSGTYPE
+    override fun pack(): ByteArray = data
+    override fun unpack(raw: ByteArray) { data = raw }
+}
+
+/** Bridge MessageBase with a caller-chosen msgType — mirrors the reference
+ *  _AdHocChannelMessage (used by wire_channel_inject msgtype overrides). */
+private class AdHocMessage(override val msgType: Int, var data: ByteArray = ByteArray(0)) : MessageBase() {
+    override fun pack(): ByteArray = data
+    override fun unpack(raw: ByteArray) { data = raw }
+}
+
+/** Bridge MessageBase for the chain-dispatch probe (reference _ChainMessage). */
+private class ChainMessage(var data: ByteArray = ByteArray(0)) : MessageBase() {
+    override val msgType = 0x0707
+    override fun pack(): ByteArray = data
+    override fun unpack(raw: ByteArray) { data = raw }
+}
+
+/**
+ * Map kotlin's ChannelExceptionType enum to the python RNS CEType integer codes
+ * (Channel.py:109-114) that the conformance tests pin. The kotlin enum's members
+ * and ordinals DIFFER from python's, so this must be explicit — never `.ordinal`.
+ */
+private fun ceType(t: ChannelExceptionType): Int = when (t) {
+    ChannelExceptionType.ME_NO_MSG_TYPE      -> 0
+    ChannelExceptionType.ME_INVALID_MSG_TYPE -> 1
+    ChannelExceptionType.ME_NOT_REGISTERED   -> 2
+    ChannelExceptionType.ME_LINK_NOT_READY   -> 3
+    ChannelExceptionType.ME_ALREADY_REGISTERED -> 4   // ~ python ME_ALREADY_SENT
+    ChannelExceptionType.ME_TOO_BIG          -> 5
+    ChannelExceptionType.ME_WINDOW_FULL      -> 3     // no python equivalent; best-effort
+}
+
+/**
+ * Lazily attach a recording message handler to an out-link's real Channel,
+ * mirroring the reference _ensure_channel_state. Idempotent per link_id.
+ */
+private fun ensureChannelState(inst: WireInstance, linkIdHex: String): ChannelState {
+    inst.channelStates[linkIdHex]?.let { return it }
+    val link = findLinkByIdWaiting(inst, linkIdHex)
+        ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+    val channel = link.getChannel()
+    // Register the wire message type (idempotent — already-registered throws
+    // ME_INVALID_MSG_TYPE "already registered", which we swallow).
+    runCatching { channel.registerMessageType(WIRE_CHANNEL_MSGTYPE, MessageFactory { WireChannelMessage() }) }
+    val state = ChannelState(channel)
+    channel.addMessageHandler { m ->
+        if (m is WireChannelMessage) { state.received.add(m.data.copyOf()); true } else false
+    }
+    inst.channelStates[linkIdHex] = state
+    return state
 }
 
 /** A captured outbound packet emission (context value, dest hash hex, data, raw). */
@@ -394,6 +484,16 @@ private class Listener(
     // Resource-strategy this listener applies to each accepted link
     // (Link.ACCEPT_ALL / ACCEPT_NONE / ACCEPT_APP). Default ACCEPT_ALL.
     val resourceStrategy: Int = Link.ACCEPT_ALL,
+    // Receiver-side Channel/Buffer state (mirrors the reference listener fields).
+    // channelReceived: _WireChannelMessage payloads delivered to the receiver's
+    // channel handler (drained by wire_channel_received receiver path).
+    val channelReceived: ConcurrentLinkedDeque<ByteArray> = ConcurrentLinkedDeque(),
+    // readers: per-stream-id RawChannelReaders registered at link establishment
+    // (default stream 0 + any buffer_stream_ids). Drained by wire_buffer_received.
+    val readers: ConcurrentHashMap<Int, RawChannelReader> = ConcurrentHashMap(),
+    // bz2-bomb abort state surfaced via Channel.receiveErrorTapForTest (#D5).
+    val aborted: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(false),
+    val abortError: java.util.concurrent.atomic.AtomicReference<String?> = java.util.concurrent.atomic.AtomicReference(null),
 )
 
 /**
@@ -670,7 +770,18 @@ private fun buildForeignAnnounce(
     return dest to plainRaw
 }
 
-fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (command) {
+fun handleWireCommand(command: String, p: JsonObject): JsonObject =
+    handleWireCmd0(command, p)
+        ?: handleWireCmd1(command, p)
+        ?: handleWireCmd2(command, p)
+        ?: handleWireCmd3(command, p)
+        ?: handleWireCmd4(command, p)
+        ?: handleWireCmd5(command, p)
+        ?: handleWireCmd6(command, p)
+        ?: handleWireCmd7(command, p)
+        ?: throw IllegalArgumentException("Unknown wire command: $command")
+
+private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_start_tcp_server" -> {
         val networkName = p.get("network_name")?.asString?.takeIf { it.isNotEmpty() }
         val passphrase = p.get("passphrase")?.asString?.takeIf { it.isNotEmpty() }
@@ -1152,6 +1263,12 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 "Unknown resource_strategy: ${p.get("resource_strategy")?.asString} (use all|none|app)",
             )
         }
+        // open_channel (default true): when false the inbound link accepts WITHOUT
+        // opening a channel, so an inbound CHANNEL packet is dropped unproven
+        // (the no-channel-no-proof negative). buffer_stream_ids: extra
+        // receiver-relative RawChannelReaders for the multi-reader stream-id test.
+        val openChannel = p.get("open_channel")?.asBoolean ?: true
+        val bufferStreamIds = p.get("buffer_stream_ids")?.asJsonArray?.map { it.asInt }
 
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
@@ -1243,6 +1360,38 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                     System.err.println("[WireTcp] wire_listen: COMPLETE resource has null data, dropping")
                 }
             }
+
+            // Channel / Buffer receiver setup (mirror reference on_link_established
+            // open_channel branch). Opening the channel makes the receiver PROVE
+            // inbound CHANNEL packets; without it they are dropped unproven.
+            if (openChannel) {
+                val ch = link.getChannel()
+                runCatching {
+                    ch.registerMessageType(WIRE_CHANNEL_MSGTYPE, MessageFactory { WireChannelMessage() })
+                }
+                ch.addMessageHandler { m ->
+                    if (m is WireChannelMessage) { listener.channelReceived.add(m.data.copyOf()); true } else false
+                }
+                // Surface the bz2 decompression-bomb abort (#D5): Channel.receive
+                // swallows the unpack exception, so the tap records it for
+                // wire_buffer_received.aborted/error. Narrow to ONLY the
+                // decompression-bound IOError (mirrors the reference's
+                // _DetectingStreamDataMessage, which records solely the
+                // StreamDataMessage.unpack failure — not Envelope-level errors).
+                ch.receiveErrorTapForTest = { e ->
+                    if (e.message?.contains("Decompressed buffer chunk exceeds") == true) {
+                        listener.aborted.set(true)
+                        listener.abortError.set(e.message ?: e.toString())
+                    }
+                }
+                // RawChannelReader for the DEFAULT stream 0 PLUS any extra
+                // requested ids — mirrors the reference, which always registers
+                // the default reader and then each buffer_stream_id.
+                val ids = (listOf(WIRE_BUFFER_STREAM_ID) + (bufferStreamIds ?: emptyList())).distinct()
+                for (sid in ids) {
+                    listener.readers[sid] = RawChannelReader(sid, ch)
+                }
+            }
         }
 
         // Announce so the sender peer can learn a path via the transport.
@@ -1309,6 +1458,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         result("link_id" to JsonPrimitive(linkIdHex))
     }
 
+    else -> null
+}
+
+private fun handleWireCmd1(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_link_send" -> {
         val handle = p.str("handle")
         val linkIdHex = p.str("link_id")
@@ -1980,6 +2133,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    else -> null
+}
+
+private fun handleWireCmd2(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_encrypt_to_remote" -> {
         // Encrypt to a REMOTE destination, auto-selecting the ratchet this peer
         // ADOPTED from that destination's announce — the same target-key choice
@@ -2601,6 +2758,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    else -> null
+}
+
+private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_listener_link_status" -> {
         // Observe the receiver-side (inbound) link a wire_listen destination
         // accepted, by destination_hash. Optionally polls for the inbound link
@@ -3245,6 +3406,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
 
     // ===== Phase 5c batch 4e: LRPROOF frame capture + link-proof injection =====
 
+    else -> null
+}
+
+private fun handleWireCmd4(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_capture_lrproof_frame" -> {
         // Capture the raw outbound LRPROOF frame + its flag-byte shape. An
         // LRPROOF is built as a PROOF packet to a LINK destination, so its flags
@@ -3919,6 +4084,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         }
     }
 
+    else -> null
+}
+
+private fun handleWireCmd5(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_send_over_closed_link" -> {
         // Drive send() over a CLOSED link and report that nothing was transmitted.
         // Mirrors cmd_wire_send_over_closed_link (wire_tcp.py:3558-3601):
@@ -4355,6 +4524,596 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Channel / Buffer commands (phase 5e). Mirror reference/wire_tcp.py.
+    // -----------------------------------------------------------------------
+
+    "wire_channel_window" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val s = ensureChannelState(inst, linkIdHex).channel.stateForTest()
+        val txArr = JsonArray()
+        for ((seq, tries) in s.txEnvelopes) {
+            val o = JsonObject()
+            o.addProperty("sequence", seq)
+            o.addProperty("tries", tries)
+            txArr.add(o)
+        }
+        result(
+            "window" to intVal(s.window),
+            "window_min" to intVal(s.windowMin),
+            "window_max" to intVal(s.windowMax),
+            "window_flexibility" to intVal(s.windowFlexibility),
+            "next_rx_sequence" to intVal(s.nextRxSequence),
+            "next_sequence" to intVal(s.nextSequence),
+            "rx_ring" to intVal(s.rxRing),
+            "tx_ring" to intVal(s.txRing),
+            "tx_tries" to intVal(s.txTries),
+            "tx_envelopes" to txArr,
+            "mdu" to intVal(s.mdu),
+            "outlet_mdu" to intVal(s.outletMdu),
+            "message_handlers" to intVal(s.messageHandlers),
+            "medium_rate_rounds" to intVal(s.mediumRateRounds),
+            "fast_rate_rounds" to intVal(s.fastRateRounds),
+        )
+    }
+
+    "wire_channel_inject" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val channel = ensureChannelState(inst, linkIdHex).channel
+        val envelopes = p.get("envelopes")?.asJsonArray ?: JsonArray()
+        val injected = JsonArray()
+        for (el in envelopes) {
+            val env = el.asJsonObject
+            val rawEl = env.get("raw")
+            if (rawEl != null && !rawEl.isJsonNull) {
+                // Raw-override: feed crafted bytes verbatim to Channel.receive.
+                channel.receive(rawEl.asString.fromHex())
+                injected.add(intVal(env.get("sequence")?.asInt ?: -1))
+            } else {
+                val seq = env.get("sequence").asInt
+                val data = env.get("data")?.asString?.fromHex() ?: ByteArray(0)
+                val msgtype = env.get("msgtype")?.takeIf { !it.isJsonNull }?.asInt
+                val msg: MessageBase = if (msgtype == null || msgtype == WIRE_CHANNEL_MSGTYPE) {
+                    WireChannelMessage(data)
+                } else {
+                    AdHocMessage(msgtype, data)
+                }
+                channel.receive(channel.packEnvelopeForTest(msg, seq))
+                injected.add(intVal(seq))
+            }
+        }
+        result("injected" to injected)
+    }
+
+    "wire_channel_received" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val messages = JsonArray()
+        val initiator = inst.channelStates[linkIdHex]
+        if (initiator != null) {
+            while (true) {
+                val d = initiator.received.poll() ?: break
+                messages.add(strVal(d.toHex()))
+            }
+        } else {
+            val listener = findListenerForLink(inst, linkIdHex)
+            if (listener != null) {
+                while (true) {
+                    val d = listener.channelReceived.poll() ?: break
+                    messages.add(strVal(d.toHex()))
+                }
+            }
+        }
+        result("messages" to messages)
+    }
+
+    "wire_channel_send" -> {
+        val handle = p.str("handle")
+        val linkIdHex = (p.get("link_id")?.takeIf { !it.isJsonNull }?.asString
+            ?: p.get("channel_id")?.takeIf { !it.isJsonNull }?.asString
+            ?: throw IllegalArgumentException("wire_channel_send requires link_id or channel_id"))
+            .fromHex().toHex()
+        val data = p.get("data")?.asString?.fromHex() ?: ByteArray(0)
+        val dropAcks = p.get("drop_acks")?.asBoolean ?: false
+        val failOutlet = p.get("fail_outlet")?.asBoolean ?: false
+        val msgtype = p.get("msgtype")?.takeIf { !it.isJsonNull }?.asInt
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 20000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        if (msgtype != null && msgtype >= 0xF000) {
+            // Reserved MSGTYPE: rejected at registration (no send).
+            val channel = ensureChannelState(inst, linkIdHex).channel
+            try {
+                channel.registerMessageType(msgtype, MessageFactory { WireChannelMessage() })
+                result("rejected" to boolVal(false), "error" to JsonNull.INSTANCE, "sent" to boolVal(false))
+            } catch (e: ChannelException) {
+                result("rejected" to boolVal(true), "error" to strVal(e.message ?: ""), "sent" to boolVal(false))
+            }
+        } else {
+            val channel = ensureChannelState(inst, linkIdHex).channel
+            val link = findLinkByIdWaiting(inst, linkIdHex)
+                ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+            if (!channel.isReadyToSend()) {
+                val s = channel.stateForTest()
+                result(
+                    "sent" to boolVal(false), "delivered" to boolVal(false), "tries" to intVal(0),
+                    "sequence" to JsonNull.INSTANCE, "window" to intVal(s.window),
+                    "window_max" to intVal(s.windowMax), "ready" to boolVal(false),
+                )
+            } else {
+                if (dropAcks) link.failProofValidationForTest = true
+                if (failOutlet) channel.failNextSendForTest = true
+                try {
+                    val envelope = channel.send(WireChannelMessage(data))
+                    while (System.currentTimeMillis() < deadline) {
+                        if (channel.isDeliveredForTest(envelope) || link.status == LinkConstants.CLOSED) break
+                        Thread.sleep(50)
+                    }
+                    // Wait for the (async) delivery callback to finish processing
+                    // (window growth + rate rounds), observable as the envelope
+                    // leaving the tx ring — python runs _packet_delivered
+                    // synchronously during proof validation, so its channel_send
+                    // returns with those side effects already applied.
+                    if (channel.isDeliveredForTest(envelope)) {
+                        val settle = System.currentTimeMillis() + 2000
+                        while (System.currentTimeMillis() < settle && envelope.tracked) Thread.sleep(5)
+                    }
+                    val s = channel.stateForTest()
+                    result(
+                        "sent" to boolVal(true),
+                        "rejected" to boolVal(false),
+                        "delivered" to boolVal(channel.isDeliveredForTest(envelope)),
+                        "tries" to intVal(envelope.tries),
+                        "sequence" to intVal(envelope.sequence),
+                        "next_sequence" to intVal(s.nextSequence),
+                        "window" to intVal(s.window),
+                        "window_max" to intVal(s.windowMax),
+                        "link_status" to intVal(link.status),
+                    )
+                } catch (e: ChannelException) {
+                    val s = channel.stateForTest()
+                    result(
+                        "sent" to boolVal(false),
+                        "rejected" to boolVal(true),
+                        "delivered" to boolVal(false),
+                        "error" to strVal(e.message ?: ""),
+                        "ce_type" to intVal(ceType(e.type)),
+                        "next_sequence" to intVal(s.nextSequence),
+                        "window" to intVal(s.window),
+                        "window_max" to intVal(s.windowMax),
+                    )
+                }
+            }
+        }
+    }
+
+    "wire_channel_register" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val kind = p.str("kind")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val channel = ensureChannelState(inst, linkIdHex).channel
+        if (kind == "envelope_pack_no_msgtype") {
+            try {
+                Envelope.packNullMessageForTest()
+                result("accepted" to boolVal(true), "error" to JsonNull.INSTANCE, "ce_type" to JsonNull.INSTANCE)
+            } catch (e: ChannelException) {
+                result("accepted" to boolVal(false), "error" to strVal(e.message ?: ""), "ce_type" to intVal(ceType(e.type)))
+            }
+        } else {
+            try {
+                when (kind) {
+                    "valid" -> channel.registerMessageType(0x0505, MessageFactory { WireChannelMessage() })
+                    "reserved" -> channel.registerMessageType(0xF001, MessageFactory { WireChannelMessage() })
+                    "not_constructible" -> channel.registerMessageType(0x0404, MessageFactory { throw RuntimeException("requires an argument") })
+                    // non_message_base / msgtype_none have no analog in kotlin's
+                    // (Int, MessageFactory) registration API. Best-effort: drive a
+                    // GENUINE reserved-range rejection that yields the same
+                    // ME_INVALID_MSG_TYPE (ce 1) python raises for them. The
+                    // production validation path runs; only the trigger differs
+                    // (documented fidelity gap #D4).
+                    "non_message_base" -> channel.registerMessageType(0xF010, MessageFactory { WireChannelMessage() })
+                    "msgtype_none" -> channel.registerMessageType(0xF011, MessageFactory { WireChannelMessage() })
+                    else -> throw IllegalArgumentException("Unknown register kind: $kind")
+                }
+                result("accepted" to boolVal(true), "error" to JsonNull.INSTANCE, "ce_type" to JsonNull.INSTANCE)
+            } catch (e: ChannelException) {
+                result("accepted" to boolVal(false), "error" to strVal(e.message ?: ""), "ce_type" to intVal(ceType(e.type)))
+            }
+        }
+    }
+
+    else -> null
+}
+
+private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (command) {
+    "wire_channel_envelope_pack" -> {
+        val msgtype = p.int("msgtype")
+        val sequence = p.int("sequence")
+        val data = p.get("data")?.asString?.fromHex() ?: ByteArray(0)
+        result("raw" to hexVal(Envelope.packForTest(msgtype, sequence, data)), "sequence" to intVal(sequence))
+    }
+
+    "wire_channel_profile" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val rttSec = p.double("rtt")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val saved = link.rtt
+        try {
+            link.setRttForTest(Math.round(rttSec * 1000.0))
+            val s = link.newThrowawayChannelForTest().stateForTest()
+            result(
+                "rtt" to doubleVal((link.rtt ?: 0L) / 1000.0),
+                "window" to intVal(s.window),
+                "window_min" to intVal(s.windowMin),
+                "window_max" to intVal(s.windowMax),
+                "window_flexibility" to intVal(s.windowFlexibility),
+                "rtt_slow" to doubleVal(Channel.RTT_SLOW / 1000.0),
+            )
+        } finally {
+            link.setRttForTest(saved)
+        }
+    }
+
+    "wire_channel_timeout_formula" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val rttSec = p.double("rtt")
+        val tries = p.int("tries")
+        val ringDepth = p.get("ring_depth")?.asInt ?: 0
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val saved = link.rtt
+        try {
+            link.setRttForTest(Math.round(rttSec * 1000.0))
+            val ch = link.newThrowawayChannelForTest()
+            ch.padTxRingForTest(ringDepth)
+            val tMs = ch.getPacketTimeoutTimeDoubleForTest(tries)
+            result(
+                "timeout" to doubleVal(tMs / 1000.0),
+                "rtt" to doubleVal((link.rtt ?: 0L) / 1000.0),
+                "tries" to intVal(tries),
+                "ring_depth" to intVal(ringDepth),
+            )
+        } finally {
+            link.setRttForTest(saved)
+        }
+    }
+
+    "wire_channel_handler_chain" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val handlers = p.get("handlers")?.asJsonArray?.map { it.asString } ?: emptyList()
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val ch = link.newThrowawayChannelForTest()
+        ch.registerMessageType(0x0707, MessageFactory { ChainMessage() })
+        val log = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        handlers.forEachIndexed { i, b ->
+            ch.addMessageHandler { _ ->
+                log.add(i)
+                if (b == "raise") throw RuntimeException("handler $i deliberate error")
+                b == "true"
+            }
+        }
+        ch.receive(ch.packEnvelopeForTest(ChainMessage("chain-probe".toByteArray()), 0))
+        val s = ch.stateForTest()
+        val logArr = JsonArray()
+        synchronized(log) { log.forEach { logArr.add(intVal(it)) } }
+        result(
+            "log" to logArr,
+            "next_rx_sequence" to intVal(s.nextRxSequence),
+            "handler_count" to intVal(s.messageHandlers),
+        )
+    }
+
+    "wire_channel_emit_capture" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val data = p.get("data")?.asString?.fromHex() ?: ByteArray(0)
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 15000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val channel = ensureChannelState(inst, linkIdHex).channel
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        val envelope = channel.send(WireChannelMessage(data))
+        while (System.currentTimeMillis() < deadline && !channel.isDeliveredForTest(envelope)) Thread.sleep(50)
+        val pkt = envelope.packet as? Packet
+        result(
+            "context" to (pkt?.let { intVal(it.context.value) } ?: JsonNull.INSTANCE),
+            "packet_type" to (pkt?.let { intVal(it.packetType.value) } ?: JsonNull.INSTANCE),
+            "packet_hash" to (pkt?.let { hexVal(it.packetHash) } ?: JsonNull.INSTANCE),
+            "delivered" to boolVal(channel.isDeliveredForTest(envelope)),
+            "channel_context" to intVal(network.reticulum.common.PacketContext.CHANNEL.value),
+            "data_context" to intVal(network.reticulum.common.PacketContext.NONE.value),
+        )
+    }
+
+    "wire_channel_spurious_proof" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 12000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val channel = ensureChannelState(inst, linkIdHex).channel
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        val envelope = channel.send(WireChannelMessage("genuine-proof".toByteArray()))
+        while (System.currentTimeMillis() < deadline && !channel.isDeliveredForTest(envelope)) Thread.sleep(20)
+        // Wait for the delivery callback to remove the envelope (and grow window).
+        val settle = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < settle && channel.stateForTest().txRing > 0) Thread.sleep(20)
+
+        val windowBefore = channel.stateForTest().window
+        val txRingBefore = channel.stateForTest().txRing
+        val errors = JsonArray()
+        val pkt = envelope.packet!!
+        runCatching { channel.firePacketDeliveredForTest(pkt) }
+            .onFailure { errors.add(strVal("duplicate_proof: ${it.message}")) }
+        val windowAfterDup = channel.stateForTest().window
+        runCatching { channel.firePacketTimeoutForTest(pkt) }
+            .onFailure { errors.add(strVal("timeout_delivered: ${it.message}")) }
+        // A genuine, never-tracked channel packet on this link.
+        val untracked = Packet.createRaw(
+            destinationHash = link.linkId,
+            data = link.encrypt("untracked-probe".toByteArray()),
+            packetType = network.reticulum.common.PacketType.DATA,
+            context = network.reticulum.common.PacketContext.CHANNEL,
+            destinationType = DestinationType.LINK,
+            mtu = link.mtu,
+        )
+        runCatching { channel.firePacketTimeoutForTest(untracked) }
+            .onFailure { errors.add(strVal("timeout_untracked: ${it.message}")) }
+        runCatching { channel.firePacketDeliveredForTest(untracked) }
+            .onFailure { errors.add(strVal("proof_untracked: ${it.message}")) }
+        val s = channel.stateForTest()
+        result(
+            "delivered" to boolVal(channel.isDeliveredForTest(envelope)),
+            "window_before" to intVal(windowBefore),
+            "window_after_duplicate" to intVal(windowAfterDup),
+            "window_final" to intVal(s.window),
+            "tx_ring_before" to intVal(txRingBefore),
+            "tx_ring_final" to intVal(s.txRing),
+            "link_status" to intVal(link.status),
+            "link_closed" to boolVal(link.status == LinkConstants.CLOSED),
+            "errors" to errors,
+        )
+    }
+
+    "wire_buffer_pack" -> {
+        val unpackRaw = p.get("unpack_raw")?.takeIf { !it.isJsonNull }?.asString
+        if (unpackRaw != null) {
+            val m = StreamDataMessage()
+            try {
+                m.unpack(unpackRaw.fromHex())
+                result(
+                    "stream_id" to intVal(m.streamId),
+                    "eof" to boolVal(m.eof),
+                    "compressed" to boolVal(m.compressed),
+                    "data" to hexVal(m.data),
+                )
+            } catch (e: Exception) {
+                result("error" to strVal(e.message ?: e.toString()))
+            }
+        } else {
+            val streamId = p.int("stream_id")
+            val data = p.get("data")?.asString?.fromHex() ?: ByteArray(0)
+            val eof = p.get("eof")?.asBoolean ?: false
+            val compressed = p.get("compressed")?.asBoolean ?: false
+            try {
+                val m = StreamDataMessage().apply {
+                    this.streamId = streamId
+                    this.data = data
+                    this.eof = eof
+                    this.compressed = compressed
+                }
+                result("raw" to hexVal(m.pack()), "msgtype" to intVal(m.msgType))
+            } catch (e: IllegalArgumentException) {
+                result("error" to strVal(e.message ?: ""))
+            }
+        }
+    }
+
+    "wire_buffer_stream" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val data = p.get("data")?.asString?.fromHex() ?: ByteArray(0)
+        val bomb = p.get("bomb")?.asBoolean ?: false
+        val bombLen = p.get("bomb_decompressed_len")?.takeIf { !it.isJsonNull }?.asInt
+        val streamId = p.get("stream_id")?.takeIf { !it.isJsonNull }?.asInt ?: WIRE_BUFFER_STREAM_ID
+        val eofWithData = p.get("eof_with_data")?.asBoolean ?: false
+        val useClose = p.get("use_close")?.asBoolean ?: false
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val channel = link.getChannel()
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        val manifest = java.util.Collections.synchronizedList(mutableListOf<JsonObject>())
+        channel.outboundMessageTapForTest = tap@{ msg, env ->
+            if (msg is StreamDataMessage) {
+                val o = JsonObject()
+                o.addProperty("bytes", msg.data.size)
+                o.addProperty("compressed", msg.compressed)
+                o.addProperty("eof", msg.eof)
+                o.addProperty("sequence", env.sequence)
+                manifest.add(o)
+            }
+        }
+        val manifestJson = {
+            val a = JsonArray()
+            synchronized(manifest) { manifest.forEach { a.add(it) } }
+            a
+        }
+        try {
+            if (bomb) {
+                val n = bombLen ?: (RawChannelWriter.MAX_CHUNK_LEN * 4)
+                val compressed = StreamDataMessage.compressForTest(ByteArray(n))
+                if (compressed.size >= StreamDataMessage.MAX_DATA_LEN) {
+                    throw RuntimeException("crafted bomb chunk does not fit a single message")
+                }
+                val message = StreamDataMessage().apply {
+                    this.streamId = streamId
+                    this.data = compressed
+                    this.eof = true
+                    this.compressed = true
+                }
+                while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+                if (!channel.isReadyToSend()) {
+                    result("written" to intVal(0), "eof" to boolVal(false), "ready" to boolVal(false), "manifest" to manifestJson())
+                } else {
+                    val env = channel.send(message)
+                    result(
+                        "written" to intVal(0),
+                        "eof" to boolVal(true),
+                        "bomb" to boolVal(true),
+                        "decompressed_len" to intVal(n),
+                        "sequence" to intVal(env.sequence),
+                        "manifest" to manifestJson(),
+                        "max_chunk_len" to intVal(RawChannelWriter.MAX_CHUNK_LEN),
+                    )
+                }
+            } else {
+                val writer = RawChannelWriter(streamId, channel)
+                var remaining = data
+                var total = 0
+                val writeReturns = JsonArray()
+                while (remaining.isNotEmpty() && System.currentTimeMillis() < deadline) {
+                    if (!channel.isReadyToSend()) { Thread.sleep(20); continue }
+                    if (eofWithData && remaining.size <= StreamDataMessage.MAX_DATA_LEN) writer.flagEofForTest()
+                    val nw = writer.writeChunkForTest(remaining)
+                    if (nw > 0) {
+                        remaining = remaining.copyOfRange(nw, remaining.size)
+                        total += nw
+                        writeReturns.add(intVal(nw))
+                    } else {
+                        Thread.sleep(20)
+                    }
+                }
+                if (useClose) {
+                    runCatching { writer.close() }
+                } else if (!eofWithData) {
+                    while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+                    writer.flagEofForTest()
+                    runCatching { writer.writeChunkForTest(ByteArray(0)) }
+                }
+                // Settle until the tx ring drains (every envelope proved).
+                while (!channel.isReadyToSend() && System.currentTimeMillis() < deadline) Thread.sleep(20)
+                while (System.currentTimeMillis() < deadline && channel.stateForTest().txRing > 0) Thread.sleep(50)
+                result(
+                    "written" to intVal(total),
+                    "eof" to boolVal(true),
+                    "manifest" to manifestJson(),
+                    "write_returns" to writeReturns,
+                    "max_data_len" to intVal(StreamDataMessage.MAX_DATA_LEN),
+                    "max_chunk_len" to intVal(RawChannelWriter.MAX_CHUNK_LEN),
+                    "compression_tries" to intVal(RawChannelWriter.COMPRESSION_TRIES),
+                    "tx_ring_after" to intVal(channel.stateForTest().txRing),
+                )
+            }
+        } finally {
+            channel.outboundMessageTapForTest = null
+        }
+    }
+
+    "wire_buffer_received" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.hex("destination_hash").toHex()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+        val sid = p.get("stream_id")?.takeIf { !it.isJsonNull }?.asInt ?: WIRE_BUFFER_STREAM_ID
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=$destHashHex")
+        val acc = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(65536)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val reader = listener.readers[sid]
+            var got = false
+            if (reader != null) {
+                while (reader.available() > 0) {
+                    val n = reader.read(buf, 0, minOf(buf.size, reader.available()))
+                    if (n <= 0) break
+                    acc.write(buf, 0, n)
+                    got = true
+                }
+            }
+            if (got) continue
+            if ((reader != null && reader.isEofForTest()) || listener.aborted.get()) break
+            Thread.sleep(50)
+        }
+        // Final drain.
+        val reader = listener.readers[sid]
+        if (reader != null) {
+            while (reader.available() > 0) {
+                val n = reader.read(buf, 0, minOf(buf.size, reader.available()))
+                if (n <= 0) break
+                acc.write(buf, 0, n)
+            }
+        }
+        result(
+            "data" to hexVal(acc.toByteArray()),
+            "eof" to boolVal(reader?.isEofForTest() ?: false),
+            "aborted" to boolVal(listener.aborted.get()),
+            "error" to (listener.abortError.get()?.let { strVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_listener_channel_rx" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.hex("destination_hash").toHex()
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=$destHashHex")
+        // Poll ~4s for the async-registered inbound channel/reader (§0.5 race).
+        val deadline = System.currentTimeMillis() + 4000
+        var channel: Channel? = null
+        while (true) {
+            channel = listener.readers[WIRE_BUFFER_STREAM_ID]?.channelForTest()
+                ?: listener.readers.values.firstOrNull()?.channelForTest()
+                ?: listener.inboundLinks.firstOrNull()?.getChannel()
+            if (channel != null || System.currentTimeMillis() >= deadline) break
+            Thread.sleep(50)
+        }
+        val ch = channel ?: throw IllegalStateException("no inbound channel on this listener")
+        val s = ch.stateForTest()
+        result(
+            "next_rx_sequence" to intVal(s.nextRxSequence),
+            "next_sequence" to intVal(s.nextSequence),
+            "rx_ring" to intVal(s.rxRing),
+        )
+    }
+
+    "wire_link_set_rtt" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val rttSec = p.double("rtt")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val previous = link.rtt
+        link.setRttForTest(Math.round(rttSec * 1000.0))
+        result(
+            "rtt" to doubleVal((link.rtt ?: 0L) / 1000.0),
+            "previous" to (previous?.let { doubleVal(it / 1000.0) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+
     // ===== Phase 5d: Resource commands =====
 
     "wire_resource_create" -> {
@@ -4647,6 +5406,10 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         out
     }
 
+    else -> null
+}
+
+private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (command) {
     "wire_resource_window_inheritance" -> {
         val handle = p.str("handle")
         val linkIdHex = p.str("link_id")
@@ -5269,5 +6032,5 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         out
     }
 
-    else -> throw IllegalArgumentException("Unknown wire command: $command")
+    else -> null
 }
