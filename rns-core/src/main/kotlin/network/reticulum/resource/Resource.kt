@@ -346,11 +346,16 @@ class Resource private constructor(
     // Conformance instrumentation counters (see *ForTest accessors). These count
     // genuine state-machine events the reference harness observes by wrapping the
     // python instance methods (which kotlin cannot monkeypatch per-instance).
-    @Volatile private var proveCalls: Int = 0
+    // AtomicInteger, not @Volatile Int: these are bumped with ++ from the
+    // receiver's part-delivery path and the background watchdog. @Volatile only
+    // guarantees visibility; ++ is a non-atomic read-modify-write that can lose
+    // increments under concurrency. incrementAndGet() is atomic. (Kotlin-only
+    // conformance instrumentation — no python equivalent.)
+    private val proveCalls = AtomicInteger(0)
     @Volatile private var lastRequestData: ByteArray? = null
-    @Volatile private var requestNextEmitCount: Int = 0
-    @Volatile private var hmuRequestsSent: Int = 0
-    @Volatile private var hashmapUpdatesReceived: Int = 0
+    private val requestNextEmitCount = AtomicInteger(0)
+    private val hmuRequestsSent = AtomicInteger(0)
+    private val hashmapUpdatesReceived = AtomicInteger(0)
 
     // Test-only: when false, receivePart() does NOT auto-issue its follow-up
     // requestNext() on a window drain. Mirrors the reference harness shadowing
@@ -820,7 +825,7 @@ class Resource private constructor(
             // instance request_next (wire_tcp.py on_resource_started). requestNext
             // early-returns while waitingForHmu, so reaching here always means a
             // false->true transition.
-            hmuRequestsSent++
+            hmuRequestsSent.incrementAndGet()
             waitingForHmu = true
         }
 
@@ -839,7 +844,7 @@ class Resource private constructor(
             // only at the actual send block, so the waitingForHmu early-return
             // above does not bump the count.
             lastRequestData = reqDataBytes
-            requestNextEmitCount++
+            requestNextEmitCount.incrementAndGet()
             val encrypted = link.encrypt(reqDataBytes)
             val packet = Packet.createRaw(
                 destinationHash = link.linkId,
@@ -1040,7 +1045,7 @@ class Resource private constructor(
             // (wire_tcp.py on_resource_started). Counted in the packet handler,
             // NOT in the private hashmapUpdate(), so the inject_hashmap_update
             // injector (which drives hashmapUpdate directly) is unaffected.
-            hashmapUpdatesReceived++
+            hashmapUpdatesReceived.incrementAndGet()
             hashmapUpdate(segment, hashmapBytes)
         } catch (e: Exception) {
             log("Failed to parse hashmap update: ${e.message}")
@@ -1105,7 +1110,7 @@ class Resource private constructor(
         // prove (wire_tcp.py cmd_wire_resource_receiver_proof_count /
         // cmd_wire_inject_corrupt_assembled_resource) to assert exactly one
         // proof per completed transfer and zero on a CORRUPT one.
-        proveCalls++
+        proveCalls.incrementAndGet()
         if (status == ResourceConstants.FAILED) return
 
         try {
@@ -1716,11 +1721,11 @@ class Resource private constructor(
     fun setMaxDecompressedSizeForTest(value: Int) { maxDecompressedSize = value }
 
     /** Instrumentation counters (see the fields for what each event is). */
-    fun proveCallCountForTest(): Int = proveCalls
+    fun proveCallCountForTest(): Int = proveCalls.get()
     fun lastRequestDataForTest(): ByteArray? = lastRequestData
-    fun requestNextEmitCountForTest(): Int = requestNextEmitCount
-    fun hmuRequestsSentForTest(): Int = hmuRequestsSent
-    fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived
+    fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
+    fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
+    fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
 
     /** Drive the private assemble(). */
     fun assembleForTest() = assemble()

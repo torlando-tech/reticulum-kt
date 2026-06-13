@@ -48,7 +48,12 @@ fun interface AnnounceHandler {
      * @param destinationHash The destination hash being announced
      * @param announcedIdentity The identity from the announce (public keys only)
      * @param appData Application data included in the announce
-     * @return true if the announce was handled, false to pass to other handlers
+     * @return value is IGNORED. Dispatch is unconditional: EVERY registered
+     *   handler (whose aspect filter matches) receives EVERY announce, mirroring
+     *   RNS where Transport calls all `announce_handlers` (Transport.py — no
+     *   first-handler-wins / early-out). A handler cannot claim exclusive
+     *   ownership of an announce; the `Boolean` is retained only for source
+     *   compatibility.
      */
     fun handleAnnounce(
         destinationHash: ByteArray,
@@ -76,6 +81,11 @@ interface RichAnnounceHandler : AnnounceHandler {
      */
     val receivePathResponses: Boolean get() = false
 
+    /**
+     * Like [handleAnnounce] but with full context. The `Boolean` return is
+     * likewise IGNORED — dispatch is unconditional (every matching handler is
+     * called); the type is kept only for source compatibility.
+     */
     fun handleAnnounceWithContext(
         destinationHash: ByteArray,
         announcedIdentity: Identity,
