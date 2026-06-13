@@ -2998,5 +2998,69 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    "wire_capture_response_packet" -> {
+        // Capture the raw RESPONSE packet RNS delivers for a Link.request. Arms
+        // a per-link inbound tap that records RESPONSE (decrypted plaintext) and
+        // RESOURCE_ADV packets, then issues link.request and waits for it to
+        // conclude. Mirrors cmd_wire_capture_response_packet.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val path = p.str("path")
+        val data = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex()
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 15000
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val captured = java.util.Collections.synchronizedList(mutableListOf<JsonObject>())
+        val responseCtx = network.reticulum.common.PacketContext.RESPONSE.value
+        val resourceAdvCtx = network.reticulum.common.PacketContext.RESOURCE_ADV.value
+        link.inboundTapForTest = { pkt ->
+            runCatching {
+                val ctx = pkt.context.value
+                if (ctx == responseCtx || ctx == resourceAdvCtx) {
+                    val entry = JsonObject()
+                    entry.addProperty("context", ctx)
+                    if (ctx == responseCtx) {
+                        val plaintext = link.decrypt(pkt.data)
+                        if (plaintext != null) entry.addProperty("plaintext", plaintext.toHex())
+                        else entry.add("plaintext", JsonNull.INSTANCE)
+                    } else {
+                        entry.add("plaintext", JsonNull.INSTANCE)
+                    }
+                    captured.add(entry)
+                }
+            }
+        }
+        var status = "timeout"
+        var responseHex: String? = null
+        try {
+            val receipt = link.request(path, data = data, timeout = timeoutMs.toLong())
+                ?: throw IllegalStateException("Link.request returned null (REQUEST not sent)")
+            val deadline = System.currentTimeMillis() + timeoutMs + 500
+            while (System.currentTimeMillis() < deadline) {
+                when (receipt.status) {
+                    RequestReceipt.READY -> {
+                        responseHex = receipt.getResponseCopy()?.toHex()
+                        status = "ready"
+                    }
+                    RequestReceipt.FAILED -> status = "failed"
+                }
+                if (status != "timeout") break
+                Thread.sleep(50)
+            }
+        } finally {
+            link.inboundTapForTest = null
+        }
+        val arr = JsonArray()
+        synchronized(captured) { captured.forEach { arr.add(it) } }
+        result(
+            "status" to strVal(status),
+            "response" to (responseHex?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "captured" to arr,
+        )
+    }
+
     else -> throw IllegalArgumentException("Unknown wire command: $command")
 }
