@@ -222,7 +222,16 @@ class Resource private constructor(
     var uncompressedSize: Int = 0
         private set
 
-    // Status
+    // Status. @Volatile because it is read across threads: the daemon
+    // advertise spin-wait (below) and the watchdog read it while cancel() /
+    // conclude write it from another thread. Without it the JVM may cache a
+    // stale value, so the daemon's `while (status == QUEUED ...)` loop could
+    // spin until shutdown and its post-loop QUEUED guards (and doAdvertise's)
+    // could see a stale QUEUED after a cancel. Python's GIL gives this
+    // cross-thread visibility for free; @Volatile is the JVM equivalent, not a
+    // behavior change. status is only ever ASSIGNED (never read-modify-written),
+    // so @Volatile suffices — no atomic needed.
+    @Volatile
     var status: Int = ResourceConstants.NONE
         private set
 
