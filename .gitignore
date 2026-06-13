@@ -44,3 +44,6 @@ local.properties
 
 # Test identity files (binary keys)
 *_identity
+
+# Kotlin compiler scratch/error logs (build artifacts; can embed local paths)
+.kotlin/
