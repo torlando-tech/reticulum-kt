@@ -146,6 +146,14 @@ private val LINK_STATUS_NAMES = mapOf(
     LinkConstants.STALE to "STALE",
     LinkConstants.CLOSED to "CLOSED",
 )
+private fun receiptStatusName(status: Int): String? = when (status) {
+    network.reticulum.packet.PacketReceipt.FAILED -> "FAILED"
+    network.reticulum.packet.PacketReceipt.SENT -> "SENT"
+    network.reticulum.packet.PacketReceipt.DELIVERED -> "DELIVERED"
+    network.reticulum.packet.PacketReceipt.CULLED -> "CULLED"
+    else -> null
+}
+
 private val LINK_TEARDOWN_NAMES = mapOf(
     LinkConstants.TEARDOWN_REASON_TIMEOUT to "TIMEOUT",
     LinkConstants.INITIATOR_CLOSED to "INITIATOR_CLOSED",
@@ -2904,6 +2912,89 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "remote_identity_after" to (remoteAfter?.hash?.let { hexVal(it) } ?: JsonNull.INSTANCE),
             "adopted" to boolVal(remoteAfter != null && remoteAfter.hash.contentEquals(claimed.hash)),
             "initiator" to boolVal(link.initiator),
+        )
+    }
+
+    // ===== Phase 5c batch 4e: LRPROOF frame capture + link-proof injection =====
+
+    "wire_capture_lrproof_frame" -> {
+        // Capture the raw outbound LRPROOF frame + its flag-byte shape. An
+        // LRPROOF is built as a PROOF packet to a LINK destination, so its flags
+        // encode dest-type LINK and pack() writes the link_id in the dest-address
+        // position. Mirrors cmd_wire_capture_lrproof_frame.
+        val handle = p.str("handle")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destIdentity = Identity.create()
+        val outDest = Destination.create(destIdentity, DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "lrproof-shape")
+        val link = Link.create(outDest)
+        val signalling = Link.signallingBytes(link.mtu, link.mode)
+        val pubBytes = link.pubBytesForTest()!!
+        val sigPubBytes = link.sigPubBytesForTest()!!
+        val signedData = link.linkId + pubBytes + sigPubBytes + signalling
+        val signature = destIdentity.sign(signedData)
+        val proofData = signature + pubBytes + signalling
+        val proof = Packet.createRaw(
+            destinationHash = link.linkId, data = proofData,
+            packetType = network.reticulum.common.PacketType.PROOF,
+            destinationType = DestinationType.LINK,
+            context = network.reticulum.common.PacketContext.LRPROOF,
+        )
+        val raw = proof.pack()
+        val flags = proof.getPackedFlags()
+        runCatching { link.teardown() }
+        result(
+            "raw" to hexVal(raw),
+            "flags" to intVal(flags),
+            "link_id" to hexVal(link.linkId),
+            "packet_type" to intVal(network.reticulum.common.PacketType.PROOF.value),
+            "context" to intVal(network.reticulum.common.PacketContext.LRPROOF.value),
+            "expected_link_dest_type" to intVal(DestinationType.LINK.value),
+            "truncated_hashlength" to intVal(network.reticulum.common.RnsConstants.TRUNCATED_HASH_BYTES),
+        )
+    }
+
+    "wire_inject_crafted_link_proof" -> {
+        // Link DATA-packet proofs are EXPLICIT-only (validateLinkProof): only the
+        // 96-byte packet_hash||signature form is accepted; a valid-signature
+        // 64-byte implicit proof is STILL rejected. Self-consistent signing lets
+        // a real link.sign produce a signature the real validate accepts.
+        val handle = p.str("handle")
+        val variant = p.str("variant")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = network.reticulum.crypto.defaultCryptoProvider()
+
+        val destIdentity = Identity.create()
+        val outDest = Destination.create(destIdentity, DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "link-proof")
+        val link = Link.create(outDest)
+        link.makeSelfConsistentSigningForTest()
+
+        val basePacket = Packet.createRaw(
+            destinationHash = outDest.hash, data = crypto.randomBytes(20),
+            packetType = network.reticulum.common.PacketType.DATA, destinationType = DestinationType.SINGLE,
+        )
+        basePacket.pack()
+        val receipt = network.reticulum.packet.PacketReceipt.forPacketForTest(basePacket)
+        val sigLen = network.reticulum.common.RnsConstants.SIGNATURE_SIZE
+        val proof: ByteArray = when (variant) {
+            "valid_explicit" -> receipt.hash + link.sign(receipt.hash)
+            "implicit_valid_sig" -> link.sign(receipt.hash)
+            "implicit_random" -> crypto.randomBytes(sigLen)
+            "wrong_length_short" -> crypto.randomBytes(sigLen / 2)
+            else -> throw IllegalArgumentException("unknown link-proof variant: $variant")
+        }
+        val validated = runCatching { receipt.validateLinkProof(proof, link, null) }.getOrDefault(false)
+        val status = receipt.status
+        runCatching { link.teardown() }
+        result(
+            "variant" to strVal(variant),
+            "validated" to boolVal(validated),
+            "status" to intVal(status),
+            "status_name" to (receiptStatusName(status)?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "proof_len" to intVal(proof.size),
+            "expl_length" to intVal(network.reticulum.packet.PacketReceipt.EXPL_LENGTH),
+            "impl_length" to intVal(network.reticulum.packet.PacketReceipt.IMPL_LENGTH),
         )
     }
 
