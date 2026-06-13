@@ -2800,5 +2800,112 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         )
     }
 
+    // ===== Phase 5c batch 4d: crafted proof / identify injectors =====
+
+    "wire_inject_crafted_lrproof" -> {
+        // Adversarial LRPROOF injector: a PENDING initiator validates the
+        // destination's LRPROOF (signature over link_id||eph_pub||dest_sig_pub).
+        // Only a signature verifying against the destination identity activates
+        // the link. Mirrors cmd_wire_inject_crafted_lrproof.
+        val handle = p.str("handle")
+        val variant = p.str("variant")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = network.reticulum.crypto.defaultCryptoProvider()
+
+        val destIdentity = Identity.create()
+        val outDest = Destination.create(destIdentity, DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "lrproof")
+        val link = Link.create(outDest)
+        link.setStatusForTest(LinkConstants.PENDING)
+
+        val ecHalf = LinkConstants.ECPUBSIZE / 2 // 32
+        val sigLen = network.reticulum.common.RnsConstants.SIGNATURE_SIZE // 64
+        val ephemeralPub = crypto.generateX25519KeyPair().publicKey
+        val destSigPub = destIdentity.getPublicKey().copyOfRange(ecHalf, LinkConstants.ECPUBSIZE)
+        val signedData = link.linkId + ephemeralPub + destSigPub
+
+        val proofData: ByteArray = when (variant) {
+            "valid", "non_pending" -> {
+                if (variant == "non_pending") link.setStatusForTest(LinkConstants.CLOSED)
+                destIdentity.sign(signedData) + ephemeralPub
+            }
+            "forged_signature" -> Identity.create().sign(signedData) + ephemeralPub
+            "wrong_signed_data" -> destIdentity.sign(network.reticulum.crypto.Hashes.fullHash("unrelated".toByteArray()).copyOf(96.coerceAtMost(32)) + ByteArray(64)) + ephemeralPub
+            "wrong_size" -> (destIdentity.sign(signedData) + ephemeralPub).let { it.copyOf(it.size - 1) }
+            "mode_mismatch" -> {
+                val signalling = Link.signallingBytes(network.reticulum.common.RnsConstants.MTU, link.mode)
+                val sig = destIdentity.sign(link.linkId + ephemeralPub + destSigPub + signalling)
+                val raw = (sig + ephemeralPub + signalling).copyOf()
+                val modeIdx = sigLen + ecHalf // 96
+                val wrongMode = LinkConstants.MODE_AES256_GCM
+                raw[modeIdx] = (((raw[modeIdx].toInt() and LinkConstants.MODE_BYTEMASK.inv()) or ((wrongMode shl 5) and LinkConstants.MODE_BYTEMASK)) and 0xFF).toByte()
+                raw
+            }
+            else -> throw IllegalArgumentException("unknown lrproof variant: $variant")
+        }
+
+        val pkt = Packet.createRaw(
+            destinationHash = link.linkId, data = proofData,
+            packetType = network.reticulum.common.PacketType.PROOF,
+            destinationType = DestinationType.LINK,
+            context = network.reticulum.common.PacketContext.LRPROOF,
+        )
+        val rx = Packet.unpack(pkt.pack())
+        if (rx != null) {
+            runCatching { link.validateProof(rx) }
+        }
+        val statusAfter = link.status
+        val activated = statusAfter == LinkConstants.ACTIVE
+        runCatching { link.teardown() }
+        result(
+            "variant" to strVal(variant),
+            "activated" to boolVal(activated),
+            "status" to intVal(statusAfter),
+            "status_name" to (LINK_STATUS_NAMES[statusAfter]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "mtu" to (if (activated) intVal(link.mtu) else JsonNull.INSTANCE),
+            "mode" to intVal(link.mode),
+        )
+    }
+
+    "wire_inject_crafted_link_identify" -> {
+        // Adversarial LINKIDENTIFY injector: the non-initiator adopts the
+        // claimed identity only when the encrypted payload is public_key(64)||
+        // signature(64) (128B) and the signature verifies over link_id||pubkey.
+        // Run on the NON-INITIATOR (the listener holding the inbound link).
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val variant = p.str("variant")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val claimed = Identity.create()
+        val publicKey = claimed.getPublicKey()
+        val signedData = link.linkId + publicKey
+        val payload: ByteArray = when (variant) {
+            "valid" -> publicKey + claimed.sign(signedData)
+            "forged_signature" -> publicKey + Identity.create().sign(signedData)
+            "wrong_signed_data" -> publicKey + claimed.sign(network.reticulum.crypto.Hashes.fullHash("unrelated".toByteArray()) + ByteArray(64))
+            "wrong_length" -> publicKey + claimed.sign(signedData).copyOf(network.reticulum.common.RnsConstants.SIGNATURE_SIZE / 2) // 96B total
+            else -> throw IllegalArgumentException("unknown link-identify variant: $variant")
+        }
+        val raw = buildLinkPacketRaw(link, payload, network.reticulum.common.PacketContext.LINKIDENTIFY)
+        val rx = Packet.unpack(raw)
+        if (rx != null) {
+            rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+            link.receive(rx)
+        }
+        Thread.sleep(50)
+        val remoteAfter = link.getRemoteIdentity()
+        result(
+            "variant" to strVal(variant),
+            "claimed_identity_hash" to hexVal(claimed.hash),
+            "remote_identity_after" to (remoteAfter?.hash?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "adopted" to boolVal(remoteAfter != null && remoteAfter.hash.contentEquals(claimed.hash)),
+            "initiator" to boolVal(link.initiator),
+        )
+    }
+
     else -> throw IllegalArgumentException("Unknown wire command: $command")
 }
