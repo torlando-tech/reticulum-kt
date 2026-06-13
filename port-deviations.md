@@ -326,3 +326,19 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Tracking:** conformance `test_identity_received_ratchet_persistence` (assertion `cleaned_removed`, "not-in-use branch, Identity.py:484-489").
 
 **Description:** kotlin's `cleanRatchetsFromDisk` previously deleted only expired/corrupted ratchet files. RNS 1.3.1 additionally treats a ratchet file whose hex filename decodes to a destination hash absent from `known_destinations` as "not in use" and unlinks it. The branch is `val unknown = runCatching { !knownDestinations.containsKey(file.name.hexToByteArray().toKey()) }.getOrDefault(false)`, OR'd into the existing delete condition. The hex decode is wrapped in `runCatching` so a non-hex filename is skipped (treated as known/not-unknown), mirroring python's per-file `try/except` which leaves an unparseable filename in place rather than crashing the sweep.
+
+### Resource.advertise spin-wait status guards + `@Volatile status`; lock deliberately NOT added — `rns-core/.../resource/Resource.kt::advertise`, `doAdvertise`, `status`
+
+**Python reference:** `RNS/Resource.py:508-541` (`advertise`/`__advertise_job`) and `:1075-1104` (`cancel`). Python's `__advertise_job` spins `while not self.link.ready_for_new_resource(): self.status = QUEUED; sleep(0.25)`, then **unconditionally** runs `advertisement_packet.send()` → `self.status = ADVERTISED` → `self.link.register_outgoing_resource(self)` — with no post-loop status re-check and no lock. `cancel()` sets `status = FAILED` + `link.cancel_outgoing_resource(self)`, also unlocked.
+
+**Category:** language/runtime adaptation (JVM memory model, category (a)) — visibility only; behavior matches python.
+
+**Date:** 2026-06-13.
+
+**Tracking:** Greptile review of reticulum-kt #80 (codeReviewId 11045586, P1 "TOCTOU between doAdvertise() guard and registration"). Upstream parity bug recorded in reticulum-conformance `UPSTREAM_ISSUES.md §5`.
+
+**Description:** The kotlin port (a) advertises **synchronously** on the common idle path and only spawns the daemon spin-wait thread when `!link.readyForNewResource()` (python always threads), and (b) adds `if (status != QUEUED) return` guards in `advertise()`, in the spin loop (`while (status == QUEUED && !readyForNewResource())`), and at the top of `doAdvertise()` — guards python's `__advertise_job` does **not** have. These guards make a concurrent `cancel()` *more* likely to be honored than in python, never less. `status` is `@Volatile` so the daemon/watchdog threads and the `cancel()` writer share a happens-before edge on the field (python gets this free from the GIL); `status` is assign-only, never read-modify-written, so `@Volatile` suffices and an `Atomic*`/lock is unnecessary for visibility.
+
+A residual narrow TOCTOU remains between `doAdvertise()`'s guard and the subsequent `link.registerOutgoingResource(this)`: a `cancel()` interleaved there can be overwritten by the trailing `status = ADVERTISED`. **This race is present in upstream python verbatim** (python has neither the pre-guard nor any lock, so its window is strictly wider). A `synchronized`/check-after-register-and-rollback fix would introduce atomicity python does not have — i.e. a behavioral divergence — so per the honesty rule it is **deliberately not added**. Matching python's concurrency semantics (down to its bugs) is the correct posture for the conformance port; the upstream fix belongs in RNS first.
+
+**Re-evaluation:** if upstream RNS adds a lock/guard around `__advertise_job`'s register+status-advance (closing the race in python), port that exact structure here and drop the "deliberately not added" note. Until then, do not unilaterally diverge.
