@@ -1749,7 +1749,17 @@ class Link private constructor(
      *
      * @param packet The incoming packet to process
      */
+    /**
+     * Conformance test seam: a per-link tap invoked for every inbound packet at
+     * the top of receive(), the kotlin equivalent of the reference bridge
+     * monkey-patching link.receive to observe inbound RESPONSE / RESOURCE_ADV
+     * packets (reference wire_capture_response_packet). Null in normal operation.
+     */
+    @Volatile
+    var inboundTapForTest: ((Packet) -> Unit)? = null
+
     fun receive(packet: Packet) {
+        inboundTapForTest?.let { tap -> runCatching { tap(packet) } }
         // Skip closed links, and skip initiator keepalive responses
         if (status == LinkConstants.CLOSED) return
         if (initiator &&
