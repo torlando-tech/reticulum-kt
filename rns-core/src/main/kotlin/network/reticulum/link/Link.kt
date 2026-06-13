@@ -708,11 +708,16 @@ class Link private constructor(
             val sigLength = RnsConstants.SIGNATURE_SIZE
             val pubSize = LinkConstants.KEYSIZE
 
-            // Check mode matches
+            // Check mode matches. python validate_proof RAISES on a mode
+            // mismatch (Link.py:402) and the surrounding except sets
+            // status=CLOSED (Link.py:452-453) — a mode-downgraded LRPROOF must
+            // CLOSE the link, not leave it PENDING. Throw so the catch below
+            // (which sets CLOSED, matching python) handles it.
             val receivedMode = modeFromLpPacket(packet)
             if (receivedMode != mode) {
-                log("Invalid link mode in proof: $receivedMode vs $mode")
-                return false
+                throw IllegalArgumentException(
+                    "Invalid link mode $receivedMode in link request proof (expected $mode)",
+                )
             }
 
             // Extract peer public key and signature
