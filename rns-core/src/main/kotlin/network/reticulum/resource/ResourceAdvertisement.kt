@@ -26,6 +26,11 @@ class ResourceAdvertisement private constructor() {
         // Guard size to prevent collisions
         val COLLISION_GUARD_SIZE = 2 * ResourceConstants.WINDOW_MAX + HASHMAP_MAX_LEN
 
+        // Keys every genuine advertisement carries (Resource.py:1341-1353). unpack
+        // rejects an advertisement missing any of these (mirrors python's KeyError
+        // on dictionary["..."], Resource.py:1363-1373).
+        private val REQUIRED_KEYS = setOf("t", "d", "n", "h", "r", "o", "m", "f", "i", "l", "q")
+
         init {
             require(HASHMAP_MAX_LEN > 0) {
                 "The configured MTU is too small to include any map hashes in resource advertisements"
@@ -109,8 +114,18 @@ class ResourceAdvertisement private constructor() {
 
                 val adv = ResourceAdvertisement()
 
+                // Track which required keys were present. Mirrors python
+                // `ResourceAdvertisement.unpack` (Resource.py:1363-1373), which
+                // accesses every field as dictionary["t"], dictionary["h"], ...
+                // — a missing key raises KeyError, which the caller
+                // (Resource.accept) catches and treats as a dropped advertisement.
+                // Without this, a packed map missing "h" silently produced a
+                // degenerate adv with hash=ByteArray(0) and started a transfer.
+                val seenKeys = HashSet<String>()
+
                 repeat(mapSize) {
                     val key = unpacker.unpackString()
+                    if (key in REQUIRED_KEYS) seenKeys.add(key)
                     when (key) {
                         "t" -> adv.transferSize = unpacker.unpackInt()
                         "d" -> adv.dataSize = unpacker.unpackInt()
@@ -146,6 +161,12 @@ class ResourceAdvertisement private constructor() {
                     }
                 }
                 unpacker.close()
+
+                // Reject an advertisement missing any required key, mirroring the
+                // KeyError python's unpack would raise (Resource.py:1363-1373).
+                if (!seenKeys.containsAll(REQUIRED_KEYS)) {
+                    return null
+                }
 
                 // Decode flags
                 adv.encrypted = (adv.flags and 0x01) == 0x01

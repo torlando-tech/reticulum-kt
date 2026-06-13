@@ -61,6 +61,7 @@ import network.reticulum.link.RequestReceipt
 import network.reticulum.packet.Packet
 import network.reticulum.packet.PacketReceipt
 import network.reticulum.resource.Resource
+import network.reticulum.resource.ResourceAdvertisement
 import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
 import network.reticulum.transport.TransportConstants
@@ -118,6 +119,11 @@ private class WireInstance(
     // (wire_tcp.py:3402-3403). wire_send_packet* stash a receipt here;
     // wire_packet_receipt_status / wire_inject_crafted_proof read it back.
     val receipts: ConcurrentHashMap<String, network.reticulum.packet.PacketReceipt> = ConcurrentHashMap(),
+    // Outbound Resources started by a non-blocking wire_resource_send(wait=false),
+    // keyed by minted resource_id — looked up by wire_resource_cancel. Mirrors the
+    // reference bridge's inst["out_resources"] (wire_tcp.py cmd_wire_resource_send /
+    // cmd_wire_resource_cancel).
+    val outResources: ConcurrentHashMap<String, Resource> = ConcurrentHashMap(),
 )
 
 /**
@@ -258,6 +264,65 @@ private fun buildLinkPacketRaw(link: Link, plaintext: ByteArray, context: networ
     return pkt.pack()
 }
 
+/** n cryptographically-random bytes (token_bytes analog). */
+private fun randomBytes(n: Int): ByteArray = ByteArray(n).also { java.security.SecureRandom().nextBytes(it) }
+
+/** Integer ceiling division ceil(a/b) for positive b — analog of python's -(-a//b). */
+private fun ceilDiv(a: Int, b: Int): Int = (a + b - 1) / b
+
+/**
+ * Build a real sender Resource on [link] plus the receiver Resource the real
+ * Resource.accept constructs from the sender's genuine ResourceAdvertisement —
+ * the kotlin analog of the reference _build_resource_receiver (wire_tcp.py:6903).
+ *
+ * [forceSdu] temporarily shrinks link.mtu (restored after) so the payload chunks
+ * into many small parts; the shrink MUST stay in effect through accept so the
+ * receiver derives the same per-part SDU as the sender. The watchdog is
+ * suppressed for the duration so the inbound state stays synchronously
+ * inspectable (the caller drives the state machine and cancels the receiver).
+ */
+private fun buildResourceReceiver(link: Link, payloadLen: Int, forceSdu: Int? = null): Pair<Resource, Resource> {
+    val savedMtu = link.mtu
+    if (forceSdu != null) {
+        link.setMtuForTest(forceSdu + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+    }
+    Resource.watchdogDisabledForTest = true
+    try {
+        val sender = Resource.create(randomBytes(payloadLen), link, advertise = false)
+        // Round-trip the advertisement through pack(segment=0)/unpack so it carries
+        // ONLY the first hashmap segment (<= HASHMAP_MAX_LEN entries), exactly like
+        // the reference _build_resource_receiver (RNS.ResourceAdvertisement(sender)
+        // .pack()). Passing the fromResource object directly would hand accept the
+        // FULL hashmap, so hashmap_height would start at the whole part count
+        // instead of the segment-0 height the HMU handshake depends on.
+        val packed = ResourceAdvertisement.fromResource(sender).pack(0)
+        val adv = ResourceAdvertisement.unpack(packed)
+            ?: throw IllegalStateException("could not unpack sender advertisement")
+        val receiver = Resource.accept(adv, link)
+            ?: throw IllegalStateException("Resource.accept did not produce a receiver")
+        return sender to receiver
+    } finally {
+        Resource.watchdogDisabledForTest = false
+        link.setMtuForTest(savedMtu)
+    }
+}
+
+/**
+ * Feed a genuine encrypted inbound link packet carrying [plaintext] under
+ * [context] through the real [link].receive dispatcher. The packet is built with
+ * the link's own encryption (buildLinkPacketRaw), re-parsed, tagged with the
+ * link's attached interface so it passes the interface-match guard
+ * (Link.kt:1773-1781), then dispatched — the kotlin analog of the reference
+ * driving RNS.Link.receive on a crafted inbound packet.
+ */
+private fun feedInboundLinkPacket(link: Link, plaintext: ByteArray, context: network.reticulum.common.PacketContext) {
+    val raw = buildLinkPacketRaw(link, plaintext, context)
+    val rx = Packet.unpack(raw)
+        ?: throw IllegalStateException("could not unpack crafted inbound resource packet")
+    rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+    link.receive(rx)
+}
+
 /** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
  *  keepalive_s/stale_time_s/rtt cross the boundary in SECONDS (kotlin millis). */
 private fun linkStatusDict(link: Link): JsonObject {
@@ -320,7 +385,26 @@ private class Listener(
     // (wire_tcp.py:1299-1317). Filled by the Link.proveTapForTest tap installed
     // in wire_listen; drained by wire_listener_proof_log.
     val proofLog: ConcurrentLinkedDeque<Int> = ConcurrentLinkedDeque(),
+    // Receiver-side inbound Resource observations, in arrival order — populated by
+    // the link's resource-started callback (see wire_listen). Mirrors the
+    // reference listener's incoming_resources list (wire_tcp.py:1205). Read by
+    // wire_resource_receiver_status. The newest record is the most recent inbound
+    // Resource; per-resource HMU counters live on the Resource itself.
+    val incomingResources: ConcurrentLinkedDeque<Resource> = ConcurrentLinkedDeque(),
+    // Resource-strategy this listener applies to each accepted link
+    // (Link.ACCEPT_ALL / ACCEPT_NONE / ACCEPT_APP). Default ACCEPT_ALL.
+    val resourceStrategy: Int = Link.ACCEPT_ALL,
 )
+
+/**
+ * Receiver-side decompression bound the listener lowers every inbound Resource to,
+ * so the bz2 decompression-bomb guard trips cheaply (mirrors the reference
+ * _WIRE_RX_MAX_DECOMPRESSED, wire_tcp.py:130). 256 KiB sits below 1 MiB so it is
+ * trippable without splitting; all legitimate wire transfers in the suite send
+ * incompressible random bytes (decompressor never runs) or sub-KiB compressible
+ * payloads, well under this ceiling.
+ */
+private const val WIRE_RX_MAX_DECOMPRESSED = 256 * 1024
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
 
@@ -444,6 +528,9 @@ private fun resetWireState() {
     // restore the RNS default (true) so a wire_set_proof_implicit toggle in one
     // test cannot leak into the next.
     runCatching { Reticulum.setUseImplicitProofForTest(true) }
+    // Reset the JVM-singleton Resource watchdog suppression so a test that left
+    // it set (e.g. crashed mid buildResourceReceiver) can't leak into the next.
+    runCatching { Resource.watchdogDisabledForTest = false }
     for (inst in stale) {
         runCatching { inst.serverIface?.detach() }
         runCatching { inst.clientIface?.detach() }
@@ -1054,6 +1141,17 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
 
         val enableRatchets = p.get("enable_ratchets")?.asBoolean ?: false
+        // Resource-acceptance strategy this listener applies to inbound links
+        // (Link.set_resource_strategy). Mirrors cmd_wire_listen's resource_strategy
+        // ('all'|'none'|'app'); default ACCEPT_ALL.
+        val resourceStrategy = when (p.get("resource_strategy")?.asString) {
+            "none" -> Link.ACCEPT_NONE
+            "app" -> Link.ACCEPT_APP
+            "all", null -> Link.ACCEPT_ALL
+            else -> throw IllegalArgumentException(
+                "Unknown resource_strategy: ${p.get("resource_strategy")?.asString} (use all|none|app)",
+            )
+        }
 
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
@@ -1074,7 +1172,7 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             destination.enableRatchets(ratchetsFile.absolutePath)
         }
 
-        val listener = Listener(destination, identity)
+        val listener = Listener(destination, identity, resourceStrategy = resourceStrategy)
         // On link established, wire both packet and resource callbacks into
         // the listener's buffers.
         destination.setLinkEstablishedCallback { linkObj ->
@@ -1090,9 +1188,23 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             link.setPacketCallback { data, _packet ->
                 listener.recvBuffer.add(data.copyOf())
             }
-            // Accept any incoming Resource transfer and buffer its
-            // reassembled data on completion.
-            link.setResourceStrategy(Link.ACCEPT_ALL)
+            // Apply the listener's resource-acceptance strategy. For ACCEPT_APP,
+            // install a deterministic predicate accepting a Resource iff its
+            // advertised uncompressed data size <= 4096 (mirrors the reference
+            // app_accept, wire_tcp.py _RESOURCE_APP_ACCEPT_MAX_SIZE).
+            link.setResourceStrategy(listener.resourceStrategy)
+            if (listener.resourceStrategy == Link.ACCEPT_APP) {
+                link.setResourceCallback { adv -> adv.dataSize <= 4096 }
+            }
+
+            // Record each inbound Resource for wire_resource_receiver_status and
+            // lower its decompression bound so the bz2-bomb guard trips cheaply
+            // (mirrors the reference on_resource_started, wire_tcp.py:1245-1290).
+            link.setResourceStartedCallback { resourceObj ->
+                val resource = resourceObj as? Resource ?: return@setResourceStartedCallback
+                runCatching { resource.setMaxDecompressedSizeForTest(WIRE_RX_MAX_DECOMPRESSED) }
+                listener.incomingResources.add(resource)
+            }
 
             // Per-link dedup set: reticulum-kt's Resource.assemble() invokes
             // Link.resourceConcluded twice for the same completed resource
@@ -1217,6 +1329,8 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val linkIdHex = p.str("link_id")
         val payload = p.hex("data")
         val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+        val metadata = p.hexOpt("metadata")
+        val wait = p.get("wait")?.asBoolean ?: true
 
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
@@ -1224,36 +1338,58 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val link = inst.outLinks[linkIdHex]
             ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
 
-        val done = CountDownLatch(1)
-        val finalStatus = java.util.concurrent.atomic.AtomicInteger(-1)
+        if (!wait) {
+            // Non-blocking start: the transfer runs on its own worker (advertise
+            // spawns the driving threads); mint a resource_id, stash the Resource
+            // so wire_resource_cancel can find it, and return immediately. Mirrors
+            // cmd_wire_resource_send wait=False (wire_tcp.py).
+            val resource = Resource.create(data = payload, link = link, metadata = metadata)
+            val resourceId = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }.toHex()
+            inst.outResources[resourceId] = resource
+            result(
+                "started" to boolVal(true),
+                "resource_id" to strVal(resourceId),
+                "size" to intVal(payload.size),
+                "has_metadata" to boolVal(resource.hasMetadata),
+                "total_segments" to intVal(resource.totalSegments),
+            )
+        } else {
+            val done = CountDownLatch(1)
+            val finalStatus = java.util.concurrent.atomic.AtomicInteger(-1)
 
-        val resource = Resource.create(
-            data = payload,
-            link = link,
-            callback = { r ->
-                finalStatus.set(r.status)
-                done.countDown()
-            },
-        )
+            val resource = Resource.create(
+                data = payload,
+                link = link,
+                metadata = metadata,
+                callback = { r ->
+                    finalStatus.set(r.status)
+                    done.countDown()
+                },
+            )
 
-        val finished = done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        if (!finished) {
-            // Cancel the still-running transfer so its background worker
-            // can't fire the resource-concluded callback on the receiver
-            // later and leave a phantom payload in the listener's buffer
-            // for a subsequent wire_resource_poll in the same test to
-            // pick up. Symmetric with the Python bridge's on-timeout
-            // cancel.
-            runCatching { resource.cancel() }
+            val finished = done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            if (!finished) {
+                // Cancel the still-running transfer so its background worker
+                // can't fire the resource-concluded callback on the receiver
+                // later and leave a phantom payload in the listener's buffer
+                // for a subsequent wire_resource_poll in the same test to
+                // pick up. Symmetric with the Python bridge's on-timeout
+                // cancel.
+                runCatching { resource.cancel() }
+            }
+            val status = finalStatus.get().takeIf { it >= 0 } ?: resource.status
+            val success = finished && status == ResourceConstants.COMPLETE
+            result(
+                "success" to boolVal(success),
+                "status" to intVal(status),
+                "size" to intVal(payload.size),
+                "timed_out" to boolVal(!finished),
+                "has_metadata" to boolVal(resource.hasMetadata),
+                "total_segments" to intVal(resource.totalSegments),
+                "original_hash" to hexVal(resource.originalHash),
+                "compressed" to boolVal(resource.compressed),
+            )
         }
-        val status = finalStatus.get().takeIf { it >= 0 } ?: resource.status
-        val success = finished && status == ResourceConstants.COMPLETE
-        result(
-            "success" to boolVal(success),
-            "status" to intVal(status),
-            "size" to intVal(payload.size),
-            "timed_out" to boolVal(!finished),
-        )
     }
 
     "wire_resource_poll" -> {
@@ -4217,6 +4353,920 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "channel_proofs" to intVal(contexts.count { it == channelCtx }),
             "channel_context" to intVal(channelCtx),
         )
+    }
+
+    // ===== Phase 5d: Resource commands =====
+
+    "wire_resource_create" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val payload = p.hexOpt("data") ?: ByteArray(0)
+        val forceSdu = p.get("force_sdu")?.asInt
+        val includeParts = p.get("include_parts")?.asBoolean ?: true
+        val autoCompress = p.get("auto_compress")?.asBoolean ?: true
+        val metadata = p.hexOpt("metadata")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        val savedMtu = link.mtu
+        if (forceSdu != null) {
+            link.setMtuForTest(forceSdu + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+        }
+        val resource = try {
+            Resource.create(payload, link, metadata = metadata, advertise = false, autoCompress = autoCompress)
+        } finally {
+            if (forceSdu != null) link.setMtuForTest(savedMtu)
+        }
+        val adv = ResourceAdvertisement.fromResource(resource)
+        val pairs = mutableListOf<Pair<String, com.google.gson.JsonElement>>(
+            "hash" to hexVal(resource.hash),
+            // kotlin has no truncatedHash field; python truncated = full_hash[:16]
+            // (TRUNCATED_HASHLENGTH//8 == 16).
+            "truncated_hash" to hexVal(resource.hash.copyOf(16)),
+            "random_hash" to hexVal(resource.randomHash),
+            "expected_proof" to (resource.expectedProofForTest()?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "hashmap" to hexVal(resource.hashmapRaw),
+            "num_parts" to intVal(resource.parts.size),
+            "encrypted" to boolVal(resource.encrypted),
+            "compressed" to boolVal(resource.compressed),
+            "split" to boolVal(resource.split),
+            "total_segments" to intVal(resource.totalSegments),
+            "segment_index" to intVal(resource.segmentIndex),
+            "original_hash" to hexVal(resource.originalHash),
+            "has_metadata" to boolVal(resource.hasMetadata),
+            "flags" to intVal(adv.flags),
+            "size" to intVal(resource.size),
+            "total_size" to intVal(resource.totalSize),
+            "sdu" to intVal(resource.sduForTest()),
+        )
+        if (includeParts) {
+            val arr = JsonArray()
+            resource.parts.forEach { arr.add((it ?: ByteArray(0)).toHex()) }
+            pairs.add("parts" to arr)
+        }
+        result(*pairs.toTypedArray())
+    }
+
+    "wire_resource_constants" -> {
+        result(
+            "WINDOW" to intVal(ResourceConstants.WINDOW),
+            "WINDOW_MIN" to intVal(ResourceConstants.WINDOW_MIN),
+            "WINDOW_MAX" to intVal(ResourceConstants.WINDOW_MAX),
+            "MAPHASH_LEN" to intVal(ResourceConstants.MAPHASH_LEN),
+            "RANDOM_HASH_SIZE" to intVal(ResourceConstants.RANDOM_HASH_SIZE),
+            "HASHMAP_MAX_LEN" to intVal(ResourceAdvertisement.HASHMAP_MAX_LEN),
+            "COLLISION_GUARD_SIZE" to intVal(ResourceAdvertisement.COLLISION_GUARD_SIZE),
+            "MAX_EFFICIENT_SIZE" to intVal(ResourceConstants.MAX_EFFICIENT_SIZE),
+            "METADATA_MAX_SIZE" to intVal(ResourceConstants.METADATA_MAX_SIZE),
+            "MAX_RETRIES" to intVal(ResourceConstants.MAX_RETRIES),
+            "MAX_ADV_RETRIES" to intVal(ResourceConstants.MAX_ADV_RETRIES),
+            "HASHMAP_IS_EXHAUSTED" to intVal(ResourceConstants.HASHMAP_IS_EXHAUSTED),
+            "HASHMAP_IS_NOT_EXHAUSTED" to intVal(ResourceConstants.HASHMAP_IS_NOT_EXHAUSTED),
+            "WINDOW_MAX_SLOW" to intVal(ResourceConstants.WINDOW_MAX_SLOW),
+            "WINDOW_MAX_VERY_SLOW" to intVal(ResourceConstants.WINDOW_MAX_VERY_SLOW),
+            "WINDOW_MAX_FAST" to intVal(ResourceConstants.WINDOW_MAX_FAST),
+            "WINDOW_FLEXIBILITY" to intVal(ResourceConstants.WINDOW_FLEXIBILITY),
+            "FAST_RATE_THRESHOLD" to intVal(ResourceConstants.FAST_RATE_THRESHOLD),
+            "VERY_SLOW_RATE_THRESHOLD" to intVal(ResourceConstants.VERY_SLOW_RATE_THRESHOLD),
+            "RATE_FAST" to doubleVal(ResourceConstants.RATE_FAST.toDouble()),
+            "RATE_VERY_SLOW" to doubleVal(ResourceConstants.RATE_VERY_SLOW.toDouble()),
+            "PART_TIMEOUT_FACTOR" to intVal(ResourceConstants.PART_TIMEOUT_FACTOR),
+            "PART_TIMEOUT_FACTOR_AFTER_RTT" to intVal(ResourceConstants.PART_TIMEOUT_FACTOR_AFTER_RTT),
+            "PROOF_TIMEOUT_FACTOR" to intVal(ResourceConstants.PROOF_TIMEOUT_FACTOR),
+            "AUTO_COMPRESS_MAX_SIZE" to intVal(ResourceConstants.AUTO_COMPRESS_MAX_SIZE),
+        )
+    }
+
+    "wire_resource_decompress_limit" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val sender = Resource.create(randomBytes(500), link, advertise = false)
+        result(
+            "max_decompressed_size" to intVal(sender.maxDecompressedSizeForTest()),
+            "auto_compress_limit" to intVal(sender.autoCompressLimitForTest()),
+            "constant" to intVal(ResourceConstants.AUTO_COMPRESS_MAX_SIZE),
+        )
+    }
+
+    "wire_resource_progress" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1500, forceSdu = 200)
+        val total = receiver.parts.size
+        if (total < 4) throw IllegalStateException("need a multi-part transfer, got $total")
+        val counter = java.util.concurrent.atomic.AtomicInteger(0)
+        receiver.callbacks.progress = { counter.incrementAndGet() }
+        val progressInitial = receiver.progress.toDouble()
+        val fed = total / 2
+        receiver.setAutoRequestNextForTest(false)
+        for (i in 0 until fed) receiver.receivePart(sender.parts[i]!!)
+        receiver.setAutoRequestNextForTest(true)
+        val out = result(
+            "total_parts" to intVal(total),
+            "fed" to intVal(fed),
+            "received_count" to intVal(receiver.receivedCountForTest()),
+            "progress_initial" to doubleVal(progressInitial),
+            "progress_mid" to doubleVal(receiver.progress.toDouble()),
+            "progress_callback_calls" to intVal(counter.get()),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_receiver_proof_count" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1200, forceSdu = 200)
+        val total = receiver.parts.size
+        if (total < 2) throw IllegalStateException("need a multi-part transfer, got $total")
+        for (i in 0 until total - 1) receiver.receivePart(sender.parts[i]!!)
+        val proofsBefore = receiver.proveCallCountForTest()
+        // Last part triggers assemble() synchronously inside receivePart.
+        receiver.receivePart(sender.parts[total - 1]!!)
+        val status = receiver.status
+        val out = result(
+            "total_parts" to intVal(total),
+            "proofs_before_final" to intVal(proofsBefore),
+            "proofs_after_assembly" to intVal(receiver.proveCallCountForTest()),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "complete" to boolVal(status == ResourceConstants.COMPLETE),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_receiver_request_state" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val n = p.get("n")?.asInt ?: 2
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1500, forceSdu = 200)
+        val total = receiver.parts.size
+        val windowInit = receiver.windowForTest()
+        val windowMin = receiver.windowMinForTest()
+        val windowMax = receiver.windowMaxForTest()
+        val cchInit = receiver.consecutiveCompletedHeightForTest()
+        val hmHeightInit = receiver.hashmapHeightForTest()
+        val waitingInit = receiver.waitingForHmuForTest()
+        val fed = minOf(n, total)
+        for (i in 0 until fed) receiver.receivePart(sender.parts[i]!!)
+        val out = result(
+            "window" to intVal(windowInit),
+            "window_min" to intVal(windowMin),
+            "window_max" to intVal(windowMax),
+            "total_parts" to intVal(total),
+            "consecutive_height_initial" to intVal(cchInit),
+            "hashmap_height_initial" to intVal(hmHeightInit),
+            "waiting_for_hmu_initial" to boolVal(waitingInit),
+            "fed" to intVal(fed),
+            "received_count" to intVal(receiver.receivedCountForTest()),
+            "consecutive_height_after" to intVal(receiver.consecutiveCompletedHeightForTest()),
+            "hashmap_height_after" to intVal(receiver.hashmapHeightForTest()),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_request_next_content" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = if (variant == "exhausted") {
+            buildResourceReceiver(link, 14000, forceSdu = 150)
+        } else {
+            buildResourceReceiver(link, 1500, forceSdu = 200)
+        }
+        val segLen = ResourceAdvertisement.HASHMAP_MAX_LEN
+        val feed = when (variant) {
+            "initial" -> 0
+            "after_parts" -> 2
+            "exhausted" -> segLen - 1
+            else -> throw IllegalArgumentException("unknown request_next variant: $variant")
+        }
+        if (variant == "exhausted" && receiver.parts.size <= segLen) {
+            throw IllegalStateException("need a multi-segment transfer (>$segLen parts), got ${receiver.parts.size}")
+        }
+        // Suppress the internal follow-up request during the feed so only the
+        // explicit requestNext below is observed (mirrors the reference shadowing
+        // receiver.request_next during the feed).
+        receiver.setAutoRequestNextForTest(false)
+        for (i in 0 until feed) receiver.receivePart(sender.parts[i]!!)
+        receiver.setAutoRequestNextForTest(true)
+
+        val window = receiver.windowForTest()
+        val cch = receiver.consecutiveCompletedHeightForTest()
+        // expected hashes: hashmap[cch+1 ..] up to window, stopping at first null.
+        val entries = receiver.hashmapEntriesForTest()
+        val expected = JsonArray()
+        run {
+            var pn = cch + 1
+            while (pn < entries.size && expected.size() < window) {
+                val h = entries[pn] ?: break
+                expected.add(h.toHex())
+                pn++
+            }
+        }
+
+        val emitBefore = receiver.requestNextEmitCountForTest()
+        receiver.requestNextForTest()
+        val emitAfterFirst = receiver.requestNextEmitCountForTest()
+        val waiting = receiver.waitingForHmuForTest()
+        val req = receiver.lastRequestDataForTest()
+            ?: throw IllegalStateException("requestNext emitted no request data")
+        val flag = req[0].toInt() and 0xFF
+        val isExhausted = flag == ResourceConstants.HASHMAP_IS_EXHAUSTED
+        val pad = 1 + (if (isExhausted) ResourceConstants.MAPHASH_LEN else 0) + ResourceConstants.RESOURCE_HASH_LEN
+        val requested = JsonArray()
+        run {
+            var i = pad
+            while (i + ResourceConstants.MAPHASH_LEN <= req.size) {
+                requested.add(req.copyOfRange(i, i + ResourceConstants.MAPHASH_LEN).toHex())
+                i += ResourceConstants.MAPHASH_LEN
+            }
+        }
+        receiver.requestNextForTest()
+        val secondEmitted = receiver.requestNextEmitCountForTest() > emitAfterFirst
+        val out = result(
+            "variant" to strVal(variant),
+            "window" to intVal(window),
+            "total_parts" to intVal(receiver.parts.size),
+            "hashmap_height" to intVal(receiver.hashmapHeightForTest()),
+            "consecutive_height" to intVal(cch),
+            "requested" to requested,
+            "expected" to expected,
+            "exhausted" to boolVal(isExhausted),
+            "waiting_for_hmu" to boolVal(waiting),
+            "second_request_emitted" to boolVal(secondEmitted),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_part_count_derivation" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val savedMtu = link.mtu
+        link.setMtuForTest(200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+        Resource.watchdogDisabledForTest = true
+        val out: JsonObject
+        try {
+            val sender = Resource.create(randomBytes(1500), link, advertise = false)
+            val adv = ResourceAdvertisement.fromResource(sender)
+            val advNGenuine = adv.numParts
+            val transferSize = adv.transferSize
+            adv.numParts = advNGenuine + 5  // tamper ONLY the part-count field
+            val receiver = Resource.accept(adv, link)
+                ?: throw IllegalStateException("Resource.accept did not produce a receiver")
+            val receiverSdu = receiver.sduForTest()
+            val derivedExpected = ceilDiv(transferSize, receiverSdu)
+            out = result(
+                "sender_parts" to intVal(sender.parts.size),
+                "adv_n_genuine" to intVal(advNGenuine),
+                "adv_n_tampered" to intVal(advNGenuine + 5),
+                "transfer_size" to intVal(transferSize),
+                "receiver_sdu" to intVal(receiverSdu),
+                "receiver_total_parts" to intVal(receiver.parts.size),
+                "derived_expected" to intVal(derivedExpected),
+            )
+            runCatching { receiver.cancel() }
+        } finally {
+            Resource.watchdogDisabledForTest = false
+            link.setMtuForTest(savedMtu)
+        }
+        out
+    }
+
+    "wire_resource_window_inheritance" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender1, receiver1) = buildResourceReceiver(link, 1500, forceSdu = 150)
+        val total1 = receiver1.parts.size
+        if (total1 <= ResourceConstants.WINDOW + 1) {
+            throw IllegalStateException("need >${ResourceConstants.WINDOW + 1} parts, got $total1")
+        }
+        for (i in 0 until total1) receiver1.receivePart(sender1.parts[i]!!)
+        val windowAfterComplete = receiver1.windowForTest()
+        val completed1 = receiver1.status == ResourceConstants.COMPLETE
+        val linkLastWindow = link.getLastResourceWindow()
+        val (_, receiver2) = buildResourceReceiver(link, 1500, forceSdu = 150)
+        val window2Initial = receiver2.windowForTest()
+        val out = result(
+            "default_window" to intVal(ResourceConstants.WINDOW),
+            "total_parts_1" to intVal(total1),
+            "completed_1" to boolVal(completed1),
+            "window_after_complete" to intVal(windowAfterComplete),
+            "link_last_window" to (linkLastWindow?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "window2_initial" to intVal(window2Initial),
+        )
+        runCatching { receiver2.cancel() }
+        out
+    }
+
+    "wire_resource_late_after_cancel" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val segLen = ResourceAdvertisement.HASHMAP_MAX_LEN
+        Resource.watchdogDisabledForTest = true
+        val out: JsonObject
+        try {
+            // RECEIVER path
+            val (rsender, receiver) = buildResourceReceiver(link, 12000, forceSdu = 150)
+            if (receiver.parts.size <= segLen) throw IllegalStateException("need >$segLen parts")
+            receiver.cancel()
+            val recvStatus = ResourceConstants.statusDescription(receiver.status)
+            val recvReceivedBefore = receiver.receivedCountForTest()
+            val recvHeightBefore = receiver.hashmapHeightForTest()
+            receiver.receivePart(rsender.parts[0]!!)
+            val recvReceivedAfter = receiver.receivedCountForTest()
+            val start = segLen * ResourceConstants.MAPHASH_LEN
+            val end = minOf(2 * segLen, rsender.parts.size) * ResourceConstants.MAPHASH_LEN
+            receiver.hashmapUpdateForTest(1, rsender.hashmapRaw.copyOfRange(start, end))
+            val recvHeightAfter = receiver.hashmapHeightForTest()
+
+            // SENDER path
+            val savedMtu = link.mtu
+            link.setMtuForTest(200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+            val sender = try { Resource.create(randomBytes(1500), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+            sender.primeTransferringForTest()
+            sender.cancel()
+            val sendStatus = ResourceConstants.statusDescription(sender.status)
+            val sendSentBefore = sender.sentPartsForTest()
+            val reqData = byteArrayOf(ResourceConstants.HASHMAP_IS_NOT_EXHAUSTED.toByte()) + sender.hash + sender.hashmapRaw
+            sender.handleRequest(reqData)
+            val sendSentAfter = sender.sentPartsForTest()
+            val proof = randomBytes(32) + (sender.expectedProofForTest() ?: ByteArray(32))
+            sender.validateProof(proof)
+            val sendStatusAfterProof = ResourceConstants.statusDescription(sender.status)
+
+            // CONTROL: a fresh sender accepts the same proof shape pre-cancel.
+            link.setMtuForTest(200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+            val ctl = try { Resource.create(randomBytes(1500), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+            ctl.setStatusForTest(ResourceConstants.AWAITING_PROOF)
+            val ctlProof = randomBytes(32) + (ctl.expectedProofForTest() ?: ByteArray(32))
+            ctl.validateProof(ctlProof)
+            val ctlStatus = ResourceConstants.statusDescription(ctl.status)
+
+            out = result(
+                "receiver_status" to strVal(recvStatus),
+                "receiver_received_before" to intVal(recvReceivedBefore),
+                "receiver_received_after_late_part" to intVal(recvReceivedAfter),
+                "receiver_height_before" to intVal(recvHeightBefore),
+                "receiver_height_after_late_hmu" to intVal(recvHeightAfter),
+                "sender_status" to strVal(sendStatus),
+                "sender_sent_before" to intVal(sendSentBefore),
+                "sender_sent_after_late_request" to intVal(sendSentAfter),
+                "sender_status_after_late_proof" to strVal(sendStatusAfterProof),
+                "control_status_after_proof" to strVal(ctlStatus),
+            )
+            runCatching { receiver.cancel() }
+            runCatching { sender.cancel() }
+            runCatching { ctl.cancel() }
+        } finally {
+            Resource.watchdogDisabledForTest = false
+        }
+        out
+    }
+
+    "wire_resource_outgoing_queue_state" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 5000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val readyEmpty = link.readyForNewResource()
+        val first = Resource.create(randomBytes(800), link, advertise = false)
+        link.registerOutgoingResource(first)
+        val readyWithOne = link.readyForNewResource()
+        val second = Resource.create(randomBytes(800), link, advertise = true)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (second.status == ResourceConstants.QUEUED) break
+            Thread.sleep(20)
+        }
+        val out = result(
+            "ready_empty" to boolVal(readyEmpty),
+            "ready_with_one" to boolVal(readyWithOne),
+            "first_status" to intVal(first.status),
+            "first_status_name" to strVal(ResourceConstants.statusDescription(first.status)),
+            "second_status" to intVal(second.status),
+            "second_status_name" to strVal(ResourceConstants.statusDescription(second.status)),
+            "queued" to boolVal(second.status == ResourceConstants.QUEUED),
+        )
+        runCatching { second.cancel() }
+        runCatching { link.cancelOutgoingResource(first) }
+        out
+    }
+
+    "wire_resource_force_collision" -> {
+        // BLOCKED (reticulum-kt#resource-collision-guard): kotlin
+        // initializeForSending builds the hashmap in a SINGLE pass with no
+        // collision_guard_list / random_hash regeneration / rebuild loop (cf.
+        // python Resource.py:436-472). There is no remap path to drive, so this
+        // reports the genuine (no-remap) observation; the test's remapped==True
+        // assertion fails by design until the collision-guard loop is implemented.
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val savedMtu = link.mtu
+        link.setMtuForTest(200 + network.reticulum.common.RnsConstants.HEADER_MAX_SIZE + network.reticulum.common.RnsConstants.IFAC_MIN_SIZE)
+        val resource = try { Resource.create(randomBytes(4000), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+        result(
+            "remapped" to boolVal(false),
+            "random_hash_before" to hexVal(resource.randomHash),
+            "random_hash_after" to hexVal(resource.randomHash),
+            "hashmap_changed" to boolVal(false),
+            "num_parts" to intVal(resource.parts.size),
+        )
+    }
+
+    "wire_resource_cancel" -> {
+        val handle = p.str("handle")
+        val resourceId = p.str("resource_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val resource = inst.outResources[resourceId]
+            ?: throw IllegalArgumentException("Unknown resource_id: $resourceId")
+        val cancelled = runCatching { resource.cancel(); true }.getOrDefault(false)
+        result(
+            "cancelled" to boolVal(cancelled),
+            "resource_id" to strVal(resourceId),
+            "status" to intVal(resource.status),
+        )
+    }
+
+    "wire_resource_send_bomb" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val requested = p.get("decompressed_size")?.asInt ?: (WIRE_RX_MAX_DECOMPRESSED + 1024 * 1024)
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 30000
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val floor = WIRE_RX_MAX_DECOMPRESSED + 1
+        val ceil = minOf(WIRE_RX_MAX_DECOMPRESSED * 2, ResourceConstants.MAX_EFFICIENT_SIZE - 1)
+        val crafted = maxOf(floor, minOf(requested, ceil))
+        val payload = ByteArray(crafted)  // zeros: bz2-compresses tiny, inflates past the bound
+        val done = CountDownLatch(1)
+        val finalStatus = java.util.concurrent.atomic.AtomicInteger(-1)
+        val resource = Resource.create(payload, link, callback = { r -> finalStatus.set(r.status); done.countDown() })
+        val resourceId = randomBytes(8).toHex()
+        inst.outResources[resourceId] = resource
+        val finished = done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        if (!finished) runCatching { resource.cancel() }
+        val status = finalStatus.get().takeIf { it >= 0 } ?: resource.status
+        result(
+            "success" to boolVal(status == ResourceConstants.COMPLETE),
+            "status" to intVal(status),
+            "size" to intVal(crafted),
+            "resource_id" to strVal(resourceId),
+        )
+    }
+
+    "wire_resource_receiver_status" -> {
+        val handle = p.str("handle")
+        val destHashHex = p.str("destination_hash")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 0
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHashHex]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=$destHashHex")
+        val terminal = setOf(ResourceConstants.COMPLETE, ResourceConstants.FAILED, ResourceConstants.CORRUPT)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            val last = listener.incomingResources.peekLast()
+            if (last != null) {
+                if (last.status in terminal || System.currentTimeMillis() >= deadline) break
+            } else if (System.currentTimeMillis() >= deadline) {
+                break
+            }
+            Thread.sleep(50)
+        }
+        val recs = listener.incomingResources.toList()
+        if (recs.isEmpty()) {
+            result("found" to boolVal(false), "resource_count" to intVal(0))
+        } else {
+            val resource = recs.last()
+            val status = resource.status
+            val metadataBytes = resource.metadataBytes
+            val dataBytes = resource.data
+            result(
+                "found" to boolVal(true),
+                "resource_count" to intVal(recs.size),
+                "status" to intVal(status),
+                "status_name" to strVal(ResourceConstants.statusDescription(status)),
+                "corrupt" to boolVal(status == ResourceConstants.CORRUPT),
+                "hmu_requests_sent" to intVal(resource.hmuRequestsSentForTest()),
+                "hashmap_updates_received" to intVal(resource.hashmapUpdatesReceivedForTest()),
+                "hashmap_height" to intVal(resource.hashmapHeightForTest()),
+                "max_decompressed_size" to intVal(resource.maxDecompressedSizeForTest()),
+                "compressed" to boolVal(resource.compressed),
+                "has_metadata" to boolVal(resource.hasMetadata),
+                "metadata" to (metadataBytes?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                "data" to (dataBytes?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            )
+        }
+    }
+
+    "wire_inject_corrupt_assembled_resource" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 900, forceSdu = 200)
+        for (i in receiver.parts.indices) receiver.setPartForTest(i, sender.parts[i]!!)
+        when (variant) {
+            "valid" -> {}
+            "corrupt" -> {
+                val j = receiver.parts.size / 2
+                receiver.setPartForTest(j, randomBytes(sender.parts[j]!!.size))
+            }
+            else -> throw IllegalArgumentException("unknown corrupt-assemble variant: $variant")
+        }
+        receiver.assembleForTest()
+        val status = receiver.status
+        val out = result(
+            "variant" to strVal(variant),
+            "status" to intVal(status),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "complete" to boolVal(status == ResourceConstants.COMPLETE),
+            "corrupt" to boolVal(status == ResourceConstants.CORRUPT),
+            "proof_calls" to intVal(receiver.proveCallCountForTest()),
+            "proof_sent" to boolVal(receiver.proveCallCountForTest() > 0),
+            "total_parts" to intVal(receiver.parts.size),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_inject_crafted_resource_part" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        fun received(r: Resource) = r.parts.count { it != null }
+
+        val out: JsonObject
+        if (variant == "beyond_window" || variant == "duplicate_filled") {
+            val (sender, receiver) = buildResourceReceiver(link, 1500, forceSdu = 200)
+            val window = receiver.windowForTest()
+            if (receiver.parts.size <= window + 1) {
+                throw IllegalStateException("need >${window + 1} parts, got ${receiver.parts.size}")
+            }
+            var partsBefore = received(receiver)
+            if (variant == "beyond_window") {
+                receiver.receivePart(sender.parts[window]!!)
+            } else {
+                receiver.receivePart(sender.parts[0]!!)
+                partsBefore = received(receiver)
+                receiver.receivePart(sender.parts[0]!!)  // duplicate into filled slot
+            }
+            val partsAfter = received(receiver)
+            out = result(
+                "variant" to strVal(variant),
+                "accepted" to boolVal(partsAfter > partsBefore),
+                "parts_before" to intVal(partsBefore),
+                "parts_after" to intVal(partsAfter),
+                "total_parts" to intVal(receiver.parts.size),
+                "window" to intVal(window),
+                "received_count_after" to intVal(receiver.receivedCountForTest()),
+            )
+            runCatching { receiver.cancel() }
+        } else {
+            Resource.watchdogDisabledForTest = true
+            try {
+                val sender = Resource.create(randomBytes(2000), link, advertise = false)
+                val receiver = Resource.accept(ResourceAdvertisement.fromResource(sender), link)
+                    ?: throw IllegalStateException("Resource.accept did not produce a receiver")
+                val partsBefore = received(receiver)
+                val partData = when (variant) {
+                    "valid" -> sender.parts[0]!!
+                    "forged_map_hash" -> randomBytes(sender.parts[0]!!.size)
+                    else -> throw IllegalArgumentException("unknown resource-part variant: $variant")
+                }
+                receiver.receivePart(partData)
+                val partsAfter = received(receiver)
+                out = result(
+                    "variant" to strVal(variant),
+                    "accepted" to boolVal(partsAfter > partsBefore),
+                    "parts_before" to intVal(partsBefore),
+                    "parts_after" to intVal(partsAfter),
+                    "total_parts" to intVal(receiver.parts.size),
+                )
+                runCatching { receiver.cancel() }
+            } finally {
+                Resource.watchdogDisabledForTest = false
+            }
+        }
+        out
+    }
+
+    "wire_inject_crafted_resource_proof" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val resource = Resource.create(randomBytes(200), link, advertise = false)
+        val expected = resource.expectedProofForTest() ?: ByteArray(32)
+        val proof = when (variant) {
+            "valid" -> randomBytes(32) + expected
+            "wrong_proof" -> randomBytes(32) + randomBytes(32)
+            "wrong_length_short" -> randomBytes(32)
+            "wrong_length_long" -> randomBytes(96)
+            else -> throw IllegalArgumentException("unknown resource-proof variant: $variant")
+        }
+        runCatching { resource.validateProof(proof) }
+        val status = resource.status
+        val out = result(
+            "variant" to strVal(variant),
+            "concluded" to boolVal(status == ResourceConstants.COMPLETE),
+            "status" to intVal(status),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "proof_len" to intVal(proof.size),
+        )
+        runCatching { resource.cancel() }
+        out
+    }
+
+    "wire_inject_crafted_resource_request" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val overhead = network.reticulum.common.RnsConstants.HEADER_MAX_SIZE +
+            network.reticulum.common.RnsConstants.IFAC_MIN_SIZE
+        fun mapHashOf(s: Resource, i: Int): ByteArray =
+            s.hashmapRaw.copyOfRange(i * ResourceConstants.MAPHASH_LEN, (i + 1) * ResourceConstants.MAPHASH_LEN)
+        val exhausted = ResourceConstants.HASHMAP_IS_EXHAUSTED.toByte()
+        val notExhausted = ResourceConstants.HASHMAP_IS_NOT_EXHAUSTED.toByte()
+
+        val out: JsonObject = when (variant) {
+            "misaligned_hmu", "aligned" -> {
+                val savedMtu = link.mtu; link.setMtuForTest(50 + overhead)
+                val sender = try { Resource.create(randomBytes(6000), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+                if (sender.parts.size < 74) throw IllegalStateException("need >=74 parts, got ${sender.parts.size}")
+                sender.primeTransferringForTest()
+                val partIndex = if (variant == "misaligned_hmu") 0 else 73
+                val req = byteArrayOf(exhausted) + mapHashOf(sender, partIndex) + sender.hash
+                sender.handleRequest(req)
+                val r = result(
+                    "variant" to strVal(variant),
+                    "cancelled" to boolVal(sender.status == ResourceConstants.FAILED),
+                    "status" to intVal(sender.status),
+                    "status_name" to strVal(ResourceConstants.statusDescription(sender.status)),
+                )
+                runCatching { sender.cancel() }
+                r
+            }
+            "aligned_scope" -> {
+                val savedMtu = link.mtu; link.setMtuForTest(50 + overhead)
+                val sender = try { Resource.create(randomBytes(9000), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+                if (sender.parts.size < 148) throw IllegalStateException("need >=148 parts, got ${sender.parts.size}")
+                sender.primeTransferringForTest()
+                val scopeBefore = sender.receiverMinConsecutiveHeightForTest()
+                val req = byteArrayOf(exhausted) + mapHashOf(sender, 147) + sender.hash
+                sender.handleRequest(req)
+                val r = result(
+                    "variant" to strVal(variant),
+                    "part_index" to intVal(148),
+                    "window_max" to intVal(ResourceConstants.WINDOW_MAX),
+                    "scope_before" to intVal(scopeBefore),
+                    "scope_after" to intVal(sender.receiverMinConsecutiveHeightForTest()),
+                    "cancelled" to boolVal(sender.status == ResourceConstants.FAILED),
+                    "status_name" to strVal(ResourceConstants.statusDescription(sender.status)),
+                )
+                runCatching { sender.cancel() }
+                r
+            }
+            "serve_all" -> {
+                val savedMtu = link.mtu; link.setMtuForTest(200 + overhead)
+                val sender = try { Resource.create(randomBytes(1500), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+                sender.primeTransferringForTest()
+                val req = byteArrayOf(notExhausted) + sender.hash + sender.hashmapRaw
+                sender.handleRequest(req)
+                val servedIndices = JsonArray()
+                sender.sentPartIndicesForTest().forEach { servedIndices.add(it) }
+                val sentParts = sender.sentPartsForTest()
+                val statusName = ResourceConstants.statusDescription(sender.status)
+                val before = sender.parts.map { it?.toHex() }
+                sender.setStatusForTest(ResourceConstants.TRANSFERRING)
+                sender.handleRequest(req)
+                val after = sender.parts.map { it?.toHex() }
+                val r = result(
+                    "variant" to strVal(variant),
+                    "served_indices" to servedIndices,
+                    "sent_parts" to intVal(sentParts),
+                    "total_parts" to intVal(sender.parts.size),
+                    "identical_on_resend" to boolVal(before == after),
+                    "status_name" to strVal(statusName),
+                )
+                runCatching { sender.cancel() }
+                r
+            }
+            "duplicate" -> {
+                // BLOCKED (reticulum-kt#resource-req-hashlist): kotlin
+                // Link.processResourceReq has no req_hashlist packet-hash de-dup
+                // (cf. Link.py:1109-1115). Drive the genuine behaviour and report
+                // it honestly; first_in_hashlist / req_hashlist_len have no source.
+                val savedMtu = link.mtu; link.setMtuForTest(200 + overhead)
+                val sender = try { Resource.create(randomBytes(1500), link, advertise = false) } finally { link.setMtuForTest(savedMtu) }
+                sender.primeTransferringForTest()
+                link.registerOutgoingResource(sender)
+                val reqData = byteArrayOf(notExhausted) + sender.hash + sender.hashmapRaw
+                feedInboundLinkPacket(link, reqData, network.reticulum.common.PacketContext.RESOURCE_REQ)
+                val firstServed = sender.sentPartsForTest()
+                feedInboundLinkPacket(link, reqData, network.reticulum.common.PacketContext.RESOURCE_REQ)
+                val secondServed = sender.sentPartsForTest()
+                val r = result(
+                    "variant" to strVal(variant),
+                    "total_parts" to intVal(sender.parts.size),
+                    "first_served" to intVal(firstServed),
+                    "second_served" to intVal(secondServed),
+                    "first_in_hashlist" to boolVal(false),
+                    "req_hashlist_len" to intVal(0),
+                    "deduped" to boolVal(false),
+                )
+                runCatching { link.cancelOutgoingResource(sender) }
+                runCatching { sender.cancel() }
+                r
+            }
+            else -> throw IllegalArgumentException("unknown resource-request variant: $variant")
+        }
+        out
+    }
+
+    "wire_inject_duplicate_resource_adv" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        Resource.watchdogDisabledForTest = true
+        val out: JsonObject
+        try {
+            val sender = Resource.create(randomBytes(800), link, advertise = false)
+            val adv = ResourceAdvertisement.fromResource(sender)
+            fun countForHash() = link.incomingResourceHashesForTest().count { it.contentEquals(sender.hash) }
+            val receiver1 = Resource.accept(adv, link)
+            val firstAccepted = receiver1 != null
+            val countAfterFirst = countForHash()
+            val receiver2 = Resource.accept(adv, link)
+            val secondCreated = receiver2 != null
+            val incomingCount = countForHash()
+            out = result(
+                "first_accepted" to boolVal(firstAccepted),
+                "second_created" to boolVal(secondCreated),
+                "incoming_count" to intVal(incomingCount),
+                "incoming_count_after_first" to intVal(countAfterFirst),
+            )
+            runCatching { receiver1?.cancel() }
+            runCatching { receiver2?.cancel() }
+        } finally {
+            Resource.watchdogDisabledForTest = false
+        }
+        out
+    }
+
+    "wire_inject_hashmap_update" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 12000, forceSdu = 150)
+        val segLen = ResourceAdvertisement.HASHMAP_MAX_LEN
+        if (sender.parts.size <= segLen) throw IllegalStateException("need >$segLen parts, got ${sender.parts.size}")
+        val heightAfterAdvert = receiver.hashmapHeightForTest()
+        val start = segLen * ResourceConstants.MAPHASH_LEN
+        val end = minOf(2 * segLen, sender.parts.size) * ResourceConstants.MAPHASH_LEN
+        val seg1 = sender.hashmapRaw.copyOfRange(start, end)
+        receiver.hashmapUpdateForTest(1, seg1)
+        val heightAfterFirst = receiver.hashmapHeightForTest()
+        receiver.hashmapUpdateForTest(1, seg1)
+        val heightAfterDuplicate = receiver.hashmapHeightForTest()
+        val out = result(
+            "total_parts" to intVal(sender.parts.size),
+            "height_after_advert" to intVal(heightAfterAdvert),
+            "height_after_first" to intVal(heightAfterFirst),
+            "height_after_duplicate" to intVal(heightAfterDuplicate),
+            "grew_on_first" to boolVal(heightAfterFirst > heightAfterAdvert),
+            "grew_on_duplicate" to boolVal(heightAfterDuplicate > heightAfterFirst),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_inject_malformed_resource_adv" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        Resource.watchdogDisabledForTest = true
+        val out: JsonObject
+        try {
+            val plaintext: ByteArray = when (variant) {
+                "garbage" -> byteArrayOf(0xC1.toByte()) + randomBytes(40)
+                "missing_key" -> {
+                    val sender = Resource.create(randomBytes(400), link, advertise = false)
+                    val genuine = ResourceAdvertisement.fromResource(sender).pack()
+                    // Re-pack the genuine msgpack map without the required "h" key.
+                    val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(genuine)
+                    val n = unpacker.unpackMapHeader()
+                    val kept = ArrayList<Pair<org.msgpack.value.Value, org.msgpack.value.Value>>()
+                    repeat(n) {
+                        val k = unpacker.unpackValue()
+                        val v = unpacker.unpackValue()
+                        if (!(k.isStringValue && k.asStringValue().asString() == "h")) kept.add(k to v)
+                    }
+                    unpacker.close()
+                    val bos = java.io.ByteArrayOutputStream()
+                    val packer = org.msgpack.core.MessagePack.newDefaultPacker(bos)
+                    packer.packMapHeader(kept.size)
+                    for ((k, v) in kept) { packer.packValue(k); packer.packValue(v) }
+                    packer.close()
+                    runCatching { sender.cancel() }
+                    bos.toByteArray()
+                }
+                else -> throw IllegalArgumentException("unknown malformed-adv variant: $variant")
+            }
+            val before = link.incomingResourceHashesForTest().size
+            var crashed = false
+            var receiver: Resource? = null
+            try {
+                val adv = ResourceAdvertisement.unpack(plaintext)
+                receiver = if (adv != null) Resource.accept(adv, link) else null
+            } catch (e: Exception) {
+                crashed = true
+            }
+            val after = link.incomingResourceHashesForTest().size
+            out = result(
+                "variant" to strVal(variant),
+                "inbound_started" to boolVal(receiver != null || after > before),
+                "crashed" to boolVal(crashed),
+            )
+            runCatching { receiver?.cancel() }
+        } finally {
+            Resource.watchdogDisabledForTest = false
+        }
+        out
+    }
+
+    "wire_inject_resource_adv_flags" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        data class FlagsCase(val requestId: ByteArray?, val isResponse: Boolean, val strategy: Int)
+        val case = when (variant) {
+            "request_autoaccept" -> FlagsCase(randomBytes(16), false, Link.ACCEPT_NONE)
+            "response_no_pending_request" -> FlagsCase(randomBytes(16), true, Link.ACCEPT_NONE)
+            "plain_accept_none" -> FlagsCase(null, false, Link.ACCEPT_NONE)
+            "plain_accept_all" -> FlagsCase(null, false, Link.ACCEPT_ALL)
+            else -> throw IllegalArgumentException("unknown adv-flags variant: $variant")
+        }
+        Resource.watchdogDisabledForTest = true
+        val out: JsonObject
+        try {
+            val sender = Resource.create(
+                randomBytes(600), link, advertise = false,
+                requestId = case.requestId, isResponse = case.isResponse,
+            )
+            val advPlain = ResourceAdvertisement.fromResource(sender).pack()
+            fun countForHash() = link.incomingResourceHashesForTest().count { it.contentEquals(sender.hash) }
+            val savedStrategy = link.getResourceStrategy()
+            val before = countForHash()
+            link.setResourceStrategy(case.strategy)
+            try {
+                feedInboundLinkPacket(link, advPlain, network.reticulum.common.PacketContext.RESOURCE_ADV)
+            } finally {
+                link.setResourceStrategy(savedStrategy)
+            }
+            val after = countForHash()
+            out = result(
+                "variant" to strVal(variant),
+                "accepted" to boolVal(after > before),
+                "strategy" to intVal(case.strategy),
+            )
+        } finally {
+            Resource.watchdogDisabledForTest = false
+        }
+        out
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")

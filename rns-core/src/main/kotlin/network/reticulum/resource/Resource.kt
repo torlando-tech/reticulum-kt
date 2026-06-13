@@ -64,6 +64,19 @@ class Resource private constructor(
         private val random = SecureRandom()
 
         /**
+         * Test-only watchdog suppression. Mirrors the reference conformance
+         * harness monkeypatching `RNS.Resource.watchdog_job = lambda self: None`
+         * around `_build_resource_receiver` (wire_tcp.py:6903) so an inbound
+         * Resource can be built and driven synchronously without its watchdog
+         * thread firing a part-request / timeout retry that would cancel the
+         * transfer out from under inspection. Production code never sets this;
+         * the conformance-bridge sets it true for the duration of a receiver
+         * build and resets it in resetWireState().
+         */
+        @Volatile
+        var watchdogDisabledForTest: Boolean = false
+
+        /**
          * Create a new resource for outgoing transfer.
          *
          * @param data The data to transfer
@@ -252,6 +265,14 @@ class Resource private constructor(
 
     // Window management
     private var window: Int = ResourceConstants.WINDOW
+
+    /**
+     * Current flow-control window, exposed module-internally so
+     * `Link.resourceConcluded` can record it as the link's last-resource-window
+     * (Link.py:1284). Not a test seam — this is production state used by the
+     * window-inheritance path.
+     */
+    internal val currentWindow: Int get() = window
     private var windowMax: Int = ResourceConstants.WINDOW_MAX_SLOW
     private var windowMin: Int = ResourceConstants.WINDOW_MIN
 
@@ -312,6 +333,31 @@ class Resource private constructor(
     // Proof tracking
     private var expectedProof: ByteArray? = null
 
+    // Decompression-bomb ceiling. Mirrors python Resource.__init__
+    // (Resource.py:364-365): max_decompressed_size == auto_compress_limit ==
+    // Resource.AUTO_COMPRESS_MAX_SIZE (64 MiB). This is the bound the receiver's
+    // bounded bz2 decompression stops at before declaring a CORRUPT bomb
+    // (Resource.py:686-689). A listener may lower it per-inbound-resource.
+    @Volatile
+    private var maxDecompressedSize: Int = ResourceConstants.AUTO_COMPRESS_MAX_SIZE
+    private var autoCompressLimit: Int = ResourceConstants.AUTO_COMPRESS_MAX_SIZE
+
+    // Conformance instrumentation counters (see *ForTest accessors). These count
+    // genuine state-machine events the reference harness observes by wrapping the
+    // python instance methods (which kotlin cannot monkeypatch per-instance).
+    @Volatile private var proveCalls: Int = 0
+    @Volatile private var lastRequestData: ByteArray? = null
+    @Volatile private var requestNextEmitCount: Int = 0
+    @Volatile private var hmuRequestsSent: Int = 0
+    @Volatile private var hashmapUpdatesReceived: Int = 0
+
+    // Test-only: when false, receivePart() does NOT auto-issue its follow-up
+    // requestNext() on a window drain. Mirrors the reference harness shadowing
+    // `receiver.request_next = lambda: None` during a part-feed so the feed only
+    // POSITIONS the consecutive pointer and the explicitly-driven requestNext()
+    // afterwards is the one observed. Default true = production behaviour.
+    @Volatile private var autoRequestNext: Boolean = true
+
     /**
      * Initialize resource for sending.
      * Matches Python RNS Resource.__init__() protocol.
@@ -321,19 +367,28 @@ class Resource private constructor(
         totalSize = data.size
         uncompressedSize = data.size
 
-        // Handle metadata - prepend with 3-byte size prefix like Python
+        // Handle metadata. Mirrors python Resource.__init__ (Resource.py:260-268):
+        //   packed_metadata = umsgpack.packb(metadata)
+        //   self.metadata   = struct.pack(">I", len(packed_metadata))[1:] + packed_metadata
+        //   data            = self.metadata + resource_data
+        // i.e. the metadata is first msgpack-packed (a `bytes` value packs to bin
+        // format: 0xC4 + len + body for <=255 bytes), THEN prefixed with a 3-byte
+        // big-endian length of the PACKED block. total_size counts the whole
+        // 3 + len(packed) metadata block. A previous build prepended the raw
+        // metadata without the msgpack wrapper, growing total_size by only
+        // 3 + len(metadata) instead of 3 + len(umsgpack.packb(metadata)).
         var dataWithMetadata = data
         if (metadata != null && metadata.size <= ResourceConstants.METADATA_MAX_SIZE) {
             this.metadata = metadata
             this.hasMetadata = true
-            // Pack metadata with 3-byte size prefix (big-endian)
-            val metaSize = metadata.size
+            val packedMetadata = msgpackPackBinary(metadata)
+            val metaSize = packedMetadata.size
             val metaPrefix = byteArrayOf(
                 ((metaSize shr 16) and 0xFF).toByte(),
                 ((metaSize shr 8) and 0xFF).toByte(),
                 (metaSize and 0xFF).toByte()
             )
-            dataWithMetadata = metaPrefix + metadata + data
+            dataWithMetadata = metaPrefix + packedMetadata + data
             totalSize = dataWithMetadata.size
         }
 
@@ -424,14 +479,29 @@ class Resource private constructor(
         totalSegments = adv.totalSegments
         requestId = adv.requestId
 
-        // Initialize parts array
-        val totalParts = adv.numParts
+        // Derive the part count from the advertised TRANSFER SIZE and this
+        // receiver's OWN per-part SDU — NOT the advertised n field. Mirrors
+        // python `Resource.accept` (Resource.py:187):
+        //   resource.total_parts = int(math.ceil(resource.size/float(resource.sdu)))
+        // The advertisement also carries n = len(parts) (Resource.py:301) but
+        // accept never reads it; trusting a tampered n would build a mis-sized
+        // parts list and desynchronise indexing.
+        val totalParts = ceil(size.toDouble() / sdu).toInt()
         parts = arrayOfNulls(totalParts)
         hashmap = arrayOfNulls(totalParts)
 
         // Parse hashmap from advertisement
         hashmapRaw = adv.hashmap
         updateHashmap(0, hashmapRaw)
+
+        // Inherit the previous transfer's final window on this link, mirroring
+        // python `Resource.accept` (Resource.py:216-218):
+        //   previous_window = resource.link.get_last_resource_window()
+        //   if previous_window: resource.window = previous_window
+        // Link.resourceConcluded records the window of each completed inbound
+        // transfer; a second transfer starts at that grown window rather than
+        // the WINDOW=4 default, preserving multi-resource throughput.
+        link.getLastResourceWindow()?.let { window = it }
 
         lastActivity = System.currentTimeMillis()
         startedTransferring = lastActivity
@@ -447,6 +517,37 @@ class Resource private constructor(
      * Advertise this resource to the receiver.
      */
     fun advertise() {
+        if (status != ResourceConstants.QUEUED) return
+
+        // One-outgoing-resource-at-a-time gate. Mirrors python
+        // `Resource.__advertise_job` (Resource.py:520-524):
+        //   while not self.link.ready_for_new_resource():
+        //       self.status = Resource.QUEUED
+        //       sleep(0.25)
+        // If the link already has an outgoing resource in flight, spin in QUEUED
+        // (on a daemon thread, like python's __advertise_job) until it is ready,
+        // then advertise. The common idle case (ready immediately) advertises
+        // synchronously, so this adds no thread/latency for the normal path.
+        if (!link.readyForNewResource()) {
+            thread(isDaemon = true, name = "resource-advertise-${hash.toHexString().take(8)}") {
+                while (status == ResourceConstants.QUEUED && !link.readyForNewResource()) {
+                    try {
+                        Thread.sleep(250)
+                    } catch (e: InterruptedException) {
+                        return@thread
+                    }
+                }
+                if (status == ResourceConstants.QUEUED) {
+                    doAdvertise()
+                }
+            }
+            return
+        }
+
+        doAdvertise()
+    }
+
+    private fun doAdvertise() {
         if (status != ResourceConstants.QUEUED) return
 
         // Register with link
@@ -656,7 +757,9 @@ class Resource private constructor(
                     }
                 }
 
-                requestNext()
+                // Auto-follow-up request, suppressible under test (see autoRequestNext)
+                // to mirror the reference shadowing request_next during a part-feed.
+                if (autoRequestNext) requestNext()
             }
         } finally {
             receivingPart = false
@@ -710,6 +813,13 @@ class Resource private constructor(
             if (lastMapHash != null) {
                 hmuPart.write(lastMapHash)
             }
+            // Count the false->true transition of waiting_for_hmu — this is the
+            // hashmap-update request the receiver issues over a >74-part transfer.
+            // The reference harness counts the same event by wrapping the
+            // instance request_next (wire_tcp.py on_resource_started). requestNext
+            // early-returns while waitingForHmu, so reaching here always means a
+            // false->true transition.
+            hmuRequestsSent++
             waitingForHmu = true
         }
 
@@ -722,6 +832,13 @@ class Resource private constructor(
         try {
             // Send encrypted via link
             val reqDataBytes = requestData.toByteArray()
+            // Record the genuine request plaintext + count this emit. Mirrors the
+            // reference harness capturing each outbound RESOURCE_REQ packet's
+            // .data (wire_tcp.py cmd_wire_resource_request_next_content). Captured
+            // only at the actual send block, so the waitingForHmu early-return
+            // above does not bump the count.
+            lastRequestData = reqDataBytes
+            requestNextEmitCount++
             val encrypted = link.encrypt(reqDataBytes)
             val packet = Packet.createRaw(
                 destinationHash = link.linkId,
@@ -766,9 +883,16 @@ class Resource private constructor(
         val wantsMoreHashmap = data[0].toInt() and 0xFF == ResourceConstants.HASHMAP_IS_EXHAUSTED
         val pad = if (wantsMoreHashmap) 1 + ResourceConstants.MAPHASH_LEN else 1
 
-        // Extract requested hashes (after pad + resource hash)
+        // Extract requested hashes (after pad + resource hash). Mirrors python
+        // `Resource.request` (Resource.py:998): requested_hashes =
+        // request_data[pad+HASHLENGTH//8:]. An exhausted HMU-only request carries
+        // NO requested hashes (data.size == hashStart) but MUST still reach the
+        // hashmap-update / sequencing-gate branch below — so only a strictly
+        // SHORTER (malformed) request is dropped here, not the empty-hashes case.
+        // (A previous `<=` guard dropped every HMU-only request, skipping the
+        // 74-alignment sequencing gate entirely.)
         val hashStart = pad + ResourceConstants.RESOURCE_HASH_LEN
-        if (data.size <= hashStart) return
+        if (data.size < hashStart) return
 
         val requestedHashesData = data.copyOfRange(hashStart, data.size)
 
@@ -784,21 +908,23 @@ class Resource private constructor(
             mapHashes.add(requestedHashesData.copyOfRange(start, end))
         }
 
-        // Find and send requested parts
+        // Find and send requested parts. Mirrors python `Resource.request`
+        // (Resource.py:1009-1014):
+        //   if not part.sent: part.send(); self.sent_parts += 1
+        //   else: part.resend()
+        // sendPart() already tracks first-send vs resend via sentPartsSet and
+        // increments sentParts exactly once per unique part — so this loop must
+        // NOT separately bump sentParts / sentPartsSet. A previous build did both
+        // (sendPart AND an inline increment), double-counting sent_parts: an
+        // 8-part serve reported sent_parts=16 and reached AWAITING_PROOF after
+        // only half the parts were actually sent.
         val searchScope = parts.slice(searchStart until minOf(searchEnd, parts.size))
         for ((index, part) in searchScope.withIndex()) {
             if (part != null) {
                 val partMapHash = getMapHash(part)
                 if (mapHashes.any { it.contentEquals(partMapHash) }) {
                     val actualIndex = searchStart + index
-                    if (!sentPartsSet.contains(actualIndex)) {
-                        sendPart(actualIndex, part)
-                        sentParts++
-                        sentPartsSet.add(actualIndex)
-                    } else {
-                        // Resend
-                        sendPart(actualIndex, part)
-                    }
+                    sendPart(actualIndex, part)
                     lastActivity = System.currentTimeMillis()
                 }
             }
@@ -908,6 +1034,12 @@ class Resource private constructor(
             val hashmapBytes = unpacker.readPayload(hashmapLen)
             unpacker.close()
 
+            // Count each accepted hashmap-update segment. Mirrors the reference
+            // harness wrapping the instance hashmap_update_packet
+            // (wire_tcp.py on_resource_started). Counted in the packet handler,
+            // NOT in the private hashmapUpdate(), so the inject_hashmap_update
+            // injector (which drives hashmapUpdate directly) is unaffected.
+            hashmapUpdatesReceived++
             hashmapUpdate(segment, hashmapBytes)
         } catch (e: Exception) {
             log("Failed to parse hashmap update: ${e.message}")
@@ -968,6 +1100,11 @@ class Resource private constructor(
      * where self.data includes metadata (before stripping).
      */
     private fun prove() {
+        // Count every prove() entry. The reference harness wraps the instance
+        // prove (wire_tcp.py cmd_wire_resource_receiver_proof_count /
+        // cmd_wire_inject_corrupt_assembled_resource) to assert exactly one
+        // proof per completed transfer and zero on a CORRUPT one.
+        proveCalls++
         if (status == ResourceConstants.FAILED) return
 
         try {
@@ -1155,9 +1292,10 @@ class Resource private constructor(
             val output = ByteArrayOutputStream()
             for (part in parts) {
                 if (part == null) {
-                    status = ResourceConstants.FAILED
-                    log("Assembly failed: missing parts")
-                    callbacks.failed?.invoke(this)
+                    // Mirrors python `Resource.assemble` (Resource.py:676): a None
+                    // part makes `b"".join(self.parts)` raise, landing in the
+                    // except branch that sets CORRUPT (Resource.py:721).
+                    markCorrupt("Assembly failed: missing parts")
                     return
                 }
                 output.write(part)
@@ -1165,12 +1303,14 @@ class Resource private constructor(
 
             val encryptedStream = output.toByteArray()
 
-            // Decrypt the stream if encrypted
+            // Decrypt the stream if encrypted. A failed Token authentication is an
+            // integrity failure: mirrors python where link.decrypt raising lands
+            // in assemble's except->CORRUPT branch (Resource.py:715/721), NOT a
+            // clean FAILED. A corrupted-in-flight part typically breaks the
+            // Token HMAC, so this is the path the corrupt-assembled injector hits.
             var decryptedData = if (encrypted) {
                 link.decrypt(encryptedStream) ?: run {
-                    status = ResourceConstants.FAILED
-                    log("Assembly failed: decryption error")
-                    callbacks.failed?.invoke(this)
+                    markCorrupt("Assembly failed: decryption/authentication error")
                     return
                 }
             } else {
@@ -1179,16 +1319,23 @@ class Resource private constructor(
 
             // Strip off the random prefix (first RANDOM_HASH_SIZE bytes)
             if (decryptedData.size < ResourceConstants.RANDOM_HASH_SIZE) {
-                status = ResourceConstants.FAILED
-                log("Assembly failed: data too short after decryption")
-                callbacks.failed?.invoke(this)
+                markCorrupt("Assembly failed: data too short after decryption")
                 return
             }
             decryptedData = decryptedData.copyOfRange(ResourceConstants.RANDOM_HASH_SIZE, decryptedData.size)
 
-            // Decompress if needed
+            // Decompress if needed, bounded by maxDecompressedSize. Mirrors python
+            // `Resource.assemble` (Resource.py:685-690):
+            //   self.data = decompressor.decompress(data, max_length=self.max_decompressed_size)
+            //   if not decompressor.eof: self.status = CORRUPT; self.cancel(); return
+            // A bz2 stream that inflates past the bound is a decompression bomb;
+            // the receiver marks the transfer CORRUPT rather than exhausting memory.
             var assembled = if (compressed) {
-                decompress(decryptedData)
+                decompressBounded(decryptedData, maxDecompressedSize) ?: run {
+                    markCorrupt("Decompressed resource exceeded maximum decompressed size")
+                    cancel()
+                    return
+                }
             } else {
                 decryptedData
             }
@@ -1196,9 +1343,7 @@ class Resource private constructor(
             // Verify hash matches
             val calculatedHash = Hashes.fullHash(assembled + randomHash)
             if (!calculatedHash.contentEquals(hash)) {
-                status = ResourceConstants.CORRUPT
-                log("Assembly failed: hash mismatch")
-                callbacks.failed?.invoke(this)
+                markCorrupt("Assembly failed: hash mismatch")
                 return
             }
 
@@ -1206,13 +1351,16 @@ class Resource private constructor(
             // This matches Python where self.data in prove() includes metadata
             val dataForProof = assembled
 
-            // Strip metadata if present
+            // Strip metadata if present. The block is [3-byte BE len(packed)] +
+            // umsgpack.packb(metadata) (Resource.py:266/696-704); recover the raw
+            // metadata by msgpack-unpacking the packed slice.
             if (hasMetadata && assembled.size > 3) {
                 val metaSize = ((assembled[0].toInt() and 0xFF) shl 16) or
                               ((assembled[1].toInt() and 0xFF) shl 8) or
                               (assembled[2].toInt() and 0xFF)
                 if (metaSize > 0 && metaSize + 3 <= assembled.size) {
-                    metadata = assembled.copyOfRange(3, 3 + metaSize)
+                    val packedMetadata = assembled.copyOfRange(3, 3 + metaSize)
+                    metadata = runCatching { msgpackUnpackBinary(packedMetadata) }.getOrNull() ?: packedMetadata
                     assembled = assembled.copyOfRange(3 + metaSize, assembled.size)
                 }
             }
@@ -1233,11 +1381,25 @@ class Resource private constructor(
             callbacks.completed?.invoke(this)
 
         } catch (e: Exception) {
-            status = ResourceConstants.FAILED
-            log("Assembly error: ${e.message}")
-            e.printStackTrace()
-            callbacks.failed?.invoke(this)
+            // Mirrors python `Resource.assemble`'s except branch (Resource.py:
+            // 719-721): any error during reassembly marks the transfer CORRUPT,
+            // not FAILED.
+            markCorrupt("Assembly error: ${e.message}")
         }
+    }
+
+    /**
+     * Mark this inbound transfer CORRUPT and conclude it on the link, mirroring
+     * python `Resource.assemble`'s CORRUPT paths (Resource.py:689/715/721) which
+     * set `status = CORRUPT` and fall through to `link.resource_concluded(self)`.
+     * No proof is sent on a CORRUPT verdict.
+     */
+    private fun markCorrupt(reason: String) {
+        status = ResourceConstants.CORRUPT
+        log(reason)
+        stopWatchdog()
+        link.resourceConcluded(this)
+        callbacks.failed?.invoke(this)
     }
 
     /**
@@ -1344,9 +1506,64 @@ class Resource private constructor(
     }
 
     /**
+     * Bounded BZ2 decompression. Returns null if the decompressed output would
+     * exceed [maxLen] bytes — the decompression-bomb guard. Mirrors python
+     * `BZ2Decompressor.decompress(data, max_length=self.max_decompressed_size)`
+     * + the `if not decompressor.eof` over-bound check (Resource.py:687-690):
+     * a stream that has not reached EOF by the bound is a bomb and is rejected.
+     */
+    private fun decompressBounded(data: ByteArray, maxLen: Int): ByteArray? {
+        val input = ByteArrayInputStream(data)
+        val output = ByteArrayOutputStream()
+        BZip2CompressorInputStream(input).use { bz2 ->
+            val buffer = ByteArray(8192)
+            var total = 0L
+            var len: Int
+            while (bz2.read(buffer).also { len = it } != -1) {
+                total += len
+                if (total > maxLen) {
+                    return null
+                }
+                output.write(buffer, 0, len)
+            }
+        }
+        return output.toByteArray()
+    }
+
+    /**
+     * MessagePack-pack a binary value (msgpack `bin` format), mirroring python
+     * `umsgpack.packb(metadata)` for a `bytes` payload (Resource.py:261).
+     */
+    private fun msgpackPackBinary(data: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        val packer = org.msgpack.core.MessagePack.newDefaultPacker(out)
+        packer.packBinaryHeader(data.size)
+        packer.writePayload(data)
+        packer.close()
+        return out.toByteArray()
+    }
+
+    /**
+     * MessagePack-unpack a single binary value, the inverse of
+     * [msgpackPackBinary] — mirrors python `umsgpack.unpackb(packed_metadata)`.
+     */
+    private fun msgpackUnpackBinary(data: ByteArray): ByteArray {
+        val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(data)
+        val len = unpacker.unpackBinaryHeader()
+        val payload = unpacker.readPayload(len)
+        unpacker.close()
+        return payload
+    }
+
+    /**
      * Start watchdog thread for timeout detection.
      */
     private fun startWatchdog() {
+        // Test-only suppression (see companion watchdogDisabledForTest): the
+        // reference harness disables the watchdog around _build_resource_receiver
+        // so an inbound Resource can be inspected synchronously without a
+        // timeout-retry cancelling it.
+        if (watchdogDisabledForTest) return
         if (watchdogActive) return
 
         watchdogActive = true
@@ -1425,6 +1642,90 @@ class Resource private constructor(
                 log("Watchdog error: ${e.message}")
             }
         }
+    }
+
+    // ===== Conformance test seams =====
+    // Each is a thin public wrapper over a private member or method. The
+    // conformance-bridge is a separate gradle module and cannot see private/
+    // internal state; these exist solely so the bridge can read back or drive
+    // the Resource state machine the way the reference harness reads/drives the
+    // python instance attributes directly. None changes protocol behaviour.
+
+    /** private expectedProof — full_hash(data+hash) (Resource.kt:expectedProof). */
+    fun expectedProofForTest(): ByteArray? = expectedProof
+
+    /** private per-part SDU captured at construction (Resource.py:338). */
+    fun sduForTest(): Int = sdu
+
+    /** private window / windowMin / windowMax (flow-control state). */
+    fun windowForTest(): Int = window
+    fun windowMinForTest(): Int = windowMin
+    fun windowMaxForTest(): Int = windowMax
+
+    /** private hashmapHeight — number of loaded hashmap slots. */
+    fun hashmapHeightForTest(): Int = hashmapHeight
+
+    /** private receivedCount — number of stored parts. */
+    fun receivedCountForTest(): Int = receivedCount
+
+    /** private consecutiveCompletedHeight — the in-order pointer. */
+    fun consecutiveCompletedHeightForTest(): Int = consecutiveCompletedHeight
+
+    /** private waitingForHmu flag. */
+    fun waitingForHmuForTest(): Boolean = waitingForHmu
+
+    /** private sentParts (sender). */
+    fun sentPartsForTest(): Int = sentParts
+
+    /** sorted copy of the private sentPartsSet (sender). */
+    fun sentPartIndicesForTest(): List<Int> = sentPartsSet.toList().sorted()
+
+    /** private receiverMinConsecutiveHeight (sender search-scope anchor). */
+    fun receiverMinConsecutiveHeightForTest(): Int = receiverMinConsecutiveHeight
+
+    /** copy of the parsed private hashmap[] array (preserves nulls). */
+    fun hashmapEntriesForTest(): List<ByteArray?> = hashmap.toList()
+
+    /** private maxDecompressedSize / autoCompressLimit (bomb-guard ceiling). */
+    fun maxDecompressedSizeForTest(): Int = maxDecompressedSize
+    fun autoCompressLimitForTest(): Int = autoCompressLimit
+    /** Lower the per-resource decompression bound (listener bomb-guard hook). */
+    fun setMaxDecompressedSizeForTest(value: Int) { maxDecompressedSize = value }
+
+    /** Instrumentation counters (see the fields for what each event is). */
+    fun proveCallCountForTest(): Int = proveCalls
+    fun lastRequestDataForTest(): ByteArray? = lastRequestData
+    fun requestNextEmitCountForTest(): Int = requestNextEmitCount
+    fun hmuRequestsSentForTest(): Int = hmuRequestsSent
+    fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived
+
+    /** Drive the private assemble(). */
+    fun assembleForTest() = assemble()
+
+    /** Set parts[index] directly (parts has a private setter). */
+    fun setPartForTest(index: Int, data: ByteArray) {
+        parts[index] = data
+    }
+
+    /** Drive the private hashmapUpdate(segment, bytes). */
+    fun hashmapUpdateForTest(segment: Int, bytes: ByteArray) = hashmapUpdate(segment, bytes)
+
+    /** Drive the private requestNext(). */
+    fun requestNextForTest() = requestNext()
+
+    /** Suppress/restore receivePart's auto-follow-up requestNext during a feed. */
+    fun setAutoRequestNextForTest(enabled: Boolean) { autoRequestNext = enabled }
+
+    /** Prime the sender as if it had just advertised (status TRANSFERRING,
+     *  adv_sent set) — mirrors the reference priming a sender before request().*/
+    fun primeTransferringForTest() {
+        status = ResourceConstants.TRANSFERRING
+        advSent = System.currentTimeMillis()
+    }
+
+    /** Force the status field (e.g. AWAITING_PROOF for the control proof case). */
+    fun setStatusForTest(newStatus: Int) {
+        status = newStatus
     }
 
     override fun toString(): String {

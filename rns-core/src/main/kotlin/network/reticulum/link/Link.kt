@@ -2761,18 +2761,13 @@ class Link private constructor(
 
         // Update statistics based on resource performance
         if (wasIncoming) {
-            // For incoming resources, track window and EIFR for bandwidth estimation
-            // TODO: Add window and eifr properties to Resource class when implemented
-            // lastResourceWindow = resource.window
-            // lastResourceEifr = resource.eifr
-
-            // Calculate expected rate from resource transfer
-            // TODO: Get resource.startedTransferring property when Resource is fully implemented
-            // For now, we skip this calculation
-            // val transferTime = (concludedAt - resource.startedTransferring) / 1000.0f
-            // if (transferTime > 0.0001f) {
-            //     expectedRate = (resource.size * 8) / transferTime
-            // }
+            // Record this transfer's final window so the NEXT inbound Resource on
+            // this link inherits it (Resource.accept reads getLastResourceWindow).
+            // Mirrors python `Link.resource_concluded` (Link.py:1284):
+            //   self.last_resource_window = resource.window
+            // Without this, every inbound transfer restarts at WINDOW=4 and
+            // multi-resource throughput silently degrades.
+            lastResourceWindow = resource.currentWindow
 
             synchronized(incomingResources) {
                 incomingResources.remove(resource)
@@ -3221,6 +3216,18 @@ class Link private constructor(
     }
 
     fun getMtu(): Int? = if (status == LinkConstants.ACTIVE) mtu else null
+
+    /**
+     * Test-only MTU override (the field has a private setter). Mirrors the
+     * reference conformance harness temporarily shrinking `link.mtu` so a modest
+     * Resource payload chunks into many small parts (wire_tcp.py
+     * cmd_wire_resource_create force_sdu / _build_resource_receiver). Resource
+     * derives its per-part SDU from this at construction; the caller restores the
+     * negotiated MTU afterwards.
+     */
+    fun setMtuForTest(value: Int) {
+        mtu = value
+    }
 
     /**
      * Get the MDU (Maximum Data Unit) for this link.
