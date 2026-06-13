@@ -213,6 +213,8 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 
 **Description:** kotlin's `Interface.hwMtu` is an immutable `open val` (subclass-declared), so python's in-place `self.HW_MTU = ...` mutation pattern cannot be expressed. The tier mapping is ported byte-for-byte (every threshold, comparator, and value identical, including the `>= 1 Gbps` top tier vs `>` elsewhere and the `None`/null bottom tier) as a pure companion function `optimiseMtu(bitrate): Int?`; callers apply python's `AUTOCONFIGURE_MTU` gate themselves and assign the result wherever their MTU state lives.
 
+**Call sites applying the gate (2026-06-13):** `TCPClientInterface.hwMtu` and `TCPServerInterface.hwMtu` now initialise to `fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)`. The `fixedMtuBytes ?:` short-circuit IS python's `AUTOCONFIGURE_MTU` gate: python sets `self.AUTOCONFIGURE_MTU = False` and pins `HW_MTU = fixed_mtu` when `fixed_mtu` is configured (TCPInterface.py:113-116), otherwise `interface_post_init` runs `optimise_mtu()` (Reticulum.py:780). So the default (non-fixed) TCP interface now resolves the 10 Mbps `BITRATE_GUESS` to HW_MTU 8192 exactly as python does, rather than statically returning the class constant 262144. The `?: HW_MTU` tail handles the `None` bottom tier, unreachable for TCP since its bitrate is always ≥ `MINIMUM_BITRATE` ≫ 62500.
+
 **Re-evaluation:** if `hwMtu` ever becomes mutable interface state, this can return to an instance method with the gate inside, matching python's shape exactly.
 
 ### WallClock pinning seam for protocol timestamps — `rns-core/.../common/WallClock.kt`, consulted by `Destination.generateAnnounceData`/`cachePathResponse`/`cleanStalePathResponses`
@@ -312,3 +314,15 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Tracking:** conformance `test_autoconnect_rejects_unsupported_records` (the `yggdrasil` case); unit `InterfaceDiscoveryTest.autoconnect skips yggdrasil endpoint`.
 
 **Description:** kotlin's `autoconnect` had no Yggdrasil guard, so a discovered `BackboneInterface` reachable on a 200::/7 address (which IS in `AUTOCONNECT_TYPES`) would invoke the connect factory. The guard `if (info.reachableOn != null && DiscoveryUtil.isYggIpv6(info.reachableOn)) return` is now applied after the type/limit/dedup checks and before the factory invoke, mirroring python. `endpointHashForTest`/`autoconnectForTest` are public test seams over the existing inline endpoint-hash computation and the private `autoconnect`.
+
+### _clean_ratchets removes "not in use" ratchets (RNS 1.3.1 forward-port) — `rns-core/.../identity/Identity.kt::cleanRatchetsFromDisk`
+
+**Python reference:** installed RNS **1.3.1** `RNS/Identity.py::_clean_ratchets` — `destination_hash = bytes.fromhex(filename); if not destination_hash in RNS.Identity.known_destinations: unknown = True`; the unlink condition is `if expired or corrupted or unknown`. The pinned `../Reticulum` checkout is **1.1.9** and its `_clean_ratchets` unlinks on `expired or corrupted` only — it has no `unknown` branch.
+
+**Category:** version-skew forward-port (conformance target is 1.3.1; the pinned source-of-truth checkout lags at 1.1.9).
+
+**Date:** 2026-06-13.
+
+**Tracking:** conformance `test_identity_received_ratchet_persistence` (assertion `cleaned_removed`, "not-in-use branch, Identity.py:484-489").
+
+**Description:** kotlin's `cleanRatchetsFromDisk` previously deleted only expired/corrupted ratchet files. RNS 1.3.1 additionally treats a ratchet file whose hex filename decodes to a destination hash absent from `known_destinations` as "not in use" and unlinks it. The branch is `val unknown = runCatching { !knownDestinations.containsKey(file.name.hexToByteArray().toKey()) }.getOrDefault(false)`, OR'd into the existing delete condition. The hex decode is wrapped in `runCatching` so a non-hex filename is skipped (treated as known/not-unknown), mirroring python's per-file `try/except` which leaves an unparseable filename in place rather than crashing the sweep.

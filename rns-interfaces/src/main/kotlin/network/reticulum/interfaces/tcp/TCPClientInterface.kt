@@ -79,9 +79,13 @@ class TCPClientInterface(
     // python Reticulum.py:765-768 — sub-minimum bitrate ignored, keeps BITRATE_GUESS.
     override val bitrate: Int =
         if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
-    // FIXED_MTU mode pins HW_MTU to the configured value; default mode keeps the
-    // class HW_MTU and auto-configures (python TCPInterface AUTOCONFIGURE_MTU=True).
-    override val hwMtu: Int = fixedMtuBytes ?: HW_MTU
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode applies the
+    // bitrate→HW_MTU optimisation python runs per-interface at config load
+    // (Reticulum.interface_post_init → interface.optimise_mtu(), Reticulum.py:860;
+    // Interface.optimise_mtu, Interface.py:198-221). The 10 Mbps BITRATE_GUESS maps
+    // to 8192. Falls back to the class HW_MTU only for the lowest bitrate tier
+    // (optimise_mtu → None). AUTOCONFIGURE_MTU=True for TCP, so the gate always holds.
+    override val hwMtu: Int = fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)
     override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
     override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true

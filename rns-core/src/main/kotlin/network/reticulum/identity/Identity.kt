@@ -2,6 +2,7 @@ package network.reticulum.identity
 
 import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.hexToByteArray
 import network.reticulum.common.toHexString
 import network.reticulum.common.toKey
 import network.reticulum.crypto.CryptoProvider
@@ -459,7 +460,7 @@ class Identity private constructor(
                 val randomHash: ByteArray
                 val ratchet: ByteArray
                 val signature: ByteArray
-                val appData: ByteArray?
+                var appData: ByteArray?
 
                 if (hasRatchet) {
                     // With ratchet: public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data
@@ -475,10 +476,12 @@ class Identity private constructor(
                         keySize + nameHashLen + 10 + ratchetSize + sigLen
                     )
 
+                    // python Identity.py:514-516 — app_data defaults to b"" (empty),
+                    // not None, when the ratcheted announce carries no trailing bytes.
                     appData = if (data.size > keySize + nameHashLen + 10 + ratchetSize + sigLen) {
                         data.copyOfRange(keySize + nameHashLen + 10 + ratchetSize + sigLen, data.size)
                     } else {
-                        null
+                        byteArrayOf()
                     }
                 } else {
                     // Without ratchet: public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data
@@ -487,15 +490,28 @@ class Identity private constructor(
                     ratchet = byteArrayOf()
                     signature = data.copyOfRange(keySize + nameHashLen + 10, keySize + nameHashLen + 10 + sigLen)
 
+                    // python Identity.py:525-527 — app_data defaults to b"" (empty),
+                    // not None, when the ratchetless announce carries no trailing bytes.
                     appData = if (data.size > keySize + nameHashLen + 10 + sigLen) {
                         data.copyOfRange(keySize + nameHashLen + 10 + sigLen, data.size)
                     } else {
-                        null
+                        byteArrayOf()
                     }
                 }
 
                 // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+                // (app_data is b"" here in every no-trailing-bytes case, matching python's
+                // pre-override value at Identity.py:529.)
                 val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
+
+                // python Identity.py:531-532 — ONLY the ratchetless no-app_data layout
+                // (data length == keysize+name_hash+10+sig_len, the threshold WITHOUT the
+                // ratchet term) nulls app_data after signing. A ratcheted no-app_data
+                // announce exceeds this threshold by the 32-byte ratchet, so it keeps the
+                // b"" sentinel; this is what `recall_app_data` must return as empty, not None.
+                if (!(data.size > keySize + nameHashLen + 10 + sigLen)) {
+                    appData = null
+                }
 
                 // Create identity from public key
                 val announcedIdentity = fromPublicKey(publicKey)
@@ -1110,7 +1126,21 @@ class Identity private constructor(
                         val isExpired = now - receivedMs > RATCHET_EXPIRY
                         val isCorrupted = ratchetSize != RnsConstants.KEY_SIZE
 
-                        if (isExpired || isCorrupted) {
+                        // RNS 1.3.1 _clean_ratchets also removes "not in use" ratchets:
+                        // a file whose dest-hash (its hex filename) is absent from
+                        // known_destinations is unknown and unlinked
+                        // (installed RNS 1.3.1 Identity.py _clean_ratchets:
+                        // `destination_hash = bytes.fromhex(filename); if not ... in
+                        // known_destinations: unknown = True`; the `expired or corrupted
+                        // or unknown` unlink). The pinned ../Reticulum checkout is 1.1.9
+                        // and lacks this branch; the conformance target is 1.3.1. The hex
+                        // decode is guarded so a non-hex filename is skipped, not deleted,
+                        // matching python's per-file try/except.
+                        val unknown = runCatching {
+                            !knownDestinations.containsKey(file.name.hexToByteArray().toKey())
+                        }.getOrDefault(false)
+
+                        if (isExpired || isCorrupted || unknown) {
                             if (isCorrupted) {
                                 println("Removing corrupted ratchet file: ${file.name}")
                             }

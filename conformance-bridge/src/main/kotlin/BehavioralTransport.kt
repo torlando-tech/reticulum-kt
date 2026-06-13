@@ -48,12 +48,16 @@ class MockInterface(
     override val ifacIdentity: Identity? = null,
     override val ifacKey: ByteArray? = null,
     override val ifacSize: Int = 0,
+    // Settable so the bridge can stand up a parent "shared instance master"
+    // MockInterface; Transport.registerInterface auto-adds a child whose
+    // parentInterface.isLocalSharedInstance==true to localClientInterfaces
+    // (Transport.kt:899), mirroring reference/behavioral_transport.py:505-531.
+    override val isLocalSharedInstance: Boolean = false,
 ) : Interface(name) {
     override val canSend: Boolean = true
     override val canReceive: Boolean = true
     override val bitrate: Int = 10_000_000
     override val supportsDiscovery: Boolean = false
-    override val isLocalSharedInstance: Boolean = false
 
     private val txQueue = ConcurrentLinkedDeque<ByteArray>()
 
@@ -109,6 +113,14 @@ private class BehavioralInstance(
     val destDeliveries: MutableMap<String, MutableList<ByteArray>> = mutableMapOf(),
     /** Recording announce handlers by id. */
     val announceHandlers: MutableMap<String, RecordingAnnounceHandler> = mutableMapOf(),
+    /**
+     * Lazily-built parent "shared instance master" MockInterface
+     * (isLocalSharedInstance=true). Local-client interfaces are attached as its
+     * children so Transport.registerInterface appends them to
+     * localClientInterfaces (Transport.kt:899). Mirrors the single shared master
+     * the reference stands up in behavioral_transport.py:505-531.
+     */
+    var sharedMaster: MockInterface? = null,
 )
 
 private val behavioralInstances = mutableMapOf<String, BehavioralInstance>()
@@ -272,6 +284,26 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         }
 
         val iface = MockInterface(name, mode, mtu, ifacIdentity, ifacKey, ifacSize)
+
+        // local_client=True: register this interface as a local-client interface
+        // behind a shared-instance master (parent isLocalSharedInstance=true), so
+        // Transport.registerInterface appends it to localClientInterfaces
+        // (Transport.kt:899) and isLocalClientInterface returns true for it. Mirrors
+        // reference/behavioral_transport.py:505-531.
+        if (p.boolOpt("local_client") == true) {
+            val master =
+                inst.sharedMaster ?: MockInterface(
+                    name = "${name}__shared_master",
+                    mode = mode,
+                    hwMtu = mtu,
+                    isLocalSharedInstance = true,
+                ).also { master ->
+                    master.start()
+                    inst.sharedMaster = master
+                }
+            iface.parentInterface = master
+        }
+
         iface.start()
         val ifaceRef = iface.toRef()
         Transport.registerInterface(ifaceRef)
@@ -385,6 +417,10 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             // kotlin AnnounceEntry has no block_rebroadcasts flag; report false.
             "block_rebroadcasts" to boolVal(false),
             "received_from" to hexVal(e.destinationHash),
+            // The announce packet hash — the 4-param announce-handler dispatch
+            // delivers this same full hash. AnnounceEntry has no stored hash field,
+            // so recompute it from the stored raw announce packet.
+            "packet_hash" to (Packet.unpack(e.raw)?.getHash()?.let { hexVal(it) } ?: JsonNull.INSTANCE),
             "attached_interface" to (inst.ifaceIdOf(
                 Transport.findInterfaceByHashForTest(e.receivingInterfaceHash))
                 ?.let { strVal(it) } ?: JsonNull.INSTANCE),
@@ -628,11 +664,13 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         val ref = inst.ifaceRefs[ifaceId]
             ?: throw IllegalArgumentException("Unknown iface_id: $ifaceId")
         val dest = p.hex("dest")
-        // The reference returns the request tag it used; kotlin's requestPath
-        // generates its own tag, so report a fresh random one for parity of
-        // shape (the emitted packet is what the test drains+inspects).
-        Transport.requestPath(dest, ref)
-        result("tag" to hexVal(network.reticulum.crypto.Hashes.getRandomHash()))
+        // Thread the harness-supplied tag (if any) into the emitted path request
+        // and return that exact value, so the test can match both the emitted
+        // payload's tag bytes and the returned tag (reference returns the tag it
+        // used). Falls back to a fresh random tag when none is supplied.
+        val tag = p.hexOpt("tag") ?: network.reticulum.crypto.Hashes.getRandomHash()
+        Transport.requestPathWithTagForTest(dest, ref, tag)
+        result("tag" to hexVal(tag))
     }
 
     "behavioral_hold_and_release_announce" -> {

@@ -2045,6 +2045,12 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         "announce_build" -> {
             val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
             val aspects = p.stringArray("aspects")
+            // Snapshot registration BEFORE create: a test may have already
+            // registered this exact destination (e.g. the local-destination
+            // announce-ignored case). create() dedups, so it returns the
+            // existing instance; we must NOT deregister something the test owns.
+            val expectedHash = Destination.computeHash(p.str("app_name"), aspects.toList(), identity.hash)
+            val preRegistered = network.reticulum.transport.Transport.findDestination(expectedHash) != null
             val dest = Destination.create(
                 identity, DestinationDirection.IN, DestinationType.SINGLE,
                 p.str("app_name"), *aspects.toTypedArray(),
@@ -2054,8 +2060,11 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             // on a SEPARATE minimal-RNS module, so they never pollute a
             // behavioral instance's destination map; deregister here to match
             // that — otherwise an injected announce for this destination would
-            // be treated as local and skipped.
-            try { network.reticulum.transport.Transport.deregisterDestination(dest) } catch (_: Exception) {}
+            // be treated as local and skipped. But ONLY undo OUR auto-registration:
+            // if the destination was already registered by the test, leave it.
+            if (!preRegistered) {
+                try { network.reticulum.transport.Transport.deregisterDestination(dest) } catch (_: Exception) {}
+            }
             if (p.boolOpt("enable_ratchets") == true) {
                 val rdir = java.nio.file.Files.createTempDirectory("rns_announce_ratchets_").toFile()
                 dest.enableRatchets(java.io.File(rdir, "ratchets.bin").absolutePath)
@@ -2272,10 +2281,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
 
         "kiss_deframe_stream" -> {
             // The library deframer strips the port nibble and only delivers
-            // CMD_DATA frames, mirroring python's TCP/KISS read loop.
+            // CMD_DATA frames, mirroring python's TCP/KISS read loop. When the
+            // request supplies hw_mtu, the deframer caps each decoded frame to it
+            // exactly as python's `len(data_buffer) < self.HW_MTU` gate
+            // (TCPInterface.py:370); absent, it stays uncapped.
             val stream = p.hex("stream")
+            val hwMtu = p.intOpt("hw_mtu") ?: Int.MAX_VALUE
             val frames = mutableListOf<ByteArray>()
-            KISS.createDeframer { _, data -> frames.add(data) }.process(stream)
+            KISS.createDeframer(hwMtu) { _, data -> frames.add(data) }.process(stream)
             result("frames" to JsonArray().apply { frames.forEach { add(it.toHex()) } })
         }
 

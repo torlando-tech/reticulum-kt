@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.tcp
 
+import network.reticulum.interfaces.Interface
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -50,10 +51,17 @@ class TCPInterfaceTuningTest {
     // --- fixed_mtu / AUTOCONFIGURE_MTU posture ---
 
     @Test
-    @DisplayName("default mode: HW_MTU class default, AUTOCONFIGURE on, FIXED off")
+    @DisplayName("default mode: HW_MTU is the bitrate-optimised value, AUTOCONFIGURE on, FIXED off")
     fun `default mtu posture`() {
         val server = TCPServerInterface(name = "s", bindPort = 0)
-        assertEquals(TCPServerInterface.HW_MTU, server.hwMtu)
+        // python interface_post_init runs optimise_mtu() on every non-fixed
+        // interface (Reticulum.py:780); the 10 Mbps BITRATE_GUESS maps to 8192,
+        // NOT the class HW_MTU=262144 (that is only the pre-optimise default).
+        assertEquals(
+            Interface.optimiseMtu(server.bitrate.toLong()) ?: TCPServerInterface.HW_MTU,
+            server.hwMtu,
+        )
+        assertEquals(8192, server.hwMtu)
         assertTrue(server.autoconfigureMtu)
         assertFalse(server.fixedMtu)
         assertTrue(server.supportsLinkMtuDiscovery)

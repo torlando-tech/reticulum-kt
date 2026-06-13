@@ -1151,6 +1151,21 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                 Transport.inbound(data, iface.toRef())
             }
 
+            // Connect-settle: TCPClientInterface.start() kicks off an ASYNC
+            // connect and returns before the socket is up. The test helpers do
+            // start_tcp_client -> server.listen()/announce() -> poll_path, so a
+            // lone startup announce can fire before this client's socket is
+            // established and be missed — the systemic wire-suite path-discovery
+            // flake. Block (bounded, best-effort) until the interface reports
+            // online so the subsequent announce is received. On timeout we fall
+            // through to today's behavior rather than hang.
+            run {
+                val deadline = System.currentTimeMillis() + 3000
+                while (!client.online.value && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(20)
+                }
+            }
+
             val identityHash = Transport.identity?.hash
                 ?: throw IllegalStateException("Transport started without an identity")
 
@@ -3236,6 +3251,23 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             ?: throw IllegalStateException("could not unpack crafted keepalive packet")
         rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
 
+        // Quiesce in-flight inbound before snapshotting the baseline. A prior
+        // (non-initiator) probe in the same test answers 0xFF with a real 0xFE
+        // that travels the TCP loopback and lands on THIS link asynchronously;
+        // if it arrives inside the before/after measurement window it spuriously
+        // advances last_inbound, racing the initiator's-own-echo-drop assertion.
+        // Wait until lastInbound stops changing (no new inbound for ~40ms) or a
+        // 500ms cap, so any in-flight keepalive answer is folded into the baseline.
+        run {
+            val quiesceDeadline = System.currentTimeMillis() + 500
+            var prev = link.lastInbound
+            Thread.sleep(40)
+            while (link.lastInbound != prev && System.currentTimeMillis() < quiesceDeadline) {
+                prev = link.lastInbound
+                Thread.sleep(40)
+            }
+        }
+
         val lastInboundBefore = link.lastInbound
         val lastDataBefore = link.lastData
         val statusBefore = link.status
@@ -3745,7 +3777,12 @@ private fun handleWireCmd4(command: String, p: JsonObject): JsonObject? = when (
             ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
         result(
             "transport_enabled" to boolVal(Reticulum.transportEnabled()),
-            "is_shared_instance" to boolVal(inst.rns.isSharedInstance),
+            // A wire instance started as a shared master attaches its own
+            // LocalServerInterface (inst.sharedServer) rather than going through
+            // the library's shareInstance=true factory, so inst.rns.isSharedInstance
+            // is never flipped. Treat the presence of sharedServer as the
+            // authoritative "is shared instance" signal.
+            "is_shared_instance" to boolVal(inst.sharedServer != null || inst.rns.isSharedInstance),
             "is_connected_to_shared_instance" to boolVal(isConnectedToSharedInstance(inst)),
         )
     }
@@ -3772,7 +3809,12 @@ private fun handleWireCmd4(command: String, p: JsonObject): JsonObject? = when (
             "interface_discovery_sources" to JsonArray().apply {
                 Reticulum.interfaceDiscoverySources().forEach { add(it.toHex()) }
             },
-            "is_shared_instance" to boolVal(inst.rns.isSharedInstance),
+            // A wire instance started as a shared master attaches its own
+            // LocalServerInterface (inst.sharedServer) rather than going through
+            // the library's shareInstance=true factory, so inst.rns.isSharedInstance
+            // is never flipped. Treat the presence of sharedServer as the
+            // authoritative "is shared instance" signal.
+            "is_shared_instance" to boolVal(inst.sharedServer != null || inst.rns.isSharedInstance),
             "is_connected_to_shared_instance" to boolVal(isConnectedToSharedInstance(inst)),
         )
     }

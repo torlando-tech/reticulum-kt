@@ -2356,6 +2356,20 @@ object Transport {
      * and recursive mode (which throttles based on announce cap).
      * Python Transport.py:2541-2588
      */
+    /**
+     * Test seam: issue a path request with an EXPLICIT request tag. The public
+     * [requestPath] always mints a fresh random tag; this lets the conformance
+     * bridge thread the harness-supplied tag through so the emitted payload tag
+     * and the returned tag match what the test sent (python's requestPath accepts
+     * a tag, Transport.py:2783). Conformance-bridge is a separate gradle module
+     * and cannot see the private [requestPathInternal].
+     */
+    fun requestPathWithTagForTest(
+        destinationHash: ByteArray,
+        onInterface: InterfaceRef? = null,
+        tag: ByteArray,
+    ) = requestPathInternal(destinationHash, onInterface, tag, recursive = false)
+
     private fun requestPathInternal(
         destinationHash: ByteArray,
         onInterface: InterfaceRef? = null,
@@ -3673,6 +3687,15 @@ object Transport {
             return
         }
 
+        // python Transport.py — local_and_hops_condition gates path admission on
+        // `packet.hops < PATHFINDER_M+1` (i.e. <= PATHFINDER_M). An announce that has
+        // already traveled more than PATHFINDER_M hops is neither admitted to the path
+        // table nor retransmitted.
+        if (packet.hops > TransportConstants.PATHFINDER_M) {
+            log("Dropping announce for ${destHash.toHexString()}: hops ${packet.hops} exceed PATHFINDER_M ceiling")
+            return
+        }
+
         // Update path table
         val randomBlobs = existingEntry?.randomBlobs?.toMutableList() ?: mutableListOf()
         if (!randomBlobs.any { it.contentEquals(announceData.randomHash) }) {
@@ -4006,6 +4029,18 @@ object Transport {
         val sourceMode = nextHopInterface(destinationHash)?.mode
         val targetInterface = packet.attachedInterface
 
+        // Targeted path-response addressed to a local client: spawned local-client
+        // interfaces have OUT=false and are skipped by the broadcast loop below, so a
+        // response explicitly attached to one would be dropped. Deliver it directly,
+        // mirroring retransmitAnnounceToLocalClients()'s direct send. (Python answers a
+        // local client's path request via the announce_table retransmit, which reaches
+        // the requesting local-client interface — Transport.py:3000 + retransmit loop.)
+        if (targetInterface != null && isLocalClientInterface(targetInterface)) {
+            runCatching { targetInterface.send(retransmitRaw) }
+                .onFailure { log("Error sending targeted path response to local client ${targetInterface.name}: ${it.message}") }
+            return
+        }
+
         for (iface in interfaces) {
             if (!iface.canSend || !iface.online || isLocalClientInterface(iface)) {
                 continue
@@ -4076,7 +4111,10 @@ object Transport {
         val destination = findDestination(packet.destinationHash)
         log("processData: findDestination result = ${destination?.hexHash ?: "null"}")
 
-        if (destination != null) {
+        // python Transport.py:2155 — local delivery requires the destination's type
+        // to match the packet's destination_type. A SINGLE packet whose hash collides
+        // with a locally-registered PLAIN destination (or vice-versa) is NOT delivered.
+        if (destination != null && destination.type == packet.destinationType) {
             // Deliver locally
             deliverPacket(destination, packet)
             return
@@ -4107,6 +4145,19 @@ object Transport {
                     log("Failed to deliver to local link: ${e.message}")
                 }
             }
+            return
+        }
+
+        // A HEADER_2 packet addressed to us as transport_id is relayed EXACTLY ONCE,
+        // by the general transport-relay block (Transport.py:1404-1510), which runs
+        // earlier in processInbound and gates on transport being enabled / a
+        // local-client flow. Python's DATA dispatch (Transport.py:2082-2160) only
+        // delivers locally — it never re-forwards. Re-forwarding here would both
+        // double-emit (the general block already sent it) and forward even when
+        // transport is disabled. Skip those packets; the reverse entry was already
+        // created by the general block (Transport.py:1495-1501).
+        val myHash = identity?.hash
+        if (packet.transportId != null && myHash != null && packet.transportId!!.contentEquals(myHash)) {
             return
         }
 
@@ -4425,10 +4476,19 @@ object Transport {
                 }
 
                 if (reverseEntry != null) {
-                    val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
-                    if (outboundInterface != null) {
-                        log("Forwarding proof for ${packet.destinationHash.toHexString()} via ${outboundInterface.name}")
-                        transmit(outboundInterface, packet.raw ?: packet.pack())
+                    // python Transport.py:2256 — only transport the proof if it arrived
+                    // on the entry's OUTBOUND interface (the one we forwarded the original
+                    // packet to). A proof heard on any other interface is NOT transported
+                    // ("Proof received on wrong interface, not transporting it"). The reverse
+                    // entry is popped either way (Transport.py:2255).
+                    if (interfaceRef.hash.contentEquals(reverseEntry.outboundInterfaceHash)) {
+                        val outboundInterface = findInterfaceByHash(reverseEntry.receivingInterfaceHash)
+                        if (outboundInterface != null) {
+                            log("Proof received on correct interface, transporting it via ${outboundInterface.name}")
+                            transmit(outboundInterface, packet.raw ?: packet.pack())
+                        }
+                    } else {
+                        log("Proof received on wrong interface, not transporting it")
                     }
                     reverseTable.remove(packet.destinationHash.toKey())
                     reverseTable.remove(packet.truncatedHash.toKey())
@@ -4664,7 +4724,10 @@ object Transport {
 
         val ratchet: ByteArray
         val signature: ByteArray
-        val appData: ByteArray?
+        // python Identity.py:514/525 — app_data defaults to b"" (empty), NOT None,
+        // when the announce carries no trailing bytes. The post-signing override
+        // below nulls it only for the ratchetless no-app_data layout.
+        var appData: ByteArray?
 
         if (hasRatchet) {
             val ratchetStart = keySize + nameHashLen + randomHashLen
@@ -4678,7 +4741,7 @@ object Transport {
 
             ratchet = data.copyOfRange(ratchetStart, ratchetEnd)
             signature = data.copyOfRange(ratchetEnd, sigEnd)
-            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else null
+            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else ByteArray(0)
         } else {
             ratchet = ByteArray(0)
             val sigStart = keySize + nameHashLen + randomHashLen
@@ -4690,7 +4753,7 @@ object Transport {
             }
 
             signature = data.copyOfRange(sigStart, sigEnd)
-            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else null
+            appData = if (data.size > sigEnd) data.copyOfRange(sigEnd, data.size) else ByteArray(0)
         }
 
         // Create identity from public key
@@ -4701,6 +4764,15 @@ object Transport {
                 log("Failed to create identity from public key: ${e.message}")
                 return null
             }
+
+        // python Identity.py:537-540 — an announce from a blackholed identity is
+        // invalidated and dropped here (before signature validation), so it can
+        // never create a path. This is the inbound validate path that feeds
+        // processAnnounce's pathTable insert + Identity.remember.
+        if (blackholedIdentities.isNotEmpty() && isBlackholed(identity.hash)) {
+            log("Invalidated and dropped announce from blackholed identity ${identity.hash.toHexString()}")
+            return null
+        }
 
         // Verify destination hash matches
         val computedDestHash = Destination.computeHash(nameHash, identity.hash)
@@ -4716,6 +4788,16 @@ object Transport {
         if (!identity.validate(signature, signedData)) {
             log("Signature validation failed")
             return null
+        }
+
+        // python Identity.py:531-532 — ONLY the ratchetless no-app_data layout
+        // (data length == keysize+name_hash+random_hash+sig_len, the threshold
+        // WITHOUT the 32-byte ratchet term) nulls app_data after signing. A
+        // ratcheted no-app_data announce exceeds this threshold by the ratchet, so
+        // it keeps the b"" sentinel — recall returns empty bytes, not None.
+        val ratchetlessThreshold = keySize + nameHashLen + randomHashLen + sigLen
+        if (!(data.size > ratchetlessThreshold)) {
+            appData = null
         }
 
         return AnnounceData(

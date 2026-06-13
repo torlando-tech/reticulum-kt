@@ -891,10 +891,19 @@ class Link private constructor(
      * Decrypt data received over the link.
      */
     fun decrypt(ciphertext: ByteArray): ByteArray? {
-        if (token == null) {
-            token = Token(derivedKey!!)
+        // python Link.decrypt wraps the token decrypt in try/except and returns
+        // None on failure (RNS 1.3.1 Link.py:decrypt; 1.1.x Link.py:1202-1209), so
+        // a tampered/forged ciphertext (Token HMAC failure) is silently dropped
+        // rather than propagating. All callers already treat a null return as "drop".
+        return try {
+            if (token == null) {
+                token = Token(derivedKey!!)
+            }
+            token!!.decrypt(ciphertext)
+        } catch (e: Exception) {
+            log("Decryption failed on link ${linkId.toHexString()}: ${e.message}")
+            null
         }
-        return token!!.decrypt(ciphertext)
     }
 
     /**

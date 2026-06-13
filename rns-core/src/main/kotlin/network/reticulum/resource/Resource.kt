@@ -7,6 +7,7 @@ import network.reticulum.common.RnsConstants
 import network.reticulum.common.toHexString
 import network.reticulum.crypto.Hashes
 import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -1430,6 +1431,28 @@ class Resource private constructor(
         }
         stopWatchdog()
         status = ResourceConstants.FAILED
+        // python Resource.py:1087-1094 — when the INITIATOR cancels a still-ACTIVE
+        // transfer it sends a RESOURCE_ICL packet carrying the resource hash so the
+        // receiver tears its inbound resource down too. Without this the receiver's
+        // inbound Resource is never told and lingers in TRANSFERRING. The receiver
+        // (processResourceIcl) decrypts the data and reads the first 16 bytes as the
+        // resource hash, so encrypt the hash to the link exactly like advertise().
+        if (initiator && link.status == LinkConstants.ACTIVE) {
+            try {
+                val cancelPacket =
+                    Packet.createRaw(
+                        destinationHash = link.linkId,
+                        data = link.encrypt(hash),
+                        packetType = PacketType.DATA,
+                        destinationType = DestinationType.LINK,
+                        context = PacketContext.RESOURCE_ICL,
+                        mtu = link.mtu,
+                    )
+                cancelPacket.send()
+            } catch (e: Exception) {
+                log("Could not send resource cancel packet: ${e.message}")
+            }
+        }
         link.resourceConcluded(this)
         callbacks.failed?.invoke(this)
         log("Resource ${hash.toHexString()} cancelled")
