@@ -179,6 +179,35 @@ private fun findLinkByIdWaiting(inst: WireInstance, linkIdHex: String, timeoutMs
     }
 }
 
+/** A captured outbound packet emission (context value, dest hash hex, data, raw). */
+private class CapturedEmission(val context: Int, val destHashHex: String, val data: ByteArray, val raw: ByteArray)
+
+/** Run [block] with the Transport outbound tap installed, returning every packet
+ *  emitted during it — the kotlin equivalent of the reference wrapping
+ *  Packet.send to capture a link's emissions. Snapshots context/dest/data/raw
+ *  inside the tap since processOutbound may mutate the packet afterward. */
+private fun captureOutbound(block: () -> Unit): List<CapturedEmission> {
+    val captured = java.util.Collections.synchronizedList(mutableListOf<CapturedEmission>())
+    Transport.outboundTapForTest = { pkt ->
+        runCatching {
+            captured.add(
+                CapturedEmission(
+                    context = pkt.context.value,
+                    destHashHex = pkt.destinationHash.toHex(),
+                    data = pkt.data.copyOf(),
+                    raw = pkt.pack(),
+                ),
+            )
+        }
+    }
+    try {
+        block()
+    } finally {
+        Transport.outboundTapForTest = null
+    }
+    return captured.toList()
+}
+
 /** Build the raw wire bytes of a genuine DATA/LINKCLOSE packet encrypted to a
  *  live link, mirroring Link.sendWithReceipt (encrypt then createRaw — pack does
  *  NOT re-encrypt for LINK destinations). The caller may corrupt the returned
@@ -263,6 +292,10 @@ private val wireInstances = mutableMapOf<String, WireInstance>()
  * it. Cleared in resetWireState so it can't leak across tests sharing the JVM.
  */
 private val wireRequestHandlerLog = ConcurrentHashMap<String, MutableList<JsonObject>>()
+
+/** Last keepalive byte a link emitted/answered, keyed by link id hex — mirrors
+ *  the reference's inst["keepalive_payloads"]. Cleared on reset. */
+private val wireKeepalivePayloads = ConcurrentHashMap<String, ByteArray>()
 
 /**
  * Inbound tap — every packet that the bridge hands to Transport.inbound is
@@ -366,6 +399,8 @@ private fun resetWireState() {
     val stale = wireInstances.values.toList()
     wireInstances.clear()
     wireRequestHandlerLog.clear()
+    wireKeepalivePayloads.clear()
+    runCatching { Transport.outboundTapForTest = null }
     for (inst in stale) {
         runCatching { inst.serverIface?.detach() }
         runCatching { inst.clientIface?.detach() }
@@ -2674,6 +2709,94 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             "delivered" to boolVal(after > before),
             "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
             "link_closed" to boolVal(link.status == LinkConstants.CLOSED),
+        )
+    }
+
+    // ===== Phase 5c batch 4c: emission-capture (keepalive / teardown) =====
+
+    "wire_send_keepalive_probe" -> {
+        // Inject a decrypted 0xFF keepalive into a link's receive path and report
+        // its response. A non-initiator answers 0xFF with 0xFE; an initiator
+        // drops its own 0xFF echo (no answer). KEEPALIVE data is unencrypted.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val value = p.get("value")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: byteArrayOf(0xFF.toByte())
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = findLinkByIdWaiting(inst, linkIdHex)
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        // KEEPALIVE packets carry their value unencrypted (Packet ciphertext==data).
+        val pkt = Packet.createRaw(
+            destinationHash = link.linkId,
+            data = value,
+            packetType = network.reticulum.common.PacketType.DATA,
+            destinationType = DestinationType.LINK,
+            context = network.reticulum.common.PacketContext.KEEPALIVE,
+            mtu = link.mtu,
+        )
+        val rx = Packet.unpack(pkt.pack())
+            ?: throw IllegalStateException("could not unpack crafted keepalive packet")
+        rx.setReceivingInterfaceHashForTest(link.attachedInterfaceHash)
+
+        val lastInboundBefore = link.lastInbound
+        val lastDataBefore = link.lastData
+        val statusBefore = link.status
+        val keepaliveCtx = network.reticulum.common.PacketContext.KEEPALIVE.value
+        val emissions = captureOutbound { link.receive(rx) }
+        val answer = emissions.lastOrNull { it.context == keepaliveCtx && it.destHashHex == linkIdHex }?.data
+        if (answer != null) wireKeepalivePayloads[linkIdHex] = answer
+        result(
+            "response" to (answer?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            "answered" to boolVal(answer != null),
+            "initiator" to boolVal(link.initiator),
+            "last_inbound_advanced" to boolVal(link.lastInbound > lastInboundBefore),
+            "last_data_advanced" to boolVal(link.lastData > lastDataBefore),
+            "status_before" to intVal(statusBefore),
+            "status_after" to intVal(link.status),
+        )
+    }
+
+    "wire_last_keepalive" -> {
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val payload = wireKeepalivePayloads[linkIdHex]
+        result("payload" to (payload?.let { hexVal(it) } ?: JsonNull.INSTANCE))
+    }
+
+    "wire_link_teardown_emission" -> {
+        // Pin Link.teardown's LINKCLOSE-emission gate: a PENDING link tears down
+        // silently; an ACTIVE link emits exactly one LINKCLOSE. Count LINKCLOSE
+        // emissions across a fresh forced-PENDING link and the established link.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val appName = p.get("app_name")?.asString ?: "conformance"
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: arrayOf("teardown-emit")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val activeLink = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown outbound link_id: $linkIdHex")
+
+        val linkcloseCtx = network.reticulum.common.PacketContext.LINKCLOSE.value
+        val activeStatusBefore = LINK_STATUS_NAMES[activeLink.status]
+        // PENDING: a fresh initiator link forced PENDING (its handshake sends a
+        // LINKREQUEST, never a LINKCLOSE, so it doesn't perturb the count). A
+        // PENDING teardown must emit no LINKCLOSE.
+        val pendingDest = Destination.create(Identity.create(), DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val pending = Link.create(pendingDest)
+        pending.setStatusForTest(LinkConstants.PENDING)
+        val pendingEmitted = captureOutbound { pending.teardown() }.count { it.context == linkcloseCtx }
+        // ACTIVE: the established link emits exactly one LINKCLOSE.
+        val activeEmitted = captureOutbound { activeLink.teardown() }
+            .count { it.context == linkcloseCtx && it.destHashHex == linkIdHex }
+
+        result(
+            "pending_linkclose_emitted" to intVal(pendingEmitted),
+            "active_linkclose_emitted" to intVal(activeEmitted),
+            "active_status_before" to (activeStatusBefore?.let { strVal(it) } ?: JsonNull.INSTANCE),
         )
     }
 
