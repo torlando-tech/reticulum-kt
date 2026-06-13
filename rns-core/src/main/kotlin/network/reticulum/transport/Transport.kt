@@ -405,6 +405,16 @@ object Transport {
      * is the source of truth, mutated by config / the conformance bridge). */
     val blackholeSources = CopyOnWriteArrayList<ByteArray>()
 
+    /** Remote-management ACL: identity hashes allowed to use the transport's
+     * remote-management destination (python Transport.remote_management_allowed,
+     * Transport.py; populated from the enable_remote_management config knob). */
+    val remoteManagementAllowed = CopyOnWriteArrayList<ByteArray>()
+
+    /** Trusted interface-discovery-source identity hashes (python
+     * Reticulum.interface_discovery_sources(); populated from the
+     * interface_discovery_sources config knob). */
+    val interfaceDiscoverySources = CopyOnWriteArrayList<ByteArray>()
+
     @Volatile private var blackholeLastChecked: Long = 0
     private val blackholeCheckIntervalMs = 60_000L
 
@@ -574,6 +584,11 @@ object Transport {
         // Blackhole state must not leak across instances (singleton reset).
         blackholedIdentities.clear()
         blackholeSources.clear()
+        // Config-derived ACL / discovery-source lists must not leak across
+        // singleton restarts either (the conformance bridge starts a fresh
+        // Reticulum per test in the same JVM).
+        remoteManagementAllowed.clear()
+        interfaceDiscoverySources.clear()
         blackholeLastChecked = 0
 
         // Stop discovery
@@ -4567,6 +4582,19 @@ object Transport {
                     } else {
                         log("No callback registered for ${destination.hexHash}")
                     }
+
+                    // Receiver-side single-packet PROOF emission per the
+                    // destination's proof strategy. python Transport.inbound
+                    // (Transport.py:2157-2165): after a successful
+                    // destination.receive() (a truthy decrypt — the decrypt
+                    // early-return above is the equivalent guard) the packet is
+                    // proved iff proof_strategy is PROVE_ALL, or PROVE_APP with the
+                    // proof_requested callback returning true; PROVE_NONE proves
+                    // nothing. Destination.shouldProve() encapsulates that decision
+                    // and packet.prove() signs+sends the PROOF back to the sender.
+                    if (destination.shouldProve(packet)) {
+                        runCatching { packet.prove() }
+                    }
                 }
 
                 PacketType.LINKREQUEST -> {
@@ -5067,6 +5095,16 @@ object Transport {
     /** Drive the real outbound transmit (applies IFAC masking) on an interface. */
     fun transmitForTest(interfaceRef: InterfaceRef, raw: ByteArray) =
         transmit(interfaceRef, raw)
+
+    /**
+     * Conformance seam: return the genuine IFAC-masked frame for [raw] on this
+     * interface WITHOUT transmitting it (the reference captures Transport.transmit's
+     * process_outgoing output, wire_tcp.py:1827-1852). Exposes the private
+     * applyIfacMasking so the wire bridge can mask a frame for injection. No port
+     * logic — just surfaces the existing masker.
+     */
+    fun applyIfacMaskingForTest(raw: ByteArray, interfaceRef: InterfaceRef): ByteArray =
+        applyIfacMasking(raw, interfaceRef)
 
     /** Replace path_table[dest]'s timestamp (epoch millis), copying the entry. */
     fun setPathTimestampForTest(destHash: ByteArray, timestampMs: Long): Boolean {

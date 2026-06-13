@@ -314,6 +314,14 @@ class InterfaceDiscovery(
             return
         }
 
+        // A BackboneInterface whose reachable_on is a Yggdrasil 200::/7 address
+        // must NOT be auto-dialled (python Discovery.py:649-651, is_ygg_ipv6
+        // guard). Without this, a yggdrasil endpoint would be wrongly connected.
+        if (info.reachableOn != null && DiscoveryUtil.isYggIpv6(info.reachableOn)) {
+            log("Skipping auto-connect for ${info.name}: Yggdrasil address ${info.reachableOn}")
+            return
+        }
+
         try {
             log("Auto-connecting discovered interface: ${info.type} \"${info.name}\" at $endpointSpecifier")
             val iface =
@@ -328,6 +336,26 @@ class InterfaceDiscovery(
         } catch (e: Exception) {
             log("Error auto-connecting discovered interface: ${e.message}")
         }
+    }
+
+    /**
+     * Test seam: drive the private [autoconnect] decision for one discovered
+     * record (the conformance bridge's wire_discovery_autoconnect_gate). Public
+     * wrapper only — the real logic stays in [autoconnect].
+     */
+    fun autoconnectForTest(info: DiscoveredInterface) = autoconnect(info)
+
+    /**
+     * Test seam: expose the endpoint dedup-key computation (the same
+     * full_hash("reachable_on:port") string assembly [autoconnect] uses inline;
+     * python Discovery.py:601-606). Public wrapper for the conformance bridge.
+     */
+    fun endpointHashForTest(info: DiscoveredInterface): ByteArray {
+        val spec = buildString {
+            info.reachableOn?.let { append(it) }
+            info.port?.let { append(":$it") }
+        }
+        return Hashes.fullHash(spec.toByteArray(Charsets.UTF_8))
     }
 
     private fun connectDiscovered() {

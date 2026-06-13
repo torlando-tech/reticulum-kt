@@ -1329,8 +1329,14 @@ class Identity private constructor(
         // Sign the packet hash
         val signature = sign(packet.packetHash)
 
-        // For now, always use explicit proofs (implicit proofs require Reticulum.shouldUseImplicitProof())
-        val proofData = packet.packetHash + signature
+        // python Identity.prove (Identity.py:961-963): an IMPLICIT proof carries
+        // only the signature; an EXPLICIT proof prepends the packet hash. The
+        // form is selected by RNS.Reticulum.should_use_implicit_proof().
+        val proofData = if (network.reticulum.Reticulum.shouldUseImplicitProof()) {
+            signature
+        } else {
+            packet.packetHash + signature
+        }
 
         // Determine destination hash for proof
         val destinationHash = destination?.hash ?: packet.truncatedHash

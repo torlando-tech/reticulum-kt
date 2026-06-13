@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import network.reticulum.Reticulum
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
@@ -52,6 +53,13 @@ class TCPClientInterface(
      * When provided, creates child scope that cancels when parent cancels - for Android service usage.
      */
     private val parentScope: CoroutineScope? = null,
+    // Configured bitrate in bps. Below MINIMUM_BITRATE is ignored, keeping
+    // BITRATE_GUESS (python Reticulum.py:765-768).
+    bitrate: Int? = null,
+    // Pinned link MTU in bytes (FIXED_MTU mode; the bridge's fixed_mtu knob).
+    private val fixedMtuBytes: Int? = null,
+    // Configured IFAC size in BITS (python Reticulum.py:719-723 bits->bytes floor).
+    private val ifacSizeBits: Int? = null,
 ) : Interface(name) {
 
     companion object {
@@ -68,8 +76,14 @@ class TCPClientInterface(
         private val DEBUG = System.getProperty("reticulum.tcp.debug", "false").toBoolean()
     }
 
-    override val bitrate: Int = BITRATE_GUESS
-    override val hwMtu: Int = HW_MTU
+    // python Reticulum.py:765-768 — sub-minimum bitrate ignored, keeps BITRATE_GUESS.
+    override val bitrate: Int =
+        if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode keeps the
+    // class HW_MTU and auto-configures (python TCPInterface AUTOCONFIGURE_MTU=True).
+    override val hwMtu: Int = fixedMtuBytes ?: HW_MTU
+    override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
+    override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true
 
     // Discovery support
@@ -86,7 +100,11 @@ class TCPClientInterface(
     }
 
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) {
+            // python Reticulum.py:719-723: configured ifac_size (bits) >=
+            // IFAC_MIN_SIZE*8 (==8) divides by 8; else floors to DEFAULT_IFAC_SIZE.
+            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
+        } else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key

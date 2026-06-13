@@ -282,3 +282,33 @@ With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` 
 **Description:** kotlin stores only the per-destination announce timestamp history (`Map<ByteArrayKey, MutableList<Long>>`), not python's full rate-limiter record with `last`/`rate_violations`/`blocked_until`. The conformance read surfaces `timestamps` faithfully and derives `last = max(timestamps)`; `rate_violations`/`blocked_until` are reported as 0 because kotlin does not yet implement the grace-counter/penalty-window enforcement. This is a genuine feature gap, not just a representation choice.
 
 **Re-evaluation:** when kotlin implements per-destination announce-rate enforcement (target rate + grace + penalty window), port python's full record and remove this entry.
+
+---
+
+### Typed config-knob threading replaces the INI config layer (Phase 5g) — `rns-core/.../Reticulum.kt::start`/`initialize`, `rns-interfaces/.../tcp/{TCPServerInterface,TCPClientInterface}.kt`, `Interface.kt`
+
+**Python reference:** `RNS/Reticulum.py:253-281` (posture defaults), `:489-495` (rpc_key parse/fallback), `:497-558` (`__apply_config` flag parse), `:575-591` (blackhole/discovery-source 16-byte validation + dedup), `:347-348` (rpc_key default = full_hash(transport private key)), `:719-723` (ifac_size bits->bytes floor), `:765-768` (bitrate MINIMUM_BITRATE floor); `RNS/Interfaces/Interface.py:89-94` (DEFAULT_AR_*, AUTOCONFIGURE_MTU/FIXED_MTU).
+
+**Category:** language/architecture divergence — kotlin has no INI/ConfigObj parser and no `__apply_config`.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `wire_instance_posture`, `wire_transport_enabled`, `wire_rpc_authkey`, `wire_interface_bitrate`, `wire_interface_hw_mtu`, `wire_interface_transport_defaults`, `wire_first_hop_timeout`, `wire_discovery_autoconnect_gate` (tests/wire/test_reticulum_config_hooks.py, test_reticulum_config_v2.py, test_interface_defaults_v2.py, test_discovery_autoconnect_v2.py, test_link_protocol.py, test_link_completeness.py).
+
+**Description:** RNS resolves these posture/interface knobs by parsing an INI config in `__apply_config`. reticulum-kt has no config layer, so the same flags are threaded as typed parameters: `Reticulum.start(respondToProbes, useImplicitProof, enableRemoteManagement, remoteManagementAllowed, panicOnInterfaceError, blackholeSources, interfaceDiscoverySources, rpcKey)` plus companion read-outs (`probeDestinationEnabled`/`shouldUseImplicitProof`/`remoteManagementEnabled`/`panicOnInterfaceError`/`interfaceDiscoverySources`); and TCP interface constructor params `bitrate`/`fixedMtuBytes`/`ifacSizeBits`. The 16-byte identity-hash validation + dedup that python does in `__apply_config` runs in `Reticulum.start()` (a wrong-length/invalid-hex hash aborts the start, matching python's ValueError). rpc_key parse-with-fallback and the SHA-256(private-key) default run in `initialize()`. The bitrate floor and ifac_size bits->bytes floor run in the interface constructors (python applies them post-init in `_synthesize_interface`); the spawned `TCPServerClientInterface` inherits the parent's MTU/bitrate posture so the receiver side of a fixed-MTU link negotiates the same value. `Interface.autoconfigureMtu`/`fixedMtu` are faithful ports of python's `AUTOCONFIGURE_MTU`/`FIXED_MTU` class attributes; `Interface.DEFAULT_AR_TARGET/_PENALTY/_GRACE` are faithful ports of the python constants. The resolved VALUES match python exactly — only the resolution mechanism (typed kwargs vs INI parse) differs.
+
+**Re-evaluation:** if reticulum-kt ever gains an INI/`_synthesize_interface` config layer, route these knobs through it and keep the typed params as the programmatic surface.
+
+---
+
+### InterfaceDiscovery.autoconnect Yggdrasil 200::/7 guard added (Phase 5g divergence fix) — `rns-core/.../discovery/InterfaceDiscovery.kt::autoconnect`
+
+**Python reference:** `RNS/Discovery.py:649-651` — `if is_ygg_ipv6(info["reachable_on"]): return` (skip auto-connecting a BackboneInterface on a Yggdrasil address).
+
+**Category:** divergence FIX (the guard was missing; kotlin wrongly auto-connected ygg endpoints).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `test_autoconnect_rejects_unsupported_records` (the `yggdrasil` case); unit `InterfaceDiscoveryTest.autoconnect skips yggdrasil endpoint`.
+
+**Description:** kotlin's `autoconnect` had no Yggdrasil guard, so a discovered `BackboneInterface` reachable on a 200::/7 address (which IS in `AUTOCONNECT_TYPES`) would invoke the connect factory. The guard `if (info.reachableOn != null && DiscoveryUtil.isYggIpv6(info.reachableOn)) return` is now applied after the type/limit/dedup checks and before the factory invoke, mirroring python. `endpointHashForTest`/`autoconnectForTest` are public test seams over the existing inline endpoint-hash computation and the private `autoconnect`.

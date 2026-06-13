@@ -32,6 +32,7 @@
  */
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
@@ -39,7 +40,14 @@ import network.reticulum.Reticulum
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.InterfaceMode
+import network.reticulum.common.PacketContext
+import network.reticulum.common.PacketType
+import network.reticulum.common.RnsConstants
+import network.reticulum.crypto.Hashes
+import network.reticulum.crypto.defaultCryptoProvider
 import network.reticulum.destination.Destination
+import network.reticulum.discovery.DiscoveredInterface
+import network.reticulum.discovery.InterfaceDiscovery
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
@@ -51,9 +59,11 @@ import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.link.RequestReceipt
 import network.reticulum.packet.Packet
+import network.reticulum.packet.PacketReceipt
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
+import network.reticulum.transport.TransportConstants
 import java.io.File
 import java.net.ServerSocket
 import java.util.UUID
@@ -103,6 +113,11 @@ private class WireInstance(
     // Link bookkeeping — used by wire_listen / wire_link_* commands below.
     val listeners: ConcurrentHashMap<String, Listener> = ConcurrentHashMap(),
     val outLinks: ConcurrentHashMap<String, Link> = ConcurrentHashMap(),
+    // Per-handle PacketReceipt store, keyed by a fresh receipt_id hex token —
+    // mirrors the reference bridge's inst["receipts"][receipt_id] = receipt
+    // (wire_tcp.py:3402-3403). wire_send_packet* stash a receipt here;
+    // wire_packet_receipt_status / wire_inject_crafted_proof read it back.
+    val receipts: ConcurrentHashMap<String, network.reticulum.packet.PacketReceipt> = ConcurrentHashMap(),
 )
 
 /**
@@ -299,6 +314,12 @@ private class Listener(
     // order — lets wire_listener_link_status observe teardown_reason on the
     // side that did NOT initiate the close.
     val inboundLinks: ConcurrentLinkedDeque<Link> = ConcurrentLinkedDeque(),
+    // Receiver-side proof log: the raw context byte of every inbound packet
+    // this listener's links PROVED, in order — mirrors the reference's
+    // listener["proof_log"] populated by wrapping link.prove_packet
+    // (wire_tcp.py:1299-1317). Filled by the Link.proveTapForTest tap installed
+    // in wire_listen; drained by wire_listener_proof_log.
+    val proofLog: ConcurrentLinkedDeque<Int> = ConcurrentLinkedDeque(),
 )
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
@@ -419,6 +440,10 @@ private fun resetWireState() {
     wireRequestHandlerLog.clear()
     wireKeepalivePayloads.clear()
     runCatching { Transport.outboundTapForTest = null }
+    // Process-wide implicit-proof policy is a JVM singleton (Reticulum companion);
+    // restore the RNS default (true) so a wire_set_proof_implicit toggle in one
+    // test cannot leak into the next.
+    runCatching { Reticulum.setUseImplicitProofForTest(true) }
     for (inst in stale) {
         runCatching { inst.serverIface?.detach() }
         runCatching { inst.clientIface?.detach() }
@@ -443,6 +468,119 @@ private fun resetWireState() {
     // unexpectedly hits tryConnectToSharedInstance or startLocalServer with
     // stale state).
     runCatching { Reticulum.clearPendingFactories() }
+}
+
+/**
+ * Locate the live wire interface on this handle (server XOR client). Mirrors the
+ * python bridge's `_primary_wire_interface(inst)`. Returns null when neither is
+ * configured (the caller throws a coherent error).
+ */
+private fun primaryWireInterface(inst: WireInstance): network.reticulum.interfaces.Interface? =
+    inst.serverIface ?: inst.clientIface
+
+/**
+ * Whether this handle is a connected local client of a shared instance (python
+ * rns.is_connected_to_shared_instance). The manual local-client attach path does
+ * not flip the rns-core instance flag, but a handle created via
+ * wire_start_local_client IS connected to a shared master by construction (its
+ * role records that), so report the truthful posture from either signal.
+ */
+private fun isConnectedToSharedInstance(inst: WireInstance): Boolean =
+    inst.role == "local_client" || inst.rns.isConnectedToSharedInstance
+
+/** Phase-5g process-wide posture/config knobs resolved from the start params. */
+private class StartConfig(
+    val enableTransport: Boolean,
+    val respondToProbes: Boolean,
+    val useImplicitProof: Boolean,
+    val enableRemoteManagement: Boolean,
+    val remoteManagementAllowed: List<ByteArray>,
+    val panicOnInterfaceError: Boolean,
+    val blackholeSources: List<ByteArray>,
+    val interfaceDiscoverySources: List<ByteArray>,
+    val rpcKey: String?,
+)
+
+/** Per-interface tuning knobs (applied in the TCP interface constructors). */
+private class IfaceTuning(
+    val bitrate: Int?,
+    val fixedMtu: Int?,
+    val ifacSizeBits: Int?,
+)
+
+/**
+ * Parse the Phase-5g start config + interface tuning from the wire params.
+ *
+ * The reference bridge writes these into the INI `[reticulum]` / interface
+ * sections (wire_tcp.py:320-405); kotlin has no config layer, so they thread as
+ * typed Reticulum.start() / interface-constructor params. Invalid-hex ACL/source
+ * entries throw here (during fromHex) → BridgeError, mirroring RNS's
+ * bytes.fromhex guard (Reticulum.py:580-581); wrong-LENGTH entries are caught by
+ * Reticulum.start()'s 16-byte validator.
+ *
+ * enable_transport is tri-state (reference wire_tcp.py:484-485): key ABSENT ->
+ * the role default; explicit JSON null -> option-absent default-OFF
+ * (Reticulum.py:253); explicit bool -> that value.
+ */
+private fun parseStartConfig(p: JsonObject, defaultEnableTransport: Boolean): Pair<StartConfig, IfaceTuning> {
+    val enableTransport =
+        if (p.has("enable_transport")) {
+            val el = p.get("enable_transport")
+            if (el.isJsonNull) false else el.asBoolean
+        } else {
+            defaultEnableTransport
+        }
+
+    fun hashList(key: String): List<ByteArray> = p.stringArray(key).map { it.fromHex() }
+    fun boolOr(key: String, default: Boolean): Boolean =
+        p.get(key)?.takeIf { !it.isJsonNull }?.asBoolean ?: default
+
+    val cfg = StartConfig(
+        enableTransport = enableTransport,
+        respondToProbes = boolOr("respond_to_probes", false),
+        useImplicitProof = boolOr("use_implicit_proof", true),
+        enableRemoteManagement = boolOr("enable_remote_management", false),
+        remoteManagementAllowed = hashList("remote_management_allowed"),
+        panicOnInterfaceError = boolOr("panic_on_interface_error", false),
+        blackholeSources = hashList("blackhole_sources"),
+        interfaceDiscoverySources = hashList("interface_discovery_sources"),
+        rpcKey = p.get("rpc_key")?.takeIf { !it.isJsonNull }?.asString,
+    )
+    val tuning = IfaceTuning(
+        bitrate = p.intOpt("bitrate"),
+        fixedMtu = p.intOpt("fixed_mtu"),
+        ifacSizeBits = p.intOpt("ifac_size"),
+    )
+    return cfg to tuning
+}
+
+/** Fresh 8-byte hex receipt id token — mirrors the reference's
+ *  `secrets.token_hex(8)` keying inst["receipts"] (wire_tcp.py:3402). */
+private fun freshReceiptId(): String = defaultCryptoProvider().randomBytes(8).toHex()
+
+/**
+ * Build a GENUINE announce frame for a FRESH, FOREIGN destination, mirroring the
+ * reference's `_build_foreign_announce` (wire_tcp.py:9798-9824): create a real IN
+ * SINGLE destination (auto-registered in Transport), capture its UNMASKED announce
+ * via announce(send=false) -> pack(), then deregister it so the local Transport
+ * treats the announce as foreign (path-learnable on inbound). A strong ref is kept
+ * on the handle so neither identity nor destination is GC'd before inbound runs.
+ * No protocol bytes are assembled — announcePacket.raw is whatever RNS packed.
+ */
+private fun buildForeignAnnounce(
+    inst: WireInstance,
+    appName: String,
+    aspects: Array<String>,
+    appData: ByteArray,
+): Pair<Destination, ByteArray> {
+    val id = Identity.create()
+    val dest = Destination.create(id, DestinationDirection.IN, DestinationType.SINGLE, appName, *aspects)
+    val ann = dest.announce(appData = appData, send = false)
+        ?: throw IllegalStateException("announce(send=false) returned null")
+    val plainRaw = ann.pack()
+    Transport.deregisterDestination(dest)
+    inst.destinations.add(id to dest)
+    return dest to plainRaw
 }
 
 fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (command) {
@@ -470,13 +608,27 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         // handle can survive pointing at a dead Reticulum.
         resetWireState()
 
+        // Phase 5g posture/config knobs threaded into the typed Reticulum.start()
+        // params (kotlin has no INI config layer; mirrors what the reference
+        // bridge writes into the [reticulum] section). See wire_instance_posture
+        // / wire_rpc_authkey / wire_interface_bitrate / wire_interface_hw_mtu.
+        val (cfg, ifaceTuning) = parseStartConfig(p, defaultEnableTransport = true)
+
         val configDir = java.nio.file.Files.createTempDirectory("rns_wire_server_").toFile()
         try {
             val rns = Reticulum.start(
                 configDir = configDir.absolutePath,
-                enableTransport = true,
+                enableTransport = cfg.enableTransport,
                 shareInstance = false,
                 connectToSharedInstance = false,
+                respondToProbes = cfg.respondToProbes,
+                useImplicitProof = cfg.useImplicitProof,
+                enableRemoteManagement = cfg.enableRemoteManagement,
+                remoteManagementAllowed = cfg.remoteManagementAllowed,
+                panicOnInterfaceError = cfg.panicOnInterfaceError,
+                blackholeSources = cfg.blackholeSources,
+                interfaceDiscoverySources = cfg.interfaceDiscoverySources,
+                rpcKey = cfg.rpcKey,
             )
 
             val server = TCPServerInterface(
@@ -485,6 +637,9 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 bindPort = bindPort,
                 ifacNetname = networkName,
                 ifacNetkey = passphrase,
+                bitrate = ifaceTuning.bitrate,
+                fixedMtuBytes = ifaceTuning.fixedMtu,
+                ifacSizeBits = ifaceTuning.ifacSizeBits,
             )
             // Park the interface in the requested mode BEFORE registering
             // with Transport. The mode is read by the InterfaceAdapter's
@@ -758,15 +913,25 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
         val targetPort = p.int("target_port")
         val desiredMode = parseInterfaceMode(p.get("mode")?.asString)
 
+        val (cfg, ifaceTuning) = parseStartConfig(p, defaultEnableTransport = true)
+
         resetWireState()
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_wire_client_").toFile()
         try {
             val rns = Reticulum.start(
                 configDir = configDir.absolutePath,
-                enableTransport = true,
+                enableTransport = cfg.enableTransport,
                 shareInstance = false,
                 connectToSharedInstance = false,
+                respondToProbes = cfg.respondToProbes,
+                useImplicitProof = cfg.useImplicitProof,
+                enableRemoteManagement = cfg.enableRemoteManagement,
+                remoteManagementAllowed = cfg.remoteManagementAllowed,
+                panicOnInterfaceError = cfg.panicOnInterfaceError,
+                blackholeSources = cfg.blackholeSources,
+                interfaceDiscoverySources = cfg.interfaceDiscoverySources,
+                rpcKey = cfg.rpcKey,
             )
 
             val client = TCPClientInterface(
@@ -775,6 +940,9 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
                 targetPort = targetPort,
                 ifacNetname = networkName,
                 ifacNetkey = passphrase,
+                bitrate = ifaceTuning.bitrate,
+                fixedMtuBytes = ifaceTuning.fixedMtu,
+                ifacSizeBits = ifaceTuning.ifacSizeBits,
             )
             if (desiredMode != null) client.modeOverride = desiredMode
             client.start()
@@ -914,6 +1082,11 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             // Track the accepted inbound link so wire_listener_link_status can
             // observe its lifecycle (e.g. teardown_reason after the initiator closes).
             listener.inboundLinks.add(link)
+            // Record every packet this link proves into the listener's proof log,
+            // the kotlin analog of the reference wrapping link.prove_packet
+            // (wire_tcp.py:1299-1317). contextRaw is the raw wire context int —
+            // 0x00 for proved link DATA, 0x0E (CHANNEL) for proved channel packets.
+            link.proveTapForTest = { provedPkt -> listener.proofLog.add(provedPkt.contextRaw) }
             link.setPacketCallback { data, _packet ->
                 listener.recvBuffer.add(data.copyOf())
             }
@@ -3260,6 +3433,790 @@ fun handleWireCommand(command: String, p: JsonObject): JsonObject = when (comman
             runCatching { configDir.deleteRecursively() }
             throw t
         }
+    }
+
+    // ===== Phase 5g: instance / config posture =====
+
+    "wire_transport_enabled" -> {
+        // Ground-truth Reticulum.transport_enabled() + the two shared-instance
+        // role flags (reference wire_tcp.py:3242-3267).
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        result(
+            "transport_enabled" to boolVal(Reticulum.transportEnabled()),
+            "is_shared_instance" to boolVal(inst.rns.isSharedInstance),
+            "is_connected_to_shared_instance" to boolVal(isConnectedToSharedInstance(inst)),
+        )
+    }
+
+    "wire_instance_posture" -> {
+        // Union of the process-wide posture flags RNS resolves at start
+        // (reference wire_tcp.py:8497-8542). Each reads the companion static /
+        // Transport list the start command populated from the config knobs.
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        result(
+            "transport_enabled" to boolVal(Reticulum.transportEnabled()),
+            "remote_management_enabled" to boolVal(Reticulum.remoteManagementEnabled()),
+            "respond_to_probes" to boolVal(Reticulum.probeDestinationEnabled()),
+            "should_use_implicit_proof" to boolVal(Reticulum.shouldUseImplicitProof()),
+            "link_mtu_discovery" to boolVal(Reticulum.linkMtuDiscovery()),
+            "remote_management_allowed" to JsonArray().apply {
+                Transport.remoteManagementAllowed.forEach { add(it.toHex()) }
+            },
+            "panic_on_interface_error" to boolVal(Reticulum.panicOnInterfaceError()),
+            "blackhole_sources" to JsonArray().apply {
+                Transport.blackholeSources.forEach { add(it.toHex()) }
+            },
+            "interface_discovery_sources" to JsonArray().apply {
+                Reticulum.interfaceDiscoverySources().forEach { add(it.toHex()) }
+            },
+            "is_shared_instance" to boolVal(inst.rns.isSharedInstance),
+            "is_connected_to_shared_instance" to boolVal(isConnectedToSharedInstance(inst)),
+        )
+    }
+
+    "wire_rpc_authkey" -> {
+        // Derived RPC authkey + the transport identity private key (reference
+        // wire_tcp.py:8655-8676). Default = SHA-256(privkey) (Reticulum.py:347-348).
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        val priv = Transport.identity?.getPrivateKey()
+            ?: throw IllegalStateException("Transport has no identity")
+        result(
+            "rpc_key" to hexVal(inst.rns.rpcKey),
+            "transport_private_key" to hexVal(priv),
+        )
+    }
+
+    "wire_interface_bitrate" -> {
+        // Live interface bitrate after the MINIMUM_BITRATE floor (reference
+        // wire_tcp.py:8629-8652; Reticulum.py:765-768). bitrate_guess is the
+        // class constant regardless of the floored value.
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        val iface = primaryWireInterface(inst)
+            ?: throw RuntimeException("No configured wire interface on this handle.")
+        val guess = when (iface) {
+            is TCPServerInterface -> TCPServerInterface.BITRATE_GUESS
+            is TCPClientInterface -> TCPClientInterface.BITRATE_GUESS
+            else -> iface.bitrate
+        }
+        result(
+            "bitrate" to intVal(iface.bitrate),
+            "bitrate_guess" to intVal(guess),
+            "minimum_bitrate" to intVal(Reticulum.MINIMUM_BITRATE),
+        )
+    }
+
+    "wire_interface_hw_mtu" -> {
+        // Link-MTU-discovery flag + interface HW_MTU posture (reference
+        // wire_tcp.py:2493-2524). fixed_mtu pins HW_MTU and disables AUTOCONFIGURE.
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        val iface = primaryWireInterface(inst)
+            ?: throw RuntimeException("No configured wire interface on this handle.")
+        val classHwMtu = when (iface) {
+            is TCPServerInterface -> TCPServerInterface.HW_MTU
+            is TCPClientInterface -> TCPClientInterface.HW_MTU
+            else -> iface.hwMtu
+        }
+        result(
+            "hw_mtu" to (iface.hwMtu?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "link_mtu_discovery" to boolVal(Reticulum.linkMtuDiscovery()),
+            "reticulum_mtu" to intVal(Reticulum.MTU),
+            "autoconfigure_mtu" to boolVal(iface.autoconfigureMtu),
+            "fixed_mtu" to boolVal(iface.fixedMtu),
+            "class_hw_mtu" to (classHwMtu?.let { intVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_interface_transport_defaults" -> {
+        // Transport-node interop default constants (reference wire_tcp.py:9143-9167).
+        wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        result(
+            "local_interface_port" to intVal(Reticulum.DEFAULT_SHARED_INSTANCE_PORT),
+            "ar_target" to intVal(network.reticulum.interfaces.Interface.DEFAULT_AR_TARGET),
+            "ar_penalty" to intVal(network.reticulum.interfaces.Interface.DEFAULT_AR_PENALTY),
+            "ar_grace" to intVal(network.reticulum.interfaces.Interface.DEFAULT_AR_GRACE),
+        )
+    }
+
+    "wire_first_hop_timeout" -> {
+        // Transport.first_hop_timeout(dh): unknown path -> DEFAULT_PER_HOP_TIMEOUT
+        // (reference wire_tcp.py:8679-8698). kotlin returns ms; convert to seconds.
+        wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+        val dh = p.hex("destination_hash")
+        val timeoutMs = Transport.firstHopTimeout(dh)
+        result(
+            "timeout" to doubleVal(timeoutMs / 1000.0),
+            "default_per_hop_timeout" to intVal(Reticulum.DEFAULT_PER_HOP_TIMEOUT),
+        )
+    }
+
+    "wire_discovery_autoconnect_gate" -> {
+        // Drive InterfaceDiscovery.autoconnect for four discovered-interface
+        // records; every one must add zero interfaces (reference wire_tcp.py:
+        // 9170-9246). Also pins the endpoint dedup hash == SHA-256("host:port").
+        val inst = wireInstances[p.str("handle")]
+            ?: throw IllegalArgumentException("Unknown handle: ${p.str("handle")}")
+
+        val savedCap = Reticulum.autoconnectDiscoveredInterfaces
+        Reticulum.autoconnectDiscoveredInterfaces = 4
+        val createdRefs = mutableListOf<network.reticulum.transport.InterfaceRef>()
+        try {
+            val disc = InterfaceDiscovery(
+                storagePath = inst.configDir.absolutePath + "/discovery_gate",
+                requiredValue = 14,
+                autoConnectFactory = { _ ->
+                    // Only reached if autoconnect's type / ygg guards wrongly
+                    // pass — registers a (non-started) dummy so the Transport
+                    // interface count rises, making the gate test discriminating.
+                    val dummy = TCPServerInterface(
+                        name = "discovery-gate-dummy-${UUID.randomUUID()}",
+                        bindPort = allocateFreePort(),
+                    )
+                    val ref = dummy.toRef()
+                    Transport.registerInterface(ref)
+                    createdRefs.add(ref)
+                    ref
+                },
+                maxAutoConnected = 4,
+            )
+
+            fun info(type: String, reachableOn: String, port: Int): DiscoveredInterface =
+                DiscoveredInterface(
+                    type = type, transport = false, name = "discovered-gate",
+                    received = 0, stampValue = 14,
+                    transportId = "00".repeat(16), networkId = "00".repeat(16),
+                    hops = 0, latitude = null, longitude = null, height = null,
+                    reachableOn = reachableOn, port = port, frequency = null,
+                    bandwidth = null, spreadingFactor = null, codingRate = null,
+                    modulation = null, channel = null, ifacNetname = null,
+                    ifacNetkey = null,
+                    discoveryHash = Hashes.fullHash((type + "discovered-gate").toByteArray()),
+                )
+
+            val cases = linkedMapOf(
+                "wrong_type" to info("UDPInterface", "10.0.0.5", 4242),
+                "tcp_client" to info("TCPClientInterface", "10.0.0.6", 4242),
+                "i2p" to info("I2PInterface", "abcdefgh.b32.i2p", 0),
+                "yggdrasil" to info("BackboneInterface", "200::1", 4242),
+            )
+            val out = mutableListOf<Pair<String, com.google.gson.JsonElement>>()
+            for ((name, rec) in cases) {
+                val before = Transport.getInterfaces().size
+                runCatching { disc.autoconnectForTest(rec) }
+                val after = Transport.getInterfaces().size
+                out += name to result("interfaces_added" to intVal(after - before))
+            }
+            val probe = info("BackboneInterface", "10.9.9.9", 4242)
+            out += "endpoint_hash" to hexVal(disc.endpointHashForTest(probe))
+            out += "endpoint_spec" to strVal("10.9.9.9:4242")
+            result(*out.toTypedArray())
+        } finally {
+            // Deregister any dummy a (buggy) autoconnect added, so it can't leak
+            // into the next test sharing this JVM singleton.
+            for (ref in createdRefs) runCatching { Transport.deregisterInterface(ref) }
+            Reticulum.autoconnectDiscoveredInterfaces = savedCap
+        }
+    }
+
+    // wire_mgmt_destinations is intentionally NOT implemented: reticulum-kt has
+    // no probe-responder / remote-management Destination feature (no
+    // rnstransport.probe or rnstransport.remote.management registration in
+    // Transport.start). Shipping only the negative "{present:false}" case would
+    // be a half-implementation that tests nothing, so it surfaces as a SUT
+    // capability gap (reticulum-kt#mgmt-destinations). config_parse_interface is
+    // likewise unimplemented: kotlin has no INI/ConfigObj parser nor
+    // _synthesize_interface (python-reference-only). Both fall through to else.
+
+    // ===== Phase 5f: packet / receipt commands =====
+
+    "wire_send_packet" -> {
+        // Send a single SINGLE-destination DATA packet with a tracked
+        // PacketReceipt. Mirrors cmd_wire_send_packet (wire_tcp.py:3343-3407):
+        // recall identity -> OUT SINGLE Destination -> Packet.send(). `sent` is
+        // read off packet.sent (kotlin send() returns null for BOTH
+        // create_receipt=false AND failure, so it can't distinguish them);
+        // hops_to falls back to PATHFINDER_M for an unknown path (python int()).
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appName = p.str("app_name")
+        val aspects = p.get("aspects")?.asJsonArray?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val createReceipt = p.get("create_receipt")?.asBoolean ?: true
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; ensure an announce for this destination was received first.",
+            )
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val packet = Packet.create(outDest, payload, createReceipt = createReceipt)
+        packet.send()
+        if (!packet.sent) {
+            result(
+                "sent" to boolVal(false),
+                "receipt_id" to JsonNull.INSTANCE,
+                "hops" to JsonNull.INSTANCE,
+            )
+        } else {
+            val receiptId = packet.receipt?.let { r ->
+                val id = freshReceiptId()
+                inst.receipts[id] = r
+                id
+            }
+            inst.destinations.add(identity to outDest)
+            result(
+                "sent" to boolVal(true),
+                "receipt_id" to (receiptId?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                "hops" to intVal(Transport.hopsTo(destHash) ?: TransportConstants.PATHFINDER_M),
+            )
+        }
+    }
+
+    "wire_send_packet_with_proof_request" -> {
+        // Like wire_send_packet but BLOCKS for the receipt to conclude, then
+        // surfaces the captured PROOF. Mirrors cmd_wire_send_packet_with_proof_request
+        // (wire_tcp.py:5881-5974). proof_is_implicit/explicit are decided by the
+        // captured proof's LENGTH, not by config; implicit_proof_config is the
+        // local should_use_implicit_proof().
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val appName = p.get("app_name")?.asString ?: "conformance"
+        val aspects = p.get("aspects")?.asJsonArray?.map { it.asString }?.toTypedArray() ?: arrayOf("wire")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 10000
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; ensure an announce for this destination was received first.",
+            )
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val packet = Packet.create(outDest, payload, createReceipt = true)
+        packet.send()
+        val implLen = PacketReceipt.IMPL_LENGTH
+        val explLen = PacketReceipt.EXPL_LENGTH
+        if (!packet.sent) {
+            result(
+                "sent" to boolVal(false),
+                "receipt_id" to JsonNull.INSTANCE,
+                "hops" to JsonNull.INSTANCE,
+                "delivered" to boolVal(false),
+                "proved" to boolVal(false),
+                "implicit_proof_config" to boolVal(Reticulum.shouldUseImplicitProof()),
+                "proof_data" to JsonNull.INSTANCE,
+                "proof_len" to JsonNull.INSTANCE,
+                "proof_is_implicit" to JsonNull.INSTANCE,
+                "proof_is_explicit" to JsonNull.INSTANCE,
+                "impl_length" to intVal(implLen),
+                "expl_length" to intVal(explLen),
+                "proof_raw" to JsonNull.INSTANCE,
+                "proved_packet_hash" to JsonNull.INSTANCE,
+            )
+        } else {
+            val receiptId = freshReceiptId()
+            val receipt = packet.receipt
+            if (receipt != null) inst.receipts[receiptId] = receipt
+            inst.destinations.add(identity to outDest)
+
+            val terminal = setOf(PacketReceipt.DELIVERED, PacketReceipt.FAILED, PacketReceipt.CULLED)
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (receipt != null && receipt.status !in terminal && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
+            }
+            val proofPacket = receipt?.proofPacket
+            val proofData = proofPacket?.data
+            val proofLen = proofData?.size
+            result(
+                "sent" to boolVal(true),
+                "receipt_id" to strVal(receiptId),
+                "hops" to intVal(Transport.hopsTo(destHash) ?: TransportConstants.PATHFINDER_M),
+                "delivered" to boolVal(receipt?.status == PacketReceipt.DELIVERED),
+                "proved" to boolVal(receipt?.proved ?: false),
+                "implicit_proof_config" to boolVal(Reticulum.shouldUseImplicitProof()),
+                "proof_data" to (proofData?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                "proof_len" to (proofLen?.let { intVal(it) } ?: JsonNull.INSTANCE),
+                "proof_is_implicit" to (proofLen?.let { boolVal(it == implLen) } ?: JsonNull.INSTANCE),
+                "proof_is_explicit" to (proofLen?.let { boolVal(it == explLen) } ?: JsonNull.INSTANCE),
+                "impl_length" to intVal(implLen),
+                "expl_length" to intVal(explLen),
+                "proof_raw" to (proofPacket?.raw?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                "proved_packet_hash" to (receipt?.hash?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+            )
+        }
+    }
+
+    "wire_send_link_data" -> {
+        // Send a DATA packet OVER an established link with a tracked receipt.
+        // Mirrors cmd_wire_send_link_data (wire_tcp.py:3518-3555). create_receipt
+        // true -> link.sendWithReceipt; false -> build (seam) + send (sendWithReceipt
+        // can't express create_receipt=false).
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val createReceipt = p.get("create_receipt")?.asBoolean ?: true
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+
+        if (createReceipt) {
+            val receipt = link.sendWithReceipt(payload)
+            if (receipt == null) {
+                result("sent" to boolVal(false), "receipt_id" to JsonNull.INSTANCE)
+            } else {
+                val id = freshReceiptId()
+                inst.receipts[id] = receipt
+                result("sent" to boolVal(true), "receipt_id" to strVal(id))
+            }
+        } else {
+            val packet = link.buildDataPacketForTest(payload, createReceipt = false)
+            packet.send()
+            result("sent" to boolVal(packet.sent), "receipt_id" to JsonNull.INSTANCE)
+        }
+    }
+
+    "wire_send_over_closed_link" -> {
+        // Drive send() over a CLOSED link and report that nothing was transmitted.
+        // Mirrors cmd_wire_send_over_closed_link (wire_tcp.py:3558-3601):
+        // sendWithReceipt returns null for a non-ACTIVE link WITHOUT transmitting,
+        // so sent=false and txBytes is unchanged.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: "after-close".toByteArray()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val txBefore = link.txBytes.get()
+        val receipt = link.sendWithReceipt(payload)
+        val txAfter = link.txBytes.get()
+        result(
+            "link_status" to intVal(link.status),
+            "link_status_name" to strVal(LINK_STATUS_NAMES[link.status] ?: link.status.toString()),
+            "sent" to boolVal(receipt != null),
+            "bytes_transmitted" to intVal((txAfter - txBefore).toInt()),
+        )
+    }
+
+    "wire_send_oversize_link_packet" -> {
+        // Build a link DATA packet of `size` random bytes and report whether the
+        // genuine link-MTU bound rejects it. Mirrors cmd_wire_send_oversize_link_packet
+        // (wire_tcp.py:2527-2578): the per-packet mtu is link.mtu (seam), and
+        // pack() (inside send()) throws when the packed size exceeds it.
+        val handle = p.str("handle")
+        val linkIdHex = p.hex("link_id").toHex()
+        val size = p.int("size")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex]
+            ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val payload = defaultCryptoProvider().randomBytes(size)
+        val packet = link.buildDataPacketForTest(payload)
+        val packetMtu = packet.mtu
+        var sent = false
+        var rejected = false
+        var error: String? = null
+        var rawLen: Int? = null
+        try {
+            packet.send()
+            sent = packet.sent
+            rawLen = packet.raw?.size
+        } catch (e: Exception) {
+            sent = false
+            rejected = true
+            error = e.message
+        }
+        result(
+            "size" to intVal(size),
+            "mtu" to intVal(link.mtu),
+            "mdu" to intVal(link.mdu),
+            "packet_mtu" to intVal(packetMtu),
+            "sent" to boolVal(sent),
+            "rejected" to boolVal(rejected),
+            "error" to (error?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "raw_len" to (rawLen?.let { intVal(it) } ?: JsonNull.INSTANCE),
+        )
+    }
+
+    "wire_send_undecryptable" -> {
+        // Adversarial: damage a genuine packed SINGLE DATA packet's final
+        // ciphertext byte and transmit the corrupted bytes raw, so the receiver
+        // can't decrypt (Token HMAC fails) and emits no proof. Mirrors
+        // cmd_wire_send_undecryptable (wire_tcp.py:3410-3466). MUST use
+        // transmitForTest, NOT send(): kotlin processOutbound always re-packs
+        // (Transport.kt) and would overwrite the damage with fresh ciphertext.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val appName = p.str("app_name")
+        val aspects = p.get("aspects")?.asJsonArray?.map { it.asString }?.toTypedArray() ?: emptyArray()
+        val payload = p.get("data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: ByteArray(0)
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val identity = Identity.recall(destHash)
+            ?: throw IllegalStateException(
+                "No identity known for ${destHash.toHex()}; ensure an announce for this destination was received first.",
+            )
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, appName, *aspects)
+        val packet = Packet.create(outDest, payload, createReceipt = true)
+        packet.pack()
+        val raw = packet.raw!!.copyOf()
+        raw[raw.size - 1] = ((raw[raw.size - 1].toInt() + 1) and 0xFF).toByte()
+        val ifaceRef = (
+            inst.serverIface ?: inst.clientIface
+                ?: throw IllegalStateException("No live interface for handle $handle")
+        ).toRef()
+        Transport.transmitForTest(ifaceRef, raw)
+        val receiptId = freshReceiptId()
+        inst.receipts[receiptId] = PacketReceipt.forPacketForTest(packet)
+        packet.sent = true
+        inst.destinations.add(identity to outDest)
+        result("sent" to boolVal(true), "receipt_id" to strVal(receiptId))
+    }
+
+    "wire_inject_raw_frame" -> {
+        // Push a genuine (optionally IFAC-masked / trimmed) announce through a live
+        // interface's Transport.inbound to drive the four pre-unpack drop guards,
+        // reporting whether a path was learned. Mirrors cmd_wire_inject_raw_frame
+        // (wire_tcp.py:9871-9982). A wire handle hosts exactly one interface.
+        val handle = p.str("handle")
+        val variant = p.str("variant")
+        val appName = p.get("app_name")?.asString ?: "rawframe"
+        val aspects = p.get("aspects")?.asJsonArray?.map { it.asString }?.toTypedArray() ?: arrayOf("inject")
+        val appData = p.get("app_data")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: "probe".toByteArray()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val iface = inst.serverIface ?: inst.clientIface
+            ?: throw IllegalStateException("No live interface for handle $handle")
+        val ref = iface.toRef()
+        val ifacRef = if (ref.ifacIdentity != null) ref else null
+        val openRef = if (ref.ifacIdentity == null) ref else null
+
+        when (variant) {
+            "inject_external" -> {
+                val target = openRef
+                    ?: throw IllegalStateException("inject_external requires a non-IFAC (open) interface")
+                val frame = p.hex("raw")
+                val dh = p.hex("dest_hash")
+                Transport.inbound(frame, target)
+                result(
+                    "dest_hash" to hexVal(dh),
+                    "frame_len" to intVal(frame.size),
+                    "learned" to boolVal(Transport.hasPath(dh)),
+                )
+            }
+            "build_masked" -> {
+                val target = ifacRef
+                    ?: throw IllegalStateException("build_masked requires an IFAC-configured interface")
+                val (dest, plainRaw) = buildForeignAnnounce(inst, appName, aspects, appData)
+                val maskedRaw = Transport.applyIfacMaskingForTest(plainRaw, target)
+                result(
+                    "dest_hash" to hexVal(dest.hash),
+                    "raw" to hexVal(maskedRaw),
+                    "frame_len" to intVal(maskedRaw.size),
+                    "ifac_size" to intVal(target.ifacSize),
+                )
+            }
+            else -> {
+                val target: network.reticulum.transport.InterfaceRef
+                val frame: ByteArray
+                val dest: Destination
+                when (variant) {
+                    "masked_full", "masked_short", "plain_on_ifac" -> {
+                        target = ifacRef
+                            ?: throw IllegalStateException("variant $variant requires an IFAC interface")
+                        val (d, plainRaw) = buildForeignAnnounce(inst, appName, aspects, appData)
+                        dest = d
+                        frame = when (variant) {
+                            "plain_on_ifac" -> plainRaw
+                            "masked_full" -> Transport.applyIfacMaskingForTest(plainRaw, target)
+                            else -> Transport.applyIfacMaskingForTest(plainRaw, target).copyOf(2 + target.ifacSize)
+                        }
+                    }
+                    "plain_on_open" -> {
+                        target = openRef
+                            ?: throw IllegalStateException("plain_on_open requires an open interface")
+                        val (d, plainRaw) = buildForeignAnnounce(inst, appName, aspects, appData)
+                        dest = d
+                        frame = plainRaw
+                    }
+                    "min_short" -> {
+                        target = openRef ?: ifacRef
+                            ?: throw IllegalStateException("min_short requires any live interface")
+                        val trimTo = p.get("trim_to")?.asInt ?: 2
+                        val (d, plainRaw) = buildForeignAnnounce(inst, appName, aspects, appData)
+                        dest = d
+                        frame = plainRaw.copyOf(trimTo)
+                    }
+                    else -> throw IllegalArgumentException("unknown variant: $variant")
+                }
+                Transport.inbound(frame, target)
+                val out = mutableListOf<Pair<String, JsonElement>>(
+                    "dest_hash" to hexVal(dest.hash),
+                    "frame_len" to intVal(frame.size),
+                    "learned" to boolVal(Transport.hasPath(dest.hash)),
+                )
+                if (ifacRef != null && target === ifacRef) {
+                    out.add("ifac_size" to intVal(ifacRef.ifacSize))
+                }
+                result(*out.toTypedArray())
+            }
+        }
+    }
+
+    "wire_inject_single_proof_format" -> {
+        // Self-contained single-packet (non-link) PROOF FORMAT injector against a
+        // receipt this command CONTROLS, so it can sign a genuinely-valid proof.
+        // Mirrors cmd_wire_inject_single_proof_format (wire_tcp.py:9571-9644).
+        // Routes through validateProof (NOT validateLinkProof) so the implicit
+        // form is honored for non-link receipts.
+        val handle = p.str("handle")
+        val variant = p.str("variant")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = defaultCryptoProvider()
+        val identity = Identity.create()
+        val outDest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "proof-format")
+        val base = Packet.create(outDest, crypto.randomBytes(20), createReceipt = true)
+        base.pack()
+        val receipt = PacketReceipt.forPacketForTest(base)
+        val hashLen = RnsConstants.FULL_HASH_BYTES
+        val proof: ByteArray = when (variant) {
+            "valid_explicit" -> receipt.hash + identity.sign(receipt.hash)
+            "valid_implicit" -> identity.sign(receipt.hash)
+            "forged_explicit" -> receipt.hash + Identity.create().sign(receipt.hash)
+            "wrong_hash_explicit" -> crypto.randomBytes(hashLen) + identity.sign(receipt.hash)
+            else -> throw IllegalArgumentException("unknown single-proof-format variant: $variant")
+        }
+        val validated = runCatching { receipt.validateProof(proof) }.getOrDefault(false)
+        val status = receipt.status
+        result(
+            "variant" to strVal(variant),
+            "validated" to boolVal(validated),
+            "status" to intVal(status),
+            "status_name" to (receiptStatusName(status)?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "proof_len" to intVal(proof.size),
+            "expl_length" to intVal(PacketReceipt.EXPL_LENGTH),
+            "impl_length" to intVal(PacketReceipt.IMPL_LENGTH),
+        )
+    }
+
+    "wire_inject_crafted_proof" -> {
+        // Adversarial single-packet PROOF injector against a PENDING receipt from a
+        // prior wire_send_packet*. Mirrors cmd_wire_inject_crafted_proof
+        // (wire_tcp.py:6188-6260). Every variant is a REJECTION case run through
+        // the real validateProof gate; none needs the receiver key.
+        val handle = p.str("handle")
+        val receiptId = p.str("receipt_id")
+        val variant = p.str("variant")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val receipt = inst.receipts[receiptId]
+            ?: throw IllegalArgumentException("Unknown receipt_id: $receiptId")
+        val crypto = defaultCryptoProvider()
+        val provenHash = receipt.hash
+        val hashLen = RnsConstants.FULL_HASH_BYTES
+        val sigLen = RnsConstants.SIGNATURE_SIZE
+        val proof: ByteArray = when (variant) {
+            "forged_implicit" -> Identity.create().sign(provenHash)
+            "forged_explicit" -> provenHash + Identity.create().sign(provenHash)
+            "wrong_hash_explicit" -> crypto.randomBytes(hashLen) + Identity.create().sign(provenHash)
+            "wrong_length_short" -> crypto.randomBytes(hashLen)
+            "wrong_length_mid" -> crypto.randomBytes(sigLen + 1)
+            "wrong_length_long" -> crypto.randomBytes(hashLen + sigLen + 1)
+            else -> throw IllegalArgumentException("unknown proof variant: $variant")
+        }
+        val validated = runCatching { receipt.validateProof(proof) }.getOrDefault(false)
+        val status = receipt.status
+        result(
+            "variant" to strVal(variant),
+            "validated" to boolVal(validated),
+            "status" to intVal(status),
+            "status_name" to (receiptStatusName(status)?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "proved" to boolVal(receipt.proved),
+            "proof_len" to intVal(proof.size),
+        )
+    }
+
+    "wire_packet_receipt_generation" -> {
+        // Report whether RNS creates a PacketReceipt for a packet of a given
+        // dest-type/context/packet-type, even with create_receipt=True. Mirrors
+        // cmd_wire_packet_receipt_generation (wire_tcp.py:9647-9713). MUST use
+        // Packet.create(destination, ...) so processOutbound's PLAIN gate keys on
+        // the real destination type, not null.
+        val handle = p.str("handle")
+        val destType = (p.get("dest_type")?.asString ?: "single").lowercase()
+        val context = p.get("context")?.asInt ?: PacketContext.NONE.value
+        val packetTypeInt = p.get("packet_type")?.asInt ?: PacketType.DATA.value
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = defaultCryptoProvider()
+        val destination = when (destType) {
+            "single" -> Destination.create(Identity.create(), DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "receipt-gen")
+            "plain" -> Destination.create(null, DestinationDirection.OUT, DestinationType.PLAIN, "conformance", "receipt-gen")
+            else -> throw IllegalArgumentException("dest_type must be 'single' or 'plain' (got $destType)")
+        }
+        val packet = Packet.create(
+            destination,
+            crypto.randomBytes(12),
+            packetType = PacketType.fromValue(packetTypeInt),
+            context = PacketContext.fromValue(context),
+            createReceipt = true,
+        )
+        runCatching { packet.send() }
+        val deadline = System.currentTimeMillis() + 1000
+        while (!packet.sent && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        result(
+            "dest_type" to strVal(destType),
+            "context" to intVal(context),
+            "packet_type" to intVal(packetTypeInt),
+            "sent" to boolVal(packet.sent),
+            "has_receipt" to boolVal(packet.receipt != null),
+            "create_receipt_flag" to boolVal(packet.createReceipt),
+        )
+    }
+
+    "wire_packet_receipt_status" -> {
+        // Poll a tracked receipt until it concludes or timeout. Mirrors
+        // cmd_wire_packet_receipt_status (wire_tcp.py:3472-3515).
+        val handle = p.str("handle")
+        val receiptId = p.str("receipt_id")
+        val timeoutMs = p.get("timeout_ms")?.asInt ?: 0
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val receipt = inst.receipts[receiptId]
+            ?: throw IllegalArgumentException("Unknown receipt_id: $receiptId")
+        val terminal = setOf(PacketReceipt.DELIVERED, PacketReceipt.FAILED, PacketReceipt.CULLED)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (receipt.status !in terminal && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50)
+        }
+        val status = receipt.status
+        result(
+            "status" to intVal(status),
+            "status_name" to (receiptStatusName(status)?.let { strVal(it) } ?: JsonNull.INSTANCE),
+            "delivered" to boolVal(status == PacketReceipt.DELIVERED),
+            "proved" to boolVal(receipt.proved),
+        )
+    }
+
+    "wire_packet_receipt_timeout" -> {
+        // Build a real PacketReceipt for a fresh path-less SINGLE destination and
+        // report its computed .timeout plus the constituents, then optionally force
+        // a timeout and run checkTimeout. Mirrors cmd_wire_packet_receipt_timeout
+        // (wire_tcp.py:9716-9783). first_hop_timeout is ms -> seconds at the boundary.
+        val handle = p.str("handle")
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val crypto = defaultCryptoProvider()
+        val identity = Identity.create()
+        val dest = Destination.create(identity, DestinationDirection.OUT, DestinationType.SINGLE, "conformance", "receipt-timeout")
+        val packet = Packet.create(dest, crypto.randomBytes(12), createReceipt = true)
+        packet.pack()
+        val receipt = PacketReceipt.forPacketForTest(packet)
+        val instance = Reticulum.getInstance()
+        val firstHopMs = instance.getFirstHopTimeout(dest.hash)
+        val out = mutableListOf<Pair<String, JsonElement>>(
+            "timeout" to doubleVal(receipt.timeout),
+            "status" to intVal(receipt.status),
+            "is_link" to boolVal(dest.type == DestinationType.LINK),
+            "default_per_hop_timeout" to intVal(Reticulum.DEFAULT_PER_HOP_TIMEOUT),
+            // kotlin has no Packet.TIMEOUT_PER_HOP; RNS defines it == DEFAULT_PER_HOP_TIMEOUT.
+            "timeout_per_hop" to intVal(Reticulum.DEFAULT_PER_HOP_TIMEOUT),
+            "pathfinder_m" to intVal(TransportConstants.PATHFINDER_M),
+            "hops_to" to intVal(Transport.hopsTo(dest.hash) ?: TransportConstants.PATHFINDER_M),
+            "first_hop_timeout" to doubleVal(firstHopMs / 1000.0),
+            "is_connected_to_shared" to boolVal(instance.isConnectedToSharedInstance),
+            "status_sent" to intVal(PacketReceipt.SENT),
+        )
+        val forceEl = p.get("force_timeout")
+        if (forceEl != null && !forceEl.isJsonNull) {
+            receipt.setTimeout(forceEl.asDouble)
+            receipt.setSentAtForTest(receipt.sentAt - 100_000_000L)
+            receipt.checkTimeout()
+            out.add("forced_timeout" to doubleVal(receipt.timeout))
+            out.add("forced_status" to intVal(receipt.status))
+            out.add("status_culled" to intVal(PacketReceipt.CULLED))
+            out.add("status_failed" to intVal(PacketReceipt.FAILED))
+        }
+        result(*out.toTypedArray())
+    }
+
+    "wire_set_proof_strategy" -> {
+        // Set a listening destination's proof strategy. Mirrors
+        // cmd_wire_set_proof_strategy (wire_tcp.py:3178-3231). For "app", install a
+        // proof_requested callback that proves iff the decrypted payload[0]==0x01.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val strategy = p.str("strategy").lowercase()
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val destination = findDestinationByHash(inst, destHash)
+            ?: throw IllegalArgumentException(
+                "No registered destination with hash ${destHash.toHex()} on handle $handle; call wire_listen first.",
+            )
+        val const = when (strategy) {
+            "all" -> Destination.PROVE_ALL
+            "app" -> Destination.PROVE_APP
+            "none" -> Destination.PROVE_NONE
+            else -> throw IllegalArgumentException("strategy must be one of [all, app, none] (got $strategy)")
+        }
+        destination.setProofStrategy(const)
+        if (strategy == "app") {
+            val listener = inst.listeners[destHash.toHex()]
+            destination.setProofRequestedCallback { pktAny ->
+                val pkt = pktAny as? Packet ?: return@setProofRequestedCallback false
+                listener?.inboundLinks?.any { link ->
+                    val pt = runCatching { link.decrypt(pkt.data) }.getOrNull()
+                    pt != null && pt.isNotEmpty() && pt[0] == 0x01.toByte()
+                } ?: false
+            }
+        }
+        result(
+            "strategy" to strVal(strategy),
+            "proof_strategy" to intVal(destination.getProofStrategy()),
+        )
+    }
+
+    "wire_set_proof_implicit" -> {
+        // Toggle the process-wide implicit-vs-explicit single-packet PROOF policy.
+        // Mirrors cmd_wire_set_proof_implicit (wire_tcp.py:5855-5872). Set on the
+        // PROVER before the proof is requested; Identity.prove branches on it.
+        val handle = p.str("handle")
+        val enabled = p.get("enabled")?.asBoolean ?: true
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        Reticulum.setUseImplicitProofForTest(enabled)
+        result("implicit_proof" to boolVal(Reticulum.shouldUseImplicitProof()))
+    }
+
+    "wire_listener_proof_log" -> {
+        // Return the receiver-side proof log for a listening destination. Mirrors
+        // cmd_wire_listener_proof_log (wire_tcp.py:4951-4979). The log is filled by
+        // the Link.proveTapForTest tap installed in wire_listen.
+        val handle = p.str("handle")
+        val destHash = p.hex("destination_hash")
+        val inst = wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val listener = inst.listeners[destHash.toHex()]
+            ?: throw IllegalArgumentException("No listener registered for destination_hash=${destHash.toHex()}")
+        val channelCtx = PacketContext.CHANNEL.value
+        val contexts = listener.proofLog.toList()
+        val arr = JsonArray()
+        contexts.forEach { arr.add(JsonPrimitive(it)) }
+        result(
+            "contexts" to arr,
+            "channel_proofs" to intVal(contexts.count { it == channelCtx }),
+            "channel_context" to intVal(channelCtx),
+        )
     }
 
     else -> throw IllegalArgumentException("Unknown wire command: $command")

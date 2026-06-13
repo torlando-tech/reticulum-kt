@@ -155,6 +155,44 @@ class InterfaceDiscoveryTest {
         file.exists() shouldBe false
     }
 
+    private fun backboneRecord(reachableOn: String): DiscoveredInterface =
+        makeDiscoveredInterface(name = "bb-$reachableOn", type = "BackboneInterface")
+            .copy(reachableOn = reachableOn, port = 4242)
+
+    @Test
+    @DisplayName("autoconnect skips a Yggdrasil 200::/7 BackboneInterface (Discovery.py:649-651)")
+    fun `autoconnect skips yggdrasil endpoint`() {
+        var factoryInvocations = 0
+        val discovery = InterfaceDiscovery(
+            storagePath = tempDir.absolutePath,
+            requiredValue = 14,
+            autoConnectFactory = { factoryInvocations++; null },
+            maxAutoConnected = 4,
+        )
+
+        // A BackboneInterface on a Yggdrasil 200::/7 address must NOT be dialled:
+        // the isYggIpv6 guard returns before the factory is consulted.
+        discovery.autoconnectForTest(backboneRecord("200::1"))
+        factoryInvocations shouldBe 0
+
+        // A BackboneInterface on an ordinary address DOES reach the factory —
+        // proving the guard above is a real rejection, not the factory being inert.
+        discovery.autoconnectForTest(backboneRecord("10.9.9.9"))
+        factoryInvocations shouldBe 1
+    }
+
+    @Test
+    @DisplayName("endpointHash is SHA-256 of reachable_on:port (Discovery.py:601-606)")
+    fun `endpoint hash matches sha256 of host port`() {
+        val discovery = InterfaceDiscovery(
+            storagePath = tempDir.absolutePath,
+            requiredValue = 14,
+        )
+        val rec = backboneRecord("10.9.9.9")
+        val expected = Hashes.fullHash("10.9.9.9:4242".toByteArray(Charsets.UTF_8))
+        discovery.endpointHashForTest(rec) shouldBe expected
+    }
+
     /**
      * Save a DiscoveredInterface to disk using msgpack, matching the format
      * used by InterfaceDiscovery's internal persistence.

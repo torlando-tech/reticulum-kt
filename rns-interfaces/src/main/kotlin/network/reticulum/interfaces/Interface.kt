@@ -91,6 +91,14 @@ abstract class Interface(
     /** Whether this interface supports link MTU discovery (Python: AUTOCONFIGURE_MTU or FIXED_MTU). */
     open val supportsLinkMtuDiscovery: Boolean = false
 
+    /** Whether this interface auto-configures its HW_MTU from bitrate
+     *  (python Interface.AUTOCONFIGURE_MTU; Interfaces/Interface.py:93 default False). */
+    open val autoconfigureMtu: Boolean = false
+
+    /** Whether this interface has a fixed (pinned) HW_MTU
+     *  (python Interface.FIXED_MTU; Interfaces/Interface.py:94 default False). */
+    open val fixedMtu: Boolean = false
+
     /** Whether this is a local shared instance server (Python RNS compatibility). */
     open val isLocalSharedInstance: Boolean = false
 
@@ -234,6 +242,13 @@ abstract class Interface(
         const val IC_BURST_HOLD = 60 * 1000L // 1 minute
         const val IC_BURST_PENALTY = 5 * 60 * 1000L // 5 minutes
         const val IC_HELD_RELEASE_INTERVAL = 30 * 1000L // 30 seconds
+
+        /** Transport-node announce-rate defaults a node applies when none are
+         *  configured (python Interface.DEFAULT_AR_TARGET/_PENALTY/_GRACE,
+         *  Interfaces/Interface.py:89-91). */
+        const val DEFAULT_AR_TARGET = 3600  // seconds
+        const val DEFAULT_AR_PENALTY = 0
+        const val DEFAULT_AR_GRACE = 5
 
         /** Interface modes that should actively discover paths. */
         val DISCOVER_PATHS_FOR = setOf(

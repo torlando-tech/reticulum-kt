@@ -898,6 +898,12 @@ class Link private constructor(
      * @param packet The packet to prove
      */
     fun provePacket(packet: Packet) {
+        // Conformance seam: notify any installed tap with the proved packet, the
+        // kotlin equivalent of the reference wrapping link.prove_packet to record
+        // each proved packet's context byte (wire_tcp.py:1299-1317). Mirrors the
+        // existing inboundTapForTest seam. Null in normal operation; no port logic.
+        runCatching { proveTapForTest?.invoke(packet) }
+
         // Sign the packet hash
         val signature = sign(packet.packetHash)
 
@@ -951,6 +957,29 @@ class Link private constructor(
             hadOutbound(isData = true)
         }
         return receipt
+    }
+
+    /**
+     * Conformance test seam: build (but do NOT send) a link DATA packet exactly
+     * as [sendWithReceipt] would — genuine [encrypt] + createRaw with mtu=this.mtu
+     * and packet.link=this — so a test can read the built packet's mtu/raw before
+     * choosing to send, and can build a create_receipt=false packet (which
+     * sendWithReceipt cannot express). packet.link is internal, so the
+     * separate-module bridge cannot replicate this. No port logic.
+     */
+    fun buildDataPacketForTest(plaintext: ByteArray, createReceipt: Boolean = true): Packet {
+        val encrypted = encrypt(plaintext)
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
+                createReceipt = createReceipt,
+                mtu = mtu,
+            )
+        packet.link = this
+        return packet
     }
 
     /**
@@ -1757,6 +1786,16 @@ class Link private constructor(
      */
     @Volatile
     var inboundTapForTest: ((Packet) -> Unit)? = null
+
+    /**
+     * Conformance test seam: a tap fired inside provePacket() with the proved
+     * packet, the kotlin equivalent of the reference wrapping link.prove_packet
+     * to record each proved packet's context byte for the receiver-proof log
+     * (reference wire_listener_proof_log, wire_tcp.py:1299-1317). Null in normal
+     * operation.
+     */
+    @Volatile
+    var proveTapForTest: ((Packet) -> Unit)? = null
 
     fun receive(packet: Packet) {
         inboundTapForTest?.let { tap -> runCatching { tap(packet) } }

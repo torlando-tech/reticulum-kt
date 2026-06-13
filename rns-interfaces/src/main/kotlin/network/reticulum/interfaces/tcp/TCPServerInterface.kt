@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import network.reticulum.Reticulum
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
 import kotlinx.coroutines.withContext
@@ -41,6 +42,16 @@ class TCPServerInterface(
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
+    // Configured bitrate in bps. A value below MINIMUM_BITRATE is ignored and
+    // the interface keeps its class BITRATE_GUESS (python Reticulum.py:765-768).
+    bitrate: Int? = null,
+    // Pinned link MTU in bytes. Non-null puts the interface in FIXED_MTU mode
+    // (AUTOCONFIGURE_MTU off), so the negotiated link MTU settles at this value
+    // (python TCPInterface FIXED_MTU; the bridge's fixed_mtu config knob).
+    internal val fixedMtuBytes: Int? = null,
+    // Configured IFAC size in BITS. Resolved to bytes via the python floor at
+    // Reticulum.py:719-723 (>= IFAC_MIN_SIZE*8 -> //8, else DEFAULT_IFAC_SIZE).
+    private val ifacSizeBits: Int? = null,
 ) : Interface(name) {
 
     companion object {
@@ -56,7 +67,12 @@ class TCPServerInterface(
     }
 
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) {
+            // python Reticulum.py:719-723: a configured ifac_size (bits) >=
+            // IFAC_MIN_SIZE*8 (==8) divides by 8; otherwise it floors back to
+            // DEFAULT_IFAC_SIZE.
+            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
+        } else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key
@@ -64,8 +80,15 @@ class TCPServerInterface(
     override val ifacIdentity: Identity?
         get() = _ifacCredentials?.identity
 
-    override val bitrate: Int = BITRATE_GUESS
-    override val hwMtu: Int = HW_MTU
+    // python Reticulum.py:765-768 — a configured bitrate below MINIMUM_BITRATE
+    // is ignored; the interface keeps its class BITRATE_GUESS.
+    override val bitrate: Int =
+        if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode keeps the
+    // class HW_MTU and auto-configures (python TCPInterface AUTOCONFIGURE_MTU=True).
+    override val hwMtu: Int = fixedMtuBytes ?: HW_MTU
+    override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
+    override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true
 
     // Discovery support
@@ -297,8 +320,14 @@ class TCPServerClientInterface internal constructor(
     override val ifacKey: ByteArray? get() = parentServer.ifacKey
     override val ifacIdentity: Identity? get() = parentServer.ifacIdentity
 
-    override val bitrate: Int = TCPServerInterface.BITRATE_GUESS
-    override val hwMtu: Int = TCPServerInterface.HW_MTU
+    // Spawned children inherit the parent server's MTU/bitrate posture so the
+    // RECEIVER side of a fixed-MTU link negotiates the same value as the parent
+    // (mirrors python TCPInterface.py:619 spawned_interface.mode = self.mode,
+    // extended to the MTU/bitrate posture the parent resolved from config).
+    override val bitrate: Int = parentServer.bitrate
+    override val hwMtu: Int = parentServer.hwMtu
+    override val autoconfigureMtu: Boolean = parentServer.autoconfigureMtu
+    override val fixedMtu: Boolean = parentServer.fixedMtu
     override val supportsLinkMtuDiscovery: Boolean = true
 
     private val writing = AtomicBoolean(false)
