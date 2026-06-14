@@ -8,9 +8,18 @@ import network.reticulum.common.*
 import network.reticulum.crypto.*
 import network.reticulum.identity.Identity
 import network.reticulum.destination.Destination
+import network.reticulum.destination.RequestPolicy
+import network.reticulum.Reticulum
 import network.reticulum.interfaces.IfacUtils
+import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
+import network.reticulum.interfaces.pipe.PipeInterface
+import network.reticulum.interfaces.rnode.RNodeInterface
+import network.reticulum.interfaces.tcp.TCPClientInterface
+import network.reticulum.interfaces.tcp.TCPServerInterface
+import network.reticulum.interfaces.udp.UDPInterface
+import network.reticulum.interfaces.auto.AutoInterfaceConstants
 import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
 import network.reticulum.resource.ResourceConstants
@@ -20,7 +29,10 @@ import org.msgpack.core.MessagePack
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
-private val gson = Gson()
+// serializeNulls: the python reference bridge emits None fields as JSON null
+// (e.g. identity_decrypt's plaintext=None contract); default Gson would DROP
+// JsonNull properties and break tests that assert `result["key"] is None`.
+private val gson = com.google.gson.GsonBuilder().serializeNulls().create()
 private val crypto: CryptoProvider = BouncyCastleProvider()
 
 fun main() {
@@ -147,6 +159,31 @@ fun result(vararg pairs: Pair<String, JsonElement>): JsonObject {
 
 fun hexVal(data: ByteArray): JsonPrimitive = JsonPrimitive(data.toHex())
 fun strVal(s: String): JsonPrimitive = JsonPrimitive(s)
+
+/**
+ * Resolve the HKDF salt used by RNS ratchet encryption — the destination
+ * Identity's hash (RNS.Identity.encrypt uses get_salt() == self.hash). The
+ * conformance suite supplies it in one of two interchangeable forms:
+ *
+ *  - identity_hash (hex): the wire-level salt, passed directly. This is the
+ *    form the reference bridge cmd_ratchet_encrypt/decrypt use on the suite's
+ *    main branch, and what the random-16-byte identity_hash round-trip tests
+ *    rely on.
+ *  - public_key / private_key (hex): a full Identity, from which the same hash
+ *    is derived.
+ *
+ * Both yield the byte-identical salt, so the two impls interoperate either way.
+ */
+fun ratchetIdentityHash(p: JsonObject): ByteArray = when {
+    p.get("identity_hash") != null && !p.get("identity_hash").isJsonNull ->
+        p.hex("identity_hash")
+    p.get("public_key") != null && !p.get("public_key").isJsonNull ->
+        Identity.fromPublicKey(p.hex("public_key"), crypto).hash
+    p.get("private_key") != null && !p.get("private_key").isJsonNull ->
+        Identity.fromPrivateKey(p.hex("private_key"), crypto).hash
+    else -> throw IllegalArgumentException("Missing param: identity_hash")
+}
+
 fun intVal(i: Int): JsonPrimitive = JsonPrimitive(i)
 fun doubleVal(d: Double): JsonPrimitive = JsonPrimitive(d)
 fun boolVal(b: Boolean): JsonPrimitive = JsonPrimitive(b)
@@ -409,10 +446,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "ed25519_verify" -> {
-            val pub = p.hex("public_key")
-            val message = p.hex("message")
-            val signature = p.hex("signature")
-            val valid = crypto.ed25519Verify(pub, message, signature)
+            // The reference command wraps VerifyingKey construction + verify in
+            // one try/except returning valid=false (bridge_server.py:241-253) —
+            // a malformed key or signature is an invalid signature, not an error.
+            val valid = try {
+                crypto.ed25519Verify(p.hex("public_key"), p.hex("message"), p.hex("signature"))
+            } catch (e: Exception) {
+                false
+            }
             result("valid" to boolVal(valid))
         }
 
@@ -435,8 +476,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "truncated_hash" -> {
+            // Reference also returns full_hash (Identity.full_hash) alongside the
+            // truncated digest, so nothing about the length is hardcoded caller-side.
             val data = p.hex("data")
-            result("hash" to hexVal(Hashes.truncatedHash(data)))
+            result(
+                "hash" to hexVal(Hashes.truncatedHash(data)),
+                "full_hash" to hexVal(Hashes.fullHash(data)),
+            )
         }
 
         // === 3. Crypto — Key Derivation ===
@@ -471,21 +517,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "pkcs7_pad" -> {
-            val data = p.hex("data")
-            val blockSize = 16
-            val padLen = blockSize - (data.size % blockSize)
-            val padded = data + ByteArray(padLen) { padLen.toByte() }
-            result("padded" to hexVal(padded))
+            result("padded" to hexVal(PKCS7.pad(p.hex("data"))))
         }
 
         "pkcs7_unpad" -> {
-            val data = p.hex("data")
-            val padLen = data.last().toInt() and 0xFF
-            if (padLen < 1 || padLen > 16 || padLen > data.size) {
-                throw IllegalArgumentException("Invalid PKCS7 padding")
-            }
-            val unpadded = data.copyOf(data.size - padLen)
-            result("unpadded" to hexVal(unpadded))
+            // Delegates to the library's PKCS7.unpad — python-faithfully LAX
+            // (strips data[-1] bytes, rejects only counts > blocksize).
+            result("unpadded" to hexVal(PKCS7.unpad(p.hex("data"))))
         }
 
         // === 5. Token Encryption ===
@@ -511,19 +549,10 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "token_verify_hmac" -> {
-            val key = p.hex("key")
-            val tokenData = p.hex("token")
-            if (tokenData.size < 64) {
-                result("valid" to boolVal(false))
-            } else {
-                // For AES-256 token: signing key = first 32 bytes of 64-byte key
-                val signingKey = key.copyOf(32)
-                val signedParts = tokenData.copyOfRange(0, tokenData.size - 32)
-                val receivedHmac = tokenData.copyOfRange(tokenData.size - 32, tokenData.size)
-                val expectedHmac = crypto.hmacSha256(signingKey, signedParts)
-                val valid = receivedHmac.contentEquals(expectedHmac)
-                result("valid" to boolVal(valid))
-            }
+            // Delegates to the library's Token.verifyHmac, which raises (as
+            // python does) for tokens of 32 bytes or fewer.
+            val token = Token(p.hex("key"), crypto)
+            result("valid" to boolVal(token.verifyHmac(p.hex("token"))))
         }
 
         // === 6. Identity ===
@@ -541,13 +570,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         "identity_encrypt" -> {
             val pubBytes = p.hex("public_key")
             val plaintext = p.hex("plaintext")
-            val identityHash = p.hex("identity_hash")
 
             val ephPrivBytes = p.hexOpt("ephemeral_private")
             val iv = p.hexOpt("iv")
 
             if (ephPrivBytes != null && iv != null) {
                 // Deterministic encryption with provided ephemeral key and IV
+                // (needs the destination identity hash as the HKDF salt).
+                val identityHash = p.hex("identity_hash")
                 val encPub = pubBytes.copyOfRange(0, 32)
                 val ephPub = crypto.x25519PublicFromPrivate(ephPrivBytes)
                 val shared = crypto.x25519Exchange(ephPrivBytes, encPub)
@@ -562,7 +592,8 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                     "derived_key" to hexVal(derived)
                 )
             } else {
-                // Random ephemeral key
+                // Random ephemeral key — the reference contract takes only
+                // public_key + plaintext (bridge_server.py:cmd_identity_encrypt).
                 val identity = Identity.fromPublicKey(pubBytes, crypto)
                 val ciphertext = identity.encrypt(plaintext)
                 result(
@@ -575,14 +606,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "identity_decrypt" -> {
-            val privBytes = p.hex("private_key")
-            val ciphertext = p.hex("ciphertext")
-            val identityHash = p.hex("identity_hash")
-            val identity = Identity.fromPrivateKey(privBytes, crypto)
-            val plaintext = identity.decrypt(ciphertext)
-                ?: throw IllegalStateException("Decryption failed")
+            // Reference contract: plaintext=None when the token does not
+            // authenticate or is too short (Identity.decrypt returns None) —
+            // not a bridge error.
+            val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
+            val plaintext = identity.decrypt(p.hex("ciphertext"))
             result(
-                "plaintext" to hexVal(plaintext),
+                "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
                 "shared_key" to strVal(""),
                 "derived_key" to strVal("")
             )
@@ -601,9 +631,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             val pubBytes = p.hex("public_key")
             val message = p.hex("message")
             val signature = p.hex("signature")
-            // Ed25519 public key is last 32 bytes of 64-byte public key
-            val sigPub = pubBytes.copyOfRange(32, 64)
-            val valid = crypto.ed25519Verify(sigPub, message, signature)
+            // Ed25519 public key is last 32 bytes of 64-byte public key.
+            // A malformed signature is an INVALID signature, not an error —
+            // python Identity.validate wraps verify in try/except -> False.
+            val valid = try {
+                crypto.ed25519Verify(pubBytes.copyOfRange(32, 64), message, signature)
+            } catch (e: Exception) {
+                false
+            }
             result("valid" to boolVal(valid))
         }
 
@@ -625,15 +660,16 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "destination_hash" -> {
+            // Delegates to the library's Destination.hash bytes overload —
+            // its dot guards and the 16-byte identity-material gate run
+            // (python Destination.hash / expand_name semantics).
             val identityHash = p.hex("identity_hash")
             val appName = p.str("app_name")
             val aspects = p.stringArray("aspects")
-            val nameHash = Destination.computeNameHash(appName, aspects)
-            val combined = nameHash + identityHash
-            val destHash = Hashes.truncatedHash(combined)
+            val destHash = Destination.hash(identityHash, appName, *aspects.toTypedArray())
             result(
                 "destination_hash" to hexVal(destHash),
-                "name_hash" to hexVal(nameHash)
+                "name_hash" to hexVal(Destination.computeNameHash(appName, aspects))
             )
         }
 
@@ -711,21 +747,15 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "packet_unpack" -> {
+            // Reference contract (cmd_packet_unpack): {unpacked: false} for a
+            // malformed packet — not an error — else unpacked:true + fields.
             val raw = p.hex("raw")
-            val packet = Packet.unpack(raw) ?: throw IllegalArgumentException("Invalid packet")
-            val r = result(
-                "header_type" to intVal(packet.headerType.value),
-                "context_flag" to intVal(packet.contextFlag.value),
-                "transport_type" to intVal(packet.transportType.value),
-                "destination_type" to intVal(packet.destinationType.value),
-                "packet_type" to intVal(packet.packetType.value),
-                "hops" to intVal(packet.hops),
-                "destination_hash" to hexVal(packet.destinationHash),
-                "context" to intVal(packet.context.value),
-                "data" to hexVal(packet.data)
-            )
-            packet.transportId?.let { r.add("transport_id", hexVal(it)) }
-            r
+            val packet = Packet.unpack(raw)
+            if (packet == null) {
+                result("unpacked" to boolVal(false))
+            } else {
+                packetFieldsJson(raw, packet).apply { addProperty("unpacked", true) }
+            }
         }
 
         "packet_parse_header" -> {
@@ -1192,30 +1222,83 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "ratchet_encrypt" -> {
-            val ratchetPub = p.hex("ratchet_public")
-            val identityHash = p.hex("identity_hash")
+            // Reproduces RNS.Identity.encrypt(plaintext, ratchet=ratchet_public):
+            // a fresh ephemeral X25519 key, ECDH against the ratchet public key,
+            // HKDF (length 64, salt = the destination identity's hash, context =
+            // None) and a Token. The salt is resolved from either identity_hash
+            // (the wire form the suite's main branch uses) or a full public_key
+            // (see ratchetIdentityHash) — both produce the identical salt that
+            // Identity.encrypt's get_salt() would. Non-deterministic; round-trip
+            // via ratchet_decrypt.
+            val ratchetPublic = p.hex("ratchet_public")
             val plaintext = p.hex("plaintext")
-            // Generate ephemeral key, do DH, HKDF, token encrypt
-            val ephKp = crypto.generateX25519KeyPair()
-            val shared = crypto.x25519Exchange(ephKp.privateKey, ratchetPub)
+            val identityHash = ratchetIdentityHash(p)
+            val ephemeral = crypto.generateX25519KeyPair()
+            val shared = crypto.x25519Exchange(ephemeral.privateKey, ratchetPublic)
             val derived = crypto.hkdf(64, shared, identityHash, null)
             val token = Token(derived, crypto)
-            val encrypted = token.encrypt(plaintext)
-            val ciphertext = ephKp.publicKey + encrypted
-            result("ciphertext" to hexVal(ciphertext))
+            result("ciphertext" to hexVal(ephemeral.publicKey + token.encrypt(plaintext)))
         }
 
         "ratchet_decrypt" -> {
-            val ratchetPriv = p.hex("ratchet_private")
-            val identityHash = p.hex("identity_hash")
+            // Two interchangeable contracts:
+            //  - private_key form: delegate to the real Identity.decrypt with the
+            //    ordered ratchet trial list, enforcement flag and ratchet-id
+            //    receiver (salt = identity.hash). plaintext may be null,
+            //    latest_ratchet_id is the winning ratchet's id or null.
+            //  - identity_hash form (suite main branch): the salt IS identity_hash,
+            //    a single ratchet private key is trialled — manual ECDH + HKDF +
+            //    Token decrypt, mirroring the reference's cmd_ratchet_decrypt.
             val ciphertext = p.hex("ciphertext")
-            val ephPubBytes = ciphertext.copyOfRange(0, 32)
-            val tokenData = ciphertext.copyOfRange(32, ciphertext.size)
-            val shared = crypto.x25519Exchange(ratchetPriv, ephPubBytes)
-            val derived = crypto.hkdf(64, shared, identityHash, null)
-            val token = Token(derived, crypto)
-            val plaintext = token.decrypt(tokenData)
-            result("plaintext" to hexVal(plaintext))
+            val ratchets: List<ByteArray>? = when {
+                p.get("ratchet_privates")?.isJsonArray == true ->
+                    p.stringArray("ratchet_privates").map { it.fromHex() }
+                p.get("ratchet_private") != null && !p.get("ratchet_private").isJsonNull ->
+                    listOf(p.hex("ratchet_private"))
+                else -> null
+            }
+            if (p.get("private_key") != null && !p.get("private_key").isJsonNull) {
+                val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
+                val receiver = Identity.RatchetIdReceiver()
+                val plaintext = identity.decrypt(
+                    ciphertext,
+                    ratchets = ratchets,
+                    enforceRatchets = p.boolOpt("enforce_ratchets") ?: false,
+                    ratchetIdReceiver = receiver,
+                )
+                result(
+                    "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                    "latest_ratchet_id" to
+                        (receiver.latestRatchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                )
+            } else {
+                val identityHash = p.hex("identity_hash")
+                val ratchetPriv = ratchets?.firstOrNull()
+                    ?: throw IllegalArgumentException("Missing param: ratchet_private")
+                if (ciphertext.size <= 32) {
+                    result(
+                        "plaintext" to JsonNull.INSTANCE,
+                        "latest_ratchet_id" to JsonNull.INSTANCE,
+                    )
+                } else {
+                    val ephemeralPub = ciphertext.copyOfRange(0, 32)
+                    val tokenData = ciphertext.copyOfRange(32, ciphertext.size)
+                    val shared = crypto.x25519Exchange(ratchetPriv, ephemeralPub)
+                    val derived = crypto.hkdf(64, shared, identityHash, null)
+                    val plaintext = try {
+                        Token(derived, crypto).decrypt(tokenData)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    val ratchetId = plaintext?.let {
+                        Hashes.fullHash(crypto.x25519PublicFromPrivate(ratchetPriv)).copyOf(10)
+                    }
+                    result(
+                        "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                        "latest_ratchet_id" to (ratchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                    )
+                }
+            }
         }
 
         "ratchet_extract_from_announce" -> {
@@ -1650,6 +1733,642 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             result("valid" to boolVal(valid), "value" to intVal(if (valid) zeros else 0))
         }
 
+        // === Conformance surface: crypto primitives (GENUINE thin wrappers) ===
+
+        "aes_256_cbc_encrypt" -> {
+            // Raw AES-256-CBC block cipher, NO padding (python RNS AES.py layer;
+            // padding lives only in Token). Delegates to the real provider.
+            val plaintext = p.hex("plaintext")
+            val key = p.hex("key")
+            val iv = p.hex("iv")
+            result("ciphertext" to hexVal(
+                crypto.aesEncryptNoPadding(plaintext, key, iv, AesMode.AES_256_CBC)))
+        }
+
+        "aes_256_cbc_decrypt" -> {
+            val ciphertext = p.hex("ciphertext")
+            val key = p.hex("key")
+            val iv = p.hex("iv")
+            result("plaintext" to hexVal(
+                crypto.aesDecryptNoPadding(ciphertext, key, iv, AesMode.AES_256_CBC)))
+        }
+
+        "token_generate_key" -> {
+            // Delegates to real Token.generateKey. The mode string -> AesMode map
+            // mirrors the reference's mode_map; an unknown string raises with the
+            // same identifying text as python Token.py's TypeError.
+            val key = when (val mode = p.strOpt("mode") ?: "AES_256_CBC") {
+                "AES_128_CBC" -> Token.generateKey(AesMode.AES_128_CBC, crypto)
+                "AES_256_CBC" -> Token.generateKey(AesMode.AES_256_CBC, crypto)
+                else -> throw IllegalArgumentException("Invalid token mode: $mode")
+            }
+            result("key" to hexVal(key))
+        }
+
+        "crypto_provider_op" -> {
+            // Python RNS selects between two crypto backends (internal | pyca) and
+            // this command compares them. reticulum-kt has exactly ONE backend
+            // (BouncyCastle), so both provider names honestly route to it: the
+            // test's external KAT assertions (RFC 7748 / NIST SP 800-38A /
+            // RFC 8032) still bind the real implementation, and the
+            // internal==pyca equality holds trivially because there is only one
+            // backend to diverge.
+            val provider = p.str("provider")
+            if (provider != "internal" && provider != "pyca") {
+                throw IllegalArgumentException("Unknown provider: $provider")
+            }
+            when (val op = p.str("op")) {
+                "x25519_exchange" -> result("result" to hexVal(
+                    crypto.x25519Exchange(p.hex("private_key"), p.hex("peer_public_key"))))
+                "ed25519_sign" -> result("result" to hexVal(
+                    crypto.ed25519Sign(p.hex("private_key"), p.hex("message"))))
+                "ed25519_verify" -> result("valid" to boolVal(
+                    crypto.ed25519Verify(p.hex("public_key"), p.hex("message"), p.hex("signature"))))
+                "aes_256_cbc_encrypt" -> result("result" to hexVal(
+                    crypto.aesEncryptNoPadding(
+                        p.hex("plaintext"), p.hex("key"), p.hex("iv"), AesMode.AES_256_CBC)))
+                else -> throw IllegalArgumentException("Unknown op: $op")
+            }
+        }
+
+        // === Conformance surface: identity persistence / file ops (LIVE) ===
+
+        "identity_to_file" -> {
+            val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
+            val file = java.io.File.createTempFile("conformance_identity_", ".bin")
+            if (!identity.toFile(file.absolutePath)) {
+                throw java.io.IOException("Identity.toFile returned false for ${file.absolutePath}")
+            }
+            result("path" to strVal(file.absolutePath))
+        }
+
+        "identity_from_file" -> {
+            val identity = Identity.fromFile(p.str("path"), crypto)
+            if (identity == null) {
+                result("found" to boolVal(false))
+            } else {
+                result(
+                    "found" to boolVal(true),
+                    "public_key" to hexVal(identity.getPublicKey()),
+                    "hash" to hexVal(identity.hash),
+                    "hexhash" to strVal(identity.hexHash),
+                )
+            }
+        }
+
+        "identity_remember" -> {
+            // Delegates to real Identity.remember, which enforces the 64-byte
+            // public-key gate (python Identity.py:101-102 TypeError; kotlin
+            // IllegalArgumentException — see port-deviations.md).
+            val publicKey = p.hex("public_key")
+            try {
+                Identity.remember(
+                    p.hex("packet_hash"), p.hex("destination_hash"),
+                    publicKey, p.hexOpt("app_data"))
+            } catch (e: IllegalArgumentException) {
+                return result(
+                    "ok" to boolVal(false),
+                    "error" to strVal("TypeError"),
+                    "public_key_len" to intVal(publicKey.size),
+                )
+            }
+            val recalled = Identity.recall(p.hex("destination_hash")) != null
+            result(
+                "ok" to boolVal(true),
+                "public_key_len" to intVal(publicKey.size),
+                "recalled" to boolVal(recalled),
+            )
+        }
+
+        "identity_keyless_op" -> {
+            // Python can build Identity(create_keys=False) holding NO key
+            // material, and decrypt/sign/encrypt all raise KeyError at runtime.
+            // reticulum-kt makes that state unrepresentable: Identity's private
+            // constructor requires key material, so the "keyless op" cannot be
+            // constructed at all — a stronger, compile-time form of the same
+            // guarantee. There is no honest way to drive the python runtime
+            // behavior here; failing loudly is the truthful report.
+            throw IllegalStateException(
+                "keyless Identity is unrepresentable in reticulum-kt " +
+                "(private constructor requires key material; the missing-key " +
+                "op python guards with KeyError is prevented at compile time)")
+        }
+
+        "identity_random_hash" -> {
+            result("random_hash" to hexVal(Identity.getRandomHash(crypto)))
+        }
+
+        // === Conformance surface: live protocol constants ===
+
+        "packet_constants" -> {
+            // Every value read off the live library constants (RnsConstants /
+            // Reticulum / LinkConstants), never restated as literals here.
+            // Python reports keysize/siglength/hashlength in BITS; kotlin keeps
+            // byte counts, so the only arithmetic is the unit conversion (*8).
+            result(
+                "mtu" to intVal(RnsConstants.MTU),
+                "header_minsize" to intVal(RnsConstants.HEADER_MIN_SIZE),
+                "header_maxsize" to intVal(RnsConstants.HEADER_MAX_SIZE),
+                "mdu" to intVal(RnsConstants.MDU),
+                "ifac_min_size" to intVal(RnsConstants.IFAC_MIN_SIZE),
+                "packet_mdu" to intVal(RnsConstants.MDU),
+                "packet_plain_mdu" to intVal(RnsConstants.MDU),
+                "packet_encrypted_mdu" to intVal(RnsConstants.ENCRYPTED_MDU),
+                "link_mdu" to intVal(LinkConstants.MDU),
+                "hashlength" to intVal(RnsConstants.FULL_HASH_LENGTH),
+                "siglength" to intVal(RnsConstants.SIGNATURE_SIZE * 8),
+                "truncated_hashlength" to intVal(RnsConstants.TRUNCATED_HASH_LENGTH),
+                "keysize" to intVal(RnsConstants.FULL_KEY_SIZE * 8),
+                "name_hash_length" to intVal(RnsConstants.NAME_HASH_LENGTH),
+                "token_overhead" to intVal(RnsConstants.TOKEN_OVERHEAD),
+                "aes128_blocksize" to intVal(RnsConstants.AES_BLOCK_SIZE),
+            )
+        }
+
+        "packet_context_constants" -> {
+            // Every named context code point read off the live PacketContext enum.
+            JsonObject().apply {
+                PacketContext.entries.forEach { addProperty(it.name, it.value) }
+            }
+        }
+
+        "announce_queue_constants" -> {
+            result(
+                "announce_cap" to intVal(Reticulum.ANNOUNCE_CAP),
+                "max_queued_announces" to intVal(Reticulum.MAX_QUEUED_ANNOUNCES),
+                "queued_announce_life" to intVal(Reticulum.QUEUED_ANNOUNCE_LIFE),
+            )
+        }
+
+        "interface_default_ifac_size" -> {
+            // Per-class DEFAULT_IFAC_SIZE read off the live interface classes.
+            // reticulum-kt implements no Serial/KISS/AX25KISS interfaces, so
+            // those python class names are honestly absent from the map.
+            val sizes = JsonObject().apply {
+                addProperty("TCPServerInterface", TCPServerInterface.DEFAULT_IFAC_SIZE)
+                addProperty("TCPClientInterface", TCPClientInterface.DEFAULT_IFAC_SIZE)
+                addProperty("UDPInterface", UDPInterface.DEFAULT_IFAC_SIZE)
+                addProperty("PipeInterface", PipeInterface.DEFAULT_IFAC_SIZE)
+                addProperty("RNodeInterface", RNodeInterface.DEFAULT_IFAC_SIZE)
+            }
+            result(
+                "default_ifac_size" to sizes,
+                "ifac_min_size" to intVal(RnsConstants.IFAC_MIN_SIZE),
+            )
+        }
+
+        "interface_hw_mtu" -> {
+            when (val itype = p.str("type")) {
+                "TCPInterface" -> result("hw_mtu" to intVal(TCPClientInterface.HW_MTU))
+                "AutoInterface" -> result("hw_mtu" to intVal(AutoInterfaceConstants.HW_MTU))
+                else -> result("error" to strVal(
+                    "unsupported interface type '$itype' " +
+                    "(reticulum-kt class-level HW_MTU: TCPInterface, AutoInterface)"))
+            }
+        }
+
+        "interface_optimise_mtu" -> {
+            // Drives the library's Interface.optimiseMtu tier mapping; the
+            // AUTOCONFIGURE_MTU gate and the -1 unchanged-sentinel mirror the
+            // reference command exactly.
+            val bitrate = p.get("bitrate").asLong
+            val autoconfigure = p.boolOpt("autoconfigure") ?: true
+            val sentinel = -1
+            val hwMtu = if (autoconfigure) Interface.optimiseMtu(bitrate) else sentinel
+            result(
+                "hw_mtu" to (hwMtu?.let { intVal(it) } ?: JsonNull.INSTANCE),
+                "unchanged" to boolVal(hwMtu == sentinel),
+            )
+        }
+
+        // === Conformance surface: destination family (LIVE) ===
+
+        "destination_construct" -> {
+            val hadIdentity = p.get("identity_private_key") != null &&
+                !p.get("identity_private_key").isJsonNull
+            val dest = makeDestination(p)
+            val out = JsonObject().apply {
+                addProperty("destination_hash", dest.hash.toHex())
+                addProperty("name", dest.name)
+                addProperty("name_hash", dest.nameHash.toHex())
+                addProperty("proof_strategy", dest.getProofStrategy())
+                addProperty("type", dest.type.value)
+                addProperty("direction", dest.direction.value)
+            }
+            // IN, non-PLAIN, no supplied identity: the library generated one
+            // and folded its hexhash into the aspects (Destination.py:174-176).
+            if (!hadIdentity && dest.identity != null) {
+                out.addProperty("auto_identity_hexhash", dest.identity!!.hexHash)
+            }
+            out
+        }
+
+        "destination_announce_attempt" -> {
+            val dest = makeDestination(p)
+            dest.announce(send = false)
+            result(
+                "ok" to boolVal(true),
+                "destination_hash" to hexVal(dest.hash),
+            )
+        }
+
+        "app_and_aspects_from_name" -> {
+            val parsed = Destination.appAndAspectsFromName(p.str("full_name"))
+                ?: throw IllegalArgumentException("Invalid full name")
+            result(
+                "app_name" to strVal(parsed.first),
+                "aspects" to JsonArray().apply { parsed.second.forEach { add(it) } },
+            )
+        }
+
+        "hash_from_name_and_identity" -> {
+            result("destination_hash" to hexVal(
+                Destination.hashFromNameAndIdentity(
+                    p.str("full_name"), p.hex("identity_hash"))))
+        }
+
+        "destination_expand_name" -> {
+            val pk = p.hexOpt("identity_private_key")
+            val identity = pk?.let { Identity.fromPrivateKey(it, crypto) }
+            val aspects = p.stringArray("aspects")
+            val out = JsonObject().apply {
+                addProperty("name", Destination.expandName(
+                    identity, p.str("app_name"), *aspects.toTypedArray()))
+            }
+            if (identity != null) out.addProperty("identity_hexhash", identity.hexHash)
+            out
+        }
+
+        "destination_set_proof_strategy_raw" -> {
+            val dest = makeDestination(p)
+            // The library's own validation runs: an unknown strategy raises
+            // ("Unsupported proof strategy"), surfacing as a BridgeError.
+            dest.setProofStrategy(p.int("strategy_value"))
+            result(
+                "set" to boolVal(true),
+                "proof_strategy" to intVal(dest.getProofStrategy()),
+            )
+        }
+
+        "destination_rotate_ratchets" -> {
+            val dest = makeDestination(p)
+            if (p.boolOpt("enable") == true) {
+                val rdir = java.nio.file.Files.createTempDirectory("rns_dest_ratchets_").toFile()
+                dest.enableRatchets(java.io.File(rdir, "ratchets.bin").absolutePath)
+                dest.ratchetInterval = 0
+            }
+            // Without enable, the library itself raises ("ratchets are not
+            // enabled") — the python SystemError path, surfaced as BridgeError.
+            val rotated = dest.rotateRatchets()
+            result(
+                "rotated" to boolVal(rotated),
+                "has_ratchets" to boolVal(true),
+            )
+        }
+
+        "destination_group_encrypt" -> {
+            val q = p.deepCopy().apply { addProperty("type", "group") }
+            if (q.get("direction") == null) q.addProperty("direction", "in")
+            val dest = makeDestination(q)
+            if (p.boolOpt("create_keys") == true) dest.createKeys()
+            val ciphertext = dest.encrypt(p.hex("plaintext"))
+            val roundtrip = dest.decrypt(ciphertext)
+            val hasKey = try { dest.getPrivateKey(); true } catch (e: Exception) { false }
+            result(
+                "ciphertext" to hexVal(ciphertext),
+                "roundtrip" to (roundtrip?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                "has_key" to boolVal(hasKey),
+            )
+        }
+
+        "destination_default_app_data" -> {
+            val dest = makeDestination(p)
+            val defaultValue = p.hexOpt("default_value") ?: ByteArray(0)
+            when (p.strOpt("default_kind") ?: "bytes") {
+                "bytes" -> dest.setDefaultAppData(defaultValue)
+                "callable" -> dest.setDefaultAppData({ defaultValue })
+                // "none" -> leave unset
+            }
+            val packet = dest.announce(p.hexOpt("override_app_data"), send = false)
+                ?: throw IllegalStateException("announce(send=false) returned no packet")
+            packet.pack()
+            // Read app_data off the announce tail at the library's field sizes
+            // (same offsets cmd_announce_build parses).
+            val data = packet.data
+            var cursor = RnsConstants.FULL_KEY_SIZE + RnsConstants.NAME_HASH_BYTES + 10
+            if (packet.contextFlag == ContextFlag.SET) cursor += RnsConstants.KEY_SIZE
+            cursor += RnsConstants.SIGNATURE_SIZE
+            result(
+                "app_data" to hexVal(data.copyOfRange(cursor, data.size)),
+                "default_app_data_set" to boolVal(dest.getDefaultAppData() != null),
+            )
+        }
+
+        "destination_register_request_handler_validate" -> {
+            val dest = makeDestination(p)
+            val path = p.strOpt("path") ?: "/test/echo"
+            val generatorValid = p.boolOpt("generator_valid") ?: true
+            if (!generatorValid) {
+                // python passes response_generator=None -> ValueError; kotlin's
+                // type system has no null generator, so the equivalent invalid-
+                // argument failure is raised here with python's message.
+                throw IllegalArgumentException("Invalid response generator specified")
+            }
+            val allow = p.intOpt("allow") ?: RequestPolicy.ALLOW_ALL
+            dest.registerRequestHandler(
+                path,
+                responseGenerator = { _, data, _, _, _, _ -> data },
+                allow = allow,
+            )
+            result(
+                "registered" to boolVal(true),
+                "handler_count" to intVal(dest.requestHandlerCount()),
+            )
+        }
+
+        "destination_path_response_cache" -> {
+            val dest = makeDestination(p)
+            val tag = p.hex("tag")
+            val advanceSeconds = p.get("advance_seconds")?.asDouble ?: 0.0
+            val baseMs = 1_000_000_000L
+            val p1 = WallClock.withPinned(baseMs) {
+                dest.announce(pathResponse = true, tag = tag, send = false)
+            } ?: throw IllegalStateException("first announce returned no packet")
+            val p2 = WallClock.withPinned(baseMs + (advanceSeconds * 1000).toLong()) {
+                dest.announce(pathResponse = true, tag = tag, send = false)
+            } ?: throw IllegalStateException("second announce returned no packet")
+            result(
+                "first_announce_data" to hexVal(p1.data),
+                "second_announce_data" to hexVal(p2.data),
+                "reused" to boolVal(p1.data.contentEquals(p2.data)),
+                "cache_size" to intVal(dest.pathResponseCount()),
+                "pr_tag_window" to intVal((Destination.PR_TAG_WINDOW / 1000).toInt()),
+                "first_is_path_response" to boolVal(p1.context == PacketContext.PATH_RESPONSE),
+            )
+        }
+
+        // === Conformance surface: announce build/validate (LIVE) ===
+
+        "announce_build" -> {
+            val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
+            val aspects = p.stringArray("aspects")
+            // Snapshot registration BEFORE create: a test may have already
+            // registered this exact destination (e.g. the local-destination
+            // announce-ignored case). create() dedups, so it returns the
+            // existing instance; we must NOT deregister something the test owns.
+            val expectedHash = Destination.computeHash(p.str("app_name"), aspects.toList(), identity.hash)
+            val preRegistered = network.reticulum.transport.Transport.findDestination(expectedHash) != null
+            val dest = Destination.create(
+                identity, DestinationDirection.IN, DestinationType.SINGLE,
+                p.str("app_name"), *aspects.toTypedArray(),
+            )
+            // Destination.create auto-registers IN destinations on the (single)
+            // Transport singleton. The python reference bridge builds announces
+            // on a SEPARATE minimal-RNS module, so they never pollute a
+            // behavioral instance's destination map; deregister here to match
+            // that — otherwise an injected announce for this destination would
+            // be treated as local and skipped. But ONLY undo OUR auto-registration:
+            // if the destination was already registered by the test, leave it.
+            if (!preRegistered) {
+                try { network.reticulum.transport.Transport.deregisterDestination(dest) } catch (_: Exception) {}
+            }
+            if (p.boolOpt("enable_ratchets") == true) {
+                val rdir = java.nio.file.Files.createTempDirectory("rns_announce_ratchets_").toFile()
+                dest.enableRatchets(java.io.File(rdir, "ratchets.bin").absolutePath)
+            }
+            val appData = p.hexOpt("app_data")
+            val emissionTs = p.get("emission_ts")?.takeIf { !it.isJsonNull }?.asLong
+            val packet = (if (emissionTs != null) {
+                WallClock.withPinned(emissionTs * 1000) { dest.announce(appData, send = false) }
+            } else {
+                dest.announce(appData, send = false)
+            }) ?: throw IllegalStateException("announce(send=false) returned no packet")
+            val raw = packet.pack()
+
+            // Parse what the library just produced, at its own field sizes.
+            val keysize = RnsConstants.FULL_KEY_SIZE
+            val nameHashLen = RnsConstants.NAME_HASH_BYTES
+            val ratchetSize = RnsConstants.KEY_SIZE
+            val sigLen = RnsConstants.SIGNATURE_SIZE
+            val hasRatchet = packet.contextFlag == ContextFlag.SET
+            val data = packet.data
+            var cursor = keysize + nameHashLen + 10
+            val ratchet = if (hasRatchet) {
+                data.copyOfRange(cursor, cursor + ratchetSize).also { cursor += ratchetSize }
+            } else ByteArray(0)
+            val signature = data.copyOfRange(cursor, cursor + sigLen)
+            cursor += sigLen
+            result(
+                "raw" to hexVal(raw),
+                "destination_hash" to hexVal(dest.hash),
+                "announce_data" to hexVal(data),
+                "public_key" to hexVal(data.copyOfRange(0, keysize)),
+                "name_hash" to hexVal(data.copyOfRange(keysize, keysize + nameHashLen)),
+                "random_hash" to hexVal(data.copyOfRange(keysize + nameHashLen, keysize + nameHashLen + 10)),
+                "ratchet" to strVal(if (ratchet.isEmpty()) "" else ratchet.toHex()),
+                "signature" to hexVal(signature),
+                "app_data" to hexVal(data.copyOfRange(cursor, data.size)),
+                "has_ratchet" to boolVal(hasRatchet),
+            )
+        }
+
+        "announce_validate" -> {
+            val packet = Packet.unpack(p.hex("raw"))
+                ?: return result("valid" to boolVal(false), "error" to strVal("unpack_failed"))
+            if (packet.packetType != PacketType.ANNOUNCE) {
+                return result("valid" to boolVal(false), "error" to strVal("not_an_announce"))
+            }
+            val valid = Identity.validateAnnounce(packet) != null
+            val out = JsonObject().apply {
+                addProperty("valid", valid)
+                addProperty("destination_hash", packet.destinationHash.toHex())
+                addProperty("has_ratchet", packet.contextFlag == ContextFlag.SET)
+            }
+            if (packet.contextFlag == ContextFlag.SET) {
+                val off = RnsConstants.FULL_KEY_SIZE + RnsConstants.NAME_HASH_BYTES + 10
+                out.addProperty(
+                    "ratchet",
+                    packet.data.copyOfRange(off, off + RnsConstants.KEY_SIZE).toHex(),
+                )
+            }
+            out
+        }
+
+        // === Conformance surface: packet build/observe (LIVE) ===
+
+        "packet_build" -> {
+            val destType = p.strOpt("dest_type") ?: "plain"
+            val packetType = PacketType.fromValue(p.intOpt("packet_type") ?: PacketType.DATA.value)
+            // python carries context as a raw int; unknown code points are
+            // legal wire bytes (forward compatibility) — see PacketContext.UNKNOWN.
+            val contextInt = p.intOpt("context") ?: 0
+            val context = PacketContext.entries.find { it.value == contextInt }
+                ?: PacketContext.UNKNOWN
+            val contextFlag = ContextFlag.fromValue(p.intOpt("context_flag") ?: 0)
+            val transportType = TransportType.fromValue(p.intOpt("transport_type") ?: 0)
+            val hops = p.intOpt("hops") ?: 0
+            val data = p.hexOpt("data") ?: ByteArray(0)
+            val headerType = when (val h = p.get("header_type")?.takeIf { !it.isJsonNull }?.asString ?: "1") {
+                "1", "HEADER_1" -> HeaderType.HEADER_1
+                "2", "HEADER_2" -> HeaderType.HEADER_2
+                else -> throw IllegalArgumentException(
+                    "unsupported header_type: $h (use 1 / 2 or 'HEADER_1' / 'HEADER_2')")
+            }
+            var transportId: ByteArray? = null
+            if (headerType == HeaderType.HEADER_2) {
+                if (packetType != PacketType.ANNOUNCE) throw IllegalArgumentException(
+                    "HEADER_2 packets are only buildable for ANNOUNCE packet_type")
+                transportId = p.hexOpt("transport_id") ?: throw IllegalArgumentException(
+                    "HEADER_2 packets require a 16-byte transport_id")
+                if (transportId.size != RnsConstants.TRUNCATED_HASH_BYTES)
+                    throw IllegalArgumentException(
+                        "transport_id must be ${RnsConstants.TRUNCATED_HASH_BYTES} bytes")
+            }
+            val destination = when (destType) {
+                "plain" -> Destination.create(
+                    null, DestinationDirection.OUT, DestinationType.PLAIN, "conformance", "packet")
+                "single" -> Destination.create(
+                    Identity.create(crypto), DestinationDirection.OUT, DestinationType.SINGLE,
+                    "conformance", "packet")
+                "group" -> Destination.create(
+                    Identity.create(crypto), DestinationDirection.OUT, DestinationType.GROUP,
+                    "conformance", "packet").also { it.createKeys() }
+                else -> throw IllegalArgumentException(
+                    "unsupported dest_type: $destType (use 'plain', 'single' or 'group')")
+            }
+            val packet = Packet.create(
+                destination, data,
+                packetType = packetType, context = context,
+                transportType = transportType, headerType = headerType,
+                transportId = transportId, contextFlag = contextFlag,
+                createReceipt = false,
+            )
+            packet.contextRaw = contextInt
+            packet.hops = hops
+            val raw = packet.pack()
+            // Read the fields back the way any receiver does — a real unpack.
+            val parsed = Packet.unpack(raw)
+                ?: throw IllegalStateException("library could not unpack its own packet")
+            packetFieldsJson(raw, parsed)
+        }
+
+        "packet_build_raw_header2" -> {
+            // Let the LIBRARY's pack() decide — missing transport_id raises
+            // from Packet.pack itself ("HEADER_2 packets require a transport ID").
+            val packetType = PacketType.fromValue(p.intOpt("packet_type") ?: PacketType.ANNOUNCE.value)
+            val dataIn = p.hexOpt("data") ?: ByteArray(0)
+            val data = if (dataIn.isEmpty()) byteArrayOf(0) else dataIn
+            val destination = Destination.create(
+                Identity.create(crypto), DestinationDirection.OUT, DestinationType.SINGLE,
+                "conformance", "packet")
+            val packet = Packet.create(
+                destination, data,
+                packetType = packetType, headerType = HeaderType.HEADER_2,
+                transportId = p.hexOpt("transport_id"), createReceipt = false,
+            )
+            try {
+                val raw = packet.pack()
+                result("raw" to hexVal(raw), "raw_len" to intVal(raw.size))
+            } catch (e: Exception) {
+                result(
+                    "error" to strVal(e.message ?: "pack failed"),
+                    "error_type" to strVal(e.javaClass.simpleName),
+                )
+            }
+        }
+
+        "packet_resend_observe" -> {
+            val dataIn = p.hexOpt("data") ?: ByteArray(0)
+            val data = if (dataIn.isEmpty()) "conformance-resend".toByteArray(Charsets.UTF_8) else dataIn
+            val destination = when (p.strOpt("dest_type") ?: "single") {
+                "plain" -> Destination.create(
+                    null, DestinationDirection.OUT, DestinationType.PLAIN, "conformance", "packet")
+                "group" -> Destination.create(
+                    Identity.create(crypto), DestinationDirection.OUT, DestinationType.GROUP,
+                    "conformance", "packet").also { it.createKeys() }
+                else -> Destination.create(
+                    Identity.create(crypto), DestinationDirection.OUT, DestinationType.SINGLE,
+                    "conformance", "packet")
+            }
+            val packet = Packet.create(destination, data, createReceipt = false)
+            packet.pack()
+            val raw1 = packet.raw!!.toHex()
+            val hash1 = packet.getHash().toHex()
+            // resend() requires the packet to have been sent; set the flag so
+            // the real re-pack (the byte generation under test) runs.
+            packet.sent = true
+            try { packet.resend() } catch (e: Exception) { /* no interface attached */ }
+            result(
+                "raw_1" to strVal(raw1), "hash_1" to strVal(hash1),
+                "raw_2" to hexVal(packet.raw!!), "hash_2" to hexVal(packet.getHash()),
+            )
+        }
+
+        // === Conformance surface: framing (LIVE — real library deframers) ===
+
+        "hdlc_deframe" -> {
+            // Extract the bytes between the first two FLAG delimiters, then
+            // reverse byte-stuffing with the library's real HDLC.unescape.
+            val framed = p.hex("framed")
+            val start = framed.indexOfFirst { it == HDLC.FLAG }
+            if (start == -1) throw IllegalArgumentException(
+                "no HDLC FLAG (0x7E) delimiter found in framed input")
+            val end = framed.drop(start + 1).indexOfFirst { it == HDLC.FLAG }
+            if (end == -1) throw IllegalArgumentException(
+                "unterminated HDLC frame: only one FLAG delimiter")
+            val inner = framed.copyOfRange(start + 1, start + 1 + end)
+            result("data" to hexVal(HDLC.unescape(inner)))
+        }
+
+        "kiss_deframe" -> {
+            val framed = p.hex("framed")
+            val start = framed.indexOfFirst { it == KISS.FEND }
+            if (start == -1) throw IllegalArgumentException(
+                "no KISS FEND (0xC0) delimiter found in framed input")
+            val end = framed.drop(start + 1).indexOfFirst { it == KISS.FEND }
+            if (end == -1) throw IllegalArgumentException(
+                "unterminated KISS frame: only one FEND delimiter")
+            val inner = framed.copyOfRange(start + 1, start + 1 + end)
+            if (inner.isEmpty()) throw IllegalArgumentException(
+                "empty KISS frame: no command byte")
+            if (inner[0] != KISS.CMD_DATA) throw IllegalArgumentException(
+                "unexpected KISS command byte 0x%02x, expected CMD_DATA (0x%02x)"
+                    .format(inner[0], KISS.CMD_DATA))
+            result("data" to hexVal(KISS.unescape(inner.copyOfRange(1, inner.size))))
+        }
+
+        "hdlc_deframe_stream" -> {
+            // Drives the library's real streaming Deframer — the same class the
+            // kotlin TCP read path uses — including its runt-frame drop.
+            val stream = p.hex("stream")
+            val frames = mutableListOf<ByteArray>()
+            HDLC.createDeframer { frames.add(it) }.process(stream)
+            result("frames" to JsonArray().apply { frames.forEach { add(it.toHex()) } })
+        }
+
+        "kiss_deframe_stream" -> {
+            // The library deframer strips the port nibble and only delivers
+            // CMD_DATA frames, mirroring python's TCP/KISS read loop. When the
+            // request supplies hw_mtu, the deframer caps each decoded frame to it
+            // exactly as python's `len(data_buffer) < self.HW_MTU` gate
+            // (TCPInterface.py:370); absent, it stays uncapped.
+            val stream = p.hex("stream")
+            val hwMtu = p.intOpt("hw_mtu") ?: Int.MAX_VALUE
+            val frames = mutableListOf<ByteArray>()
+            KISS.createDeframer(hwMtu) { _, data -> frames.add(data) }.process(stream)
+            result("frames" to JsonArray().apply { frames.forEach { add(it.toHex()) } })
+        }
+
+        "auto_discovery_token" -> {
+            // full_hash(group_id + utf8(addr)) — the same composition
+            // AutoInterface.discovery_handler performs (python AutoInterface.py:365,
+            // kotlin AutoInterface.kt expectedToken), via the library's Hashes.
+            val groupId = p.hex("group_id")
+            val addr = p.str("link_local_addr")
+            result("token" to hexVal(
+                Hashes.fullHash(groupId + addr.toByteArray(Charsets.UTF_8))))
+        }
+
         else -> {
             if (command.startsWith("behavioral_")) {
                 handleBehavioralCommand(command, p)
@@ -1657,10 +2376,60 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                 handleWireCommand(command, p)
             } else if (command.startsWith("lxmf_")) {
                 handleLxmfCommand(command, p)
+            } else if (command.startsWith("discovery_")) {
+                handleDiscoveryCommand(command, p)
             } else {
                 throw IllegalArgumentException("Unknown command: $command")
             }
         }
+    }
+}
+
+// --- Destination construction helper (mirrors reference _make_destination) ---
+
+fun makeDestination(p: JsonObject, defaultDirection: String = "in", defaultType: String = "single"): Destination {
+    val typeStr = p.strOpt("type") ?: defaultType
+    val type = when (typeStr.lowercase()) {
+        "single" -> network.reticulum.common.DestinationType.SINGLE
+        "group" -> network.reticulum.common.DestinationType.GROUP
+        "plain" -> network.reticulum.common.DestinationType.PLAIN
+        "link" -> network.reticulum.common.DestinationType.LINK
+        else -> network.reticulum.common.DestinationType.fromValue(typeStr.toInt())
+    }
+    val dirStr = p.strOpt("direction") ?: defaultDirection
+    val direction = when (dirStr.lowercase()) {
+        "in" -> network.reticulum.common.DestinationDirection.IN
+        "out" -> network.reticulum.common.DestinationDirection.OUT
+        else -> network.reticulum.common.DestinationDirection.fromValue(dirStr.toInt())
+    }
+    val identity = p.hexOpt("identity_private_key")?.let {
+        Identity.fromPrivateKey(it, defaultCryptoProvider())
+    }
+    val aspects = p.stringArray("aspects")
+    return Destination.create(identity, direction, type, p.str("app_name"), *aspects.toTypedArray())
+}
+
+// --- Packet field decomposition (mirrors reference packet_build/unpack shape) ---
+
+fun packetFieldsJson(raw: ByteArray, parsed: network.reticulum.packet.Packet): JsonObject {
+    return JsonObject().apply {
+        addProperty("raw", raw.toHex())
+        addProperty("flags", raw[0].toInt() and 0xFF)
+        addProperty("hops", parsed.hops)
+        addProperty("header_type", parsed.headerType.value)
+        addProperty("context_flag", parsed.contextFlag.value)
+        addProperty("transport_type", parsed.transportType.value)
+        addProperty("destination_type", parsed.destinationType.value)
+        addProperty("packet_type", parsed.packetType.value)
+        addProperty("destination_hash", parsed.destinationHash.toHex())
+        if (parsed.transportId != null) {
+            addProperty("transport_id", parsed.transportId!!.toHex())
+        } else {
+            add("transport_id", JsonNull.INSTANCE)
+        }
+        addProperty("context", parsed.contextRaw)
+        addProperty("data", parsed.data.toHex())
+        addProperty("hash", parsed.getHash().toHex())
     }
 }
 

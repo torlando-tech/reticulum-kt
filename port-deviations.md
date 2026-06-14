@@ -148,3 +148,197 @@ To restore the python invariant ("the flag is true iff we're a shared-instance c
 With the `registerInterface` widening above, kotlin clients now pack `HEADER_2` outbound on the same code path as python, so the master receives `packet.transportId != null` and no compensation is required. The compensation block is removed; the master's processing now mirrors python's exactly.
 
 **Re-evaluation:** the removal is a strict re-convergence with the python reference — there's nothing to re-evaluate unless a future kotlin downstream consumer reintroduces a code path that bypasses both `Reticulum.tryConnectToSharedInstance` and `Transport.registerInterface`'s flag widening (which would be a separate bug to fix at the new bypass site, not here).
+
+### Eager client-side path persistence with deferred (lazy) interface validation — `rns-core/.../Transport.kt::loadPersistedDataFromStorage`, `hasPath`/`hopsTo`/`nextHop`/`isDanglingPath`, `cullTables`
+
+**Python reference:** `RNS/Transport.py:255-300` (`__init__` load of `destination_table` from `destination_table` cache). Python loads the persisted path table **only when `Reticulum.transport_enabled()`** is true (leaf clients never persist or restore paths), and validates each entry **at load time**: an entry is dropped if its `receiving_interface` no longer resolves to a registered interface ("The interface is no longer available") or if no cached announce backs it. After load, `has_path`/`hops_to`/`next_hop` can therefore trust that every table entry references a live interface.
+
+**Category:** new feature (client-side path persistence) + language/runtime forced (lazy validation timing).
+
+**Date:** 2026-06-09.
+
+**Tracking:** columba#1004 (D5). See also `columba` memory `issue-1004-path-requests-direct-delivery`.
+
+**Description:** Columba persists the path table on *plain clients* (phones) via a Room-backed [PathStore] — an intentional improvement over python, where only transport nodes persist paths, so that a freshly-opened app can reach recently-known destinations without waiting for a fresh announce ([path-persistence-improvement]). Two deviations follow from this:
+
+1. **Eager load (feature).** `loadPersistedDataFromStorage` restores `pathTable` unconditionally, omitting python's `transport_enabled()` gate. This is the persistence feature itself and must not be "fixed" back to the python gate.
+
+2. **Lazy interface validation (runtime-forced).** Python validates interfaces at load time because, in python, all configured interfaces are constructed and registered *before* `Transport` loads the table. On Android, interfaces (TCP, BLE, RNode) register **asynchronously after** `Transport.start()`, so a load-time validation would wrongly drop every restored entry during the startup window before its interface comes up. Instead, validation is deferred and split:
+   - `hasPath`/`hopsTo`/`nextHop` apply a **non-destructive** `isDanglingPath` check: a restored entry whose `receivingInterfaceHash` resolves to no registered interface is treated as absent, *but only once at least one interface has registered* (`interfaces.isNotEmpty()` — the same guard `savePathTable` uses, mirroring `Transport.py:2905-2910`). This preserves python's invariant ("a usable path references a live interface") at the read APIs without racing async registration.
+   - `cullTables` performs the **destructive** prune (removing the entry and calling `pathStore.removePath`) but only after `STARTUP_GRACE_PERIOD` past `startTime`, which is the kotlin equivalent of python's load-time "interface no longer available" drop (`Transport.py:284-298`), shifted later to accommodate async registration.
+
+   Net effect: once interfaces are up, kotlin's read APIs and table contents converge on exactly what python would have after its load-time validation.
+
+**Re-evaluation:** if Android interface registration is ever made synchronous-before-`Transport.start()` (matching python's construct-then-load order), the lazy split can collapse back into a single load-time validation in `loadPersistedDataFromStorage`, and the `interfaces.isNotEmpty()` guard plus the grace-period cull become unnecessary. The eager-load feature (item 1) is independent and stays regardless, as long as Columba wants client-side path persistence.
+
+### Adaptive multicast announce interval + Doze throttle — `rns-interfaces/.../auto/AutoInterface.kt::startAnnouncementLoop`, `updateAnnounceInterval`, `resetAnnounceInterval`, `throttleMultiplier`
+
+**Python reference:** `RNS/Interfaces/AutoInterface.py:62` (`ANNOUNCE_INTERVAL = 1.6`), `:472-475` (`announce_handler`: `while True: peer_announce(ifname); time.sleep(1.6)` — a fixed 1.6s multicast discovery transmission, per adopted interface, forever). Python constants that interact with this deviation: `:61` (`PEERING_TIMEOUT = 22.0`), `:371-381` (`peer_jobs` expires peers not heard within the timeout and tears down their spawned interfaces), `:614` (`AutoInterfacePeer.process_incoming` refreshes `last_heard` on inbound data, not just announces).
+
+**Category:** new feature (mobile power optimization). **Rule caveat:** as written above, reason 2 requires that kotlin-only behavior "not change semantics of any code path that does exist in python" — this deviation *does* change the announce cadence of a python-existing path. It landed 2026-04-05 without an entry here; documented retroactively 2026-06-11. Owner should confirm the justification stands (process rule 3), especially given the hazard below.
+
+**Date:** code 2026-04-05 (`9b0d21a` adaptive interval, `59db315` Doze throttle); entry 2026-06-11.
+
+**Tracking:** columba `docs/battery-optimization-opportunities.md` item 1 (announce-loop wakeup mechanics) and its parity note.
+
+**Description:** python transmits a multicast discovery announce every 1.6 seconds per adopted interface, unconditionally — ~54,000 multicast TX/day per interface, which on a phone keeps the WiFi radio out of power-save indefinitely. kotlin replaces the fixed cadence with an adaptive ramp (`AutoInterface.kt:57-70, 536-552`): announces start at the python-compatible 1.6s (`minAnnounceIntervalMs = ANNOUNCE_INTERVAL_MS`), and over the 60s following the last peer-topology change (`rampUpDurationMs`) the interval ramps linearly to `maxAnnounceIntervalMs = 120_000` (2 minutes). Any peer add/remove calls `resetAnnounceInterval()`, snapping back to 1.6s so new or changed peers are discovered at python speed. An additional `throttleMultiplier` (default 1.0) scales the effective max; rns-android's Doze plumbing raises it when the device idles. Receiving-side behavior is unchanged: like python, kotlin discovers announcing peers regardless of its own TX rate, and refreshes `lastHeard` on both announces (`addPeer`→`refreshPeer`, `AutoInterface.kt:700`) and inbound data (`AutoInterface.kt:465`), matching python's `:614`.
+
+**Known hazard — steady-state interval exceeds PEERING_TIMEOUT (owner decision needed):** both implementations expire peers not heard for 22s (`PEERING_TIMEOUT`; kotlin `peerJobs`, `AutoInterface.kt:661-676`). Data traffic refreshes peers on both sides, so *active* links are unaffected. But for an **idle** pair, announces are the only refresh source, and the ramped announce gap (→120s, larger still under the Doze multiplier) blows through the 22s timeout: once the ramp produces a gap >22s (roughly 10–30s after the last peer change), the remote side expires us — and expiry is disruptive, not cosmetic: kotlin's `removePeer` deregisters the spawned peer interface from `Transport` (`AutoInterface.kt:751-762`); python tears down its spawned interface likewise (`:381+`). Expiry also fires `resetAnnounceInterval()`, so the pair re-peers within seconds and starts ramping again — an add→expire→re-add flap cycle on the order of once per minute at idle, with Transport interface churn each cycle, against both python and kotlin remotes. Two consequences: (1) the nominal "~75x fewer announces" steady state is never actually reached against a live peer — the effective announce rate oscillates between 1.6s and roughly the timeout; (2) inbound delivery via AutoInterface during an expired window can be dropped on the remote (no spawned interface exists for us until our next announce). Mitigation options: (a) cap `effectiveMax` at ~15–18s — safely inside `PEERING_TIMEOUT` with jitter margin, still ~10x fewer TX than python; (b) keep slow multicast announces but add a unicast keepalive to *established* peers at <22s cadence (python's `reverse_announce`, `:477-489`, is precedent; kotlin currently has no unicast announce path); (c) a negotiated/longer peering timeout — not viable against fixed python remotes. Until one of these lands, AutoInterface peer flapping in idle-device logs is this deviation, not a network bug. Related dead code: `AutoInterfaceConstants.kt:52` defines `ANDROID_PEERING_TIMEOUT = 27.5` but nothing references it.
+
+**Re-evaluation:** if the announce cadence is capped ≤ `PEERING_TIMEOUT` (option a), the hazard paragraph retires and the deviation becomes a strict improvement; if upstream python ever adopts adaptive announces, converge on its constants instead. The columba battery-doc item 1 (replacing the announce loop's 1s flag-poll wakeup with a channel signal) is orthogonal wakeup mechanics and folds into this entry whenever it lands.
+
+### remember() malformed-key gate raises IllegalArgumentException, not TypeError — `rns-core/.../identity/Identity.kt::remember`
+
+**Python reference:** `RNS/Identity.py:100-101` (1.1.3) / `:102-103` (1.3.1) — `remember()` raises `TypeError` when `len(public_key) != Identity.KEYSIZE//8` (64 bytes), so a corrupt announce can never plant an unusable key.
+
+**Category:** language/runtime forced (exception-type idiom only; the gate condition and placement mirror python exactly).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance-suite `identity_remember` bridge command (reticulum-conformance `reference/bridge_server.py::cmd_identity_remember`).
+
+**Description:** kotlin's `remember()` previously had NO length gate (silent divergence — any key size was stored). The gate is now added to match python. Python raises `TypeError`; kotlin throws `IllegalArgumentException`, the JVM-idiomatic equivalent for an invalid argument (kotlin reserves its `TypeCastException`-family for actual cast failures, so `TypeError` has no faithful counterpart). Callers that need python parity should treat `IllegalArgumentException` from `remember()` as python's `TypeError`.
+
+**Re-evaluation:** none needed — permanent idiom mapping. NOTE (pre-existing, undocumented divergence spotted during this change, NOT introduced by it): python 1.3.1's `remember()` additionally takes `known_destinations_lock`, stores 5-element entries, and on an already-known destination UPDATES timestamp/packet_hash/public_key/app_data in place (`Identity.py:105-117`); kotlin unconditionally overwrites with a fresh `IdentityData` and has no 5th element. Functionally close but not identical (the 1.3.1 5th element survives updates). Needs its own entry or a port fix when the `remember-update-refreshes-existing-entry` conformance behavior gets exercised.
+
+### optimiseMtu as companion function, not instance mutator — `rns-interfaces/.../Interface.kt::Companion.optimiseMtu`
+
+**Python reference:** `RNS/Interfaces/Interface.py:140-163` (1.1.3) / `:198-221` (1.3.1) — `optimise_mtu(self)` mutates `self.HW_MTU` from a bitrate tier table, gated on `self.AUTOCONFIGURE_MTU`.
+
+**Category:** language/runtime forced.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `interface_optimise_mtu` bridge command.
+
+**Description:** kotlin's `Interface.hwMtu` is an immutable `open val` (subclass-declared), so python's in-place `self.HW_MTU = ...` mutation pattern cannot be expressed. The tier mapping is ported byte-for-byte (every threshold, comparator, and value identical, including the `>= 1 Gbps` top tier vs `>` elsewhere and the `None`/null bottom tier) as a pure companion function `optimiseMtu(bitrate): Int?`; callers apply python's `AUTOCONFIGURE_MTU` gate themselves and assign the result wherever their MTU state lives.
+
+**Call sites applying the gate (2026-06-13):** `TCPClientInterface.hwMtu` and `TCPServerInterface.hwMtu` now initialise to `fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)`. The `fixedMtuBytes ?:` short-circuit IS python's `AUTOCONFIGURE_MTU` gate: python sets `self.AUTOCONFIGURE_MTU = False` and pins `HW_MTU = fixed_mtu` when `fixed_mtu` is configured (TCPInterface.py:113-116), otherwise `interface_post_init` runs `optimise_mtu()` (Reticulum.py:780). So the default (non-fixed) TCP interface now resolves the 10 Mbps `BITRATE_GUESS` to HW_MTU 8192 exactly as python does, rather than statically returning the class constant 262144. The `?: HW_MTU` tail handles the `None` bottom tier, unreachable for TCP since its bitrate is always ≥ `MINIMUM_BITRATE` ≫ 62500.
+
+**Re-evaluation:** if `hwMtu` ever becomes mutable interface state, this can return to an instance method with the gate inside, matching python's shape exactly.
+
+### WallClock pinning seam for protocol timestamps — `rns-core/.../common/WallClock.kt`, consulted by `Destination.generateAnnounceData`/`cachePathResponse`/`cleanStalePathResponses`
+
+**Python reference:** none directly — the python *conformance bridge* pins `time.time()` by monkeypatching around single `announce()` calls (reticulum-conformance `reference/bridge_server.py::cmd_announce_build`, `cmd_destination_path_response_cache`); the library itself reads the real clock.
+
+**Category:** new feature (test seam), forced by the JVM's inability to patch `System.currentTimeMillis()`.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance kotlin-bridge command surface work (announce_build emission_ts, destination_path_response_cache, Phase-3 behavioral time control).
+
+**Description:** protocol code paths whose wall-clock reads are observable behavior (announce random-hash timestamp embed, path-response PR_TAG_WINDOW bookkeeping; later transport-table ages) read `WallClock.nowMs()` instead of `System.currentTimeMillis()`. With `overrideMs == null` (always, in production) this is byte-for-byte `System.currentTimeMillis()`; the override exists solely so the conformance bridge can pin the clock the way the python bridge pins `time.time()`. No python-visible semantics change.
+
+**Re-evaluation:** if a general clock-injection design ever lands (e.g. kotlinx-datetime Clock plumbed through constructors), fold this into it.
+
+### Blanket: python TypeError/ValueError argument guards → kotlin IllegalArgumentException — port-wide
+
+**Python reference:** recurring pattern — e.g. `Destination.py:128` (`hash`: "Invalid material supplied..."), `:365-366` (`set_proof_strategy`: "Unsupported proof strategy"), `Identity.py:101-102` (`remember`).
+
+**Category:** language/runtime forced (exception-type idiom only).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance kotlin-bridge surface work.
+
+**Description:** python uses TypeError/ValueError interchangeably for invalid-argument guards; kotlin's idiomatic equivalent for both is IllegalArgumentException (via `require` or explicit throw). Wherever the port adds or corrects such a guard, the CONDITION and MESSAGE mirror python exactly and only the exception class maps to IAE. This blanket entry covers all such sites (each carries a code comment citing its python line); per-site entries are only written when more than the exception class differs.
+
+**Re-evaluation:** none — permanent idiom mapping.
+
+### Packet context as enum + contextRaw; createRaw pass-through pack() — `rns-core/.../packet/Packet.kt`
+
+**Python reference:** `RNS/Packet.py:186-238` (pack: encrypt-at-pack branch table, HEADER_2 announce-only assembly, IOError on missing transport id), `:246-252` (unpack: context is a raw int — any wire byte parses and simply matches no dispatch branch).
+
+**Category:** language/runtime forced (representation), plus one pre-existing kotlin-only construct documented retroactively.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance packet_build/packet_build_raw_header2/packet_resend_observe arms; conformance tests test_packet*.py.
+
+**Description:** (1) python's `Packet.context` is a bare int; kotlin's typed `PacketContext` enum cannot carry unnamed code points, so `contextRaw: Int` is the wire source of truth (pack writes it, unpack stores it) and `PacketContext.UNKNOWN(-1)` is the named view for unknown bytes — matching python's accept-and-match-nothing forward compatibility byte-for-byte. (2) python encrypts inside pack() (fresh ephemeral/IV per pack, which is what makes resend() re-encrypt); kotlin previously encrypted at Packet.create — now moved into pack() with python's exact unencrypted-class branch table and HEADER_2 announce-only rule (python error text preserved; IOError/AttributeError → IllegalStateException per the blanket idiom entry). (3) kotlin-only `Packet.createRaw` (no python counterpart — python transport splices raw bytes instead of re-packing) passes `data` through pack() untouched; that pass-through is its documented contract and is unreachable from python-mirrored code paths.
+
+**Re-evaluation:** if PacketContext is ever refactored to a value-class over Int, UNKNOWN/contextRaw collapse into it.
+
+### Discovery: polymorphic type-field sourcing; no executable reachable_on; injected source allowlist — `rns-core/.../discovery/{InterfaceAnnouncer,InterfaceAnnounceHandler,DiscoveryUtil}.kt`
+
+**Python reference:** `RNS/Discovery.py:96-186` (builder: per-type fields AND rules centralized; the reachable_on-from-executable subprocess branch at :117-131), `:214-362` (received_announce), `:216` (sources read live from Reticulum config), `:769-790` (validators/san_map).
+
+**Category:** mixed — (a) language/structure: per-type announce FIELDS are sourced polymorphically via `Interface.getDiscoveryData()` (kotlin's typed interfaces can't be duck-probed for arbitrary attributes), while every RULE (TCPClient-without-KISS abort, Backbone/TCPServer reachable_on validation+abort, KISS rewrite, IFAC publication, insertion order via LinkedHashMap) is centralized in the builder exactly as python's; (b) deliberate omission: the reachable_on-from-executable branch (python runs a user-configured executable and parses stdout) is NOT ported — running config-supplied executables is rejected on JVM/Android; an executable path therefore fails the IP/hostname validation and aborts the announce (python's failure mode for a broken script). (c) the receiver's source allowlist is constructor-injected instead of read live from Reticulum config (kotlin has no INI config layer yet); empty/null disables gating exactly like python's falsy check. Receiver validation core (hard type gates, whitelist, sanitize_name/san_map, config_entry strings, callback(None) on missing INTERFACE_TYPE) is a line-for-line port.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance discovery_* bridge commands; tests/test_discovery_*.py.
+
+**Re-evaluation:** when kotlin grows a config layer, switch the allowlist to a live read; revisit the executable branch only if a sandboxed design is approved by the owner.
+
+### announce_rate_table is a timestamp list, not python's dict — `rns-core/.../transport/Transport.kt::announceRateTable`
+
+**Python reference:** `RNS/Transport.py:1830-1860` — `announce_rate_table[dest]` is a dict `{"last", "rate_violations", "blocked_until", "timestamps":[...]}`.
+
+**Category:** new feature divergence (simplified model) — flagged for follow-up.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `behavioral_read_announce_rate`; announce-rate ENFORCEMENT is LIMITS-class per CONFORMANCE_COMPLETENESS_V2 §, so only the timestamp history is observably pinned today.
+
+**Description:** kotlin stores only the per-destination announce timestamp history (`Map<ByteArrayKey, MutableList<Long>>`), not python's full rate-limiter record with `last`/`rate_violations`/`blocked_until`. The conformance read surfaces `timestamps` faithfully and derives `last = max(timestamps)`; `rate_violations`/`blocked_until` are reported as 0 because kotlin does not yet implement the grace-counter/penalty-window enforcement. This is a genuine feature gap, not just a representation choice.
+
+**Re-evaluation:** when kotlin implements per-destination announce-rate enforcement (target rate + grace + penalty window), port python's full record and remove this entry.
+
+---
+
+### Typed config-knob threading replaces the INI config layer (Phase 5g) — `rns-core/.../Reticulum.kt::start`/`initialize`, `rns-interfaces/.../tcp/{TCPServerInterface,TCPClientInterface}.kt`, `Interface.kt`
+
+**Python reference:** `RNS/Reticulum.py:253-281` (posture defaults), `:489-495` (rpc_key parse/fallback), `:497-558` (`__apply_config` flag parse), `:575-591` (blackhole/discovery-source 16-byte validation + dedup), `:347-348` (rpc_key default = full_hash(transport private key)), `:719-723` (ifac_size bits->bytes floor), `:765-768` (bitrate MINIMUM_BITRATE floor); `RNS/Interfaces/Interface.py:89-94` (DEFAULT_AR_*, AUTOCONFIGURE_MTU/FIXED_MTU).
+
+**Category:** language/architecture divergence — kotlin has no INI/ConfigObj parser and no `__apply_config`.
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `wire_instance_posture`, `wire_transport_enabled`, `wire_rpc_authkey`, `wire_interface_bitrate`, `wire_interface_hw_mtu`, `wire_interface_transport_defaults`, `wire_first_hop_timeout`, `wire_discovery_autoconnect_gate` (tests/wire/test_reticulum_config_hooks.py, test_reticulum_config_v2.py, test_interface_defaults_v2.py, test_discovery_autoconnect_v2.py, test_link_protocol.py, test_link_completeness.py).
+
+**Description:** RNS resolves these posture/interface knobs by parsing an INI config in `__apply_config`. reticulum-kt has no config layer, so the same flags are threaded as typed parameters: `Reticulum.start(respondToProbes, useImplicitProof, enableRemoteManagement, remoteManagementAllowed, panicOnInterfaceError, blackholeSources, interfaceDiscoverySources, rpcKey)` plus companion read-outs (`probeDestinationEnabled`/`shouldUseImplicitProof`/`remoteManagementEnabled`/`panicOnInterfaceError`/`interfaceDiscoverySources`); and TCP interface constructor params `bitrate`/`fixedMtuBytes`/`ifacSizeBits`. The 16-byte identity-hash validation + dedup that python does in `__apply_config` runs in `Reticulum.start()` (a wrong-length/invalid-hex hash aborts the start, matching python's ValueError). rpc_key parse-with-fallback and the SHA-256(private-key) default run in `initialize()`. The bitrate floor and ifac_size bits->bytes floor run in the interface constructors (python applies them post-init in `_synthesize_interface`); the spawned `TCPServerClientInterface` inherits the parent's MTU/bitrate posture so the receiver side of a fixed-MTU link negotiates the same value. `Interface.autoconfigureMtu`/`fixedMtu` are faithful ports of python's `AUTOCONFIGURE_MTU`/`FIXED_MTU` class attributes; `Interface.DEFAULT_AR_TARGET/_PENALTY/_GRACE` are faithful ports of the python constants. The resolved VALUES match python exactly — only the resolution mechanism (typed kwargs vs INI parse) differs.
+
+**Re-evaluation:** if reticulum-kt ever gains an INI/`_synthesize_interface` config layer, route these knobs through it and keep the typed params as the programmatic surface.
+
+---
+
+### InterfaceDiscovery.autoconnect Yggdrasil 200::/7 guard added (Phase 5g divergence fix) — `rns-core/.../discovery/InterfaceDiscovery.kt::autoconnect`
+
+**Python reference:** `RNS/Discovery.py:649-651` — `if is_ygg_ipv6(info["reachable_on"]): return` (skip auto-connecting a BackboneInterface on a Yggdrasil address).
+
+**Category:** divergence FIX (the guard was missing; kotlin wrongly auto-connected ygg endpoints).
+
+**Date:** 2026-06-12.
+
+**Tracking:** conformance `test_autoconnect_rejects_unsupported_records` (the `yggdrasil` case); unit `InterfaceDiscoveryTest.autoconnect skips yggdrasil endpoint`.
+
+**Description:** kotlin's `autoconnect` had no Yggdrasil guard, so a discovered `BackboneInterface` reachable on a 200::/7 address (which IS in `AUTOCONNECT_TYPES`) would invoke the connect factory. The guard `if (info.reachableOn != null && DiscoveryUtil.isYggIpv6(info.reachableOn)) return` is now applied after the type/limit/dedup checks and before the factory invoke, mirroring python. `endpointHashForTest`/`autoconnectForTest` are public test seams over the existing inline endpoint-hash computation and the private `autoconnect`.
+
+### _clean_ratchets removes "not in use" ratchets (RNS 1.3.1 forward-port) — `rns-core/.../identity/Identity.kt::cleanRatchetsFromDisk`
+
+**Python reference:** installed RNS **1.3.1** `RNS/Identity.py::_clean_ratchets` — `destination_hash = bytes.fromhex(filename); if not destination_hash in RNS.Identity.known_destinations: unknown = True`; the unlink condition is `if expired or corrupted or unknown`. The pinned `../Reticulum` checkout is **1.1.9** and its `_clean_ratchets` unlinks on `expired or corrupted` only — it has no `unknown` branch.
+
+**Category:** version-skew forward-port (conformance target is 1.3.1; the pinned source-of-truth checkout lags at 1.1.9).
+
+**Date:** 2026-06-13.
+
+**Tracking:** conformance `test_identity_received_ratchet_persistence` (assertion `cleaned_removed`, "not-in-use branch, Identity.py:484-489").
+
+**Description:** kotlin's `cleanRatchetsFromDisk` previously deleted only expired/corrupted ratchet files. RNS 1.3.1 additionally treats a ratchet file whose hex filename decodes to a destination hash absent from `known_destinations` as "not in use" and unlinks it. The branch is `val unknown = runCatching { !knownDestinations.containsKey(file.name.hexToByteArray().toKey()) }.getOrDefault(false)`, OR'd into the existing delete condition. The hex decode is wrapped in `runCatching` so a non-hex filename is skipped (treated as known/not-unknown), mirroring python's per-file `try/except` which leaves an unparseable filename in place rather than crashing the sweep.
+
+### Resource.advertise spin-wait status guards + `@Volatile status`; lock deliberately NOT added — `rns-core/.../resource/Resource.kt::advertise`, `doAdvertise`, `status`
+
+**Python reference:** `RNS/Resource.py:508-541` (`advertise`/`__advertise_job`) and `:1075-1104` (`cancel`). Python's `__advertise_job` spins `while not self.link.ready_for_new_resource(): self.status = QUEUED; sleep(0.25)`, then **unconditionally** runs `advertisement_packet.send()` → `self.status = ADVERTISED` → `self.link.register_outgoing_resource(self)` — with no post-loop status re-check and no lock. `cancel()` sets `status = FAILED` + `link.cancel_outgoing_resource(self)`, also unlocked.
+
+**Category:** language/runtime adaptation (JVM memory model, category (a)) — visibility only; behavior matches python.
+
+**Date:** 2026-06-13.
+
+**Tracking:** Greptile review of reticulum-kt #80 (codeReviewId 11045586, P1 "TOCTOU between doAdvertise() guard and registration"). Upstream parity bug recorded in reticulum-conformance `UPSTREAM_ISSUES.md §5`.
+
+**Description:** The kotlin port (a) advertises **synchronously** on the common idle path and only spawns the daemon spin-wait thread when `!link.readyForNewResource()` (python always threads), and (b) adds `if (status != QUEUED) return` guards in `advertise()`, in the spin loop (`while (status == QUEUED && !readyForNewResource())`), and at the top of `doAdvertise()` — guards python's `__advertise_job` does **not** have. These guards make a concurrent `cancel()` *more* likely to be honored than in python, never less. `status` is `@Volatile` so the daemon/watchdog threads and the `cancel()` writer share a happens-before edge on the field (python gets this free from the GIL); `status` is assign-only, never read-modify-written, so `@Volatile` suffices and an `Atomic*`/lock is unnecessary for visibility.
+
+A residual narrow TOCTOU remains between `doAdvertise()`'s guard and the subsequent `link.registerOutgoingResource(this)`: a `cancel()` interleaved there can be overwritten by the trailing `status = ADVERTISED`. **This race is present in upstream python verbatim** (python has neither the pre-guard nor any lock, so its window is strictly wider). A `synchronized`/check-after-register-and-rollback fix would introduce atomicity python does not have — i.e. a behavioral divergence — so per the honesty rule it is **deliberately not added**. Matching python's concurrency semantics (down to its bugs) is the correct posture for the conformance port; the upstream fix belongs in RNS first.
+
+**Re-evaluation:** if upstream RNS adds a lock/guard around `__advertise_job`'s register+status-advance (closing the race in python), port that exact structure here and drop the "deliberately not added" note. Until then, do not unilaterally diverge.

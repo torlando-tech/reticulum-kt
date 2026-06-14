@@ -46,6 +46,9 @@ class PipeInterface(
 
         /** Hardware MTU (matches Python PipeInterface.HW_MTU = 1064). */
         const val HW_MTU = 1064
+
+        /** Default IFAC tag length in bytes for framed-serial media (python PipeInterface.py:57). */
+        const val DEFAULT_IFAC_SIZE = 8
     }
 
     override val bitrate: Int = bitrateEstimate

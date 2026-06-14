@@ -379,6 +379,39 @@ class Link private constructor(
             )
         }
 
+        /**
+         * Conformance test seam: build a genuine initiator LINKREQUEST payload
+         * (pub_bytes || sig_pub_bytes || signalling_bytes) with freshly-generated
+         * ephemeral X25519/Ed25519 keys, WITHOUT putting it on the wire. This is
+         * the kotlin equivalent of the reference bridge patching Packet.send off
+         * during _build_initiator_request_data (reticulum-conformance reference/
+         * wire_tcp.py): initializeAsInitiator() bundles the genuine assembly with
+         * the wire send, so this re-runs ONLY the assembly via the same crypto +
+         * signallingBytes() the handshake uses, at the default MTU (Reticulum.MTU,
+         * the value a no-MTU-discovery next hop yields). No port logic — pure
+         * read-only assembly for the link-request adversarial commands.
+         */
+        /** Result holder for [buildInitiatorRequestDataForTest]. */
+        class InitiatorRequestDataForTest(
+            val requestData: ByteArray,
+            val pubBytes: ByteArray,
+            val sigPubBytes: ByteArray,
+            val mtu: Int,
+            val mode: Int,
+        )
+
+        fun buildInitiatorRequestDataForTest(
+            mode: Int = LinkConstants.MODE_DEFAULT,
+        ): InitiatorRequestDataForTest {
+            val crypto = defaultCryptoProvider()
+            val x = crypto.generateX25519KeyPair()
+            val ed = crypto.generateEd25519KeyPair()
+            val mtu = RnsConstants.MTU
+            val signalling = signallingBytes(mtu, mode)
+            val requestData = x.publicKey + ed.publicKey + signalling
+            return InitiatorRequestDataForTest(requestData, x.publicKey, ed.publicKey, mtu, mode)
+        }
+
         private fun log(message: String) {
             val timestamp =
                 java.time.LocalDateTime.now().format(
@@ -409,6 +442,30 @@ class Link private constructor(
     // Timing
     var rtt: Long? = null
         private set
+
+    /**
+     * Conformance test seam: set the measured RTT (milliseconds). Python's
+     * `RNS.Link.rtt` is a freely-mutable public attribute; kotlin keeps the
+     * setter private, so the wire bridge's wire_link_set_rtt / wire_channel_
+     * profile / wire_channel_timeout_formula commands use this to drive the
+     * Channel rate-promotion bands (which read outlet.rtt == link.rtt live).
+     * Mirrors the reference's `link.rtt = rtt`. No port logic beyond the assign.
+     */
+    fun setRttForTest(rttMs: Long?) {
+        rtt = rttMs
+    }
+
+    /**
+     * Conformance test seam: when true, every PacketReceipt validation on this
+     * link's packets returns false (the proof never validates), even across
+     * resends that build fresh receipts. Mirrors the reference neutering
+     * `packet.receipt.validate_proof` for wire_channel_send(drop_acks=true) so
+     * the Channel retransmits to _max_tries and tears the link down. Honored in
+     * PacketReceipt.validateProof / validateLinkProof. Not used in production.
+     */
+    @Volatile
+    var failProofValidationForTest: Boolean = false
+
     var mtu: Int = RnsConstants.MTU
         private set
     var mdu: Int = LinkConstants.calculateMdu()
@@ -438,7 +495,16 @@ class Link private constructor(
 
     // Timestamps
     private var requestTime: Long = 0
-    private var activatedAt: Long = 0
+
+    /**
+     * Wall-clock time the link was activated (status reached [LinkConstants.ACTIVE]),
+     * or 0 if it never activated. Exposed read-only so LXMF-kt's direct-delivery
+     * CLOSED-link handling can distinguish "was active, closed unexpectedly" from
+     * "never activated" — Python LXMF reads `direct_link.activated_at != None`
+     * (`LXMRouter.py` direct-delivery branch).
+     */
+    var activatedAt: Long = 0
+        private set
     var lastInbound: Long = 0
         private set
     var lastOutbound: Long = 0
@@ -666,11 +732,16 @@ class Link private constructor(
             val sigLength = RnsConstants.SIGNATURE_SIZE
             val pubSize = LinkConstants.KEYSIZE
 
-            // Check mode matches
+            // Check mode matches. python validate_proof RAISES on a mode
+            // mismatch (Link.py:402) and the surrounding except sets
+            // status=CLOSED (Link.py:452-453) — a mode-downgraded LRPROOF must
+            // CLOSE the link, not leave it PENDING. Throw so the catch below
+            // (which sets CLOSED, matching python) handles it.
             val receivedMode = modeFromLpPacket(packet)
             if (receivedMode != mode) {
-                log("Invalid link mode in proof: $receivedMode vs $mode")
-                return false
+                throw IllegalArgumentException(
+                    "Invalid link mode $receivedMode in link request proof (expected $mode)",
+                )
             }
 
             // Extract peer public key and signature
@@ -820,10 +891,19 @@ class Link private constructor(
      * Decrypt data received over the link.
      */
     fun decrypt(ciphertext: ByteArray): ByteArray? {
-        if (token == null) {
-            token = Token(derivedKey!!)
+        // python Link.decrypt wraps the token decrypt in try/except and returns
+        // None on failure (RNS 1.3.1 Link.py:decrypt; 1.1.x Link.py:1202-1209), so
+        // a tampered/forged ciphertext (Token HMAC failure) is silently dropped
+        // rather than propagating. All callers already treat a null return as "drop".
+        return try {
+            if (token == null) {
+                token = Token(derivedKey!!)
+            }
+            token!!.decrypt(ciphertext)
+        } catch (e: Exception) {
+            log("Decryption failed on link ${linkId.toHexString()}: ${e.message}")
+            null
         }
-        return token!!.decrypt(ciphertext)
     }
 
     /**
@@ -851,6 +931,12 @@ class Link private constructor(
      * @param packet The packet to prove
      */
     fun provePacket(packet: Packet) {
+        // Conformance seam: notify any installed tap with the proved packet, the
+        // kotlin equivalent of the reference wrapping link.prove_packet to record
+        // each proved packet's context byte (wire_tcp.py:1299-1317). Mirrors the
+        // existing inboundTapForTest seam. Null in normal operation; no port logic.
+        runCatching { proveTapForTest?.invoke(packet) }
+
         // Sign the packet hash
         val signature = sign(packet.packetHash)
 
@@ -907,6 +993,29 @@ class Link private constructor(
     }
 
     /**
+     * Conformance test seam: build (but do NOT send) a link DATA packet exactly
+     * as [sendWithReceipt] would — genuine [encrypt] + createRaw with mtu=this.mtu
+     * and packet.link=this — so a test can read the built packet's mtu/raw before
+     * choosing to send, and can build a create_receipt=false packet (which
+     * sendWithReceipt cannot express). packet.link is internal, so the
+     * separate-module bridge cannot replicate this. No port logic.
+     */
+    fun buildDataPacketForTest(plaintext: ByteArray, createReceipt: Boolean = true): Packet {
+        val encrypted = encrypt(plaintext)
+        val packet =
+            Packet.createRaw(
+                destinationHash = linkId,
+                data = encrypted,
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.LINK,
+                createReceipt = createReceipt,
+                mtu = mtu,
+            )
+        packet.link = this
+        return packet
+    }
+
+    /**
      * Send resource data over this link.
      * NOTE: Resource data is NOT link-encrypted! It's already encrypted at the
      * resource level. This matches Python RNS behavior.
@@ -946,6 +1055,16 @@ class Link private constructor(
     }
 
     /**
+     * Conformance test seam: build a fresh, NON-cached Channel over a real
+     * LinkChannelOutlet on this link, mirroring the reference's
+     * `Channel(LinkChannelOutlet(link))` throwaway used by wire_channel_profile /
+     * wire_channel_timeout_formula / wire_channel_handler_chain. LinkChannelOutlet
+     * is a private inner class, so this factory must live on Link. It does NOT
+     * touch the cached `_channel` (the live channel is untouched).
+     */
+    fun newThrowawayChannelForTest(): Channel = Channel(LinkChannelOutlet(this))
+
+    /**
      * ChannelOutlet implementation that wraps a Link.
      * Provides the transport layer for Channel message delivery.
      */
@@ -959,15 +1078,32 @@ class Link private constructor(
             get() = link.rtt
 
         override val isUsable: Boolean
-            get() = link.status == LinkConstants.ACTIVE
+            // Mirror python RNS LinkChannelOutlet.is_usable (Channel.py:709-710),
+            // which returns True unconditionally ("had issues looking at
+            // Link.status"). Channel.is_ready_to_send therefore does NOT gate on
+            // link status; readiness is governed solely by the tx-ring window, and
+            // a send on a non-ACTIVE link instead fails via the no-receipt branch
+            // (Channel.send -> ME_LINK_NOT_READY) because send() below only
+            // actually transmits when ACTIVE.
+            get() = true
 
         override val timedOut: Boolean
             get() =
                 link.status == LinkConstants.CLOSED &&
                     link.teardownReason == LinkConstants.TEARDOWN_REASON_TIMEOUT
 
+        override fun notifyTimedOut() {
+            // Mirror python LinkChannelOutlet.timed_out (Channel.py:707-708):
+            // tear the Link down when the Channel exhausts its retransmissions.
+            link.teardown(LinkConstants.TEARDOWN_REASON_TIMEOUT)
+        }
+
         override fun send(raw: ByteArray): Any? {
-            if (!isUsable) return null
+            // Mirror python LinkChannelOutlet.send (Channel.py:669-672): only
+            // actually transmit when the link is ACTIVE; otherwise return null so
+            // the packet has no receipt and Channel.send restores the reserved
+            // sequence and raises ME_LINK_NOT_READY (the dead-channel send path).
+            if (link.status != LinkConstants.ACTIVE) return null
 
             val encrypted = link.encrypt(raw)
             val packet =
@@ -1358,9 +1494,13 @@ class Link private constructor(
      */
     private fun calculateRequestTimeout(): Long {
         val linkRtt = rtt ?: LinkConstants.KEEPALIVE_MAX
-        // Python: timeout = self.rtt * self.traffic_timeout_factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125
-        // For simplicity, use RTT * 6 + 5 seconds
-        return linkRtt * trafficTimeoutFactor + 5000L
+        // python Link.request: timeout = self.rtt * self.traffic_timeout_factor +
+        // RNS.Resource.RESPONSE_MAX_GRACE_TIME*1.125 (Link.py:493-494). rtt is in
+        // MILLIS here; RESPONSE_MAX_GRACE_TIME (10) is SECONDS, so 10*1.125 s =
+        // 11250 ms. (The previous +5000 ms was an admitted approximation that
+        // diverged from the reference.)
+        val graceMs = (network.reticulum.resource.ResourceConstants.RESPONSE_MAX_GRACE_TIME * 1125L)
+        return linkRtt * trafficTimeoutFactor + graceMs
     }
 
     /**
@@ -1395,6 +1535,16 @@ class Link private constructor(
         }
 
         Transport.deregisterLink(this)
+
+        // Purge the ephemeral key material, mirroring python link_closed()
+        // (Link.py:728-733: prv/pub/pub_bytes/shared_key/derived_key = None).
+        // This is the forward-secrecy guarantee — once a link closes, its
+        // ephemeral private key and derived link key must not linger in memory
+        // where a later compromise could recover past traffic.
+        prv = null
+        pub = null
+        sharedKey = null
+        derivedKey = null
 
         callbacks.linkClosed?.let { callback ->
             try {
@@ -1688,7 +1838,27 @@ class Link private constructor(
      *
      * @param packet The incoming packet to process
      */
+    /**
+     * Conformance test seam: a per-link tap invoked for every inbound packet at
+     * the top of receive(), the kotlin equivalent of the reference bridge
+     * monkey-patching link.receive to observe inbound RESPONSE / RESOURCE_ADV
+     * packets (reference wire_capture_response_packet). Null in normal operation.
+     */
+    @Volatile
+    var inboundTapForTest: ((Packet) -> Unit)? = null
+
+    /**
+     * Conformance test seam: a tap fired inside provePacket() with the proved
+     * packet, the kotlin equivalent of the reference wrapping link.prove_packet
+     * to record each proved packet's context byte for the receiver-proof log
+     * (reference wire_listener_proof_log, wire_tcp.py:1299-1317). Null in normal
+     * operation.
+     */
+    @Volatile
+    var proveTapForTest: ((Packet) -> Unit)? = null
+
     fun receive(packet: Packet) {
+        inboundTapForTest?.let { tap -> runCatching { tap(packet) } }
         // Skip closed links, and skip initiator keepalive responses
         if (status == LinkConstants.CLOSED) return
         if (initiator &&
@@ -2483,7 +2653,10 @@ class Link private constructor(
             return
         }
 
-        // Prove receipt of the channel packet (Python: Link.py:1173)
+        // Prove receipt of the channel packet (Python: Link.py:1173). The
+        // proveTapForTest seam fires inside provePacket() (which packet.prove()
+        // routes to for a link packet), so the channel-proof context is logged
+        // there — no separate tap call here (it would double-count).
         packet.link = this
         packet.prove()
 
@@ -2651,18 +2824,13 @@ class Link private constructor(
 
         // Update statistics based on resource performance
         if (wasIncoming) {
-            // For incoming resources, track window and EIFR for bandwidth estimation
-            // TODO: Add window and eifr properties to Resource class when implemented
-            // lastResourceWindow = resource.window
-            // lastResourceEifr = resource.eifr
-
-            // Calculate expected rate from resource transfer
-            // TODO: Get resource.startedTransferring property when Resource is fully implemented
-            // For now, we skip this calculation
-            // val transferTime = (concludedAt - resource.startedTransferring) / 1000.0f
-            // if (transferTime > 0.0001f) {
-            //     expectedRate = (resource.size * 8) / transferTime
-            // }
+            // Record this transfer's final window so the NEXT inbound Resource on
+            // this link inherits it (Resource.accept reads getLastResourceWindow).
+            // Mirrors python `Link.resource_concluded` (Link.py:1284):
+            //   self.last_resource_window = resource.window
+            // Without this, every inbound transfer restarts at WINDOW=4 and
+            // multi-resource throughput silently degrades.
+            lastResourceWindow = resource.currentWindow
 
             synchronized(incomingResources) {
                 incomingResources.remove(resource)
@@ -3076,7 +3244,53 @@ class Link private constructor(
      *
      * @return MTU if link is active, null otherwise
      */
+    // ===== Conformance test seams (separate-module bridge can't read private state) =====
+    /** [prv, pub, sharedKey, derivedKey] presence — pins forward-secret
+     *  ephemeral-key purge on close (reference wire_link_key_material). */
+    fun keyMaterialPresenceForTest(): BooleanArray =
+        booleanArrayOf(prv != null, pub != null, sharedKey != null, derivedKey != null)
+
+    /** Plant sentinel physical-layer stats so the track_phy_stats gating in
+     *  getRssi/getSnr/getQ is observable (reference wire_link_phy_stats_gate). */
+    fun setPhyStatsForTest(rssiValue: Int?, snrValue: Float?, qValue: Float?) {
+        phyRssi = rssiValue
+        phySnr = snrValue
+        phyQ = qValue
+    }
+
+    /** Force the link lifecycle status (status has a private setter). Mirrors
+     *  the reference's `link.status = Link.PENDING` to deterministically hit
+     *  identify()'s ACTIVE-only guard (reference wire_link_identify_pending). */
+    fun setStatusForTest(newStatus: Int) {
+        status = newStatus
+    }
+
+    /** This link's own ephemeral X25519 / Ed25519 public bytes (reference
+     *  wire_capture_lrproof_frame reads link.pub_bytes / link.sig_pub_bytes). */
+    fun pubBytesForTest(): ByteArray? = pub?.copyOf()
+    fun sigPubBytesForTest(): ByteArray? = sigPub?.copyOf()
+
+    /** Point the peer signing key at this link's OWN sig pub so a real
+     *  link.sign() yields a signature real validation accepts — the reference's
+     *  `link.peer_sig_pub = link.sig_pub` self-consistent-signing setup for
+     *  wire_inject_crafted_link_proof (no cross-process key needed). */
+    fun makeSelfConsistentSigningForTest() {
+        peerSigPub = sigPub?.copyOf()
+    }
+
     fun getMtu(): Int? = if (status == LinkConstants.ACTIVE) mtu else null
+
+    /**
+     * Test-only MTU override (the field has a private setter). Mirrors the
+     * reference conformance harness temporarily shrinking `link.mtu` so a modest
+     * Resource payload chunks into many small parts (wire_tcp.py
+     * cmd_wire_resource_create force_sdu / _build_resource_receiver). Resource
+     * derives its per-part SDU from this at construction; the caller restores the
+     * negotiated MTU afterwards.
+     */
+    fun setMtuForTest(value: Int) {
+        mtu = value
+    }
 
     /**
      * Get the MDU (Maximum Data Unit) for this link.

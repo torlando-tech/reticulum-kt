@@ -53,6 +53,8 @@ class RNodeInterface(
 ) : Interface(name) {
 
     companion object {
+        /** Default IFAC tag length in bytes for framed-serial media (python RNodeInterface.py:110). */
+        const val DEFAULT_IFAC_SIZE = 8
         private const val RSSI_OFFSET = 157
         private const val REQUIRED_FW_VER_MAJ = 1
         private const val REQUIRED_FW_VER_MIN = 52

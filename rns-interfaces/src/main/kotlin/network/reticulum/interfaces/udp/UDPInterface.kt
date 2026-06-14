@@ -51,6 +51,8 @@ class UDPInterface(
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 1064 // Must match Python reference for interop
+        /** Default IFAC tag length in bytes for packet/IP media (python UDPInterface.py:42). */
+        const val DEFAULT_IFAC_SIZE = 16
         const val DEFAULT_BUFFER_SIZE = 4096
 
         /**

@@ -2,6 +2,7 @@ package network.reticulum.identity
 
 import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.hexToByteArray
 import network.reticulum.common.toHexString
 import network.reticulum.common.toKey
 import network.reticulum.crypto.CryptoProvider
@@ -357,6 +358,14 @@ class Identity private constructor(
             publicKey: ByteArray,
             appData: ByteArray? = null
         ) {
+            // Python RNS rejects malformed keys at remember() time
+            // (Identity.py:101-102, TypeError on len != KEYSIZE//8); without
+            // this gate a corrupt announce could plant an unusable key.
+            if (publicKey.size != RnsConstants.FULL_KEY_SIZE) {
+                throw IllegalArgumentException(
+                    "Can't remember destination, public key size of ${publicKey.size} is not valid"
+                )
+            }
             val data = IdentityData(
                 timestamp = System.currentTimeMillis(),
                 packetHash = packetHash.copyOf(),
@@ -369,6 +378,15 @@ class Identity private constructor(
             // Index by identity hash for reverse lookups
             val identityHash = Hashes.truncatedHash(publicKey)
             identityHashIndex[identityHash.toKey()] = destHash.copyOf()
+        }
+
+        /**
+         * Get a random truncated hash, exactly as Python RNS's
+         * Identity.get_random_hash(): the truncated SHA-256 of
+         * TRUNCATED_HASH_BYTES of random data (Identity.py:386-393).
+         */
+        fun getRandomHash(crypto: CryptoProvider = defaultCryptoProvider()): ByteArray {
+            return Hashes.truncatedHash(crypto.randomBytes(RnsConstants.TRUNCATED_HASH_BYTES))
         }
 
         /**
@@ -442,7 +460,7 @@ class Identity private constructor(
                 val randomHash: ByteArray
                 val ratchet: ByteArray
                 val signature: ByteArray
-                val appData: ByteArray?
+                var appData: ByteArray?
 
                 if (hasRatchet) {
                     // With ratchet: public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data
@@ -458,10 +476,12 @@ class Identity private constructor(
                         keySize + nameHashLen + 10 + ratchetSize + sigLen
                     )
 
+                    // python Identity.py:514-516 — app_data defaults to b"" (empty),
+                    // not None, when the ratcheted announce carries no trailing bytes.
                     appData = if (data.size > keySize + nameHashLen + 10 + ratchetSize + sigLen) {
                         data.copyOfRange(keySize + nameHashLen + 10 + ratchetSize + sigLen, data.size)
                     } else {
-                        null
+                        byteArrayOf()
                     }
                 } else {
                     // Without ratchet: public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data
@@ -470,18 +490,40 @@ class Identity private constructor(
                     ratchet = byteArrayOf()
                     signature = data.copyOfRange(keySize + nameHashLen + 10, keySize + nameHashLen + 10 + sigLen)
 
+                    // python Identity.py:525-527 — app_data defaults to b"" (empty),
+                    // not None, when the ratchetless announce carries no trailing bytes.
                     appData = if (data.size > keySize + nameHashLen + 10 + sigLen) {
                         data.copyOfRange(keySize + nameHashLen + 10 + sigLen, data.size)
                     } else {
-                        null
+                        byteArrayOf()
                     }
                 }
 
                 // Build signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
+                // (app_data is b"" here in every no-trailing-bytes case, matching python's
+                // pre-override value at Identity.py:529.)
                 val signedData = destinationHash + publicKey + nameHash + randomHash + ratchet + (appData ?: byteArrayOf())
 
-                // Create identity from public key and validate signature
+                // python Identity.py:531-532 — ONLY the ratchetless no-app_data layout
+                // (data length == keysize+name_hash+10+sig_len, the threshold WITHOUT the
+                // ratchet term) nulls app_data after signing. A ratcheted no-app_data
+                // announce exceeds this threshold by the 32-byte ratchet, so it keeps the
+                // b"" sentinel; this is what `recall_app_data` must return as empty, not None.
+                if (!(data.size > keySize + nameHashLen + 10 + sigLen)) {
+                    appData = null
+                }
+
+                // Create identity from public key
                 val announcedIdentity = fromPublicKey(publicKey)
+
+                // Blackhole gate (python Identity.py:566-569): an announce from a
+                // blackholed identity is invalidated and dropped BEFORE signature
+                // validation, so it learns no path.
+                if (network.reticulum.transport.Transport.blackholedIdentities.isNotEmpty() &&
+                    network.reticulum.transport.Transport.isBlackholed(announcedIdentity.hash)
+                ) {
+                    return null
+                }
 
                 if (!announcedIdentity.validate(signature, signedData)) {
                     return null // Invalid signature
@@ -973,6 +1015,21 @@ class Identity private constructor(
         }
 
         /**
+         * Conformance test seam: drop the in-memory ratchet cache entry for a
+         * destination so the next getRatchet() must load from the on-disk store
+         * (the conformance bridge is a separate module and can't touch the
+         * private destinationRatchets map). Mirrors the reference bridge's
+         * `Identity.known_ratchets.pop(dest_hash, None)` (reticulum-conformance
+         * reference/wire_tcp.py cmd_wire_identity_ratchet_persist), which forces
+         * the disk-load path. Read-only on disk; no port logic.
+         */
+        fun dropRatchetCacheForTest(destHash: ByteArray) {
+            synchronized(destinationRatchets) {
+                destinationRatchets.remove(destHash.toKey())
+            }
+        }
+
+        /**
          * Get the ratchet ID for the current ratchet of a destination.
          * The ratchet ID is the first 10 bytes of the SHA-256 hash of the ratchet public key.
          *
@@ -981,8 +1038,15 @@ class Identity private constructor(
          */
         fun currentRatchetId(destHash: ByteArray): ByteArray? {
             val ratchet = getRatchet(destHash) ?: return null
-            return Hashes.fullHash(ratchet).copyOfRange(0, RnsConstants.NAME_HASH_BYTES)
+            return ratchetIdFor(ratchet)
         }
+
+        /**
+         * The id of a ratchet from its public bytes: full_hash[:10], exactly
+         * python Identity._get_ratchet_id (Identity.py:410-411).
+         */
+        fun ratchetIdFor(ratchetPubBytes: ByteArray): ByteArray =
+            Hashes.fullHash(ratchetPubBytes).copyOfRange(0, RnsConstants.NAME_HASH_BYTES)
 
         /**
          * Clean all expired ratchets from memory and disk.
@@ -1062,7 +1126,21 @@ class Identity private constructor(
                         val isExpired = now - receivedMs > RATCHET_EXPIRY
                         val isCorrupted = ratchetSize != RnsConstants.KEY_SIZE
 
-                        if (isExpired || isCorrupted) {
+                        // RNS 1.3.1 _clean_ratchets also removes "not in use" ratchets:
+                        // a file whose dest-hash (its hex filename) is absent from
+                        // known_destinations is unknown and unlinked
+                        // (installed RNS 1.3.1 Identity.py _clean_ratchets:
+                        // `destination_hash = bytes.fromhex(filename); if not ... in
+                        // known_destinations: unknown = True`; the `expired or corrupted
+                        // or unknown` unlink). The pinned ../Reticulum checkout is 1.1.9
+                        // and lacks this branch; the conformance target is 1.3.1. The hex
+                        // decode is guarded so a non-hex filename is skipped, not deleted,
+                        // matching python's per-file try/except.
+                        val unknown = runCatching {
+                            !knownDestinations.containsKey(file.name.hexToByteArray().toKey())
+                        }.getOrDefault(false)
+
+                        if (isExpired || isCorrupted || unknown) {
                             if (isCorrupted) {
                                 println("Removing corrupted ratchet file: ${file.name}")
                             }
@@ -1144,18 +1222,35 @@ class Identity private constructor(
     }
 
     /**
+     * Receives the id of the ratchet that successfully decrypted a token,
+     * mirroring python's `ratchet_id_receiver` duck-typed argument to
+     * Identity.decrypt (Identity.py:865,884-908): set to the winning
+     * ratchet's id on a ratchet decrypt, and to null when the static key
+     * was used, enforcement failed, or decryption failed entirely.
+     */
+    class RatchetIdReceiver {
+        var latestRatchetId: ByteArray? = null
+    }
+
+    /**
      * Decrypt ciphertext that was encrypted for this identity.
+     *
+     * Mirrors python Identity.decrypt (Identity.py:865-921), including the
+     * ratchet trial order (supplied list IN ORDER, first success wins,
+     * per-ratchet failures swallowed) and the [ratchetIdReceiver] contract.
      *
      * @param ciphertext The ciphertext token (ephemeral_pub || token)
      * @param ratchets Optional list of ratchet private keys to try
      * @param enforceRatchets If true, only decrypt if a ratchet succeeds
+     * @param ratchetIdReceiver Receives the winning ratchet id (see [RatchetIdReceiver])
      * @return Decrypted plaintext, or null if decryption fails
      * @throws IllegalStateException if this identity doesn't have a private key
      */
     fun decrypt(
         ciphertext: ByteArray,
         ratchets: List<ByteArray>? = null,
-        enforceRatchets: Boolean = false
+        enforceRatchets: Boolean = false,
+        ratchetIdReceiver: RatchetIdReceiver? = null
     ): ByteArray? {
         check(hasPrivateKey) { "Decryption failed because identity does not hold a private key" }
 
@@ -1172,9 +1267,15 @@ class Identity private constructor(
         if (ratchets != null) {
             for (ratchet in ratchets) {
                 try {
+                    // python computes the candidate's id before the exchange
+                    // (Identity._get_ratchet_id(ratchet_prv.public_key()...))
+                    val ratchetId = ratchetIdFor(crypto.x25519PublicFromPrivate(ratchet))
                     val sharedKey = crypto.x25519Exchange(ratchet, peerPublicBytes)
                     plaintext = decryptWithSharedKey(sharedKey, tokenData)
-                    if (plaintext != null) break
+                    if (plaintext != null) {
+                        ratchetIdReceiver?.latestRatchetId = ratchetId
+                        break
+                    }
                 } catch (e: Exception) {
                     // Try next ratchet
                 }
@@ -1183,15 +1284,19 @@ class Identity private constructor(
 
         // If ratchet enforcement is on and we didn't decrypt, fail
         if (enforceRatchets && plaintext == null) {
+            ratchetIdReceiver?.latestRatchetId = null
             return null
         }
 
-        // Try regular decryption if ratchets didn't work
+        // Try regular decryption if ratchets didn't work; a static-key
+        // success (or failure) reports no ratchet id, as python does.
         if (plaintext == null) {
             try {
                 val sharedKey = crypto.x25519Exchange(x25519Private!!, peerPublicBytes)
                 plaintext = decryptWithSharedKey(sharedKey, tokenData)
+                ratchetIdReceiver?.latestRatchetId = null
             } catch (e: Exception) {
+                ratchetIdReceiver?.latestRatchetId = null
                 return null
             }
         }
@@ -1254,8 +1359,14 @@ class Identity private constructor(
         // Sign the packet hash
         val signature = sign(packet.packetHash)
 
-        // For now, always use explicit proofs (implicit proofs require Reticulum.shouldUseImplicitProof())
-        val proofData = packet.packetHash + signature
+        // python Identity.prove (Identity.py:961-963): an IMPLICIT proof carries
+        // only the signature; an EXPLICIT proof prepends the packet hash. The
+        // form is selected by RNS.Reticulum.should_use_implicit_proof().
+        val proofData = if (network.reticulum.Reticulum.shouldUseImplicitProof()) {
+            signature
+        } else {
+            packet.packetHash + signature
+        }
 
         // Determine destination hash for proof
         val destinationHash = destination?.hash ?: packet.truncatedHash

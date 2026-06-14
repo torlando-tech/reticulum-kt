@@ -156,6 +156,12 @@ class RatchetFileInteropTest : InteropTestBase() {
             )
             dest.enableRatchets(filePath)
 
+            // enableRatchets persists an empty signed file but does NOT rotate
+            // (Python Destination.enable_ratchets / _reload_ratchets). The first
+            // ratchet is created on the first announce/rotate, so trigger one
+            // rotation to populate the store with a single ratchet.
+            dest.rotateRatchets() shouldBe true
+
             // Verify file was written
             File(filePath).exists() shouldBe true
 
@@ -171,7 +177,7 @@ class RatchetFileInteropTest : InteropTestBase() {
 
             pyResult.getBoolean("valid") shouldBe true
             pyResult.getBoolean("signature_valid") shouldBe true
-            pyResult.getInt("ratchet_count") shouldBe 1  // Initial rotation creates 1 ratchet
+            pyResult.getInt("ratchet_count") shouldBe 1  // First rotation creates 1 ratchet
 
             // Verify the ratchet key matches
             val pyRatchetKeys: List<String> = pyResult.getList("ratchet_keys")
@@ -208,11 +214,13 @@ class RatchetFileInteropTest : InteropTestBase() {
 
             dest.enableRatchets(filePath)
 
-            // Force additional rotations by resetting lastRatchetRotation
+            // enableRatchets does NOT eagerly rotate (Python-faithful), so every
+            // ratchet here comes from an explicit rotation. Force 5 rotations by
+            // resetting lastRatchetRotation before each so the interval gate opens.
             val lastRotField = Destination::class.java.getDeclaredField("lastRatchetRotation")
             lastRotField.isAccessible = true
 
-            repeat(4) {
+            repeat(5) {
                 lastRotField.setLong(dest, 0L)
                 dest.rotateRatchets()
             }
@@ -229,7 +237,7 @@ class RatchetFileInteropTest : InteropTestBase() {
 
             pyResult.getBoolean("valid") shouldBe true
             pyResult.getBoolean("signature_valid") shouldBe true
-            pyResult.getInt("ratchet_count") shouldBe 5  // 1 initial + 4 rotations
+            pyResult.getInt("ratchet_count") shouldBe 5  // 5 explicit rotations
         }
     }
 
@@ -287,6 +295,10 @@ class RatchetFileInteropTest : InteropTestBase() {
 
             dest2.enableRatchets(kotlinFile)
 
+            // enableRatchets only writes an empty signed file; rotate once so the
+            // Kotlin-written store actually carries a ratchet for Python to read.
+            dest2.rotateRatchets() shouldBe true
+
             // Step 4: Python reads the Kotlin-written file
             val ed25519Public = identity.sigPub  // Ed25519 signing public key
 
@@ -333,7 +345,11 @@ class RatchetFileInteropTest : InteropTestBase() {
             )
             dest.enableRatchets(filePath)
 
-            // After enableRatchets with empty file, it should have generated a new ratchet
+            // Loading an empty ratchet list succeeds with no current ratchet
+            // (Python-faithful: enable_ratchets does not rotate). getRatchetKey()
+            // is null until the first rotation, after which it is populated.
+            dest.getRatchetKey() shouldBe null
+            dest.rotateRatchets() shouldBe true
             val ratchetKey = dest.getRatchetKey()
             ratchetKey shouldNotBe null
         }

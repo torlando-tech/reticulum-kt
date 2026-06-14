@@ -98,7 +98,7 @@ class InterfaceAnnouncer {
         println("[Discovery:Announcer] $msg")
     }
 
-    internal fun getInterfaceAnnounceData(iface: InterfaceRef): ByteArray? {
+    fun getInterfaceAnnounceData(iface: InterfaceRef): ByteArray? {
         val interfaceType = iface.discoveryInterfaceType
         if (interfaceType !in DiscoveryConstants.DISCOVERABLE_INTERFACE_TYPES) return null
 
@@ -107,8 +107,10 @@ class InterfaceAnnouncer {
 
         var flags: Byte = 0x00
 
-        // Build base info dict
-        val info = HashMap<Int, Any?>()
+        // Build base info dict. python dicts preserve insertion order and the
+        // map is msgpack-packed verbatim, so a LinkedHashMap in python's exact
+        // field order (Discovery.py:103-110) keeps the wire bytes aligned.
+        val info = LinkedHashMap<Int, Any?>()
         info[DiscoveryConstants.INTERFACE_TYPE] = interfaceType
         info[DiscoveryConstants.TRANSPORT] = Transport.transportEnabled
         info[DiscoveryConstants.TRANSPORT_ID] = transportIdentity.hash
@@ -117,10 +119,39 @@ class InterfaceAnnouncer {
         info[DiscoveryConstants.LONGITUDE] = iface.discoveryLongitude
         info[DiscoveryConstants.HEIGHT] = iface.discoveryHeight
 
-        // Add type-specific data
+        // python aborts a TCPClientInterface announce unless it is the
+        // KISS-framed radio-modem form (Discovery.py:111-113).
+        if (interfaceType == "TCPClientInterface" && !iface.kissFraming) {
+            log("Invalid interface discovery configuration for ${iface.name}, aborting discovery announce")
+            return null
+        }
+
+        // Add type-specific data (per-type field sourcing is polymorphic in
+        // kotlin — see port-deviations.md — but the RULES below are central,
+        // as python's builder is).
         val typeData = iface.getDiscoveryData()
         if (typeData != null) {
             info.putAll(typeData)
+        }
+
+        // python validates reachable_on for Backbone/TCPServer and aborts the
+        // announce when it is neither IP nor hostname (Discovery.py:115-138;
+        // the executable-script branch is intentionally not ported — see
+        // port-deviations.md).
+        if (interfaceType == "BackboneInterface" || interfaceType == "TCPServerInterface") {
+            val ro = DiscoveryUtil.sanitizeAnnouncerString(info[DiscoveryConstants.REACHABLE_ON] as? String)
+            if (ro == null || !(DiscoveryUtil.isIpAddress(ro) || DiscoveryUtil.isHostname(ro))) {
+                log("The configured reachable_on parameter \"$ro\" for ${iface.name} is not a valid IP address or hostname")
+                log("Aborting discovery announce")
+                return null
+            }
+            info[DiscoveryConstants.REACHABLE_ON] = ro
+        }
+
+        // python announces a KISS-framed TCPClient as KISSInterface
+        // (Discovery.py:158-162).
+        if (interfaceType == "TCPClientInterface" && iface.kissFraming) {
+            info[DiscoveryConstants.INTERFACE_TYPE] = "KISSInterface"
         }
 
         // Publish IFAC credentials if requested
@@ -161,7 +192,7 @@ class InterfaceAnnouncer {
      * Keys 0x00-0x0E are type-specific, 0xFE-0xFF are base.
      * Key 0xFF must encode as uint8 (0xcc 0xff), not fixint.
      */
-    internal fun packInfoDict(info: Map<Int, Any?>): ByteArray {
+    fun packInfoDict(info: Map<Int, Any?>): ByteArray {
         val out = ByteArrayOutputStream()
         val packer = MessagePack.newDefaultPacker(out)
 

@@ -155,9 +155,13 @@ class RatchetLifecycleTest : InteropTestBase() {
             "ratchetlifecycle"
         )
 
-        // Enable ratchets
+        // Enable ratchets. enableRatchets is Python-faithful and does NOT
+        // eagerly rotate (Destination.enable_ratchets just persists an empty
+        // signed file); the first ratchet is created by the first announce or
+        // an explicit rotate. Rotate once here to mirror that first announce.
         val ratchetsPath = File(tempDir, "ratchets").absolutePath
         destination.enableRatchets(ratchetsPath)
+        destination.rotateRatchets() shouldBe true
 
         // Inspect ratchet state
         val ratchetKey = destination.getRatchetKey()
@@ -311,6 +315,9 @@ class RatchetLifecycleTest : InteropTestBase() {
 
         val ratchetsPath = File(tempDir, "ratchets3").absolutePath
         destination.enableRatchets(ratchetsPath)
+        // enableRatchets does not eagerly rotate (Python-faithful); create the
+        // first ratchet explicitly, as the first announce would.
+        destination.rotateRatchets() shouldBe true
 
         val ratchetKey = destination.getRatchetKey()!!
         val ratchetsField = Destination::class.java.getDeclaredField("ratchets")

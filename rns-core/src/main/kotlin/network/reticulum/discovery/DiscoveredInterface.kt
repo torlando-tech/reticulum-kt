@@ -30,6 +30,10 @@ data class DiscoveredInterface(
     val ifacNetname: String?,
     val ifacNetkey: String?,
     val discoveryHash: ByteArray,
+    /** The PoW stamp bytes from the announce (python info["stamp"]). */
+    val stamp: ByteArray? = null,
+    /** Ready-to-paste config entry python builds per type (info["config_entry"]). */
+    val configEntry: String? = null,
     // Persistence metadata — mutated by InterfaceDiscovery
     var discovered: Long = 0,
     var lastHeard: Long = 0,

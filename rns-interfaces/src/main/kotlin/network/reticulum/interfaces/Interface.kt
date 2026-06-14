@@ -91,6 +91,14 @@ abstract class Interface(
     /** Whether this interface supports link MTU discovery (Python: AUTOCONFIGURE_MTU or FIXED_MTU). */
     open val supportsLinkMtuDiscovery: Boolean = false
 
+    /** Whether this interface auto-configures its HW_MTU from bitrate
+     *  (python Interface.AUTOCONFIGURE_MTU; Interfaces/Interface.py:93 default False). */
+    open val autoconfigureMtu: Boolean = false
+
+    /** Whether this interface has a fixed (pinned) HW_MTU
+     *  (python Interface.FIXED_MTU; Interfaces/Interface.py:94 default False). */
+    open val fixedMtu: Boolean = false
+
     /** Whether this is a local shared instance server (Python RNS compatibility). */
     open val isLocalSharedInstance: Boolean = false
 
@@ -127,6 +135,10 @@ abstract class Interface(
 
     /** Interface type name for discovery announces. */
     open val discoveryInterfaceType: String = "Interface"
+
+    /** Whether this interface uses KISS framing (python: interface.kiss_framing,
+     * read by the discovery announce builder's TCPClient/KISS rules). */
+    open val kissFraming: Boolean = false
 
     /** Type-specific discovery data. */
     open fun getDiscoveryData(): Map<Int, Any>? = null
@@ -208,9 +220,17 @@ abstract class Interface(
     private val heldAnnounces = ConcurrentHashMap<ByteArrayKey, HeldAnnounce>()
 
     companion object {
-        /** How many samples for announce frequency calculation. */
-        const val IA_FREQ_SAMPLES = 6
-        const val OA_FREQ_SAMPLES = 6
+        /** Announce-frequency deque length (python Interface.py:58-59 = 48). */
+        const val IA_FREQ_SAMPLES = 48
+        const val OA_FREQ_SAMPLES = 48
+
+        /**
+         * Minimum samples in the frequency deque before a burst may activate or
+         * deactivate (python IC_BURST_MIN_SAMPLES, Interface.py:84). Without
+         * this gate the ingress limiter trips on as few as 2 announces, holding
+         * legitimate distinct announces that python would process.
+         */
+        const val IC_BURST_MIN_SAMPLES = 6
 
         /** Maximum held announces. */
         const val MAX_HELD_ANNOUNCES = 256
@@ -223,12 +243,41 @@ abstract class Interface(
         const val IC_BURST_PENALTY = 5 * 60 * 1000L // 5 minutes
         const val IC_HELD_RELEASE_INTERVAL = 30 * 1000L // 30 seconds
 
+        /** Transport-node announce-rate defaults a node applies when none are
+         *  configured (python Interface.DEFAULT_AR_TARGET/_PENALTY/_GRACE,
+         *  Interfaces/Interface.py:89-91). */
+        const val DEFAULT_AR_TARGET = 3600  // seconds
+        const val DEFAULT_AR_PENALTY = 0
+        const val DEFAULT_AR_GRACE = 5
+
         /** Interface modes that should actively discover paths. */
         val DISCOVER_PATHS_FOR = setOf(
             InterfaceMode.ACCESS_POINT,
             InterfaceMode.GATEWAY,
             InterfaceMode.ROAMING
         )
+
+        /**
+         * Python RNS's Interface.optimise_mtu bitrate→HW_MTU tier mapping
+         * (Interface.py:140-163 in 1.1.3, :198-221 in 1.3.1 — identical).
+         * Returns the HW_MTU python assigns for [bitrate] (bps), or null for
+         * the lowest tier (python sets HW_MTU = None). Python gates the whole
+         * mapping on AUTOCONFIGURE_MTU; callers apply their equivalent gate
+         * before calling, exactly as python's `if self.AUTOCONFIGURE_MTU`.
+         */
+        fun optimiseMtu(bitrate: Long): Int? = when {
+            bitrate >= 1_000_000_000L -> 524288
+            bitrate > 750_000_000L -> 262144
+            bitrate > 400_000_000L -> 131072
+            bitrate > 200_000_000L -> 65536
+            bitrate > 100_000_000L -> 32768
+            bitrate > 10_000_000L -> 16384
+            bitrate > 5_000_000L -> 8192
+            bitrate > 2_000_000L -> 4096
+            bitrate > 1_000_000L -> 2048
+            bitrate > 62_500L -> 1024
+            else -> null
+        }
     }
 
     /**
@@ -343,16 +392,24 @@ abstract class Interface(
         val freqThreshold = if (age() < IC_NEW_TIME) IC_BURST_FREQ_NEW else IC_BURST_FREQ
         val iaFreq = incomingAnnounceFrequency()
 
+        val sampleCount = incomingAnnounceTimestamps.size
         if (burstActive.get()) {
+            // python Interface.py:151-152 — deactivate only once the burst hold
+            // has elapsed AND at least IC_BURST_MIN_SAMPLES are in the deque.
+            // (python does NOT touch ic_held_release in this arm.)
             if (iaFreq < freqThreshold && System.currentTimeMillis() > burstActivatedAt + IC_BURST_HOLD) {
-                burstActive.set(false)
-                heldReleaseAt = System.currentTimeMillis() + IC_BURST_PENALTY
+                if (sampleCount >= IC_BURST_MIN_SAMPLES) burstActive.set(false)
             }
             return true
         } else {
-            if (iaFreq > freqThreshold) {
+            // python Interface.py:155-160 — activate only when over threshold
+            // AND the deque holds at least IC_BURST_MIN_SAMPLES samples. The
+            // min-samples gate is what stops 2 distinct announces from tripping
+            // the limiter.
+            if (iaFreq > freqThreshold && sampleCount >= IC_BURST_MIN_SAMPLES) {
                 burstActive.set(true)
                 burstActivatedAt = System.currentTimeMillis()
+                heldReleaseAt = System.currentTimeMillis() + IC_BURST_PENALTY
                 return true
             }
             return false
@@ -422,6 +479,19 @@ abstract class Interface(
      * Number of announces currently held on this interface.
      */
     fun heldAnnounceCount(): Int = heldAnnounces.size
+
+    /** Destination hashes of the currently-held announces (conformance seam). */
+    fun heldAnnounceDestinations(): List<ByteArray> =
+        heldAnnounces.values.map { it.destinationHash.copyOf() }
+
+    /**
+     * Open the held-announce release gate deterministically (conformance seam) —
+     * the kotlin analogue of the reference bridge backdating `ic_held_release`
+     * to 0 so `process_held_announces()` can release without a real sleep.
+     */
+    fun openHeldReleaseGateForTest() {
+        heldReleaseAt = 0
+    }
 
     /**
      * Get the effective MTU for this interface.

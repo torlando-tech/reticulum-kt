@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import network.reticulum.Reticulum
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
@@ -52,11 +53,20 @@ class TCPClientInterface(
      * When provided, creates child scope that cancels when parent cancels - for Android service usage.
      */
     private val parentScope: CoroutineScope? = null,
+    // Configured bitrate in bps. Below MINIMUM_BITRATE is ignored, keeping
+    // BITRATE_GUESS (python Reticulum.py:765-768).
+    bitrate: Int? = null,
+    // Pinned link MTU in bytes (FIXED_MTU mode; the bridge's fixed_mtu knob).
+    private val fixedMtuBytes: Int? = null,
+    // Configured IFAC size in BITS (python Reticulum.py:719-723 bits->bytes floor).
+    private val ifacSizeBits: Int? = null,
 ) : Interface(name) {
 
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
+        /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:77). */
+        const val DEFAULT_IFAC_SIZE = 16
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
 
         @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
@@ -66,8 +76,18 @@ class TCPClientInterface(
         private val DEBUG = System.getProperty("reticulum.tcp.debug", "false").toBoolean()
     }
 
-    override val bitrate: Int = BITRATE_GUESS
-    override val hwMtu: Int = HW_MTU
+    // python Reticulum.py:765-768 — sub-minimum bitrate ignored, keeps BITRATE_GUESS.
+    override val bitrate: Int =
+        if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode applies the
+    // bitrate→HW_MTU optimisation python runs per-interface at config load
+    // (Reticulum.interface_post_init → interface.optimise_mtu(), Reticulum.py:860;
+    // Interface.optimise_mtu, Interface.py:198-221). The 10 Mbps BITRATE_GUESS maps
+    // to 8192. Falls back to the class HW_MTU only for the lowest bitrate tier
+    // (optimise_mtu → None). AUTOCONFIGURE_MTU=True for TCP, so the gate always holds.
+    override val hwMtu: Int = fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)
+    override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
+    override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true
 
     // Discovery support
@@ -84,7 +104,11 @@ class TCPClientInterface(
     }
 
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) {
+            // python Reticulum.py:719-723: configured ifac_size (bits) >=
+            // IFAC_MIN_SIZE*8 (==8) divides by 8; else floors to DEFAULT_IFAC_SIZE.
+            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
+        } else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key
@@ -165,7 +189,9 @@ class TCPClientInterface(
         processIncoming(data)
     }
 
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
+    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
+    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }

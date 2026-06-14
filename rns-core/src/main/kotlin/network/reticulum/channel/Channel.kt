@@ -109,9 +109,45 @@ class Channel(
     // Tracking lock
     private val lock = ReentrantLock()
 
+    // Send serialization lock. Mirrors python RNS Channel._send_lock
+    // (Channel.py:288): send() takes this OUTER lock so the reserve/pack/
+    // size-check/advance sequence is atomic with the outlet transmit, even
+    // though outlet.send runs outside the inner state lock.
+    private val sendLock = ReentrantLock()
+
     // State
     @Volatile
     private var isShutdown = false
+
+    /**
+     * Conformance test seam: when set, the next [send] treats the outlet as if
+     * it failed to transmit (returns no packet), driving the
+     * "outlet did not transmit" branch (sequence restore + ME_LINK_NOT_READY,
+     * mirrors python Channel.py:621-626). One-shot — cleared on use. Set by the
+     * wire bridge's wire_channel_send(fail_outlet=true). Not used in production.
+     */
+    @Volatile
+    var failNextSendForTest: Boolean = false
+
+    /**
+     * Conformance test seam: invoked inside [send] after a StreamDataMessage/
+     * MessageBase is packed and handed to the outlet, with the message and its
+     * Envelope. The wire bridge installs a tap to build the per-message Buffer
+     * manifest (the kotlin analog of the reference wrapping `channel.send`).
+     * Null in production.
+     */
+    @Volatile
+    var outboundMessageTapForTest: ((MessageBase, Envelope) -> Unit)? = null
+
+    /**
+     * Conformance test seam: invoked from [receive]'s catch when unpacking an
+     * inbound envelope raises (e.g. the bz2 decompression-bomb guard in
+     * StreamDataMessage.unpack). Lets the wire listener surface
+     * `buffer_state.aborted/error`, since [receive] otherwise swallows the
+     * exception. Null in production.
+     */
+    @Volatile
+    var receiveErrorTapForTest: ((Throwable) -> Unit)? = null
 
     init {
         // Initialize window based on RTT
@@ -220,55 +256,104 @@ class Channel(
      * @throws ChannelException if channel is not ready or message is too big
      */
     fun send(message: MessageBase): Envelope {
-        lock.withLock {
-            if (!isReadyToSend()) {
+        // Mirror python RNS Channel.send (Channel.py:599-637): the whole send is
+        // serialized by _send_lock; the reserve/pack/size-check/advance happens
+        // under the inner state lock, then outlet.send runs OUTSIDE it, then the
+        // emplace/callback wiring re-takes the inner lock.
+        sendLock.withLock {
+            val reservedSequence: Int
+            val envelope: Envelope
+            lock.withLock {
+                if (!isReadyToSend()) {
+                    throw ChannelException(
+                        ChannelExceptionType.ME_LINK_NOT_READY,
+                        "Link is not ready"
+                    )
+                }
+
+                // Reserve (but do NOT yet advance) the next sequence number.
+                reservedSequence = nextSequence.get()
+                envelope = Envelope(outlet, message, sequence = reservedSequence)
+
+                // Pack the message FIRST, then size-check BEFORE advancing the
+                // sequence or emplacing — python Channel.py:613-617 raises
+                // ME_TOO_BIG here, leaving _next_sequence untouched and the tx
+                // ring clean (no stale envelope).
+                envelope.pack()
+                val raw = envelope.raw!!
+                if (raw.size > outlet.mdu) {
+                    throw ChannelException(
+                        ChannelExceptionType.ME_TOO_BIG,
+                        "Packed message too big for packet: ${raw.size} > ${outlet.mdu}"
+                    )
+                }
+
+                // Only now advance the transmit sequence (Channel.py:617).
+                nextSequence.set((reservedSequence + 1) % SEQ_MODULUS)
+            }
+
+            // Transmit via the outlet OUTSIDE the inner lock (Channel.py:619).
+            // failNextSendForTest fault-injects the "outlet did not transmit"
+            // path used by wire_channel_send(fail_outlet=true).
+            val packet: Any? = if (failNextSendForTest) {
+                failNextSendForTest = false
+                null
+            } else {
+                outlet.send(envelope.raw!!)
+            }
+            envelope.packet = packet
+
+            // Outlet did not transmit (null packet / no receipt): restore the
+            // reserved sequence and raise ME_LINK_NOT_READY so the next send
+            // reuses the freed sequence with no gap (python Channel.py:621-626).
+            if (packet == null || !packetHasReceipt(packet)) {
+                lock.withLock { nextSequence.set(reservedSequence) }
                 throw ChannelException(
                     ChannelExceptionType.ME_LINK_NOT_READY,
-                    "Link is not ready"
+                    "Outlet did not transmit packet"
                 )
             }
 
-            // Create envelope with next sequence number
-            val sequence = nextSequence.getAndUpdate { (it + 1) % SEQ_MODULUS }
-            val envelope = Envelope(outlet, message, sequence = sequence)
+            val alreadyDelivered: Boolean
+            lock.withLock {
+                // Add to TX ring and wire up the delivery/timeout callbacks
+                // (Channel.py:628-633).
+                emplaceEnvelope(envelope, txRing)
+                envelope.tries++
 
-            // Add to TX ring
-            emplaceEnvelope(envelope, txRing)
-
-            // Pack the message
-            envelope.pack()
-
-            // Check size
-            val raw = envelope.raw!!
-            if (raw.size > outlet.mdu) {
-                throw ChannelException(
-                    ChannelExceptionType.ME_INVALID_MSG_TYPE,
-                    "Packed message too big for packet: ${raw.size} > ${outlet.mdu}"
-                )
-            }
-
-            // Send via outlet
-            val packet = outlet.send(raw)
-            envelope.packet = packet
-            envelope.tries++
-
-            // Set up callbacks if packet was sent
-            if (packet != null) {
                 outlet.setPacketDeliveredCallback(packet) { pkt ->
                     packetDelivered(pkt)
                 }
-
-                val timeout = getPacketTimeoutTime(envelope.tries)
                 outlet.setPacketTimeoutCallback(packet, { pkt ->
                     packetTimeout(pkt)
-                }, timeout)
+                }, getPacketTimeoutTime(envelope.tries))
+
+                updatePacketTimeouts()
+                alreadyDelivered = outlet.getPacketState(packet) == MessageState.DELIVERED
             }
 
-            updatePacketTimeouts()
+            // Prevent a tx_ring leak when the proof round-tripped before the
+            // delivery callback was wired (loopback can deliver in microseconds).
+            // Mirrors python Channel.py:634-637.
+            if (alreadyDelivered) {
+                packetDelivered(packet)
+            }
+
+            // Conformance manifest tap (StreamDataMessage Buffer streaming).
+            outboundMessageTapForTest?.let { tap -> runCatching { tap(message, envelope) } }
 
             return envelope
         }
     }
+
+    /**
+     * Whether a transmitted packet carries a delivery receipt — mirrors the
+     * python guard `getattr(envelope.packet, "receipt", None) is None`
+     * (Channel.py:621-623). A packet built but not actually sent (e.g. on a
+     * non-ACTIVE link) has no receipt, so the send is treated as a non-transmit.
+     */
+    private fun packetHasReceipt(packet: Any): Boolean =
+        outlet.getPacketState(packet) != MessageState.FAILED
 
     /**
      * Receive raw data from the outlet.
@@ -311,8 +396,13 @@ class Channel(
             processContiguousMessages()
 
         } catch (e: ChannelException) {
+            // Python Channel._receive swallows the exception (Channel.py:467-468)
+            // and never advances the rx sequence. Surface it to the test tap so a
+            // listener can observe e.g. the bz2 decompression-bomb abort.
+            receiveErrorTapForTest?.let { tap -> runCatching { tap(e) } }
             println("[Channel] Error receiving message: ${e.message}")
         } catch (e: Exception) {
+            receiveErrorTapForTest?.let { tap -> runCatching { tap(e) } }
             println("[Channel] Unexpected error receiving message: ${e.message}")
         }
     }
@@ -324,6 +414,14 @@ class Channel(
         val contiguous = mutableListOf<Envelope>()
 
         lock.withLock {
+            // Mirror python Channel._receive's contiguous-delivery loop
+            // (Channel.py:444-466): it iterates the WHOLE rx ring, appending each
+            // envelope whose sequence == next_rx_sequence — it does NOT break on
+            // the first mismatch. Across the 0xFFFF->0 wrap the ring sorts as
+            // [0, 0xFFFF] (the half-space rule cannot place 0xFFFF before 0), so a
+            // break-on-mismatch would never reach the 0xFFFF that unblocks the
+            // run. Skipping (not breaking) matches python and still stops
+            // appending naturally once the contiguous run ends.
             for (envelope in rxRing) {
                 if (envelope.sequence == nextRxSequence.get()) {
                     contiguous.add(envelope)
@@ -339,8 +437,6 @@ class Channel(
                             }
                         }
                     }
-                } else {
-                    break
                 }
             }
 
@@ -499,10 +595,12 @@ class Channel(
         if (envelope.tries >= MAX_TRIES) {
             println("[Channel] Retry count exceeded, tearing down Link")
             shutdown()
-            // Signal outlet that we timed out
-            if (outlet.timedOut) {
-                // Outlet is already timed out
-            }
+            // Mirror python Channel._packet_timeout (Channel.py:578-583): after
+            // the channel shuts down, tell the outlet it timed out, which tears
+            // the underlying Link DOWN (LinkChannelOutlet.timed_out ->
+            // link.teardown(), Channel.py:707-708). The previous no-op left the
+            // link ACTIVE, so drop_acks teardown never became observable.
+            outlet.notifyTimedOut()
             return true
         }
 
@@ -564,7 +662,10 @@ class Channel(
      * Maximum data unit size for messages.
      */
     val mdu: Int
-        get() = outlet.mdu - 6  // Subtract envelope header
+        // Mirror python RNS Channel.mdu (Channel.py:643-654): outlet.mdu minus the
+        // 6-byte envelope header, capped at 0xFFFF (the envelope length field is
+        // 16-bit). Previously uncapped, which over-reported mdu on large-MTU links.
+        get() = minOf(outlet.mdu - 6, 0xFFFF)
 
     /**
      * Shutdown the channel and clear all callbacks.
@@ -598,4 +699,64 @@ class Channel(
     override fun close() {
         shutdown()
     }
+
+    // -----------------------------------------------------------------------
+    // Conformance test seams (read-only snapshots / pure helpers + callback
+    // re-fire hooks). These expose private state for the wire bridge's
+    // channel/buffer commands; none change production behavior.
+    // -----------------------------------------------------------------------
+
+    /** Immutable snapshot of the channel's window / sequence / ring state. */
+    class ChannelStateForTest(
+        val window: Int, val windowMin: Int, val windowMax: Int, val windowFlexibility: Int,
+        val nextSequence: Int, val nextRxSequence: Int,
+        val rxRing: Int, val txRing: Int,
+        val txTries: Int, val txEnvelopes: List<Pair<Int, Int>>,
+        val mdu: Int, val outletMdu: Int,
+        val messageHandlers: Int, val mediumRateRounds: Int, val fastRateRounds: Int,
+    )
+
+    /** Snapshot the live window/sequence/ring state (the wire_channel_window /
+     *  wire_listener_channel_rx observable). */
+    fun stateForTest(): ChannelStateForTest = lock.withLock {
+        val tx = txRing.toList()
+        ChannelStateForTest(
+            window, windowMin, windowMax, windowFlexibility,
+            nextSequence.get(), nextRxSequence.get(),
+            rxRing.size, tx.size,
+            tx.maxOfOrNull { it.tries } ?: 0,
+            tx.map { it.sequence to it.tries },
+            mdu, outlet.mdu, messageHandlers.size, mediumRateRounds, fastRateRounds,
+        )
+    }
+
+    /** Pack a real Envelope wrapping [message] at [sequence] via this channel's
+     *  outlet (the wire_channel_inject / handler_chain feed). */
+    fun packEnvelopeForTest(message: MessageBase, sequence: Int): ByteArray =
+        Envelope(outlet, message, sequence = sequence).pack()
+
+    /** The un-truncated (Double, milliseconds) retransmit-timeout formula value.
+     *  Production [getPacketTimeoutTime] truncates to a Long ms; this returns the
+     *  exact `pow(1.5,tries-1) * max(rtt*2.5, 25) * (txRing+1.5)` so the formula
+     *  test can compare against python's float-seconds re-derivation. */
+    fun getPacketTimeoutTimeDoubleForTest(tries: Int): Double {
+        val r = outlet.rtt ?: 25L
+        return 1.5.pow(tries - 1) * maxOf(r * 2.5, 25.0) * (txRing.size + 1.5)
+    }
+
+    /** Pad the tx ring with [depth] placeholder Envelopes so the timeout formula
+     *  scales by (depth+1.5), mirroring the reference padding _tx_ring. */
+    fun padTxRingForTest(depth: Int) {
+        lock.withLock { repeat(depth) { txRing.add(Envelope(outlet, sequence = it)) } }
+    }
+
+    /** Whether [env]'s packet is in the DELIVERED state per the real outlet. */
+    fun isDeliveredForTest(env: Envelope): Boolean =
+        env.packet?.let { outlet.getPacketState(it) == MessageState.DELIVERED } ?: false
+
+    /** Re-fire the private delivery callback for [packet] (spurious-proof test). */
+    fun firePacketDeliveredForTest(packet: Any) = packetDelivered(packet)
+
+    /** Re-fire the private timeout callback for [packet] (stale-timeout test). */
+    fun firePacketTimeoutForTest(packet: Any) = packetTimeout(packet)
 }

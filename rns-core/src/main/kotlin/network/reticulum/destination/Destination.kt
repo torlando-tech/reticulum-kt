@@ -194,8 +194,9 @@ class Destination private constructor(
 
     /**
      * Minimum interval between ratchet rotations (milliseconds).
+     * Public-settable, as python's `Destination.ratchet_interval` attribute is.
      */
-    private var ratchetInterval: Long = RATCHET_ROTATION_INTERVAL
+    var ratchetInterval: Long = RATCHET_ROTATION_INTERVAL
 
     /**
      * Timestamp of the last ratchet rotation (milliseconds).
@@ -223,6 +224,12 @@ class Destination private constructor(
      * Maps tag (ByteArray) to (timestamp, announce_data).
      */
     private val pathResponses = mutableMapOf<ByteArrayKey, Pair<Long, ByteArray>>()
+
+    /** Number of registered request handlers (python: len(dest.request_handlers)). */
+    fun requestHandlerCount(): Int = requestHandlers.size
+
+    /** Number of cached path-response entries (python: len(dest.path_responses)). */
+    fun pathResponseCount(): Int = pathResponses.size
 
     /**
      * Lock for path response tag access.
@@ -294,6 +301,53 @@ class Destination private constructor(
      */
     fun ratchetCount(): Int = ratchets.size
 
+    // ===== Conformance test seams (ratchet introspection) =====
+    // The conformance bridge is a separate gradle module and cannot read the
+    // private ratchet state these expose. They mirror the python attribute
+    // access the reference bridge uses (reticulum-conformance reference/
+    // wire_tcp.py cmd_wire_read_ratchets / rotate_ratchet / set_retained_ratchets
+    // / ratchet_file_roundtrip). Pure read-only / hook accessors — no port logic.
+
+    /** Snapshot of the in-memory ratchet PRIVATE keys, newest first. */
+    fun ratchetsSnapshotForTest(): List<ByteArray> = ratchets.map { it.copyOf() }
+
+    /** Whether enableRatchets() has been called on this destination. */
+    fun ratchetsEnabledForTest(): Boolean = ratchetsEnabled
+
+    /** The on-disk ratchet store path (null when ratchets disabled). */
+    fun ratchetsPathForTest(): String? = ratchetsPath
+
+    /** The retained-ratchets cap (Destination.retained_ratchets). */
+    fun retainedRatchetsForTest(): Int = retainedRatchets
+
+    /**
+     * latest_ratchet_time in python is an epoch-SECONDS attribute; kotlin
+     * stores it as lastRatchetRotation in MILLIS. The bridge converts at the
+     * boundary. Backdating it (reference: destination.latest_ratchet_time =
+     * time.time() - ago_s) deterministically opens/shuts the rotation gate.
+     */
+    var lastRatchetRotationForTest: Long
+        get() = lastRatchetRotation
+        set(value) { lastRatchetRotation = value }
+
+    /** Force a signed write of the ratchet store (reference: _persist_ratchets). */
+    fun persistRatchetsForTest() = persistRatchets()
+
+    /**
+     * Clear the in-memory ratchet list and reload from the signed on-disk
+     * store, mirroring the reference's `destination.ratchets = None;
+     * _reload_ratchets(path)`. Returns reloadRatchets()'s success flag.
+     */
+    fun reloadRatchetsFromDiskForTest(): Boolean {
+        ratchets.clear()
+        return reloadRatchets()
+    }
+
+    /** Append a raw ratchet private key (reference pad: ratchets.append(...)). */
+    fun addRatchetForTest(ratchetPrivate: ByteArray) {
+        ratchets.add(ratchetPrivate.copyOf())
+    }
+
     /**
      * Set the ratchet public key for encryption to this destination.
      * This is called when receiving an announce with a ratchet.
@@ -336,16 +390,14 @@ class Destination private constructor(
 
         this.ratchetsPath = ratchetsPath
         this.lastRatchetRotation = 0L
-        this.ratchetsEnabled = true  // Enable before calling rotateRatchets
+        this.ratchetsEnabled = true
 
-        // Try to reload existing ratchets from disk
+        // Try to reload existing ratchets from disk. python enable_ratchets
+        // (Destination.py:466-489) does NOT eagerly rotate — the first
+        // rotation happens inside announce() (or an explicit rotate call),
+        // and rotate's interval gate skips the check on the first rotation.
         reloadRatchets()
-
-        // If no ratchets exist, create the first one
-        if (ratchets.isEmpty()) {
-            rotateRatchets()
-        } else {
-            // Update ratchetKey and ratchetId from current ratchet
+        if (ratchets.isNotEmpty()) {
             updateRatchetKeyAndId()
         }
 
@@ -487,6 +539,17 @@ class Destination private constructor(
 
         val file: File? = if (storedBytes == null && ratchetsPath != null) File(ratchetsPath!!) else null
         if (storedBytes == null && (file == null || !file.exists())) {
+            // python Destination._reload_ratchets else-branch (Destination.py
+            // 1.1.9 :459-463): when no existing ratchet data is found, initialise
+            // an empty ratchet list and persist a fresh signed store. This is how
+            // enable_ratchets creates the on-disk file WITHOUT eagerly rotating —
+            // the first ratchet is added later by announce()/rotate_ratchets().
+            val hasSink = ratchetsPath != null ||
+                network.reticulum.transport.Transport.destinationRatchetStore != null
+            if (hasSink) {
+                ratchets.clear()
+                persistRatchets()
+            }
             return false
         }
 
@@ -816,14 +879,25 @@ class Destination private constructor(
                 require(!aspect.contains('.')) { "Aspects cannot contain dots" }
             }
 
+            // python Destination.__init__ (Destination.py:174-182): an IN,
+            // non-PLAIN destination with no identity auto-generates one and
+            // folds its hexhash into the aspect list BEFORE the name/hash
+            // derivations, so the address is unique per generated identity.
+            var effectiveIdentity = identity
+            var effectiveAspects = aspects.toList()
+            if (identity == null && direction == DestinationDirection.IN && type != DestinationType.PLAIN) {
+                effectiveIdentity = Identity.create()
+                effectiveAspects = effectiveAspects + effectiveIdentity.hexHash
+            }
+
             // Validate identity vs type
             when (type) {
                 DestinationType.PLAIN -> {
-                    require(identity == null) { "PLAIN destinations cannot hold an identity" }
+                    require(effectiveIdentity == null) { "Selected destination type PLAIN cannot hold an identity" }
                 }
                 DestinationType.SINGLE, DestinationType.GROUP -> {
                     if (direction == DestinationDirection.OUT) {
-                        require(identity != null) { "Outbound SINGLE/GROUP destinations require an identity" }
+                        require(effectiveIdentity != null) { "Can't create outbound SINGLE destination without an identity" }
                     }
                 }
                 DestinationType.LINK -> {
@@ -832,11 +906,11 @@ class Destination private constructor(
             }
 
             val destination = Destination(
-                identity = identity,
+                identity = effectiveIdentity,
                 direction = direction,
                 type = type,
                 appName = appName,
-                aspects = aspects.toList()
+                aspects = effectiveAspects
             )
 
             // Auto-register inbound destinations with Transport (matches Python Destination.py:196)
@@ -876,8 +950,14 @@ class Destination private constructor(
 
         /**
          * Compute the name hash (first 10 bytes of SHA-256).
+         *
+         * python's name expansion validates components on EVERY path that
+         * builds a name (expand_name, Destination.py:102-106), so the dotted
+         * guards live here where all kotlin name/hash derivations converge.
          */
         fun computeNameHash(appName: String, aspects: List<String>): ByteArray {
+            require(!appName.contains('.')) { "Dots can't be used in app names" }
+            aspects.forEach { require(!it.contains('.')) { "Dots can't be used in aspects" } }
             val name = buildNameWithoutIdentity(appName, aspects)
             return Hashes.fullHash(name.toByteArray(Charsets.UTF_8))
                 .copyOf(RnsConstants.NAME_HASH_BYTES)
@@ -980,6 +1060,30 @@ class Destination private constructor(
 
             // Return truncated hash (16 bytes)
             return Hashes.truncatedHash(hashMaterial)
+        }
+
+        /**
+         * python Destination.hash also accepts the raw 16-byte identity hash
+         * in place of an Identity instance (Destination.py:122-128), raising
+         * for any other length. Kotlin expresses that as an overload.
+         */
+        fun hash(identityHash: ByteArray?, appName: String, vararg aspects: String): ByteArray {
+            if (identityHash != null && identityHash.size != RnsConstants.TRUNCATED_HASH_BYTES) {
+                throw IllegalArgumentException("Invalid material supplied for destination hash calculation")
+            }
+            val nameHash = computeNameHash(appName, aspects.toList())
+            val hashMaterial = if (identityHash != null) nameHash + identityHash else nameHash
+            return Hashes.truncatedHash(hashMaterial)
+        }
+
+        /**
+         * [hashFromNameAndIdentity] for a raw 16-byte identity hash, the form
+         * python's duck-typed `identity` argument also accepts.
+         */
+        fun hashFromNameAndIdentity(fullName: String, identityHash: ByteArray?): ByteArray {
+            val parsed = appAndAspectsFromName(fullName)
+                ?: throw IllegalArgumentException("Invalid full name: $fullName")
+            return hash(identityHash, parsed.first, *parsed.second.toTypedArray())
         }
 
         /**
@@ -1134,7 +1238,17 @@ class Destination private constructor(
                 val token = groupToken ?: throw IllegalStateException(
                     "Cannot decrypt for GROUP destination without private key. Call createKeys() or loadPrivateKey() first."
                 )
-                token.decrypt(ciphertext)
+                // python Destination.decrypt swallows a GROUP Token auth/format
+                // failure and returns None rather than propagating (Destination.py
+                // :644-651) — a member holding the WRONG key for the group must
+                // get None, never garbage and never a raised ValueError.
+                // Token.decrypt raises on HMAC mismatch, so catch it here to
+                // match the reference contract.
+                try {
+                    token.decrypt(ciphertext)
+                } catch (e: Exception) {
+                    null
+                }
             }
 
             DestinationType.LINK -> {
@@ -1263,8 +1377,11 @@ class Destination private constructor(
      * @return true if the strategy was set successfully
      */
     fun setProofStrategy(strategy: Int): Boolean {
+        // python raises TypeError("Unsupported proof strategy")
+        // (Destination.py:365-366); a silent false-return would let a caller
+        // believe an invalid strategy took effect.
         if (strategy !in listOf(PROVE_NONE, PROVE_APP, PROVE_ALL)) {
-            return false
+            throw IllegalArgumentException("Unsupported proof strategy")
         }
         proofStrategy = strategy
         return true
@@ -1401,7 +1518,9 @@ class Destination private constructor(
     fun cachePathResponse(tag: ByteArray, announceData: ByteArray) {
         pathResponseLock.withLock {
             val key = tag.toKey()
-            pathResponses[key] = Pair(System.currentTimeMillis(), announceData.copyOf())
+            // WallClock: PR_TAG_WINDOW bookkeeping is observable announce
+            // behavior; see WallClock.kt and port-deviations.md.
+            pathResponses[key] = Pair(network.reticulum.common.WallClock.nowMs(), announceData.copyOf())
         }
     }
 
@@ -1409,7 +1528,7 @@ class Destination private constructor(
      * Clean expired path response entries.
      */
     private fun cleanStalePathResponses() {
-        val now = System.currentTimeMillis()
+        val now = network.reticulum.common.WallClock.nowMs()
         val staleKeys = pathResponses.entries
             .filter { now - it.value.first > PR_TAG_WINDOW }
             .map { it.key }
@@ -1427,7 +1546,9 @@ class Destination private constructor(
     private fun generateAnnounceData(id: Identity, appData: ByteArray?): Pair<ByteArray, Boolean> {
         // Generate random hash component (5 random bytes + 5 timestamp bytes)
         val randomPart = Hashes.getRandomHash().copyOf(5)
-        val timestamp = System.currentTimeMillis() / 1000 // Convert to seconds
+        // WallClock: the embedded emission timestamp is load-bearing for path
+        // freshness comparisons; see WallClock.kt and port-deviations.md.
+        val timestamp = network.reticulum.common.WallClock.nowSeconds()
         val timestampBytes = ByteArray(5) { i ->
             ((timestamp shr (8 * (4 - i))) and 0xFF).toByte()
         }
@@ -1440,8 +1561,10 @@ class Destination private constructor(
         val ratchet: ByteArray
         val hasRatchet: Boolean
 
-        if (ratchetsEnabled && ratchets.isNotEmpty()) {
-            // Rotate ratchets if interval has passed
+        if (ratchetsEnabled) {
+            // python announce() rotates whenever ratchets are enabled
+            // (Destination.py:284-286) — including the FIRST rotation on a
+            // freshly-enabled destination with an empty list.
             rotateRatchets()
 
             // Use the first (most recent) ratchet
@@ -1451,10 +1574,14 @@ class Destination private constructor(
             ratchet = ratchetPub
             hasRatchet = true
 
-            // NOTE: Do not store the ratchet public key under our own hash!
-            // The ratchet public key should only be stored by REMOTE parties who receive our announce.
-            // We keep the private keys in our ratchets list for decryption.
-            // Storing the public key under our own hash would confuse the encryption logic.
+            // Store our OWN current ratchet public key under our own hash, exactly
+            // as python announce() does (RNS.Identity._remember_ratchet(self.hash,
+            // ratchet), Destination.py:287). Destination.encrypt selects its ratchet
+            // via this same lookup (get_ratchet(self.hash), Destination.py:596) and
+            // records latest_ratchet_id; without the store, encrypt falls back to
+            // the static key and latest_ratchet_id never gets set for our own
+            // outbound messages — a divergence from the reference.
+            setRatchetForDestination(hash, ratchetPub)
         } else {
             ratchet = byteArrayOf()
             hasRatchet = false

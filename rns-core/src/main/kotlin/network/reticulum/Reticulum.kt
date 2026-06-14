@@ -1,6 +1,9 @@
 package network.reticulum
 
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.hexToByteArray
+import network.reticulum.common.toHexString
+import network.reticulum.crypto.Hashes
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.transport.Transport
@@ -66,6 +69,22 @@ class Reticulum private constructor(
      * legacy `$storagePath/transport_identity` file behaviour.
      */
     private val transportIdentityOverride: Identity? = null,
+    /**
+     * Process-wide posture knobs. kotlin has no INI config layer / RNS
+     * `__apply_config`, so the flags python resolves from config
+     * (Reticulum.py:253-281, :497-558, :575-591) are threaded here as typed
+     * constructor parameters with RNS-matching defaults. See port-deviations.md.
+     */
+    val respondToProbes: Boolean = false,            // python __allow_probes (default False, :257)
+    val useImplicitProof: Boolean = true,            // python __use_implicit_proof (default True, :256)
+    val enableRemoteManagement: Boolean = false,     // python __remote_management_enabled (default False, :255)
+    private val remoteManagementAllowedHashes: List<ByteArray> = emptyList(),
+    val panicOnInterfaceError: Boolean = false,      // python panic_on_interface_error (default False, :281)
+    private val blackholeSourceHashes: List<ByteArray> = emptyList(),
+    /** Trusted interface-discovery-source identity hashes (python __interface_sources). */
+    val interfaceDiscoverySources: List<ByteArray> = emptyList(),
+    /** Raw rpc_key hex string; parsed (with SHA-256(privkey) fallback) in initialize(). */
+    private val rpcKeyHex: String? = null,
 ) {
     companion object {
         /**
@@ -90,6 +109,12 @@ class Reticulum private constructor(
         const val MAX_QUEUED_ANNOUNCES = 16384
 
         /**
+         * How long a queued announce survives before being purged as stale,
+         * in seconds (python: QUEUED_ANNOUNCE_LIFE = 60*60*24, Reticulum.py:111).
+         */
+        const val QUEUED_ANNOUNCE_LIFE = 60 * 60 * 24
+
+        /**
          * Announce cap - maximum percentage of bandwidth for announces.
          */
         const val ANNOUNCE_CAP = 2
@@ -108,6 +133,55 @@ class Reticulum private constructor(
          * Default TCP port for shared instance communication.
          */
         const val DEFAULT_SHARED_INSTANCE_PORT = 37428
+
+        /**
+         * Interface-discovery master gate (python __discover_interfaces,
+         * Reticulum.py:259 — default OFF; config `discover_interfaces`).
+         */
+        @Volatile var discoverInterfaces: Boolean = false
+
+        /**
+         * Autoconnect-discovered-interfaces knob (python
+         * __autoconnect_discovered_interfaces, Reticulum.py:260,592-595 —
+         * default off; a configured value > 0 is the max autoconnect count).
+         */
+        @Volatile var autoconnectDiscoveredInterfaces: Int = 0
+
+        /** python Reticulum.should_autoconnect_discovered_interfaces(). */
+        fun shouldAutoconnectDiscoveredInterfaces(): Boolean = autoconnectDiscoveredInterfaces > 0
+
+        /** python Reticulum.max_autoconnected_interfaces(). */
+        fun maxAutoconnectedInterfaces(): Int = autoconnectDiscoveredInterfaces
+
+        /**
+         * Process-wide implicit-vs-explicit single-packet PROOF policy. RNS keeps
+         * this as the class attribute `__use_implicit_proof` (python
+         * Reticulum.py:256, default True; config parse :555-558), so it is static
+         * here too. [initialize] seeds it from the started instance's configured
+         * posture, mirroring python's `__init__` setting the class attribute.
+         * Identity.prove branches on it (Identity.py:961-963): implicit emits the
+         * signature only, explicit prepends the packet hash.
+         */
+        @Volatile
+        private var implicitProofPolicy: Boolean = true
+
+        /** python RNS.Reticulum.should_use_implicit_proof() (Reticulum.py:1699-1705). */
+        fun shouldUseImplicitProof(): Boolean = implicitProofPolicy
+
+        /**
+         * Conformance seam: set the implicit-proof policy the prover reads (the
+         * reference flips the same `__use_implicit_proof` class attribute,
+         * python Reticulum.py:555-558 / the bridge's `_Reticulum__use_implicit_proof`,
+         * wire_tcp.py:5871). No port logic — just exposes the static flag.
+         */
+        fun setUseImplicitProofForTest(enabled: Boolean) {
+            implicitProofPolicy = enabled
+        }
+
+        /** Internal: [initialize] seeds the static policy from the instance posture. */
+        internal fun seedImplicitProofPolicy(enabled: Boolean) {
+            implicitProofPolicy = enabled
+        }
 
         @Volatile
         private var instance: Reticulum? = null
@@ -178,7 +252,22 @@ class Reticulum private constructor(
             sharedInstancePort: Int = DEFAULT_SHARED_INSTANCE_PORT,
             connectToSharedInstance: Boolean = false,
             transportIdentity: Identity? = null,
+            respondToProbes: Boolean = false,
+            useImplicitProof: Boolean = true,
+            enableRemoteManagement: Boolean = false,
+            remoteManagementAllowed: List<ByteArray> = emptyList(),
+            panicOnInterfaceError: Boolean = false,
+            blackholeSources: List<ByteArray> = emptyList(),
+            interfaceDiscoverySources: List<ByteArray> = emptyList(),
+            rpcKey: String? = null,
         ): Reticulum {
+            // Validate + dedup the identity-hash lists BEFORE claiming the
+            // singleton (pure, no side effects) so a malformed/wrong-length hash
+            // aborts the start cleanly with a ValueError-equivalent, exactly as
+            // python's __apply_config raises (Reticulum.py:532-536,:578-588).
+            val rmAllowed = validateAndDedupHashes(remoteManagementAllowed, "remote management ACL")
+            val bhSources = validateAndDedupHashes(blackholeSources, "blackhole source")
+            val idSources = validateAndDedupHashes(interfaceDiscoverySources, "interface discovery source")
             if (started.compareAndSet(false, true)) {
                 val dir = configDir ?: getDefaultConfigDir()
                 val rns =
@@ -189,6 +278,14 @@ class Reticulum private constructor(
                         sharedInstancePort = sharedInstancePort,
                         connectToSharedInstance = connectToSharedInstance,
                         transportIdentityOverride = transportIdentity,
+                        respondToProbes = respondToProbes,
+                        useImplicitProof = useImplicitProof,
+                        enableRemoteManagement = enableRemoteManagement,
+                        remoteManagementAllowedHashes = rmAllowed,
+                        panicOnInterfaceError = panicOnInterfaceError,
+                        blackholeSourceHashes = bhSources,
+                        interfaceDiscoverySources = idSources,
+                        rpcKeyHex = rpcKey,
                     )
                 instance = rns
 
@@ -300,6 +397,60 @@ class Reticulum private constructor(
         fun transportEnabled(): Boolean = instance?.enableTransport ?: false
 
         /**
+         * Whether probe responses are enabled (python Reticulum.probe_destination_enabled,
+         * default False). A connected local CLIENT always reports False regardless of
+         * the configured knob (python Reticulum.py:431, the attach-time override).
+         */
+        fun probeDestinationEnabled(): Boolean =
+            instance?.let { if (it.isConnectedToSharedInstance) false else it.respondToProbes } ?: false
+
+        /**
+         * Whether remote management is enabled (python Reticulum.remote_management_enabled,
+         * default False). A connected local CLIENT always reports False (python
+         * Reticulum.py:430, the attach-time override).
+         */
+        fun remoteManagementEnabled(): Boolean =
+            instance?.let { if (it.isConnectedToSharedInstance) false else it.enableRemoteManagement } ?: false
+
+        /**
+         * Whether an interface error should panic the process (python
+         * Reticulum.panic_on_interface_error, default False).
+         */
+        fun panicOnInterfaceError(): Boolean = instance?.panicOnInterfaceError ?: false
+
+        /**
+         * Trusted interface-discovery-source identity hashes (python
+         * Reticulum.interface_discovery_sources()).
+         */
+        fun interfaceDiscoverySources(): List<ByteArray> = instance?.interfaceDiscoverySources ?: emptyList()
+
+        /**
+         * Trusted remote blackhole-source identity hashes (python
+         * Reticulum.blackhole_sources()); reads the live Transport list.
+         */
+        fun blackholeSources(): List<ByteArray> = Transport.blackholeSources.toList()
+
+        /**
+         * Validate and deduplicate a list of identity-hash entries (mirrors
+         * python Reticulum.py:532-536, :578-588, :582 for remote_management_allowed
+         * / blackhole_sources / interface_discovery_sources): each entry must be
+         * exactly TRUNCATED_HASHLENGTH//8 == 16 bytes, else the start aborts with a
+         * ValueError-equivalent; duplicates collapse to a single entry. Pure (no
+         * side effects) so it can run before the singleton is claimed.
+         */
+        private fun validateAndDedupHashes(hashes: List<ByteArray>, label: String): List<ByteArray> {
+            val out = ArrayList<ByteArray>()
+            for (h in hashes) {
+                require(h.size == RnsConstants.TRUNCATED_HASH_BYTES) {
+                    "Identity hash length for $label ${h.toHexString()} is invalid, must be " +
+                        "${RnsConstants.TRUNCATED_HASH_BYTES} bytes."
+                }
+                if (out.none { it.contentEquals(h) }) out.add(h)
+            }
+            return out
+        }
+
+        /**
          * Check if link MTU discovery is enabled.
          */
         fun linkMtuDiscovery(): Boolean = LINK_MTU_DISCOVERY
@@ -321,6 +472,16 @@ class Reticulum private constructor(
     // State
     private val interfaces = mutableListOf<Any>()
     private val shutdownHooks = mutableListOf<() -> Unit>()
+
+    /**
+     * Derived RPC control-channel authkey (python Reticulum.rpc_key). With no
+     * configured rpc_key it is full_hash(transport_identity.private_key) ==
+     * SHA-256(private key) (Reticulum.py:347-348); a valid hex rpc_key is used
+     * verbatim and a malformed one falls back to the default
+     * (Reticulum.py:489-495). Set during [initialize].
+     */
+    lateinit var rpcKey: ByteArray
+        private set
 
     /** Whether this instance is the shared instance (has the local server running). */
     var isSharedInstance: Boolean = false
@@ -348,6 +509,13 @@ class Reticulum private constructor(
     private fun initialize() {
         log("Initializing Reticulum...")
 
+        // Seed the process-wide implicit-proof policy from this instance's
+        // configured posture, mirroring python __init__ setting the class
+        // attribute __use_implicit_proof (Reticulum.py:256). shouldUseImplicitProof()
+        // reads the static policy thereafter (the conformance bridge may then flip
+        // it at runtime via setUseImplicitProofForTest).
+        seedImplicitProofPolicy(useImplicitProof)
+
         // Directory layout is lazily created at each write site (Transport, Identity,
         // InterfaceDiscovery, Destination all mkdirs parents on demand) and on Android
         // everything routes through Room stores anyway, so there's no reason to
@@ -367,6 +535,14 @@ class Reticulum private constructor(
                 loadOrCreateTransportIdentity()
             }
 
+        // Derive the RPC control-channel authkey. A valid hex rpc_key is used
+        // verbatim; a malformed one falls back to the SHA-256(private-key)
+        // default, exactly as python catches bytes.fromhex failure
+        // (Reticulum.py:489-495) and defaults at :347-348. full_hash == SHA-256.
+        rpcKey = rpcKeyHex
+            ?.let { runCatching { it.hexToByteArray() }.getOrNull()?.takeIf { it.isNotEmpty() } }
+            ?: Hashes.fullHash(transportIdentity.getPrivateKey())
+
         // Configure Transport and Identity storage paths
         Transport.setCachePath(cachePath)
         Transport.setStoragePath(storagePath)
@@ -376,6 +552,7 @@ class Reticulum private constructor(
         // Check if we should connect to an existing shared instance
         if (connectToSharedInstance) {
             if (tryConnectToSharedInstance(transportIdentity)) {
+                applyConfigToTransport()
                 log("Connected to shared instance on port $sharedInstancePort")
                 return
             } else {
@@ -386,12 +563,43 @@ class Reticulum private constructor(
         // Start Transport with identity
         Transport.start(transportIdentity = transportIdentity, enableTransport = enableTransport)
 
+        // Publish the config-derived ACL / source lists onto the live Transport
+        // (validated + deduped in start()). Mirrors python __apply_config
+        // appending into RNS.Transport.remote_management_allowed /
+        // Reticulum.__blackhole_sources / __interface_sources.
+        applyConfigToTransport()
+
         // If shareInstance is enabled, start the local server
         if (shareInstance) {
             startLocalServer()
         }
 
         log("Reticulum started (transport=${if (enableTransport) "enabled" else "disabled"}, shared=$isSharedInstance)")
+    }
+
+    /**
+     * Publish the config-derived ACL / source lists onto the live Transport.
+     * The lists are already validated (16-byte) and deduplicated in [start];
+     * this copies them in, mirroring python __apply_config appending into
+     * RNS.Transport.remote_management_allowed / Reticulum.__blackhole_sources /
+     * __interface_sources (Reticulum.py:528-541, :575-591).
+     */
+    private fun applyConfigToTransport() {
+        for (h in remoteManagementAllowedHashes) {
+            if (Transport.remoteManagementAllowed.none { it.contentEquals(h) }) {
+                Transport.remoteManagementAllowed.add(h)
+            }
+        }
+        for (h in blackholeSourceHashes) {
+            if (Transport.blackholeSources.none { it.contentEquals(h) }) {
+                Transport.blackholeSources.add(h)
+            }
+        }
+        for (h in interfaceDiscoverySources) {
+            if (Transport.interfaceDiscoverySources.none { it.contentEquals(h) }) {
+                Transport.interfaceDiscoverySources.add(h)
+            }
+        }
     }
 
     /**

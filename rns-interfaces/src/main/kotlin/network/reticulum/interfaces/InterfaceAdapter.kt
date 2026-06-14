@@ -73,6 +73,7 @@ class InterfaceAdapter private constructor(
     override val discoveryLongitude: Double? get() = iface.discoveryLongitude
     override val discoveryHeight: Double? get() = iface.discoveryHeight
     override val discoveryInterfaceType: String get() = iface.discoveryInterfaceType
+    override val kissFraming: Boolean get() = iface.kissFraming
     override val ifacNetname: String? get() = iface.ifacNetname
     override val ifacNetkey: String? get() = iface.ifacNetkey
 

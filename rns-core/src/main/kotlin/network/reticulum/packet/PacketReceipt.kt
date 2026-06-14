@@ -42,6 +42,16 @@ class PacketReceipt internal constructor(
         // Proof lengths
         val EXPL_LENGTH = RnsConstants.FULL_HASH_BYTES + RnsConstants.SIGNATURE_SIZE
         val IMPL_LENGTH = RnsConstants.SIGNATURE_SIZE
+
+        /**
+         * Conformance test seam: construct a PacketReceipt over an already-packed
+         * packet (the constructor is internal, so the separate-module bridge can't
+         * call it). Mirrors the reference's `RNS.PacketReceipt(base_packet)` for
+         * the proof-injection commands (wire_inject_crafted_proof / _link_proof),
+         * which need a receipt with a genuine packet hash to validate proofs
+         * against. No port logic.
+         */
+        fun forPacketForTest(packet: Packet): PacketReceipt = PacketReceipt(packet)
     }
 
     /** The full hash of the packet. */
@@ -55,7 +65,8 @@ class PacketReceipt internal constructor(
         private set
 
     /** The timestamp when the packet was sent (in milliseconds). */
-    val sentAt: Long = System.currentTimeMillis()
+    var sentAt: Long = System.currentTimeMillis()
+        private set
 
     /** Whether the delivery has been proven. */
     var proved: Boolean = false
@@ -109,9 +120,14 @@ class PacketReceipt internal constructor(
             return TransportConstants.DEFAULT_PER_HOP_TIMEOUT / 1000.0
         }
 
-        // For other destinations, calculate based on hops
-        val firstHopTimeout = Transport.firstHopTimeout(destination?.hash ?: packet.destinationHash)
-        val hops = Transport.hopsTo(destination?.hash ?: packet.destinationHash) ?: 1
+        // For other destinations: get_first_hop_timeout(dest) + TIMEOUT_PER_HOP *
+        // hops_to(dest) (python Packet.py:432-433). hops_to returns PATHFINDER_M
+        // when the path is unknown (python Transport.hops_to, Transport.py:2641-2648),
+        // so a fresh path-less destination yields DEFAULT_PER_HOP_TIMEOUT(6) +
+        // TIMEOUT_PER_HOP(6) * PATHFINDER_M(128) == 774s, not the per-hop=1 floor.
+        val destHash = destination?.hash ?: packet.destinationHash
+        val firstHopTimeout = Transport.firstHopTimeout(destHash)
+        val hops = Transport.hopsTo(destHash) ?: TransportConstants.PATHFINDER_M
         val perHopTimeout = TransportConstants.DEFAULT_PER_HOP_TIMEOUT / 1000.0
 
         return (firstHopTimeout / 1000.0) + (perHopTimeout * hops)
@@ -147,7 +163,10 @@ class PacketReceipt internal constructor(
      */
     fun checkTimeout(): Boolean {
         if (status == SENT && isTimedOut()) {
-            status = if (retries > 0) {
+            // python check_timeout (Packet.py:561-565): the timeout==-1 sentinel
+            // concludes the receipt CULLED, every finite timeout concludes it
+            // FAILED. (Keyed on the timeout value, not on retries.)
+            status = if (timeout == -1.0) {
                 CULLED
             } else {
                 FAILED
@@ -170,6 +189,17 @@ class PacketReceipt internal constructor(
      */
     fun setTimeout(timeout: Double) {
         this.timeout = timeout
+    }
+
+    /**
+     * Conformance seam: back-date [sentAt] (epoch millis) so isTimedOut() is true
+     * for any finite/sentinel timeout, isolating the CULLED-vs-FAILED branch of
+     * checkTimeout from any real wall-clock wait. The reference back-dates
+     * receipt.sent_at directly (wire_tcp.py:3776) — python's sent_at is a plain
+     * mutable attribute. No port logic.
+     */
+    fun setSentAtForTest(epochMillis: Long) {
+        sentAt = epochMillis
     }
 
     /**
@@ -242,6 +272,11 @@ class PacketReceipt internal constructor(
      * @return true if the proof is valid
      */
     fun validateLinkProof(proof: ByteArray, link: Link, proofPacket: Packet? = null): Boolean {
+        // Conformance test seam (wire_channel_send drop_acks): when the link is
+        // flagged, the proof never validates — mirrors the reference neutering
+        // packet.receipt.validate_proof so the Channel retransmits to exhaustion.
+        if (link.failProofValidationForTest) return false
+
         // For now, only handle explicit proofs
         if (proof.size == EXPL_LENGTH) {
             // Extract proof components
@@ -282,6 +317,9 @@ class PacketReceipt internal constructor(
      * @return true if the proof is valid
      */
     fun validateProof(proof: ByteArray, proofPacket: Packet? = null): Boolean {
+        // Conformance test seam (wire_channel_send drop_acks): see validateLinkProof.
+        if (link?.failProofValidationForTest == true) return false
+
         when (proof.size) {
             EXPL_LENGTH -> {
                 // Explicit proof

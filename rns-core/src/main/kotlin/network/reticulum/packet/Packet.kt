@@ -61,6 +61,14 @@ class Packet private constructor(
     /** MTU for this packet. Python sets per-packet from destination.mtu; defaults to global MTU. */
     val mtu: Int = RnsConstants.MTU
 ) {
+    /**
+     * The actual context byte on the wire. python carries context as a raw
+     * int (any value parses; unknown values match no handler), so this is
+     * the pack/unpack source of truth — [context] is the named view and is
+     * [PacketContext.UNKNOWN] when the byte has no named code point.
+     */
+    var contextRaw: Int = context.value
+
     /** The destination this packet is addressed to (null if created from raw). */
     internal var destination: Destination? = null
 
@@ -74,6 +82,18 @@ class Packet private constructor(
     var receivingInterfaceHash: ByteArray? = null
         internal set
 
+    /**
+     * Conformance test seam: stamp the receiving-interface hash on a crafted
+     * inbound packet, the kotlin equivalent of the reference setting
+     * `rx.receiving_interface = <iface>` before feeding a hand-built packet to
+     * Link.validateRequest / link.receive (reticulum-conformance reference/
+     * wire_tcp.py). The setter is internal so the separate-module bridge needs
+     * this seam. No port logic — just exposes the existing field.
+     */
+    fun setReceivingInterfaceHashForTest(hash: ByteArray?) {
+        receivingInterfaceHash = hash
+    }
+
     /** Physical layer signal stats from receiving interface. */
     var rssi: Int? = null
         internal set
@@ -82,9 +102,12 @@ class Packet private constructor(
     var q: Float? = null
         internal set
 
-    /** Whether this packet has been sent. */
+    /**
+     * Whether this packet has been sent. Public-settable, as python's
+     * `Packet.sent` attribute is (resend()'s precondition; the conformance
+     * bridge sets it exactly as the python reference bridge does).
+     */
     var sent: Boolean = false
-        private set
 
     /** The timestamp when the packet was sent. */
     var sentAt: Long? = null
@@ -132,44 +155,73 @@ class Packet private constructor(
     }
 
     /**
-     * Pack the packet into raw bytes.
+     * Pack the packet into raw bytes, mirroring python Packet.pack
+     * (Packet.py:186-238).
+     *
+     * With a [destination] attached (builder path, [create]): the ciphertext
+     * is produced HERE, fresh on every pack — python encrypts inside pack()
+     * precisely so resend() re-packs with new ephemeral key material/IV —
+     * via python's exact branch table of unencrypted packet classes; and a
+     * HEADER_2 header only assembles for ANNOUNCE packets (any other type
+     * never assigns ciphertext and pack fails, as python's AttributeError
+     * path does).
+     *
+     * Without a destination ([createRaw] path — transport re-wraps, proofs,
+     * pre-encrypted link traffic): [data] IS the final payload and is passed
+     * through untouched, matching how python transport code splices raw
+     * bytes rather than re-packing.
      */
     fun pack(): ByteArray {
-        val result = mutableListOf<Byte>()
+        var header = byteArrayOf(getPackedFlags().toByte(), hops.toByte())
+        var ciphertext: ByteArray? = null
 
-        // Flags byte
-        result.add(getPackedFlags().toByte())
-
-        // Hops byte
-        result.add(hops.toByte())
-
-        // Header content depends on type
         when (headerType) {
             HeaderType.HEADER_1 -> {
-                // Destination hash
-                result.addAll(destinationHash.toList())
+                header += destinationHash
+                val dest = destination
+                ciphertext = if (dest == null) {
+                    data
+                } else when {
+                    // python's unencrypted classes (Packet.py:189-212)
+                    packetType == PacketType.ANNOUNCE -> data
+                    packetType == PacketType.LINKREQUEST -> data
+                    packetType == PacketType.PROOF && context == PacketContext.RESOURCE_PRF -> data
+                    packetType == PacketType.PROOF && dest.type == DestinationType.LINK -> data
+                    context == PacketContext.RESOURCE -> data
+                    context == PacketContext.KEEPALIVE -> data
+                    context == PacketContext.CACHE_REQUEST -> data
+                    else -> dest.encrypt(data)
+                }
             }
             HeaderType.HEADER_2 -> {
-                // Transport ID first
                 val tid = transportId ?: throw IllegalStateException(
-                    "HEADER_2 packets require a transport ID"
+                    "Packet with header type 2 must have a transport ID"
                 )
-                result.addAll(tid.toList())
-                // Then destination hash
-                result.addAll(destinationHash.toList())
+                header += tid
+                header += destinationHash
+                ciphertext = if (destination == null) {
+                    data
+                } else if (packetType == PacketType.ANNOUNCE) {
+                    // Announce packets are not encrypted (Packet.py:224-226);
+                    // python assigns ciphertext ONLY for announces here.
+                    data
+                } else {
+                    null
+                }
             }
         }
 
-        // Context byte
-        result.add(context.value.toByte())
+        // python: a destination-built non-ANNOUNCE HEADER_2 never assigns
+        // self.ciphertext, so raw assembly raises (AttributeError upstream).
+        val body = ciphertext ?: throw IllegalStateException(
+            "Packet with header type 2 can only be assembled for announces"
+        )
 
-        // Data
-        result.addAll(data.toList())
-
-        val packed = result.toByteArray()
+        header += byteArrayOf(contextRaw.toByte())
+        val packed = header + body
         raw = packed
 
-        // Validate MTU (per-packet MTU, set from destination/link MTU or global default)
+        // python: IOError("Packet size of X exceeds MTU of Y bytes")
         if (packed.size > mtu) {
             throw IllegalStateException(
                 "Packet size of ${packed.size} exceeds MTU of ${mtu} bytes"
@@ -185,6 +237,12 @@ class Packet private constructor(
      * For packet hash calculation, the transport_id is excluded for HEADER_2 packets,
      * and only the lower 4 bits of the flags byte are used (masking header_type and context_flag).
      */
+    /**
+     * The packet hash: full SHA-256 of the hashable part, exactly python
+     * Packet.get_hash (Packet.py:356-358) — stable across hops/transport_id.
+     */
+    fun getHash(): ByteArray = Hashes.fullHash(getHashablePart())
+
     fun getHashablePart(): ByteArray {
         val packed = raw ?: pack()
 
@@ -222,17 +280,10 @@ class Packet private constructor(
             contextFlag: ContextFlag = ContextFlag.UNSET,
             createReceipt: Boolean = true
         ): Packet {
-            // Determine if we need to encrypt
-            val packetData = when {
-                packetType == PacketType.ANNOUNCE -> data // Announces are not encrypted
-                packetType == PacketType.LINKREQUEST -> data // Link requests are not encrypted
-                context == PacketContext.RESOURCE -> data // Resources handle their own encryption
-                context == PacketContext.CACHE_REQUEST -> data // Cache requests are not encrypted
-                context == PacketContext.KEEPALIVE -> data // Keepalives are not encrypted
-                packetType == PacketType.PROOF && context == PacketContext.RESOURCE_PRF -> data // Resource proofs
-                else -> destination.encrypt(data) // Normal encryption
-            }
-
+            // python encrypts inside pack(), NOT at construction — so that
+            // resend()'s re-pack produces fresh ephemeral key material/IV
+            // (Packet.py:305-323). data stays plaintext here; pack() applies
+            // python's unencrypted-class branch table.
             return Packet(
                 packetType = packetType,
                 headerType = headerType,
@@ -243,7 +294,7 @@ class Packet private constructor(
                 hops = 0,
                 destinationHash = destination.hash.copyOf(),
                 transportId = transportId?.copyOf(),
-                data = packetData,
+                data = data,
                 createReceipt = createReceipt
             ).also {
                 it.destination = destination
@@ -315,12 +366,12 @@ class Packet private constructor(
                 val context: PacketContext
                 val data: ByteArray
 
+                val contextByte: Int
                 when (headerType) {
                     HeaderType.HEADER_1 -> {
                         transportId = null
                         destinationHash = raw.copyOfRange(2, 2 + dstLen)
-                        val contextByte = raw[2 + dstLen].toInt() and 0xFF
-                        context = PacketContext.fromValue(contextByte)
+                        contextByte = raw[2 + dstLen].toInt() and 0xFF
                         data = raw.copyOfRange(3 + dstLen, raw.size)
                     }
                     HeaderType.HEADER_2 -> {
@@ -329,10 +380,15 @@ class Packet private constructor(
                         }
                         transportId = raw.copyOfRange(2, 2 + dstLen)
                         destinationHash = raw.copyOfRange(2 + dstLen, 2 + 2 * dstLen)
-                        context = PacketContext.fromValue(raw[2 + 2 * dstLen].toInt() and 0xFF)
+                        contextByte = raw[2 + 2 * dstLen].toInt() and 0xFF
                         data = raw.copyOfRange(3 + 2 * dstLen, raw.size)
                     }
                 }
+                // python keeps context as a raw int — an unknown code point
+                // parses fine and matches no dispatch branch. UNKNOWN +
+                // contextRaw preserve that (forward compatibility).
+                context = PacketContext.entries.find { it.value == contextByte }
+                    ?: PacketContext.UNKNOWN
 
                 Packet(
                     packetType = packetType,
@@ -346,6 +402,7 @@ class Packet private constructor(
                     transportId = transportId,
                     data = data
                 ).also {
+                    it.contextRaw = contextByte
                     it.raw = raw.copyOf()
                 }
             } catch (e: Exception) {

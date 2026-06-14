@@ -161,16 +161,30 @@ object KISS {
      * @param onFrame Callback invoked with (command, data) for each complete frame
      * @return Deframer instance
      */
-    fun createDeframer(onFrame: (command: Byte, data: ByteArray) -> Unit): Deframer {
-        return Deframer(onFrame)
+    fun createDeframer(
+        hwMtu: Int = Int.MAX_VALUE,
+        onFrame: (command: Byte, data: ByteArray) -> Unit,
+    ): Deframer {
+        return Deframer(onFrame, hwMtu)
     }
 
     /**
      * Streaming KISS deframer.
      *
      * Accumulates incoming bytes and emits complete frames via callback.
+     *
+     * @param hwMtu caps the emitted (decoded) frame to its first [hwMtu] bytes,
+     *   mirroring python's per-byte `len(data_buffer) < self.HW_MTU` accumulation
+     *   gate (TCPInterface.py:370) which drops payload bytes once the decoded
+     *   buffer reaches HW_MTU. Truncating the fully-decoded frame left-to-right
+     *   is byte-exactly equivalent because python's gate also counts decoded
+     *   bytes left-to-right and the command nibble is never appended. Defaults to
+     *   uncapped so existing callers are unchanged.
      */
-    class Deframer(private val onFrame: (command: Byte, data: ByteArray) -> Unit) {
+    class Deframer(
+        private val onFrame: (command: Byte, data: ByteArray) -> Unit,
+        private val hwMtu: Int = Int.MAX_VALUE,
+    ) {
         private var buffer = ByteArrayOutputStream()
         private var inFrame = false
         private var command: Byte = CMD_UNKNOWN
@@ -189,8 +203,11 @@ object KISS {
                             val frameData = buffer.toByteArray()
                             buffer.reset()
                             val unescaped = unescape(frameData)
-                            if (unescaped.isNotEmpty()) {
-                                onFrame(command, unescaped)
+                            // python TCPInterface.py:370 — payload bytes past HW_MTU
+                            // are never accumulated; truncate the decoded frame to match.
+                            val capped = if (unescaped.size > hwMtu) unescaped.copyOf(hwMtu) else unescaped
+                            if (capped.isNotEmpty()) {
+                                onFrame(command, capped)
                             }
                         }
                         // Start of new frame
