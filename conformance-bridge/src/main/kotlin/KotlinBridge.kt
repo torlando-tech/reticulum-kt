@@ -159,6 +159,31 @@ fun result(vararg pairs: Pair<String, JsonElement>): JsonObject {
 
 fun hexVal(data: ByteArray): JsonPrimitive = JsonPrimitive(data.toHex())
 fun strVal(s: String): JsonPrimitive = JsonPrimitive(s)
+
+/**
+ * Resolve the HKDF salt used by RNS ratchet encryption — the destination
+ * Identity's hash (RNS.Identity.encrypt uses get_salt() == self.hash). The
+ * conformance suite supplies it in one of two interchangeable forms:
+ *
+ *  - identity_hash (hex): the wire-level salt, passed directly. This is the
+ *    form the reference bridge cmd_ratchet_encrypt/decrypt use on the suite's
+ *    main branch, and what the random-16-byte identity_hash round-trip tests
+ *    rely on.
+ *  - public_key / private_key (hex): a full Identity, from which the same hash
+ *    is derived.
+ *
+ * Both yield the byte-identical salt, so the two impls interoperate either way.
+ */
+fun ratchetIdentityHash(p: JsonObject): ByteArray = when {
+    p.get("identity_hash") != null && !p.get("identity_hash").isJsonNull ->
+        p.hex("identity_hash")
+    p.get("public_key") != null && !p.get("public_key").isJsonNull ->
+        Identity.fromPublicKey(p.hex("public_key"), crypto).hash
+    p.get("private_key") != null && !p.get("private_key").isJsonNull ->
+        Identity.fromPrivateKey(p.hex("private_key"), crypto).hash
+    else -> throw IllegalArgumentException("Missing param: identity_hash")
+}
+
 fun intVal(i: Int): JsonPrimitive = JsonPrimitive(i)
 fun doubleVal(d: Double): JsonPrimitive = JsonPrimitive(d)
 fun boolVal(b: Boolean): JsonPrimitive = JsonPrimitive(b)
@@ -1197,21 +1222,34 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
         }
 
         "ratchet_encrypt" -> {
-            // Delegates to real Identity.encrypt(plaintext, ratchet=...) — the
-            // library performs the ECDH-with-ratchet, HKDF (salt = identity's
-            // own hash) and Token encryption itself, mirroring the reference's
-            // cmd_ratchet_encrypt. Non-deterministic; round-trip via
-            // ratchet_decrypt.
-            val identity = Identity.fromPublicKey(p.hex("public_key"), crypto)
-            result("ciphertext" to hexVal(
-                identity.encrypt(p.hex("plaintext"), ratchet = p.hex("ratchet_public"))))
+            // Reproduces RNS.Identity.encrypt(plaintext, ratchet=ratchet_public):
+            // a fresh ephemeral X25519 key, ECDH against the ratchet public key,
+            // HKDF (length 64, salt = the destination identity's hash, context =
+            // None) and a Token. The salt is resolved from either identity_hash
+            // (the wire form the suite's main branch uses) or a full public_key
+            // (see ratchetIdentityHash) — both produce the identical salt that
+            // Identity.encrypt's get_salt() would. Non-deterministic; round-trip
+            // via ratchet_decrypt.
+            val ratchetPublic = p.hex("ratchet_public")
+            val plaintext = p.hex("plaintext")
+            val identityHash = ratchetIdentityHash(p)
+            val ephemeral = crypto.generateX25519KeyPair()
+            val shared = crypto.x25519Exchange(ephemeral.privateKey, ratchetPublic)
+            val derived = crypto.hkdf(64, shared, identityHash, null)
+            val token = Token(derived, crypto)
+            result("ciphertext" to hexVal(ephemeral.publicKey + token.encrypt(plaintext)))
         }
 
         "ratchet_decrypt" -> {
-            // Delegates to real Identity.decrypt with the ordered ratchet trial
-            // list, enforcement flag, and ratchet-id receiver — mirroring the
-            // reference's cmd_ratchet_decrypt contract: plaintext may be null,
-            // latest_ratchet_id is the id of the winning ratchet or null.
+            // Two interchangeable contracts:
+            //  - private_key form: delegate to the real Identity.decrypt with the
+            //    ordered ratchet trial list, enforcement flag and ratchet-id
+            //    receiver (salt = identity.hash). plaintext may be null,
+            //    latest_ratchet_id is the winning ratchet's id or null.
+            //  - identity_hash form (suite main branch): the salt IS identity_hash,
+            //    a single ratchet private key is trialled — manual ECDH + HKDF +
+            //    Token decrypt, mirroring the reference's cmd_ratchet_decrypt.
+            val ciphertext = p.hex("ciphertext")
             val ratchets: List<ByteArray>? = when {
                 p.get("ratchet_privates")?.isJsonArray == true ->
                     p.stringArray("ratchet_privates").map { it.fromHex() }
@@ -1219,19 +1257,48 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
                     listOf(p.hex("ratchet_private"))
                 else -> null
             }
-            val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
-            val receiver = Identity.RatchetIdReceiver()
-            val plaintext = identity.decrypt(
-                p.hex("ciphertext"),
-                ratchets = ratchets,
-                enforceRatchets = p.boolOpt("enforce_ratchets") ?: false,
-                ratchetIdReceiver = receiver,
-            )
-            result(
-                "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
-                "latest_ratchet_id" to
-                    (receiver.latestRatchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
-            )
+            if (p.get("private_key") != null && !p.get("private_key").isJsonNull) {
+                val identity = Identity.fromPrivateKey(p.hex("private_key"), crypto)
+                val receiver = Identity.RatchetIdReceiver()
+                val plaintext = identity.decrypt(
+                    ciphertext,
+                    ratchets = ratchets,
+                    enforceRatchets = p.boolOpt("enforce_ratchets") ?: false,
+                    ratchetIdReceiver = receiver,
+                )
+                result(
+                    "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                    "latest_ratchet_id" to
+                        (receiver.latestRatchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                )
+            } else {
+                val identityHash = p.hex("identity_hash")
+                val ratchetPriv = ratchets?.firstOrNull()
+                    ?: throw IllegalArgumentException("Missing param: ratchet_private")
+                if (ciphertext.size <= 32) {
+                    result(
+                        "plaintext" to JsonNull.INSTANCE,
+                        "latest_ratchet_id" to JsonNull.INSTANCE,
+                    )
+                } else {
+                    val ephemeralPub = ciphertext.copyOfRange(0, 32)
+                    val tokenData = ciphertext.copyOfRange(32, ciphertext.size)
+                    val shared = crypto.x25519Exchange(ratchetPriv, ephemeralPub)
+                    val derived = crypto.hkdf(64, shared, identityHash, null)
+                    val plaintext = try {
+                        Token(derived, crypto).decrypt(tokenData)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    val ratchetId = plaintext?.let {
+                        Hashes.fullHash(crypto.x25519PublicFromPrivate(ratchetPriv)).copyOf(10)
+                    }
+                    result(
+                        "plaintext" to (plaintext?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                        "latest_ratchet_id" to (ratchetId?.let { hexVal(it) } ?: JsonNull.INSTANCE),
+                    )
+                }
+            }
         }
 
         "ratchet_extract_from_announce" -> {
