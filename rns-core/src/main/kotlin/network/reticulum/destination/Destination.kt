@@ -539,6 +539,17 @@ class Destination private constructor(
 
         val file: File? = if (storedBytes == null && ratchetsPath != null) File(ratchetsPath!!) else null
         if (storedBytes == null && (file == null || !file.exists())) {
+            // python Destination._reload_ratchets else-branch (Destination.py
+            // 1.1.9 :459-463): when no existing ratchet data is found, initialise
+            // an empty ratchet list and persist a fresh signed store. This is how
+            // enable_ratchets creates the on-disk file WITHOUT eagerly rotating —
+            // the first ratchet is added later by announce()/rotate_ratchets().
+            val hasSink = ratchetsPath != null ||
+                network.reticulum.transport.Transport.destinationRatchetStore != null
+            if (hasSink) {
+                ratchets.clear()
+                persistRatchets()
+            }
             return false
         }
 
