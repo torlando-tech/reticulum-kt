@@ -3,9 +3,10 @@ package network.reticulum.interfaces.tcp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
@@ -92,6 +93,31 @@ class TCPClientInterfaceBackoffTest {
             )
             serverThread.join(1_000)
         }
+    }
+
+    @Test
+    @Timeout(8, unit = TimeUnit.SECONDS)
+    fun `configured retry limit is checked after Python fixed wait`() = runBlocking {
+        val unavailablePort = ServerSocket(0).use { it.localPort }
+        val iface = TCPClientInterface(
+            name = "PythonReconnectLimit",
+            targetHost = "127.0.0.1",
+            targetPort = unavailablePort,
+            connectTimeoutMs = 250,
+            maxReconnectAttempts = 0,
+        )
+        interfaces.add(iface)
+
+        iface.start()
+        delay(1_000)
+        assertFalse(iface.detached.get(), "Python waits five seconds before checking the retry limit")
+
+        withTimeout(5_500) {
+            while (!iface.detached.get()) {
+                delay(25)
+            }
+        }
+        assertTrue(iface.detached.get())
     }
 
     @Test
