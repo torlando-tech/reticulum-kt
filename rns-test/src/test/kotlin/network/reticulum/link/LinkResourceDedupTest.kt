@@ -6,6 +6,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -208,6 +209,35 @@ class LinkResourceDedupTest {
         } finally {
             acceptedResource.cancel()
         }
+    }
+
+    @Test
+    @DisplayName("Resource.accept does not restart watchdog after resource-started cancels")
+    @Timeout(5)
+    fun `Resource accept does not restart watchdog after resource started cancels`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAD.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+
+        var callbackCount = 0
+        link.setResourceStartedCallback { resourceObj ->
+            callbackCount++
+            (resourceObj as Resource).cancel()
+        }
+
+        val accepted = assertNotNull(
+            Resource.accept(advertisement = adv, link = link),
+            "Callback cancellation should conclude, not invalidate, the accepted Resource",
+        )
+
+        assertEquals(1, callbackCount, "resource-started must run exactly once")
+        assertEquals(ResourceConstants.FAILED, accepted.status, "Callback cancellation must remain terminal")
+        assertFalse(accepted.watchdogActiveForTest(), "A terminal Resource must not restart its watchdog")
+        assertFalse(
+            link.hasIncomingResource(advHash),
+            "Callback cancellation must remove the Resource from inbound tracking",
+        )
     }
 
     @Test
