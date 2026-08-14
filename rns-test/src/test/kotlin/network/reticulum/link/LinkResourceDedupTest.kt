@@ -156,6 +156,46 @@ class LinkResourceDedupTest {
     }
 
     @Test
+    @DisplayName("Resource.accept invokes resource-started synchronously before requesting parts")
+    @Timeout(5)
+    fun `Resource accept invokes resource started before requesting parts`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAC.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+
+        var callbackCount = 0
+        link.setResourceStartedCallback { resourceObj ->
+            val resource = resourceObj as Resource
+            callbackCount++
+            assertTrue(
+                link.hasIncomingResource(resource.hash),
+                "The Resource must be registered before resource-started runs",
+            )
+            assertEquals(
+                0,
+                resource.requestNextEmitCountForTest(),
+                "No part request may be emitted before resource-started returns",
+            )
+        }
+
+        // Resource.accept must invoke the callback after registration and before
+        // requestNext(). This is where callers configure per-transfer limits.
+        val accepted = Resource.accept(advertisement = adv, link = link)
+
+        assertNotNull(accepted, "Synthetic advertisement should be accepted")
+        assertTrue(
+            accepted.requestNextEmitCountForTest() > 0,
+            "Resource.accept should request parts only after resource-started returns",
+        )
+        assertEquals(
+            1,
+            callbackCount,
+            "resource-started must run synchronously before the first part request",
+        )
+    }
+
+    @Test
     @DisplayName("Resource.accept returns null on duplicate-hash advertisement (covers all 4 call sites)")
     @Timeout(5)
     fun `Resource accept returns null on duplicate-hash advertisement`() {

@@ -2366,15 +2366,6 @@ class Link private constructor(
                         )
                     if (resource != null) {
                         registerIncomingResource(resource)
-                        callbacks.resourceStarted?.let { callback ->
-                            thread(isDaemon = true) {
-                                try {
-                                    callback(resource)
-                                } catch (e: Exception) {
-                                    log("Error in resource started callback: ${e.message}")
-                                }
-                            }
-                        }
                     }
                 }
                 ACCEPT_APP -> {
@@ -2397,15 +2388,6 @@ class Link private constructor(
                                     )
                                 if (resource != null) {
                                     registerIncomingResource(resource)
-                                    callbacks.resourceStarted?.let { startCallback ->
-                                        thread(isDaemon = true) {
-                                            try {
-                                                startCallback(resource)
-                                            } catch (e: Exception) {
-                                                log("Error in resource started callback: ${e.message}")
-                                            }
-                                        }
-                                    }
                                 }
                             } else {
                                 log("Rejecting resource ${advertisement.hash.toHexString()} (strategy: ACCEPT_APP, callback returned false)")
@@ -2793,6 +2775,23 @@ class Link private constructor(
         synchronized(incomingResources) {
             incomingResources.any { it.hash.contentEquals(advertisementHash) }
         }
+
+    /**
+     * Invoke the inbound Resource start callback synchronously.
+     *
+     * Python calls this callback inside `Resource.accept`, after registration
+     * and before requesting the first parts. Keep the same ordering so callback
+     * configuration is guaranteed to apply before any payload can assemble.
+     */
+    internal fun resourceStarted(resource: network.reticulum.resource.Resource) {
+        callbacks.resourceStarted?.let { callback ->
+            try {
+                callback(resource)
+            } catch (e: Exception) {
+                log("Error in resource started callback: ${e.message}")
+            }
+        }
+    }
 
     /**
      * Test-only: snapshot of the current incoming resource hashes.

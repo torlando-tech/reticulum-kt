@@ -172,6 +172,14 @@ class Resource private constructor(
                 progressCallback?.let { resource.callbacks.progress = it }
 
                 resource.initializeFromAdvertisement(advertisement)
+                // Python invokes resource_started synchronously after the
+                // inbound Resource is registered and before hashmap_update()
+                // requests the first parts (Resource.py:223-234). This ordering
+                // is load-bearing: applications use the callback to configure
+                // per-transfer limits such as max_decompressed_size. Deferring
+                // it lets a small compressed Resource arrive and assemble with
+                // the default limit before the callback applies its bound.
+                link.resourceStarted(resource)
                 resource.requestNext()
 
                 resource
