@@ -1452,11 +1452,21 @@ class Resource private constructor(
         // Necessary now that cancel() fires `callbacks.failed?.invoke`:
         // without this guard, a double-cancel from application code +
         // watchdog timeout would deliver the failed callback twice.
-        if (status >= ResourceConstants.COMPLETE) {
-            return
+        val transitionedToFailed = synchronized(this) {
+            if (status >= ResourceConstants.COMPLETE) {
+                false
+            } else {
+                // Publish the terminal status while holding the same monitor used
+                // by startWatchdog(). Python likewise sets FAILED before stopping
+                // its watchdog. This closes the stop-then-status gap where another
+                // thread could otherwise install a fresh watchdog on a canceled
+                // Resource.
+                status = ResourceConstants.FAILED
+                stopWatchdog()
+                true
+            }
         }
-        stopWatchdog()
-        status = ResourceConstants.FAILED
+        if (!transitionedToFailed) return
         // python Resource.py:1087-1094 — when the INITIATOR cancels a still-ACTIVE
         // transfer it sends a RESOURCE_ICL packet carrying the resource hash so the
         // receiver tears its inbound resource down too. Without this the receiver's
@@ -1766,6 +1776,7 @@ class Resource private constructor(
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
     fun watchdogActiveForTest(): Boolean = watchdogActive
+    fun startWatchdogForTest() = startWatchdog()
 
     /** Drive the private assemble(). */
     fun assembleForTest() = assemble()

@@ -15,6 +15,9 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -234,10 +237,53 @@ class LinkResourceDedupTest {
         assertEquals(1, callbackCount, "resource-started must run exactly once")
         assertEquals(ResourceConstants.FAILED, accepted.status, "Callback cancellation must remain terminal")
         assertFalse(accepted.watchdogActiveForTest(), "A terminal Resource must not restart its watchdog")
+        accepted.startWatchdogForTest()
+        assertFalse(accepted.watchdogActiveForTest(), "Explicit restart must reject a terminal Resource")
         assertFalse(
             link.hasIncomingResource(advHash),
             "Callback cancellation must remove the Resource from inbound tracking",
         )
+    }
+
+    @Test
+    @DisplayName("Concurrent cancel and watchdog start leave Resource terminal and stopped")
+    @Timeout(5)
+    fun `Concurrent cancel and watchdog start leave Resource terminal and stopped`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAE.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+        link.setResourceStartedCallback { }
+
+        val accepted = assertNotNull(Resource.accept(advertisement = adv, link = link))
+        assertTrue(accepted.watchdogActiveForTest(), "Test requires an initially active watchdog")
+
+        val ready = CountDownLatch(2)
+        val start = CountDownLatch(1)
+        val finished = CountDownLatch(2)
+        val cancelThread = thread(start = true, isDaemon = true) {
+            ready.countDown()
+            start.await()
+            accepted.cancel()
+            finished.countDown()
+        }
+        val restartThread = thread(start = true, isDaemon = true) {
+            ready.countDown()
+            start.await()
+            accepted.startWatchdogForTest()
+            finished.countDown()
+        }
+
+        assertTrue(ready.await(1, TimeUnit.SECONDS), "Both lifecycle operations must be ready")
+        start.countDown()
+        assertTrue(finished.await(2, TimeUnit.SECONDS), "Both lifecycle operations must finish")
+        cancelThread.join()
+        restartThread.join()
+
+        assertEquals(ResourceConstants.FAILED, accepted.status)
+        assertFalse(accepted.watchdogActiveForTest(), "Atomic terminal transition must win either ordering")
+        accepted.startWatchdogForTest()
+        assertFalse(accepted.watchdogActiveForTest(), "Terminal Resource must reject later watchdog starts")
     }
 
     @Test
