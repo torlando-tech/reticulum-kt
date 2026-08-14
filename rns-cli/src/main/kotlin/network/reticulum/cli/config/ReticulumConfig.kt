@@ -55,7 +55,18 @@ data class InterfaceConfig(
     val listenPort: Int? get() = (options["listen_port"] as? Number)?.toInt()
     val mode: Int? get() = (options["selected_interface_mode"] as? Number)?.toInt()
     val bitrate: Int? get() = (options["configured_bitrate"] as? Number)?.toInt()
-    val maxReconnectTries: Int? get() = (options["max_reconnect_tries"] as? Number)?.toInt()
+    val maxReconnectTries: Int?
+        get() {
+            val value = options["max_reconnect_tries"] ?: return null
+            return when (value) {
+                is Byte -> value.toInt()
+                is Short -> value.toInt()
+                is Int -> value
+                is Long -> value.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+                is String -> value.toPythonDecimalIntOrNull()
+                else -> null
+            } ?: throw IllegalArgumentException("max_reconnect_tries must be a 32-bit integer")
+        }
 
     // AutoInterface options
     val groupId: String? get() = options["group_id"] as? String
@@ -77,6 +88,45 @@ data class InterfaceConfig(
         else -> null
     }
 }
+
+private fun String.toPythonDecimalIntOrNull(): Int? {
+    val value = trim()
+    if (value.isEmpty()) return null
+
+    val normalized = StringBuilder(value.length)
+    var index = 0
+    if (value.first() == '+' || value.first() == '-') {
+        normalized.append(value.first())
+        index++
+        if (index == value.length) return null
+    }
+
+    var previousWasDigit = false
+    while (index < value.length) {
+        val codePoint = value.codePointAt(index)
+        val nextIndex = index + Character.charCount(codePoint)
+        if (codePoint == '_'.code) {
+            if (
+                !previousWasDigit ||
+                nextIndex >= value.length ||
+                !value.codePointAt(nextIndex).isPythonDecimalDigit()
+            ) {
+                return null
+            }
+            previousWasDigit = false
+        } else {
+            if (!codePoint.isPythonDecimalDigit()) return null
+            normalized.append(Character.digit(codePoint, 10))
+            previousWasDigit = true
+        }
+        index = nextIndex
+    }
+
+    return normalized.toString().toIntOrNull()
+}
+
+private fun Int.isPythonDecimalDigit(): Boolean =
+    Character.getType(this) == Character.DECIMAL_DIGIT_NUMBER.toInt()
 
 /**
  * Supported interface types.
