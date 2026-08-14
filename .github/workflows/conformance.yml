@@ -43,7 +43,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install pytest
+        run: pip install -r reticulum-conformance/requirements.txt
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
