@@ -26,7 +26,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 
 | Interface | Status | Notes |
 |-----------|--------|-------|
-| TCP Server/Client | Complete | HDLC framing, exponential backoff reconnect |
+| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python |
 | UDP | Complete | Unicast, broadcast, multicast |
 | Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps |
 | RNode (LoRa) | Complete | Full KISS protocol, firmware checking, BLE + serial transport |

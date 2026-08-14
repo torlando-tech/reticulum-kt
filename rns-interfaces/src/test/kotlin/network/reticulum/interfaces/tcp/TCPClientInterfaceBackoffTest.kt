@@ -10,14 +10,14 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Timeout
+import java.net.ServerSocket
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 /**
- * Tests for TCPClientInterface backoff integration.
- *
- * These tests verify that ExponentialBackoff is properly integrated
- * into TCPClientInterface. The core backoff logic is tested in
- * ExponentialBackoffTest - these tests focus on the integration.
+ * Tests for TCPClientInterface reconnect behavior.
  */
 class TCPClientInterfaceBackoffTest {
 
@@ -54,6 +54,44 @@ class TCPClientInterfaceBackoffTest {
         assertNotNull(iface1)
         assertNotNull(iface5)
         assertNotNull(ifaceDefault)
+    }
+
+    @Test
+    @Timeout(18, unit = TimeUnit.SECONDS)
+    fun `short lived connections retain Python fixed five second reconnect wait`() {
+        ServerSocket(0).use { server ->
+            val acceptedAt = CopyOnWriteArrayList<Long>()
+            val accepted = CountDownLatch(3)
+            val serverThread = thread(start = true, isDaemon = true) {
+                repeat(3) {
+                    server.accept().use { socket ->
+                        acceptedAt += System.nanoTime()
+                        accepted.countDown()
+                        socket.setSoLinger(true, 0)
+                    }
+                }
+            }
+
+            val iface = TCPClientInterface(
+                name = "PythonReconnectCadence",
+                targetHost = "127.0.0.1",
+                targetPort = server.localPort,
+                connectTimeoutMs = 250,
+            )
+            interfaces.add(iface)
+
+            iface.start()
+            assertTrue(accepted.await(15, TimeUnit.SECONDS), "Expected initial and two reconnect attempts")
+
+            val intervalsMs = acceptedAt.zipWithNext { first, second ->
+                TimeUnit.NANOSECONDS.toMillis(second - first)
+            }
+            assertTrue(
+                intervalsMs.all { it in 4_500..8_000 },
+                "Python parity requires fixed five-second reconnect waits, observed $intervalsMs",
+            )
+            serverThread.join(1_000)
+        }
     }
 
     @Test

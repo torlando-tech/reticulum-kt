@@ -294,8 +294,8 @@ class ScopeInjectionTest {
             targetHost = "127.0.0.1",
             targetPort = 15311,
             connectTimeoutMs = 100,
-            // Use high maxReconnectAttempts so interface keeps retrying during test window
-            // (with exponential backoff starting at 1s, 10 attempts gives >2 minutes of retries)
+            // Use high maxReconnectAttempts so the interface keeps retrying during the test window.
+            // Python-compatible reconnects wait a fixed five seconds between attempts.
             maxReconnectAttempts = 10,
             parentScope = parentScope
         )
@@ -311,7 +311,7 @@ class ScopeInjectionTest {
         assertTrue(parentScope.isActive, "Parent scope should still be active")
         assertFalse(tcp.detached.get(), "Interface should NOT be detached while parent is active")
 
-        // Wait longer - still should not auto-detach (within backoff window)
+        // Wait longer - still should not auto-detach during the reconnect wait
         delay(500)
         assertFalse(tcp.detached.get(), "Interface should STILL not be detached after 800ms")
     }

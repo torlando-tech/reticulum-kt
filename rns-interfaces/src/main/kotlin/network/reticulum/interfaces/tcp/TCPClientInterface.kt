@@ -15,7 +15,6 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
-import network.reticulum.interfaces.backoff.ExponentialBackoff
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
 import java.io.IOException
@@ -41,6 +40,7 @@ class TCPClientInterface(
     private val targetPort: Int,
     private val useKissFraming: Boolean = false,
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
+    // Python RECONNECT_MAX_TRIES parity: null retries indefinitely.
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
     private val keepAlive: Boolean = true,
@@ -69,7 +69,7 @@ class TCPClientInterface(
         const val DEFAULT_IFAC_SIZE = 16
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
 
-        @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
+        /** Fixed reconnect wait matching Python TCPClientInterface.RECONNECT_WAIT. */
         const val RECONNECT_WAIT_MS = 5000L // 5 seconds
 
         /** Enable verbose debug logging via -Dreticulum.tcp.debug=true */
@@ -132,11 +132,6 @@ class TCPClientInterface(
     // Debug counters
     private val framesSent = AtomicLong(0)
     private val framesReceived = AtomicLong(0)
-
-    // Exponential backoff for reconnection: 1s, 2s, 4s... up to 60s, give up after maxReconnectAttempts
-    private val backoff = ExponentialBackoff(
-        maxAttempts = maxReconnectAttempts ?: 10
-    )
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope: CoroutineScope = createScope(parentScope).also {
@@ -271,7 +266,7 @@ class TCPClientInterface(
         } catch (e: Exception) {
             if (initial) {
                 log("Initial connection failed: ${e.message}")
-                log("Will retry with exponential backoff (1s, 2s, 4s... up to 60s)")
+                log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
             false
         }
@@ -280,19 +275,19 @@ class TCPClientInterface(
     private suspend fun reconnect() {
         if (reconnecting.getAndSet(true)) return
 
-        // Note: Do NOT reset backoff here - network change handler will reset when appropriate
-        // This allows progressive backoff across reconnect cycles
+        var attempts = 0
 
         while (!online.value && !detached.get()) {
-            val delayMs = backoff.nextDelay()
+            delay(RECONNECT_WAIT_MS)
+            attempts++
 
-            if (delayMs == null) {
-                log("Max reconnection attempts (${backoff.attemptCount}) reached, giving up")
+            // Python checks the configured limit after waiting and incrementing,
+            // before opening the next socket. A null limit retries indefinitely.
+            if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
+                log("Max reconnection attempts reached, giving up")
                 detach()
                 break
             }
-
-            delay(delayMs)
 
             // Check if scope still active after delay
             if (!ioScope.isActive) break
@@ -300,16 +295,15 @@ class TCPClientInterface(
             try {
                 if (connect()) {
                     if (!neverConnected.get()) {
-                        log("Reconnected successfully after ${backoff.attemptCount} attempts")
+                        log("Reconnected successfully after $attempts attempts")
                     }
-                    backoff.reset() // Success - reset for next time
                     break
                 }
             } catch (e: CancellationException) {
                 // Scope was cancelled, stop reconnecting
                 break
             } catch (e: Exception) {
-                log("Reconnection attempt ${backoff.attemptCount} failed: ${e.message}")
+                log("Reconnection attempt $attempts failed: ${e.message}")
             }
         }
 
@@ -469,16 +463,14 @@ class TCPClientInterface(
     /**
      * Notify the interface that the network has changed.
      *
-     * This resets the reconnection backoff counter, allowing quick
-     * reconnection attempts on the new network. Call this when:
+     * This requests reconnection on the new network when the interface is
+     * offline and no reconnect owner is active. Call this when:
      * - WiFi <-> cellular handoff occurs
      * - Network becomes available after being offline
      *
-     * Per CONTEXT.md: "Network changes reset the backoff counter"
      */
     fun onNetworkChanged() {
-        log("Network changed - resetting reconnection backoff")
-        backoff.reset()
+        log("Network changed - requesting reconnection")
 
         // If currently offline and not detached, trigger reconnection
         if (!online.value && !detached.get() && !reconnecting.get()) {

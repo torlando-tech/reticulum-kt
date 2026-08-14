@@ -38,7 +38,7 @@ LXMF has been extracted to a separate repository: [LXMF-kt](https://github.com/t
 - **Buffer**: Stream I/O over channels
 
 #### Interfaces
-- **TCP**: Client and server with HDLC framing, exponential backoff reconnect
+- **TCP**: Client and server with HDLC framing, fixed five-second reconnect matching Python
 - **UDP**: Unicast, broadcast, multicast
 - **Local**: Server/client IPC for sharing Reticulum across apps
 - **RNode (LoRa)**: Full KISS protocol, firmware checking, BLE + serial transport
