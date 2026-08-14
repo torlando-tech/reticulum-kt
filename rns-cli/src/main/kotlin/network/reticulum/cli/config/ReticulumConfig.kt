@@ -55,6 +55,7 @@ data class InterfaceConfig(
     val listenPort: Int? get() = (options["listen_port"] as? Number)?.toInt()
     val mode: Int? get() = (options["selected_interface_mode"] as? Number)?.toInt()
     val bitrate: Int? get() = (options["configured_bitrate"] as? Number)?.toInt()
+    val maxReconnectTries: Int? get() = (options["max_reconnect_tries"] as? Number)?.toInt()
 
     // AutoInterface options
     val groupId: String? get() = options["group_id"] as? String

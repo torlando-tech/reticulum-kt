@@ -86,7 +86,7 @@ object InterfaceConfigFactory {
     /**
      * Create a TCP client interface.
      */
-    private fun createTcpClient(config: InterfaceConfig): Interface? {
+    internal fun createTcpClient(config: InterfaceConfig): Interface? {
         val targetHost = config.targetHost
         val targetPort = config.targetPort
 
@@ -100,7 +100,8 @@ object InterfaceConfigFactory {
         return TCPClientInterface(
             name = config.name,
             targetHost = targetHost,
-            targetPort = targetPort
+            targetPort = targetPort,
+            maxReconnectAttempts = config.maxReconnectTries,
         )
     }
 
