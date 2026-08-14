@@ -15,6 +15,7 @@ import java.net.ServerSocket
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -79,6 +80,14 @@ class TCPClientInterfaceBackoffTest {
                 targetPort = server.localPort,
                 connectTimeoutMs = 250,
             )
+            val publishedConnections = AtomicInteger(0)
+            iface.onConnectionPublishedForTest = {
+                if (publishedConnections.incrementAndGet() == 2) {
+                    // Model an outgoing failure after the replacement socket is
+                    // published but before reconnect() installs its read loop.
+                    iface.teardown()
+                }
+            }
             interfaces.add(iface)
 
             iface.start()
