@@ -335,6 +335,7 @@ class Resource private constructor(
     // Watchdog
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
+    @Volatile private var cancelTransitionHookForTest: (() -> Unit)? = null
 
     // SDU for this resource — uses plain packet MDU (not link MDU) because
     // resource parts are already bulk-encrypted before splitting, and are sent
@@ -1462,6 +1463,7 @@ class Resource private constructor(
                 // thread could otherwise install a fresh watchdog on a canceled
                 // Resource.
                 status = ResourceConstants.FAILED
+                cancelTransitionHookForTest?.invoke()
                 stopWatchdog()
                 true
             }
@@ -1777,6 +1779,9 @@ class Resource private constructor(
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
     fun watchdogActiveForTest(): Boolean = watchdogActive
     fun startWatchdogForTest() = startWatchdog()
+    fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
+        cancelTransitionHookForTest = hook
+    }
 
     /** Drive the private assemble(). */
     fun assembleForTest() = assemble()

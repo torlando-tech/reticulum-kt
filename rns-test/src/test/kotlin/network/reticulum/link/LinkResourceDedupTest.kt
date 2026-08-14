@@ -258,32 +258,43 @@ class LinkResourceDedupTest {
         val accepted = assertNotNull(Resource.accept(advertisement = adv, link = link))
         assertTrue(accepted.watchdogActiveForTest(), "Test requires an initially active watchdog")
 
-        val ready = CountDownLatch(2)
-        val start = CountDownLatch(1)
-        val finished = CountDownLatch(2)
-        val cancelThread = thread(start = true, isDaemon = true) {
-            ready.countDown()
-            start.await()
-            accepted.cancel()
-            finished.countDown()
-        }
-        val restartThread = thread(start = true, isDaemon = true) {
-            ready.countDown()
-            start.await()
-            accepted.startWatchdogForTest()
-            finished.countDown()
+        val terminalPublished = CountDownLatch(1)
+        val releaseCancel = CountDownLatch(1)
+        accepted.setCancelTransitionHookForTest {
+            terminalPublished.countDown()
+            assertTrue(releaseCancel.await(2, TimeUnit.SECONDS), "Test must release cancellation")
         }
 
-        assertTrue(ready.await(1, TimeUnit.SECONDS), "Both lifecycle operations must be ready")
-        start.countDown()
-        assertTrue(finished.await(2, TimeUnit.SECONDS), "Both lifecycle operations must finish")
-        cancelThread.join()
-        restartThread.join()
-
+        val cancelThread = thread(start = true, isDaemon = true) { accepted.cancel() }
+        assertTrue(
+            terminalPublished.await(1, TimeUnit.SECONDS),
+            "Cancellation must publish FAILED while holding the watchdog monitor",
+        )
         assertEquals(ResourceConstants.FAILED, accepted.status)
-        assertFalse(accepted.watchdogActiveForTest(), "Atomic terminal transition must win either ordering")
-        accepted.startWatchdogForTest()
-        assertFalse(accepted.watchdogActiveForTest(), "Terminal Resource must reject later watchdog starts")
+
+        val restartThread = thread(start = true, isDaemon = true) { accepted.startWatchdogForTest() }
+        val blockedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+        while (restartThread.state != Thread.State.BLOCKED && restartThread.isAlive && System.nanoTime() < blockedDeadline) {
+            Thread.onSpinWait()
+        }
+
+        try {
+            assertEquals(
+                Thread.State.BLOCKED,
+                restartThread.state,
+                "Watchdog start must block on the atomic cancellation monitor",
+            )
+        } finally {
+            releaseCancel.countDown()
+            cancelThread.join(2_000)
+            restartThread.join(2_000)
+            accepted.setCancelTransitionHookForTest(null)
+        }
+
+        assertFalse(cancelThread.isAlive, "Cancellation must finish after test release")
+        assertFalse(restartThread.isAlive, "Watchdog restart must finish after cancellation")
+        assertEquals(ResourceConstants.FAILED, accepted.status)
+        assertFalse(accepted.watchdogActiveForTest(), "Atomic terminal transition must reject the waiting restart")
     }
 
     @Test
