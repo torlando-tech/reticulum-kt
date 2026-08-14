@@ -158,6 +158,11 @@ class TCPClientInterface(
     private var readJob: Job? = null
     private var connectJob: Job? = null
 
+    private data class EstablishedConnection(
+        val socket: Socket,
+        val inputStream: InputStream,
+    )
+
     /**
      * Create the appropriate coroutine scope based on parent.
      * - With parent: child scope that cancels when parent cancels (Android service lifecycle)
@@ -198,13 +203,16 @@ class TCPClientInterface(
 
     override fun start() {
         connectJob = ioScope.launch {
-            if (!connect(initial = true)) {
+            val connection = connect(initial = true)
+            if (connection == null) {
                 reconnect()
+            } else {
+                startReadLoop(connection.socket, connection.inputStream)
             }
         }
     }
 
-    private fun connect(initial: Boolean = false): Boolean {
+    private fun connect(initial: Boolean = false): EstablishedConnection? {
         return try {
             if (initial) {
                 log("Establishing TCP connection to $targetHost:$targetPort...")
@@ -260,54 +268,59 @@ class TCPClientInterface(
             // 100ms gives time for the handler thread to start blocking on recv()
             Thread.sleep(100)
 
-            // Pass socket and stream directly to avoid race conditions
-            startReadLoop(sock, inputStream)
-            true
+            EstablishedConnection(sock, inputStream)
         } catch (e: Exception) {
             if (initial) {
                 log("Initial connection failed: ${e.message}")
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
-            false
+            null
         }
     }
 
     private suspend fun reconnect() {
-        if (reconnecting.getAndSet(true)) return
+        if (!reconnecting.compareAndSet(false, true)) return
 
+        var connection: EstablishedConnection? = null
         var attempts = 0
+        try {
+            while (!online.value && !detached.get()) {
+                delay(RECONNECT_WAIT_MS)
+                attempts++
 
-        while (!online.value && !detached.get()) {
-            delay(RECONNECT_WAIT_MS)
-            attempts++
+                // Python checks the configured limit after waiting and incrementing,
+                // before opening the next socket. A null limit retries indefinitely.
+                if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
+                    log("Max reconnection attempts reached, giving up")
+                    detach()
+                    break
+                }
 
-            // Python checks the configured limit after waiting and incrementing,
-            // before opening the next socket. A null limit retries indefinitely.
-            if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
-                log("Max reconnection attempts reached, giving up")
-                detach()
-                break
-            }
+                // Check if scope still active after delay
+                if (!ioScope.isActive) break
 
-            // Check if scope still active after delay
-            if (!ioScope.isActive) break
-
-            try {
-                if (connect()) {
+                connection = connect()
+                if (connection != null) {
                     if (!neverConnected.get()) {
                         log("Reconnected successfully after $attempts attempts")
                     }
                     break
                 }
-            } catch (e: CancellationException) {
-                // Scope was cancelled, stop reconnecting
-                break
-            } catch (e: Exception) {
-                log("Reconnection attempt $attempts failed: ${e.message}")
             }
+        } catch (_: CancellationException) {
+            // Scope was cancelled, stop reconnecting.
+        } finally {
+            // Python clears reconnect ownership before starting the replacement
+            // read loop. This ensures an immediately closed replacement socket
+            // can synchronously claim the next reconnect instead of being dropped.
+            reconnecting.set(false)
         }
 
-        reconnecting.set(false)
+        connection?.let { established ->
+            if (ioScope.isActive && online.value && !detached.get()) {
+                startReadLoop(established.socket, established.inputStream)
+            }
+        }
     }
 
     private fun startReadLoop(sock: Socket, inputStream: InputStream) {
