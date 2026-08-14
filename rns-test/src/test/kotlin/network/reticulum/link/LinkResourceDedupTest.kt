@@ -14,10 +14,6 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.concurrent.thread
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -164,18 +160,13 @@ class LinkResourceDedupTest {
     @Timeout(5)
     fun `Resource accept invokes resource started before requesting parts`() {
         val link = freshLink()
-        link.setRttForTest(1)
         val advHash = ByteArray(16) { 0xAC.toByte() }
         val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
         assertNotNull(adv, "Test sanity: advertisement should unpack")
 
         var callbackCount = 0
-        val callbackEntered = CountDownLatch(1)
-        val releaseCallback = CountDownLatch(1)
-        val callbackResource = AtomicReference<Resource>()
         link.setResourceStartedCallback { resourceObj ->
             val resource = resourceObj as Resource
-            callbackResource.set(resource)
             callbackCount++
             assertTrue(
                 link.hasIncomingResource(resource.hash),
@@ -186,44 +177,28 @@ class LinkResourceDedupTest {
                 resource.requestNextEmitCountForTest(),
                 "No part request may be emitted before resource-started returns",
             )
-            callbackEntered.countDown()
-            assertTrue(
-                releaseCallback.await(3, TimeUnit.SECONDS),
-                "Test must release the blocked resource-started callback",
+            assertFalse(
+                resource.watchdogActiveForTest(),
+                "Watchdog must not start before resource-started returns",
             )
         }
 
         // Resource.accept must invoke the callback after registration and before
-        // both requestNext() and watchdog startup. A 1 ms RTT makes an incorrectly
-        // early watchdog retry on its first one-second tick while the callback is
-        // blocked, deterministically reproducing the CI race.
-        var accepted: Resource? = null
-        val acceptThread = thread(start = true, isDaemon = true) {
-            accepted = Resource.accept(advertisement = adv, link = link)
-        }
-
-        assertTrue(
-            callbackEntered.await(2, TimeUnit.SECONDS),
-            "resource-started callback should run during Resource.accept",
+        // both requestNext() and watchdog startup. The callback's direct state
+        // assertions make the race regression deterministic without wall-clock
+        // sleeps or scheduler assumptions.
+        val acceptedResource = assertNotNull(
+            Resource.accept(advertisement = adv, link = link),
+            "Synthetic advertisement should be accepted",
         )
-        try {
-            Thread.sleep(1_200)
-            assertEquals(
-                0,
-                callbackResource.get().requestNextEmitCountForTest(),
-                "Neither initial nor watchdog part requests may run while resource-started is blocked",
-            )
-        } finally {
-            releaseCallback.countDown()
-            acceptThread.join(2_000)
-        }
-
-        assertFalse(acceptThread.isAlive, "Resource.accept should finish after callback release")
-        val acceptedResource = assertNotNull(accepted, "Synthetic advertisement should be accepted")
         try {
             assertTrue(
                 acceptedResource.requestNextEmitCountForTest() > 0,
                 "Resource.accept should request parts only after resource-started returns",
+            )
+            assertTrue(
+                acceptedResource.watchdogActiveForTest(),
+                "Resource.accept should start the watchdog after the initial part request",
             )
             assertEquals(
                 1,

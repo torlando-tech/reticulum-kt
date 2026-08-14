@@ -1747,6 +1747,7 @@ class Resource private constructor(
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
+    fun watchdogActiveForTest(): Boolean = watchdogActive
 
     /** Drive the private assemble(). */
     fun assembleForTest() = assemble()
