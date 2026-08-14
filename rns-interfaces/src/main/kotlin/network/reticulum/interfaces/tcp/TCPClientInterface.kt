@@ -15,7 +15,6 @@ import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
 import network.reticulum.interfaces.Interface
-import network.reticulum.interfaces.backoff.ExponentialBackoff
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.framing.KISS
 import java.io.IOException
@@ -26,6 +25,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * TCP client interface for Reticulum.
@@ -41,6 +41,7 @@ class TCPClientInterface(
     private val targetPort: Int,
     private val useKissFraming: Boolean = false,
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
+    // Python RECONNECT_MAX_TRIES parity: null retries indefinitely.
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
     private val keepAlive: Boolean = true,
@@ -69,7 +70,7 @@ class TCPClientInterface(
         const val DEFAULT_IFAC_SIZE = 16
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
 
-        @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
+        /** Fixed reconnect wait matching Python TCPClientInterface.RECONNECT_WAIT. */
         const val RECONNECT_WAIT_MS = 5000L // 5 seconds
 
         /** Enable verbose debug logging via -Dreticulum.tcp.debug=true */
@@ -116,8 +117,14 @@ class TCPClientInterface(
     override val ifacIdentity: Identity?
         get() = _ifacCredentials?.identity
 
+    private enum class ReconnectState {
+        IDLE,
+        RUNNING,
+        PENDING,
+    }
+
     private var socket: Socket? = null
-    private val reconnecting = AtomicBoolean(false)
+    private val reconnectState = AtomicReference(ReconnectState.IDLE)
     private val neverConnected = AtomicBoolean(true)
 
     // Serializes concurrent writes to the socket. Was previously an
@@ -132,11 +139,6 @@ class TCPClientInterface(
     // Debug counters
     private val framesSent = AtomicLong(0)
     private val framesReceived = AtomicLong(0)
-
-    // Exponential backoff for reconnection: 1s, 2s, 4s... up to 60s, give up after maxReconnectAttempts
-    private val backoff = ExponentialBackoff(
-        maxAttempts = maxReconnectAttempts ?: 10
-    )
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope: CoroutineScope = createScope(parentScope).also {
@@ -162,6 +164,13 @@ class TCPClientInterface(
     }
     private var readJob: Job? = null
     private var connectJob: Job? = null
+
+    internal var onConnectionPublishedForTest: (() -> Unit)? = null
+
+    private data class EstablishedConnection(
+        val socket: Socket,
+        val inputStream: InputStream,
+    )
 
     /**
      * Create the appropriate coroutine scope based on parent.
@@ -203,13 +212,16 @@ class TCPClientInterface(
 
     override fun start() {
         connectJob = ioScope.launch {
-            if (!connect(initial = true)) {
+            val connection = connect(initial = true)
+            if (connection == null) {
                 reconnect()
+            } else {
+                startReadLoop(connection.socket, connection.inputStream)
             }
         }
     }
 
-    private fun connect(initial: Boolean = false): Boolean {
+    private fun connect(initial: Boolean = false): EstablishedConnection? {
         return try {
             if (initial) {
                 log("Establishing TCP connection to $targetHost:$targetPort...")
@@ -227,6 +239,7 @@ class TCPClientInterface(
 
             socket = sock
             setOnline(true)
+            onConnectionPublishedForTest?.invoke()
             neverConnected.set(false)
 
             // Request tunnel synthesis for this connection
@@ -265,55 +278,112 @@ class TCPClientInterface(
             // 100ms gives time for the handler thread to start blocking on recv()
             Thread.sleep(100)
 
-            // Pass socket and stream directly to avoid race conditions
-            startReadLoop(sock, inputStream)
-            true
+            EstablishedConnection(sock, inputStream)
         } catch (e: Exception) {
             if (initial) {
                 log("Initial connection failed: ${e.message}")
-                log("Will retry with exponential backoff (1s, 2s, 4s... up to 60s)")
+                log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
-            false
+            null
         }
     }
 
     private suspend fun reconnect() {
-        if (reconnecting.getAndSet(true)) return
+        if (!claimReconnectOwnership()) return
 
-        // Note: Do NOT reset backoff here - network change handler will reset when appropriate
-        // This allows progressive backoff across reconnect cycles
+        var connection: EstablishedConnection? = null
+        var reconnectWasPending = false
+        var attempts = 0
+        try {
+            while (!online.value && !detached.get()) {
+                delay(RECONNECT_WAIT_MS)
+                attempts++
 
-        while (!online.value && !detached.get()) {
-            val delayMs = backoff.nextDelay()
-
-            if (delayMs == null) {
-                log("Max reconnection attempts (${backoff.attemptCount}) reached, giving up")
-                detach()
-                break
-            }
-
-            delay(delayMs)
-
-            // Check if scope still active after delay
-            if (!ioScope.isActive) break
-
-            try {
-                if (connect()) {
-                    if (!neverConnected.get()) {
-                        log("Reconnected successfully after ${backoff.attemptCount} attempts")
-                    }
-                    backoff.reset() // Success - reset for next time
+                // Python checks the configured limit after waiting and incrementing,
+                // before opening the next socket. A null limit retries indefinitely.
+                if (maxReconnectAttempts != null && attempts > maxReconnectAttempts) {
+                    log("Max reconnection attempts reached, giving up")
+                    detach()
                     break
                 }
-            } catch (e: CancellationException) {
-                // Scope was cancelled, stop reconnecting
-                break
-            } catch (e: Exception) {
-                log("Reconnection attempt ${backoff.attemptCount} failed: ${e.message}")
+
+                // Check if scope still active after delay
+                if (!ioScope.isActive) break
+
+                connection = connect()
+                if (connection != null) {
+                    if (!neverConnected.get()) {
+                        log("Reconnected successfully after $attempts attempts")
+                    }
+                    break
+                }
+            }
+        } catch (_: CancellationException) {
+            // Scope was cancelled, stop reconnecting.
+        } finally {
+            // Python clears reconnect ownership before starting the replacement
+            // read loop. This ensures an immediately closed replacement socket
+            // can synchronously claim the next reconnect instead of being dropped.
+            reconnectWasPending = releaseReconnectOwnership()
+        }
+
+        connection?.let { established ->
+            if (ioScope.isActive && online.value && !detached.get()) {
+                startReadLoop(established.socket, established.inputStream)
             }
         }
 
-        reconnecting.set(false)
+        // A write failure can tear down a newly published socket before its
+        // reader is installed. If that teardown requested reconnect while this
+        // owner was active, take responsibility for the deferred request now.
+        if (
+            reconnectWasPending &&
+            ioScope.isActive &&
+            !online.value &&
+            !detached.get()
+        ) {
+            ioScope.launch { reconnect() }
+        }
+    }
+
+    private fun claimReconnectOwnership(): Boolean {
+        while (true) {
+            when (reconnectState.get()) {
+                ReconnectState.IDLE -> {
+                    if (reconnectState.compareAndSet(ReconnectState.IDLE, ReconnectState.RUNNING)) {
+                        return true
+                    }
+                }
+
+                ReconnectState.RUNNING -> {
+                    if (reconnectState.compareAndSet(ReconnectState.RUNNING, ReconnectState.PENDING)) {
+                        return false
+                    }
+                }
+
+                ReconnectState.PENDING -> return false
+            }
+        }
+    }
+
+    private fun releaseReconnectOwnership(): Boolean {
+        while (true) {
+            when (reconnectState.get()) {
+                ReconnectState.RUNNING -> {
+                    if (reconnectState.compareAndSet(ReconnectState.RUNNING, ReconnectState.IDLE)) {
+                        return false
+                    }
+                }
+
+                ReconnectState.PENDING -> {
+                    if (reconnectState.compareAndSet(ReconnectState.PENDING, ReconnectState.IDLE)) {
+                        return true
+                    }
+                }
+
+                ReconnectState.IDLE -> return false
+            }
+        }
     }
 
     private fun startReadLoop(sock: Socket, inputStream: InputStream) {
@@ -469,19 +539,17 @@ class TCPClientInterface(
     /**
      * Notify the interface that the network has changed.
      *
-     * This resets the reconnection backoff counter, allowing quick
-     * reconnection attempts on the new network. Call this when:
+     * This requests reconnection on the new network when the interface is
+     * offline and no reconnect owner is active. Call this when:
      * - WiFi <-> cellular handoff occurs
      * - Network becomes available after being offline
      *
-     * Per CONTEXT.md: "Network changes reset the backoff counter"
      */
     fun onNetworkChanged() {
-        log("Network changed - resetting reconnection backoff")
-        backoff.reset()
+        log("Network changed - requesting reconnection")
 
         // If currently offline and not detached, trigger reconnection
-        if (!online.value && !detached.get() && !reconnecting.get()) {
+        if (!online.value && !detached.get() && reconnectState.get() == ReconnectState.IDLE) {
             ioScope.launch {
                 reconnect()
             }
@@ -497,7 +565,7 @@ class TCPClientInterface(
         closeSocket()
     }
 
-    private fun teardown() {
+    internal fun teardown() {
         if (DEBUG) {
             debugLog("Teardown called - transitioning to OFFLINE")
             debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")

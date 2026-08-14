@@ -3,21 +3,23 @@ package network.reticulum.interfaces.tcp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Timeout
+import java.net.ServerSocket
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 
 /**
- * Tests for TCPClientInterface backoff integration.
- *
- * These tests verify that ExponentialBackoff is properly integrated
- * into TCPClientInterface. The core backoff logic is tested in
- * ExponentialBackoffTest - these tests focus on the integration.
+ * Tests for TCPClientInterface reconnect behavior.
  */
 class TCPClientInterfaceBackoffTest {
 
@@ -54,6 +56,77 @@ class TCPClientInterfaceBackoffTest {
         assertNotNull(iface1)
         assertNotNull(iface5)
         assertNotNull(ifaceDefault)
+    }
+
+    @Test
+    @Timeout(18, unit = TimeUnit.SECONDS)
+    fun `short lived connections retain Python fixed five second reconnect wait`() {
+        ServerSocket(0).use { server ->
+            val acceptedAt = CopyOnWriteArrayList<Long>()
+            val accepted = CountDownLatch(3)
+            val serverThread = thread(start = true, isDaemon = true) {
+                repeat(3) {
+                    server.accept().use { socket ->
+                        acceptedAt += System.nanoTime()
+                        accepted.countDown()
+                        socket.setSoLinger(true, 0)
+                    }
+                }
+            }
+
+            val iface = TCPClientInterface(
+                name = "PythonReconnectCadence",
+                targetHost = "127.0.0.1",
+                targetPort = server.localPort,
+                connectTimeoutMs = 250,
+            )
+            val publishedConnections = AtomicInteger(0)
+            iface.onConnectionPublishedForTest = {
+                if (publishedConnections.incrementAndGet() == 2) {
+                    // Model an outgoing failure after the replacement socket is
+                    // published but before reconnect() installs its read loop.
+                    iface.teardown()
+                }
+            }
+            interfaces.add(iface)
+
+            iface.start()
+            assertTrue(accepted.await(15, TimeUnit.SECONDS), "Expected initial and two reconnect attempts")
+
+            val intervalsMs = acceptedAt.zipWithNext { first, second ->
+                TimeUnit.NANOSECONDS.toMillis(second - first)
+            }
+            assertTrue(
+                intervalsMs.all { it in 4_500..8_000 },
+                "Python parity requires fixed five-second reconnect waits, observed $intervalsMs",
+            )
+            serverThread.join(1_000)
+        }
+    }
+
+    @Test
+    @Timeout(8, unit = TimeUnit.SECONDS)
+    fun `configured retry limit is checked after Python fixed wait`() = runBlocking {
+        val unavailablePort = ServerSocket(0).use { it.localPort }
+        val iface = TCPClientInterface(
+            name = "PythonReconnectLimit",
+            targetHost = "127.0.0.1",
+            targetPort = unavailablePort,
+            connectTimeoutMs = 250,
+            maxReconnectAttempts = 0,
+        )
+        interfaces.add(iface)
+
+        iface.start()
+        delay(1_000)
+        assertFalse(iface.detached.get(), "Python waits five seconds before checking the retry limit")
+
+        withTimeout(5_500) {
+            while (!iface.detached.get()) {
+                delay(25)
+            }
+        }
+        assertTrue(iface.detached.get())
     }
 
     @Test
