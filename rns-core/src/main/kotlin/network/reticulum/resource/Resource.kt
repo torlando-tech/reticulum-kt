@@ -181,6 +181,11 @@ class Resource private constructor(
                 // the default limit before the callback applies its bound.
                 link.resourceStarted(resource)
                 resource.requestNext()
+                // Python starts the watchdog only after resource_started and
+                // the initial hashmap request (Resource.py:223-234). Starting
+                // it during initialization allows a watchdog retry to bypass a
+                // slow callback and request parts before configuration finishes.
+                resource.startWatchdog()
 
                 resource
             } catch (e: Exception) {
@@ -532,7 +537,6 @@ class Resource private constructor(
         // Register with link
         link.registerIncomingResource(this)
 
-        startWatchdog()
         log("Resource ${hash.toHexString()} accepted: $size bytes in ${parts.size} parts")
     }
 
