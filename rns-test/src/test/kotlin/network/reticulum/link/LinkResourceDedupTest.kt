@@ -6,6 +6,7 @@ import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.resource.Resource
 import network.reticulum.resource.ResourceAdvertisement
+import network.reticulum.resource.ResourceConstants
 import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -14,6 +15,9 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.msgpack.core.MessagePack
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -153,6 +157,144 @@ class LinkResourceDedupTest {
             "hasIncomingResource must catch duplicate-hash from a fresh Resource instance " +
                 "(production: Resource.accept consults this — covers all four call sites)",
         )
+    }
+
+    @Test
+    @DisplayName("Resource.accept invokes resource-started synchronously before requesting parts")
+    @Timeout(5)
+    fun `Resource accept invokes resource started before requesting parts`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAC.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+
+        var callbackCount = 0
+        link.setResourceStartedCallback { resourceObj ->
+            val resource = resourceObj as Resource
+            callbackCount++
+            assertTrue(
+                link.hasIncomingResource(resource.hash),
+                "The Resource must be registered before resource-started runs",
+            )
+            assertEquals(
+                0,
+                resource.requestNextEmitCountForTest(),
+                "No part request may be emitted before resource-started returns",
+            )
+            assertFalse(
+                resource.watchdogActiveForTest(),
+                "Watchdog must not start before resource-started returns",
+            )
+        }
+
+        // Resource.accept must invoke the callback after registration and before
+        // both requestNext() and watchdog startup. The callback's direct state
+        // assertions make the race regression deterministic without wall-clock
+        // sleeps or scheduler assumptions.
+        val acceptedResource = assertNotNull(
+            Resource.accept(advertisement = adv, link = link),
+            "Synthetic advertisement should be accepted",
+        )
+        try {
+            assertTrue(
+                acceptedResource.requestNextEmitCountForTest() > 0,
+                "Resource.accept should request parts only after resource-started returns",
+            )
+            assertTrue(
+                acceptedResource.watchdogActiveForTest(),
+                "Resource.accept should start the watchdog after the initial part request",
+            )
+            assertEquals(
+                1,
+                callbackCount,
+                "resource-started must run synchronously before the first part request",
+            )
+        } finally {
+            acceptedResource.cancel()
+        }
+    }
+
+    @Test
+    @DisplayName("Resource.accept does not restart watchdog after resource-started cancels")
+    @Timeout(5)
+    fun `Resource accept does not restart watchdog after resource started cancels`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAD.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+
+        var callbackCount = 0
+        link.setResourceStartedCallback { resourceObj ->
+            callbackCount++
+            (resourceObj as Resource).cancel()
+        }
+
+        val accepted = assertNotNull(
+            Resource.accept(advertisement = adv, link = link),
+            "Callback cancellation should conclude, not invalidate, the accepted Resource",
+        )
+
+        assertEquals(1, callbackCount, "resource-started must run exactly once")
+        assertEquals(ResourceConstants.FAILED, accepted.status, "Callback cancellation must remain terminal")
+        assertFalse(accepted.watchdogActiveForTest(), "A terminal Resource must not restart its watchdog")
+        accepted.startWatchdogForTest()
+        assertFalse(accepted.watchdogActiveForTest(), "Explicit restart must reject a terminal Resource")
+        assertFalse(
+            link.hasIncomingResource(advHash),
+            "Callback cancellation must remove the Resource from inbound tracking",
+        )
+    }
+
+    @Test
+    @DisplayName("Concurrent cancel and watchdog start leave Resource terminal and stopped")
+    @Timeout(5)
+    fun `Concurrent cancel and watchdog start leave Resource terminal and stopped`() {
+        val link = freshLink()
+        val advHash = ByteArray(16) { 0xAE.toByte() }
+        val adv = ResourceAdvertisement.unpack(buildAdvertisementBytes(hash = advHash))
+        assertNotNull(adv, "Test sanity: advertisement should unpack")
+        link.setResourceStartedCallback { }
+
+        val accepted = assertNotNull(Resource.accept(advertisement = adv, link = link))
+        assertTrue(accepted.watchdogActiveForTest(), "Test requires an initially active watchdog")
+
+        val terminalPublished = CountDownLatch(1)
+        val releaseCancel = CountDownLatch(1)
+        accepted.setCancelTransitionHookForTest {
+            terminalPublished.countDown()
+            assertTrue(releaseCancel.await(2, TimeUnit.SECONDS), "Test must release cancellation")
+        }
+
+        val cancelThread = thread(start = true, isDaemon = true) { accepted.cancel() }
+        assertTrue(
+            terminalPublished.await(1, TimeUnit.SECONDS),
+            "Cancellation must publish FAILED while holding the watchdog monitor",
+        )
+        assertEquals(ResourceConstants.FAILED, accepted.status)
+
+        val restartThread = thread(start = true, isDaemon = true) { accepted.startWatchdogForTest() }
+        val blockedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+        while (restartThread.state != Thread.State.BLOCKED && restartThread.isAlive && System.nanoTime() < blockedDeadline) {
+            Thread.onSpinWait()
+        }
+
+        try {
+            assertEquals(
+                Thread.State.BLOCKED,
+                restartThread.state,
+                "Watchdog start must block on the atomic cancellation monitor",
+            )
+        } finally {
+            releaseCancel.countDown()
+            cancelThread.join(2_000)
+            restartThread.join(2_000)
+            accepted.setCancelTransitionHookForTest(null)
+        }
+
+        assertFalse(cancelThread.isAlive, "Cancellation must finish after test release")
+        assertFalse(restartThread.isAlive, "Watchdog restart must finish after cancellation")
+        assertEquals(ResourceConstants.FAILED, accepted.status)
+        assertFalse(accepted.watchdogActiveForTest(), "Atomic terminal transition must reject the waiting restart")
     }
 
     @Test

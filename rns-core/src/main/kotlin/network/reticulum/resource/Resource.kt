@@ -172,7 +172,20 @@ class Resource private constructor(
                 progressCallback?.let { resource.callbacks.progress = it }
 
                 resource.initializeFromAdvertisement(advertisement)
+                // Python invokes resource_started synchronously after the
+                // inbound Resource is registered and before hashmap_update()
+                // requests the first parts (Resource.py:223-234). This ordering
+                // is load-bearing: applications use the callback to configure
+                // per-transfer limits such as max_decompressed_size. Deferring
+                // it lets a small compressed Resource arrive and assemble with
+                // the default limit before the callback applies its bound.
+                link.resourceStarted(resource)
                 resource.requestNext()
+                // Python starts the watchdog only after resource_started and
+                // the initial hashmap request (Resource.py:223-234). Starting
+                // it during initialization allows a watchdog retry to bypass a
+                // slow callback and request parts before configuration finishes.
+                resource.startWatchdog()
 
                 resource
             } catch (e: Exception) {
@@ -322,6 +335,7 @@ class Resource private constructor(
     // Watchdog
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
+    @Volatile private var cancelTransitionHookForTest: (() -> Unit)? = null
 
     // SDU for this resource — uses plain packet MDU (not link MDU) because
     // resource parts are already bulk-encrypted before splitting, and are sent
@@ -524,7 +538,6 @@ class Resource private constructor(
         // Register with link
         link.registerIncomingResource(this)
 
-        startWatchdog()
         log("Resource ${hash.toHexString()} accepted: $size bytes in ${parts.size} parts")
     }
 
@@ -1440,11 +1453,22 @@ class Resource private constructor(
         // Necessary now that cancel() fires `callbacks.failed?.invoke`:
         // without this guard, a double-cancel from application code +
         // watchdog timeout would deliver the failed callback twice.
-        if (status >= ResourceConstants.COMPLETE) {
-            return
+        val transitionedToFailed = synchronized(this) {
+            if (status >= ResourceConstants.COMPLETE) {
+                false
+            } else {
+                // Publish the terminal status while holding the same monitor used
+                // by startWatchdog(). Python likewise sets FAILED before stopping
+                // its watchdog. This closes the stop-then-status gap where another
+                // thread could otherwise install a fresh watchdog on a canceled
+                // Resource.
+                status = ResourceConstants.FAILED
+                cancelTransitionHookForTest?.invoke()
+                stopWatchdog()
+                true
+            }
         }
-        stopWatchdog()
-        status = ResourceConstants.FAILED
+        if (!transitionedToFailed) return
         // python Resource.py:1087-1094 — when the INITIATOR cancels a still-ACTIVE
         // transfer it sends a RESOURCE_ICL packet carrying the resource hash so the
         // receiver tears its inbound resource down too. Without this the receiver's
@@ -1595,6 +1619,7 @@ class Resource private constructor(
     /**
      * Start watchdog thread for timeout detection.
      */
+    @Synchronized
     private fun startWatchdog() {
         // Test-only suppression (see companion watchdogDisabledForTest): the
         // reference harness disables the watchdog around _build_resource_receiver
@@ -1602,11 +1627,18 @@ class Resource private constructor(
         // timeout-retry cancelling it.
         if (watchdogDisabledForTest) return
         if (watchdogActive) return
+        if (status >= ResourceConstants.ASSEMBLING) return
 
         watchdogActive = true
-        watchdogThread = thread(name = "resource-watchdog-${hash.toHexString().take(8)}") {
+        val newThread = thread(
+            start = false,
+            isDaemon = true,
+            name = "resource-watchdog-${hash.toHexString().take(8)}",
+        ) {
             watchdogJob()
         }
+        watchdogThread = newThread
+        newThread.start()
     }
 
     /**
@@ -1623,6 +1655,7 @@ class Resource private constructor(
      * rather than thread interruption (Resource.py:560-670), so the
      * equivalent self-targeting issue doesn't exist there.
      */
+    @Synchronized
     private fun stopWatchdog() {
         watchdogActive = false
         val thread = watchdogThread
@@ -1636,47 +1669,56 @@ class Resource private constructor(
      * Watchdog job for timeout handling.
      */
     private fun watchdogJob() {
-        while (watchdogActive) {
-            try {
-                Thread.sleep(ResourceConstants.WATCHDOG_MAX_SLEEP * 1000)
+        try {
+            while (watchdogActive && status < ResourceConstants.ASSEMBLING) {
+                try {
+                    Thread.sleep(ResourceConstants.WATCHDOG_MAX_SLEEP * 1000)
 
-                if (!watchdogActive) break
+                    if (!watchdogActive || status >= ResourceConstants.ASSEMBLING) break
 
-                val now = System.currentTimeMillis()
-                val idleTime = now - lastActivity
+                    val now = System.currentTimeMillis()
+                    val idleTime = now - lastActivity
 
-                // Check for timeout
-                val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
-                if (idleTime > timeout) {
-                    retries++
-                    if (retries > ResourceConstants.MAX_RETRIES) {
-                        // Mirrors python `Resource.py:578, 591, 628, 636, 648,
-                        // 667, 690` etc. — every retries-exhausted branch in
-                        // python's watchdog calls `self.cancel()`. Calling
-                        // cancel() (rather than the previous inline
-                        // `status = FAILED; callbacks.failed?.invoke`) ensures
-                        // `link.resourceConcluded(this)` runs, which removes
-                        // the resource from `incomingResources` so a future
-                        // RESOURCE_ADV with the same hash is no longer
-                        // dropped by the dedup guard inside
-                        // `Resource.accept`. Without this, a single
-                        // watchdog-fail leaves the hash registered for the
-                        // lifetime of the link, killing the recovery path.
-                        log("Resource ${hash.toHexString()} timed out after $retries retries")
-                        cancel()
-                        break
-                    } else {
-                        log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
-                        if (!initiator) {
-                            requestNext()
+                    // Check for timeout
+                    val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
+                    if (idleTime > timeout) {
+                        retries++
+                        if (retries > ResourceConstants.MAX_RETRIES) {
+                            // Mirrors python `Resource.py:578, 591, 628, 636, 648,
+                            // 667, 690` etc. — every retries-exhausted branch in
+                            // python's watchdog calls `self.cancel()`. Calling
+                            // cancel() (rather than the previous inline
+                            // `status = FAILED; callbacks.failed?.invoke`) ensures
+                            // `link.resourceConcluded(this)` runs, which removes
+                            // the resource from `incomingResources` so a future
+                            // RESOURCE_ADV with the same hash is no longer
+                            // dropped by the dedup guard inside
+                            // `Resource.accept`. Without this, a single
+                            // watchdog-fail leaves the hash registered for the
+                            // lifetime of the link, killing the recovery path.
+                            log("Resource ${hash.toHexString()} timed out after $retries retries")
+                            cancel()
+                            break
+                        } else {
+                            log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
+                            if (!initiator) {
+                                requestNext()
+                            }
                         }
                     }
-                }
 
-            } catch (e: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                log("Watchdog error: ${e.message}")
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    log("Watchdog error: ${e.message}")
+                }
+            }
+        } finally {
+            synchronized(this) {
+                if (watchdogThread === Thread.currentThread()) {
+                    watchdogActive = false
+                    watchdogThread = null
+                }
             }
         }
     }
@@ -1735,6 +1777,11 @@ class Resource private constructor(
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
+    fun watchdogActiveForTest(): Boolean = watchdogActive
+    fun startWatchdogForTest() = startWatchdog()
+    fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
+        cancelTransitionHookForTest = hook
+    }
 
     /** Drive the private assemble(). */
     fun assembleForTest() = assemble()
