@@ -61,6 +61,31 @@ class RoomIdentityStoreTest {
         assertEquals(1, dao.upsertCount)
     }
 
+    /**
+     * Follow-up green test: the policy swallows exactly one write (the
+     * transient SQLITE_BUSY lock) without degrading the write path. The DAO
+     * fails its FIRST upsert with the real SQLiteDatabaseLockedException and
+     * succeeds on the second; both calls must reach the DAO and no exception
+     * may escape. This guards against a "fix" that works by broadly swallowing
+     * arbitrary production exceptions or by permanently dropping the path.
+     */
+    @Test
+    fun `upsertKnownDestination still lands the next write after one swallowed SQLITE_BUSY lock`() {
+        val dao = FailFirstKnownDestinationDao(
+            firstCallFailure = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(dao, NoopIdentityRatchetDao(), DirectExecutorService())
+
+        // First write: transient lock — swallowed by submitWriteThrough's
+        // SQLException branch; must not escape.
+        store.upsertKnownDestination(byteArrayOf(1), sampleIdentityData())
+        // Second write: must still reach the DAO and succeed.
+        store.upsertKnownDestination(byteArrayOf(1), sampleIdentityData())
+
+        // Both attempts reached the DAO; the second landed.
+        assertEquals(2, dao.upsertCount)
+    }
+
     private fun sampleIdentityData() = IdentityData(
         timestamp = 1L,
         packetHash = byteArrayOf(2, 3),
@@ -81,6 +106,21 @@ class RoomIdentityStoreTest {
         override fun upsert(entity: KnownDestinationEntity) {
             upsertCount++
             failure?.let { throw it }
+        }
+
+        override fun getByHash(destHash: ByteArray): KnownDestinationEntity? = null
+        override fun getAll(): List<KnownDestinationEntity> = emptyList()
+        override fun count(): Int = 0
+    }
+
+    private class FailFirstKnownDestinationDao(
+        private val firstCallFailure: Exception,
+    ) : KnownDestinationDao {
+        var upsertCount = 0
+
+        override fun upsert(entity: KnownDestinationEntity) {
+            upsertCount++
+            if (upsertCount == 1) throw firstCallFailure
         }
 
         override fun getByHash(destHash: ByteArray): KnownDestinationEntity? = null
