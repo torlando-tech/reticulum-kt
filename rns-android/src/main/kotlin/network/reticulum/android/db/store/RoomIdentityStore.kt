@@ -26,7 +26,10 @@ class RoomIdentityStore(
             publicKey = data.publicKey.copyOf(),
             appData = data.appData?.copyOf()
         )
-        writeExecutor.submitWriteThroughDurable("identity.upsertKnownDestination") { knownDestDao.upsert(entity) }
+        writeExecutor.submitWriteThroughDurable(
+            "identity.upsertKnownDestination",
+            DurableRowKey("knownDest", destHash.toKey())
+        ) { knownDestDao.upsert(entity) }
     }
 
     override fun getKnownDestination(destHash: ByteArray): IdentityData? {
@@ -60,7 +63,10 @@ class RoomIdentityStore(
             ratchet = ratchet.copyOf(),
             timestamp = timestampMs
         )
-        writeExecutor.submitWriteThroughDurable("identity.upsertRatchet") { ratchetDao.upsert(entity) }
+        writeExecutor.submitWriteThroughDurable(
+            "identity.upsertRatchet",
+            DurableRowKey("ratchet", destHash.toKey())
+        ) { ratchetDao.upsert(entity) }
     }
 
     override fun getRatchet(destHash: ByteArray): Pair<ByteArray, Long>? {
@@ -70,6 +76,12 @@ class RoomIdentityStore(
 
     override fun removeExpiredRatchets(maxAgeMs: Long) {
         val threshold = System.currentTimeMillis() - maxAgeMs
-        writeExecutor.submitWriteThroughDurable("identity.removeExpiredRatchets") { ratchetDao.deleteExpiredBefore(threshold) }
+        writeExecutor.submitWriteThroughDurable(
+            "identity.removeExpiredRatchets",
+            // Range delete with no per-row key; a fixed marker key keeps it out
+            // of the row-key namespace so it never collides with an upsert, and
+            // pending deletes coalesce (newest threshold wins, monotonic).
+            DurableRowKey("expiry-delete", ByteArrayKey(byteArrayOf()))
+        ) { ratchetDao.deleteExpiredBefore(threshold) }
     }
 }

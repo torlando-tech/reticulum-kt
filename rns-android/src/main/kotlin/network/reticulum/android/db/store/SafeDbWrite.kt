@@ -3,9 +3,11 @@ package network.reticulum.android.db.store
 import android.database.SQLException
 import android.database.sqlite.SQLiteDatabaseLockedException
 import android.util.Log
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
 import kotlin.math.min
+import network.reticulum.common.ByteArrayKey
 
 private const val TAG = "RoomStore"
 
@@ -79,16 +81,41 @@ private const val MAX_LOCK_ATTEMPTS = 3
 private const val INITIAL_LOCK_BACKOFF_MS = 10L
 private const val MAX_LOCK_BACKOFF_MS = 40L
 
+// Per-turn cap on how many pending durable writes one successful write may
+// reconcile, so a single executor task's reconciliation work stays bounded as
+// the backlog grows (see flushPendingDurableWrites).
+internal const val MAX_PENDING_FLUSH_PER_TURN = 16
+
 // Durable (identity/ratchet) writes whose bounded lock-retry budget was
 // exhausted while SQLite stayed locked. They MUST be durable and are NOT
 // reconstructable from the live network, so they are never permanently
 // dropped: each stays pending and is reconciled (flushed) into Room at the
-// next safe point — the next successful durable write, which proves the lock
-// has cleared. Mutated only from the single write-executor thread (or the
-// test thread), so the synchronized wrappers are belt-and-braces; the list is
-// drained once per flush, never spun, and each re-attempt uses the same
-// bounded budget, so nothing unbounded blocks the write thread.
-private val pendingDurableWrites = mutableListOf<Pair<String, () -> Unit>>()
+// next safe point — a successful durable write, which proves the lock has
+// cleared. Mutated only from the single write-executor thread (or the test
+// thread), so the synchronized wrappers are belt-and-braces; each re-attempt
+// uses the same bounded budget, so nothing unbounded blocks the write thread.
+//
+// The pending set is scoped to the owning executor — not process-global, as
+// the previous correction was — so one writer/database instance can never
+// flush another instance's backlog. Entries are coalesced by a row key
+// (table namespace + dest_hash) so same-key writes reconcile latest-write-wins:
+// an older pending write for a key is superseded by a newer one, and a write
+// that commits removes any older pending entry for the same key before the
+// flush runs, so replay can never regress durable state to a stale value.
+internal class DurableRowKey(val namespace: String, val destHash: ByteArrayKey) {
+    override fun equals(other: Any?): Boolean =
+        other is DurableRowKey && namespace == other.namespace && destHash == other.destHash
+
+    override fun hashCode(): Int = 31 * namespace.hashCode() + destHash.hashCode()
+
+    override fun toString(): String = "$namespace:${destHash}"
+}
+
+private val pendingDurableWritesByExecutor =
+    ConcurrentHashMap<ExecutorService, MutableMap<DurableRowKey, Pair<String, () -> Unit>>>()
+
+private fun pendingMapFor(executor: ExecutorService): MutableMap<DurableRowKey, Pair<String, () -> Unit>> =
+    pendingDurableWritesByExecutor.computeIfAbsent(executor) { mutableMapOf() }
 
 private enum class DurableWriteOutcome { COMMITTED, LOCK_EXHAUSTED, DROPPED }
 
@@ -130,21 +157,34 @@ private fun attemptDurableWrite(op: String, block: () -> Unit): DurableWriteOutc
     }
 }
 
-// Reconcile any pending durable writes now that a write has just succeeded
-// (the lock cleared). Re-attempts each pending block once with the same
-// bounded budget; a pending write that still exhausts stays pending for a
-// later flush, one that is dropped (DB closed / non-lock error) is removed —
-// it can no longer be made durable. Runs on the write thread, drains the list
-// once, and never spins.
-private fun flushPendingDurableWrites() {
-    val pending = synchronized(pendingDurableWrites) {
-        pendingDurableWrites.toList().also { pendingDurableWrites.clear() }
+// Reconcile a BOUNDED number of pending durable writes now that a write has
+// just succeeded (the lock cleared). Each turn takes at most
+// [MAX_PENDING_FLUSH_PER_TURN] pending entries, so one executor task performs
+// only a fixed amount of reconciliation work no matter how large the backlog
+// grows; entries that remain after the turn stay pending (coalesced under their
+// key) and are reconciled by later bounded turns — the next successful durable
+// writes. Each pending block is re-attempted once with the same bounded budget;
+// one that still exhausts stays pending, one that is dropped (DB closed /
+// non-lock error) is removed — it can no longer be made durable. Runs on the
+// write thread for the owning executor and never spins.
+private fun flushPendingDurableWrites(executor: ExecutorService) {
+    val state = pendingMapFor(executor)
+    val turn = synchronized(state) {
+        val taken = ArrayList<Pair<DurableRowKey, Pair<String, () -> Unit>>>(MAX_PENDING_FLUSH_PER_TURN)
+        val it = state.iterator()
+        while (it.hasNext() && taken.size < MAX_PENDING_FLUSH_PER_TURN) {
+            val e = it.next()
+            taken.add(e.key to e.value)
+            it.remove()
+        }
+        taken
     }
-    for ((op, block) in pending) {
+    for ((key, entry) in turn) {
+        val (op, block) = entry
         when (attemptDurableWrite(op, block)) {
             DurableWriteOutcome.COMMITTED -> { /* reconciled durably */ }
-            DurableWriteOutcome.LOCK_EXHAUSTED -> synchronized(pendingDurableWrites) {
-                pendingDurableWrites.add(op to block)
+            DurableWriteOutcome.LOCK_EXHAUSTED -> synchronized(state) {
+                state[key] = entry
             }
             DurableWriteOutcome.DROPPED -> { /* can no longer be made durable */ }
         }
@@ -163,10 +203,18 @@ private fun flushPendingDurableWrites() {
  * momentary lock cannot silently discard a ratchet/identity write that would
  * otherwise leave durable state stale or missing after a restart. And, unlike
  * [submitWriteThrough], retry exhaustion is NOT a permanent drop: the write is
- * kept pending and reconciled (flushed) into Room at the next safe point — the
- * next successful durable write, which proves the lock has cleared — so the
+ * kept pending and reconciled (flushed) into Room at the next safe point — a
+ * successful durable write, which proves the lock has cleared — so the
  * security-relevant value is never silently lost even when another writer
  * holds the lock longer than the bounded retry window.
+ *
+ * [key] is the durable row identity (table namespace + dest_hash) used to
+ * coalesce the pending set latest-write-wins. Reconciliation is bounded per
+ * successful write ([MAX_PENDING_FLUSH_PER_TURN] entries per turn) and scoped
+ * to this executor, so a single task never drains an unbounded backlog and one
+ * writer/database instance can never flush another instance's backlog. A write
+ * that commits removes any older pending entry for the same [key] before the
+ * flush runs, so a stale pending write can never replay over newer state.
  *
  * [IllegalStateException] (DB closed mid-write during teardown) and every
  * other [SQLException] (non-lock transient SQLite failure) are still dropped
@@ -177,15 +225,26 @@ private fun flushPendingDurableWrites() {
  * main-thread DB access, matching the [submitWriteThrough] contract.
  *
  * @param op short operation label for the dropped-write log line.
+ * @param key durable row identity used to coalesce same-key pending writes
+ *   latest-write-wins.
  */
-internal fun ExecutorService.submitWriteThroughDurable(op: String, block: () -> Unit) {
+internal fun ExecutorService.submitWriteThroughDurable(op: String, key: DurableRowKey, block: () -> Unit) {
+    val executor = this
     try {
         execute {
+            val state = pendingMapFor(executor)
             when (attemptDurableWrite(op, block)) {
-                DurableWriteOutcome.COMMITTED -> flushPendingDurableWrites()
+                DurableWriteOutcome.COMMITTED -> {
+                    // The value just committed is newer than any pending write
+                    // for the same key — remove the stale pending entry so a
+                    // later flush can never replay it over the newer value
+                    // (latest-write-wins), then reconcile a bounded turn.
+                    synchronized(state) { state.remove(key) }
+                    flushPendingDurableWrites(executor)
+                }
                 DurableWriteOutcome.LOCK_EXHAUSTED -> {
                     Log.w(TAG, "DB write '$op'; SQLite locked after $MAX_LOCK_ATTEMPTS attempts; keeping pending for reconciliation")
-                    synchronized(pendingDurableWrites) { pendingDurableWrites.add(op to block) }
+                    synchronized(state) { state[key] = op to block }
                 }
                 DurableWriteOutcome.DROPPED -> { /* dropped immediately, as above */ }
             }

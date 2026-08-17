@@ -5,6 +5,8 @@ import network.reticulum.android.db.dao.IdentityRatchetDao
 import network.reticulum.android.db.dao.KnownDestinationDao
 import network.reticulum.android.db.entity.IdentityRatchetEntity
 import network.reticulum.android.db.entity.KnownDestinationEntity
+import network.reticulum.common.ByteArrayKey
+import network.reticulum.common.toKey
 import network.reticulum.identity.Identity.IdentityData
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -180,6 +182,104 @@ class RoomIdentityStoreTest {
         assertEquals(99L, second.second)
     }
 
+    /**
+     * New regression (DeepSeek correction, latest-write-wins): a stale pending
+     * write for the SAME dest_hash must not replay over a newer successful
+     * durable write. First an older ratchet write exhausts its bounded lock
+     * budget and goes PENDING; then a NEWER ratchet write for the SAME
+     * dest_hash succeeds. `IdentityRatchetDao.upsert` is Room @Upsert and
+     * dest_hash is the primary key, so replaying the older pending write after
+     * the newer commit would regress durable state to the stale value. Post-fix
+     * the committed newer write removes the stale pending entry before the
+     * flush runs, so the final durable value/timestamp must be the newer one.
+     * The DAO below mirrors Room @Upsert's last-write-wins per dest_hash (not
+     * the firstOrNull semantics of [LockThenCommitRatchetDao], which masked the
+     * same-key hazard).
+     */
+    @Test
+    fun `a newer successful same-dest_hash ratchet write supersedes an older pending one`() {
+        val dao = SameKeyLockThenCommitRatchetDao(
+            lockCalls = 3,
+            lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // Older ratchet for dest_hash [1] exhausts the whole bounded budget and
+        // stays PENDING (never dropped).
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+        // Newer ratchet for the SAME dest_hash [1] succeeds immediately.
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(10, 11, 12), timestampMs = 99L)
+
+        // The final durable value must be the NEWER one. Pre-fix the flush
+        // replays the stale older write after the newer commit, so the durable
+        // ratchet regresses to (7,8,9)/42 and this fails (red).
+        val final = store.getRatchet(byteArrayOf(1))
+        assertNotNull(final)
+        assertArrayEquals(byteArrayOf(10, 11, 12), final!!.first)
+        assertEquals(99L, final.second)
+    }
+
+    /**
+     * New regression (DeepSeek correction, bounded reconciliation): one
+     * successful executor task must reconcile only a FIXED number of pending
+     * durable writes, with the remaining backlog left for later bounded turns —
+     * not drain the whole backlog in a single task as it grows. Seed
+     * `MAX_PENDING_FLUSH_PER_TURN + 4` pending ratchet writes (each exhausts
+     * the bounded budget); a first successful write must flush exactly one
+     * bounded turn (MAX_PENDING_FLUSH_PER_TURN entries), leaving the rest
+     * pending; a later successful write (the next bounded turn) flushes the
+     * remainder. All ordering is via the counting DAO + DirectExecutorService —
+     * no sleeps.
+     */
+    @Test
+    fun `ratchet retry exhaustion reconciles a bounded number per successful write and leaves the backlog for later turns`() {
+        val n = MAX_PENDING_FLUSH_PER_TURN
+        val pendingKeyCount = n + 4
+        // Each seeded write exhausts the bounded lock budget: 3 attempts per
+        // write (MAX_LOCK_ATTEMPTS).
+        val seedLockCalls = pendingKeyCount * 3
+        // After seeding, commits: trigger1(1) + n flushed + remaining 4 + trigger2(1).
+        val commitBudget = n + 1 + 4 + 1
+
+        val dao = BoundedFlushRatchetDao(
+            lockCalls = seedLockCalls,
+            commitBudget = commitBudget,
+            lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // Seed: pendingKeyCount ratchet writes, each exhausting the bounded
+        // budget -> all go PENDING, none durable yet.
+        for (i in 1..pendingKeyCount) {
+            store.upsertRatchet(byteArrayOf(i.toByte()), byteArrayOf(i.toByte()), timestampMs = i.toLong())
+        }
+        assertEquals(pendingKeyCount * 3, dao.upsertCount)
+        for (i in 1..pendingKeyCount) {
+            assertNull(store.getRatchet(byteArrayOf(i.toByte())))
+        }
+
+        // First successful write: it must reconcile only ONE bounded turn (n
+        // entries), leaving the rest pending. Pre-fix the flush drains the whole
+        // backlog, so upsertCount is higher and the leftover keys are already
+        // present (red).
+        store.upsertRatchet(byteArrayOf(99), byteArrayOf(9, 9), timestampMs = 99L)
+        assertEquals(seedLockCalls + n + 1, dao.upsertCount)
+        for (i in 1..n) {
+            assertNotNull(store.getRatchet(byteArrayOf(i.toByte())))
+        }
+        for (i in (n + 1)..pendingKeyCount) {
+            assertNull(store.getRatchet(byteArrayOf(i.toByte())))
+        }
+
+        // A later successful write (the next bounded turn) reconciles the
+        // remaining backlog.
+        store.upsertRatchet(byteArrayOf(100), byteArrayOf(8, 8), timestampMs = 100L)
+        assertEquals(seedLockCalls + n + 1 + 4 + 1, dao.upsertCount)
+        for (i in (n + 1)..pendingKeyCount) {
+            assertNotNull(store.getRatchet(byteArrayOf(i.toByte())))
+        }
+    }
+
     private fun sampleIdentityData() = IdentityData(
         timestamp = 1L,
         packetHash = byteArrayOf(2, 3),
@@ -255,6 +355,63 @@ class RoomIdentityStoreTest {
 
         override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
             committed.firstOrNull { it.destHash.contentEquals(destHash) }
+
+        override fun deleteExpiredBefore(thresholdMs: Long) = Unit
+    }
+
+    /**
+     * Mirrors Room @Upsert semantics for the identity_ratchets table: dest_hash
+     * is the primary key, so a later upsert for a key overwrites the earlier
+     * one (last write wins). Used by the same-dest_hash latest-write-wins
+     * regression — unlike [LockThenCommitRatchetDao], which reads firstOrNull
+     * and would mask the stale-replay hazard.
+     */
+    private class SameKeyLockThenCommitRatchetDao(
+        private val lockCalls: Int,
+        private val lock: Exception,
+    ) : IdentityRatchetDao {
+        var upsertCount = 0
+        private val committed = mutableMapOf<ByteArrayKey, IdentityRatchetEntity>()
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            if (upsertCount <= lockCalls) throw lock
+            committed[entity.destHash.toKey()] = entity
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
+            committed[destHash.toKey()]
+
+        override fun deleteExpiredBefore(thresholdMs: Long) = Unit
+    }
+
+    /**
+     * Counting DAO for the bounded-reconciliation regression. The first
+     * `lockCalls` upserts throw the SQLite lock (used to seed the pending
+     * backlog), then the next `commitBudget` upserts commit (last write wins
+     * per key), and any further upsert throws the lock again (so a flush turn
+     * that overruns the bounded budget would be observable via upsertCount).
+     */
+    private class BoundedFlushRatchetDao(
+        private val lockCalls: Int,
+        private val commitBudget: Int,
+        private val lock: Exception,
+    ) : IdentityRatchetDao {
+        var upsertCount = 0
+        private val committed = mutableMapOf<ByteArrayKey, IdentityRatchetEntity>()
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            if (upsertCount <= lockCalls) throw lock
+            if (upsertCount <= lockCalls + commitBudget) {
+                committed[entity.destHash.toKey()] = entity
+            } else {
+                throw lock
+            }
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
+            committed[destHash.toKey()]
 
         override fun deleteExpiredBefore(thresholdMs: Long) = Unit
     }
