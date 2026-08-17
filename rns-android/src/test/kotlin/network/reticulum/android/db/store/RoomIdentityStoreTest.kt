@@ -9,6 +9,7 @@ import network.reticulum.identity.Identity.IdentityData
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -131,6 +132,54 @@ class RoomIdentityStoreTest {
         assertEquals(2, dao.upsertCount)
     }
 
+    /**
+     * Greptile P1 regression (retry-exhaustion discard): when SQLite stays
+     * locked through the ENTIRE bounded retry budget (3 attempts), the
+     * security-relevant ratchet write must NOT be permanently dropped. The
+     * value is not reconstructable from the live network, so it must be kept
+     * pending and reconciled into Room at the next safe point (flush on the
+     * next successful durable write). Pre-fix the exhaustion branch logs and
+     * drops the write, so the value never reappears after a later successful
+     * write — this test fails (red). Post-fix the pending value is flushed and
+     * lands durably.
+     */
+    @Test
+    fun `ratchet retry exhaustion keeps the durable write pending and reconciles it on the next successful write`() {
+        // Locks for the first 3 upsert calls (the whole bounded budget of the
+        // first write), then commits. The first ratchet write must exhaust the
+        // budget and go PENDING, not be dropped; a later successful write must
+        // flush it into Room.
+        val dao = LockThenCommitRatchetDao(
+            lockCalls = 3,
+            lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // First ratchet write: the lock persists through the whole bounded
+        // retry budget. Durable state is (still) absent — the lock never
+        // cleared — but the write must be kept PENDING for reconciliation,
+        // not permanently dropped. Attempts stay bounded (no spin): exactly 3.
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+        assertNull(store.getRatchet(byteArrayOf(1)))
+        assertEquals(3, dao.upsertCount)
+
+        // A second write now succeeds (the lock clears). It must flush the
+        // pending first ratchet value into Room: the durable state that was
+        // "lost" on exhaustion must reappear. Pre-fix nothing rewrites it, so
+        // the value stays missing and this assertion fails (red).
+        store.upsertRatchet(byteArrayOf(2), byteArrayOf(10, 11, 12), timestampMs = 99L)
+
+        val first = store.getRatchet(byteArrayOf(1))
+        assertNotNull(first)
+        assertArrayEquals(byteArrayOf(7, 8, 9), first!!.first)
+        assertEquals(42L, first.second)
+
+        val second = store.getRatchet(byteArrayOf(2))
+        assertNotNull(second)
+        assertArrayEquals(byteArrayOf(10, 11, 12), second!!.first)
+        assertEquals(99L, second.second)
+    }
+
     private fun sampleIdentityData() = IdentityData(
         timestamp = 1L,
         packetHash = byteArrayOf(2, 3),
@@ -187,6 +236,25 @@ class RoomIdentityStoreTest {
 
         override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
             committed?.takeIf { it.destHash.contentEquals(destHash) }
+
+        override fun deleteExpiredBefore(thresholdMs: Long) = Unit
+    }
+
+    private class LockThenCommitRatchetDao(
+        private val lockCalls: Int,
+        private val lock: Exception,
+    ) : IdentityRatchetDao {
+        var upsertCount = 0
+        private val committed = mutableListOf<IdentityRatchetEntity>()
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            if (upsertCount <= lockCalls) throw lock
+            committed.add(entity)
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
+            committed.firstOrNull { it.destHash.contentEquals(destHash) }
 
         override fun deleteExpiredBefore(thresholdMs: Long) = Unit
     }

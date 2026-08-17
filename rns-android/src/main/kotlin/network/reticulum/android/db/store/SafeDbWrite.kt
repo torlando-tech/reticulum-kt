@@ -73,10 +73,83 @@ internal fun ExecutorService.submitWriteThrough(op: String, block: () -> Unit) {
 
 // Bounded retry budget for a transient SQLite lock on a security-relevant
 // durable write. Small backoff doubles between attempts; the total worst-case
-// stall is bounded so a foreground-service write thread can never ANR.
+// stall of a single attempt sequence is bounded so a foreground-service write
+// thread can never ANR.
 private const val MAX_LOCK_ATTEMPTS = 3
 private const val INITIAL_LOCK_BACKOFF_MS = 10L
 private const val MAX_LOCK_BACKOFF_MS = 40L
+
+// Durable (identity/ratchet) writes whose bounded lock-retry budget was
+// exhausted while SQLite stayed locked. They MUST be durable and are NOT
+// reconstructable from the live network, so they are never permanently
+// dropped: each stays pending and is reconciled (flushed) into Room at the
+// next safe point — the next successful durable write, which proves the lock
+// has cleared. Mutated only from the single write-executor thread (or the
+// test thread), so the synchronized wrappers are belt-and-braces; the list is
+// drained once per flush, never spun, and each re-attempt uses the same
+// bounded budget, so nothing unbounded blocks the write thread.
+private val pendingDurableWrites = mutableListOf<Pair<String, () -> Unit>>()
+
+private enum class DurableWriteOutcome { COMMITTED, LOCK_EXHAUSTED, DROPPED }
+
+// Runs [block] through the bounded SQLite-lock retry budget and reports how
+// it ended. COMMITTED — written durably. LOCK_EXHAUSTED — SQLite stayed locked
+// through the whole budget (the caller keeps the write pending for
+// reconciliation). DROPPED — an immediate, non-retryable drop: the
+// [IllegalStateException] close-race (DB closed mid-write), a non-lock
+// [SQLException], or an interrupt while awaiting the lock. Those keep exactly
+// the [submitWriteThrough] semantics — a write cannot be made durable once the
+// `RoomDatabase` is gone.
+private fun attemptDurableWrite(op: String, block: () -> Unit): DurableWriteOutcome {
+    var attempt = 0
+    var backoffMs = INITIAL_LOCK_BACKOFF_MS
+    while (true) {
+        try {
+            block()
+            return DurableWriteOutcome.COMMITTED
+        } catch (e: SQLiteDatabaseLockedException) {
+            attempt++
+            if (attempt >= MAX_LOCK_ATTEMPTS) {
+                return DurableWriteOutcome.LOCK_EXHAUSTED
+            }
+            try {
+                Thread.sleep(backoffMs)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                Log.w(TAG, "DB write '$op' interrupted while awaiting SQLite lock: ${ie.message}")
+                return DurableWriteOutcome.DROPPED
+            }
+            backoffMs = min(backoffMs * 2, MAX_LOCK_BACKOFF_MS)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Dropped DB write '$op'; database closed mid-write: ${e.message}")
+            return DurableWriteOutcome.DROPPED
+        } catch (e: SQLException) {
+            Log.w(TAG, "Dropped DB write '$op'; transient SQLite error: ${e.message}")
+            return DurableWriteOutcome.DROPPED
+        }
+    }
+}
+
+// Reconcile any pending durable writes now that a write has just succeeded
+// (the lock cleared). Re-attempts each pending block once with the same
+// bounded budget; a pending write that still exhausts stays pending for a
+// later flush, one that is dropped (DB closed / non-lock error) is removed —
+// it can no longer be made durable. Runs on the write thread, drains the list
+// once, and never spins.
+private fun flushPendingDurableWrites() {
+    val pending = synchronized(pendingDurableWrites) {
+        pendingDurableWrites.toList().also { pendingDurableWrites.clear() }
+    }
+    for ((op, block) in pending) {
+        when (attemptDurableWrite(op, block)) {
+            DurableWriteOutcome.COMMITTED -> { /* reconciled durably */ }
+            DurableWriteOutcome.LOCK_EXHAUSTED -> synchronized(pendingDurableWrites) {
+                pendingDurableWrites.add(op to block)
+            }
+            DurableWriteOutcome.DROPPED -> { /* can no longer be made durable */ }
+        }
+    }
+}
 
 /**
  * Submit a write-through persistence task whose contents MUST be durable —
@@ -84,13 +157,16 @@ private const val MAX_LOCK_BACKOFF_MS = 40L
  * is not reconstructable from the live network (unlike the announce/path/
  * packet-hash caches that [submitWriteThrough] serves).
  *
- * The one difference from [submitWriteThrough]: a transient SQLite lock
+ * The differences from [submitWriteThrough]: a transient SQLite lock
  * ([SQLiteDatabaseLockedException], e.g. "database is locked" / SQLITE_BUSY)
  * is retried a bounded number of times with a small doubling backoff, so a
  * momentary lock cannot silently discard a ratchet/identity write that would
- * otherwise leave durable state stale or missing after a restart. Only after
- * the bounded budget is exhausted does the write fall back to the same
- * drop-and-log behavior as [submitWriteThrough].
+ * otherwise leave durable state stale or missing after a restart. And, unlike
+ * [submitWriteThrough], retry exhaustion is NOT a permanent drop: the write is
+ * kept pending and reconciled (flushed) into Room at the next safe point — the
+ * next successful durable write, which proves the lock has cleared — so the
+ * security-relevant value is never silently lost even when another writer
+ * holds the lock longer than the bounded retry window.
  *
  * [IllegalStateException] (DB closed mid-write during teardown) and every
  * other [SQLException] (non-lock transient SQLite failure) are still dropped
@@ -105,33 +181,13 @@ private const val MAX_LOCK_BACKOFF_MS = 40L
 internal fun ExecutorService.submitWriteThroughDurable(op: String, block: () -> Unit) {
     try {
         execute {
-            var attempt = 0
-            var backoffMs = INITIAL_LOCK_BACKOFF_MS
-            while (true) {
-                try {
-                    block()
-                    return@execute // committed durably
-                } catch (e: SQLiteDatabaseLockedException) {
-                    attempt++
-                    if (attempt >= MAX_LOCK_ATTEMPTS) {
-                        Log.w(TAG, "Dropped DB write '$op'; SQLite locked after $MAX_LOCK_ATTEMPTS attempts: ${e.message}")
-                        return@execute
-                    }
-                    try {
-                        Thread.sleep(backoffMs)
-                    } catch (ie: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        Log.w(TAG, "Dropped DB write '$op'; interrupted while awaiting SQLite lock: ${ie.message}")
-                        return@execute
-                    }
-                    backoffMs = min(backoffMs * 2, MAX_LOCK_BACKOFF_MS)
-                } catch (e: IllegalStateException) {
-                    Log.w(TAG, "Dropped DB write '$op'; database closed mid-write: ${e.message}")
-                    return@execute
-                } catch (e: SQLException) {
-                    Log.w(TAG, "Dropped DB write '$op'; transient SQLite error: ${e.message}")
-                    return@execute
+            when (attemptDurableWrite(op, block)) {
+                DurableWriteOutcome.COMMITTED -> flushPendingDurableWrites()
+                DurableWriteOutcome.LOCK_EXHAUSTED -> {
+                    Log.w(TAG, "DB write '$op'; SQLite locked after $MAX_LOCK_ATTEMPTS attempts; keeping pending for reconciliation")
+                    synchronized(pendingDurableWrites) { pendingDurableWrites.add(op to block) }
                 }
+                DurableWriteOutcome.DROPPED -> { /* dropped immediately, as above */ }
             }
         }
     } catch (e: RejectedExecutionException) {
