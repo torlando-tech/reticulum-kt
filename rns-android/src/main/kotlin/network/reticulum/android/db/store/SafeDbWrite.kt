@@ -1,9 +1,11 @@
 package network.reticulum.android.db.store
 
 import android.database.SQLException
+import android.database.sqlite.SQLiteDatabaseLockedException
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
+import kotlin.math.min
 
 private const val TAG = "RoomStore"
 
@@ -61,6 +63,75 @@ internal fun ExecutorService.submitWriteThrough(op: String, block: () -> Unit) {
                 Log.w(TAG, "Dropped DB write '$op'; database closed mid-write: ${e.message}")
             } catch (e: SQLException) {
                 Log.w(TAG, "Dropped DB write '$op'; transient SQLite error: ${e.message}")
+            }
+        }
+    } catch (e: RejectedExecutionException) {
+        // Executor already shutdown() by StoreLifecycle during service teardown.
+        Log.w(TAG, "DB write '$op' rejected; executor already shut down")
+    }
+}
+
+// Bounded retry budget for a transient SQLite lock on a security-relevant
+// durable write. Small backoff doubles between attempts; the total worst-case
+// stall is bounded so a foreground-service write thread can never ANR.
+private const val MAX_LOCK_ATTEMPTS = 3
+private const val INITIAL_LOCK_BACKOFF_MS = 10L
+private const val MAX_LOCK_BACKOFF_MS = 40L
+
+/**
+ * Submit a write-through persistence task whose contents MUST be durable —
+ * the security-relevant identity/ratchet state stored by [RoomIdentityStore]
+ * is not reconstructable from the live network (unlike the announce/path/
+ * packet-hash caches that [submitWriteThrough] serves).
+ *
+ * The one difference from [submitWriteThrough]: a transient SQLite lock
+ * ([SQLiteDatabaseLockedException], e.g. "database is locked" / SQLITE_BUSY)
+ * is retried a bounded number of times with a small doubling backoff, so a
+ * momentary lock cannot silently discard a ratchet/identity write that would
+ * otherwise leave durable state stale or missing after a restart. Only after
+ * the bounded budget is exhausted does the write fall back to the same
+ * drop-and-log behavior as [submitWriteThrough].
+ *
+ * [IllegalStateException] (DB closed mid-write during teardown) and every
+ * other [SQLException] (non-lock transient SQLite failure) are still dropped
+ * immediately, exactly as in [submitWriteThrough] — the close-race semantics
+ * and the reconstructable-cache policy are unchanged; a write cannot be made
+ * durable once the `RoomDatabase` is gone. The [IllegalStateException] catch
+ * is deliberately NOT broadened: each [block] stays a plain DAO call with no
+ * main-thread DB access, matching the [submitWriteThrough] contract.
+ *
+ * @param op short operation label for the dropped-write log line.
+ */
+internal fun ExecutorService.submitWriteThroughDurable(op: String, block: () -> Unit) {
+    try {
+        execute {
+            var attempt = 0
+            var backoffMs = INITIAL_LOCK_BACKOFF_MS
+            while (true) {
+                try {
+                    block()
+                    return@execute // committed durably
+                } catch (e: SQLiteDatabaseLockedException) {
+                    attempt++
+                    if (attempt >= MAX_LOCK_ATTEMPTS) {
+                        Log.w(TAG, "Dropped DB write '$op'; SQLite locked after $MAX_LOCK_ATTEMPTS attempts: ${e.message}")
+                        return@execute
+                    }
+                    try {
+                        Thread.sleep(backoffMs)
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        Log.w(TAG, "Dropped DB write '$op'; interrupted while awaiting SQLite lock: ${ie.message}")
+                        return@execute
+                    }
+                    backoffMs = min(backoffMs * 2, MAX_LOCK_BACKOFF_MS)
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "Dropped DB write '$op'; database closed mid-write: ${e.message}")
+                    return@execute
+                } catch (e: SQLException) {
+                    Log.w(TAG, "Dropped DB write '$op'; transient SQLite error: ${e.message}")
+                    return@execute
+                }
             }
         }
     } catch (e: RejectedExecutionException) {

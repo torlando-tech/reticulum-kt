@@ -6,7 +6,9 @@ import network.reticulum.android.db.dao.KnownDestinationDao
 import network.reticulum.android.db.entity.IdentityRatchetEntity
 import network.reticulum.android.db.entity.KnownDestinationEntity
 import network.reticulum.identity.Identity.IdentityData
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -30,13 +32,21 @@ import org.robolectric.annotation.Config
  * A live SQLITE_BUSY can't be reproduced deterministically through a real
  * Robolectric Room DB (host JDBC SQLite no-ops writes after `close()` instead
  * of throwing — see [RoomAnnounceStoreTest]), so the test injects the real
- * `SQLiteDatabaseLockedException` through a fake [KnownDestinationDao] and runs
- * the production write lambda inline on the test thread via
- * [DirectExecutorService]. The store method, the executor, and the lambda are
- * all production code; only the DAO is a fake that raises the exact real
- * exception type. Pre-fix the exception escapes the `writeExecutor.execute`
- * lambda and the test fails; post-fix [submitWriteThrough] swallows it (its
- * `SQLException` branch covers `SQLiteDatabaseLockedException` by inheritance).
+ * `SQLiteDatabaseLockedException` through a fake DAO and runs the production
+ * write lambda inline on the test thread via [DirectExecutorService]. The
+ * store method, the executor, and the lambda are all production code; only
+ * the DAO is a fake that raises the exact real exception type. Pre-fix the
+ * exception escapes the `writeExecutor.execute` lambda and the test fails;
+ * post-fix [submitWriteThrough] swallows it (its `SQLException` branch covers
+ * `SQLiteDatabaseLockedException` by inheritance).
+ *
+ * The identity/ratchet state written by this store is security-relevant and is
+ * NOT reconstructable from the live network (unlike the announce/path/
+ * packet-hash caches), so its writes route through
+ * [submitWriteThroughDurable]: a transient SQLite lock is retried a bounded
+ * number of times so a momentary lock cannot silently discard the durable
+ * write. The D4 crash-escape guarantee is preserved — the lock still never
+ * escapes the write thread.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
@@ -52,37 +62,72 @@ class RoomIdentityStoreTest {
         // Pre-fix: upsertKnownDestination bypasses submitWriteThrough, so this
         // SQLiteDatabaseLockedException escapes the writeExecutor.execute lambda
         // and, on the NativeReticulumDB-write thread, reaches the uncaught handler
-        // — fatal (COLUMBA-D4). Post-fix: submitWriteThrough's SQLException branch
-        // swallows it.
+        // — fatal (COLUMBA-D4). Post-fix: submitWriteThroughDurable retries the
+        // transient lock a bounded number of times, then drops it — it never
+        // escapes the write thread.
         store.upsertKnownDestination(byteArrayOf(1), sampleIdentityData())
 
         // Reaching here means the exception did not escape; the write was
-        // attempted once then dropped.
-        assertEquals(1, dao.upsertCount)
+        // attempted the bounded retry budget times (1 + retries = 3), then
+        // dropped. Every attempt reached the DAO before the drop.
+        assertEquals(3, dao.upsertCount)
     }
 
     /**
-     * Follow-up green test: the policy swallows exactly one write (the
-     * transient SQLITE_BUSY lock) without degrading the write path. The DAO
+     * Follow-up test: the policy retries a transient SQLITE_BUSY lock and the
+     * write still lands durably without degrading the write path. The DAO
      * fails its FIRST upsert with the real SQLiteDatabaseLockedException and
-     * succeeds on the second; both calls must reach the DAO and no exception
-     * may escape. This guards against a "fix" that works by broadly swallowing
-     * arbitrary production exceptions or by permanently dropping the path.
+     * succeeds on the second; the single write must be retried and committed
+     * and no exception may escape. This guards against a "fix" that works by
+     * broadly swallowing arbitrary production exceptions or by permanently
+     * dropping the security-relevant path.
      */
     @Test
-    fun `upsertKnownDestination still lands the next write after one swallowed SQLITE_BUSY lock`() {
+    fun `upsertKnownDestination retries one SQLITE_BUSY lock and durably commits the identity write`() {
         val dao = FailFirstKnownDestinationDao(
             firstCallFailure = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
         )
         val store = RoomIdentityStore(dao, NoopIdentityRatchetDao(), DirectExecutorService())
 
-        // First write: transient lock — swallowed by submitWriteThrough's
-        // SQLException branch; must not escape.
+        // First write: transient lock — retried by submitWriteThroughDurable,
+        // must not escape and must still land durably.
         store.upsertKnownDestination(byteArrayOf(1), sampleIdentityData())
         // Second write: must still reach the DAO and succeed.
         store.upsertKnownDestination(byteArrayOf(1), sampleIdentityData())
 
-        // Both attempts reached the DAO; the second landed.
+        // Under the durable contract the FIRST write is retried and committed
+        // (attempt 1 locked, attempt 2 committed), then the second write lands:
+        // 3 upsert calls total. No exception escaped.
+        assertEquals(3, dao.upsertCount)
+    }
+
+    /**
+     * New durability regression (Greptile P1): a security-relevant RATCHET
+     * upsert that hits one transient SQLiteDatabaseLockedException must end
+     * with the durable ratchet state PRESENT — the single write itself is
+     * retried and committed, not merely "the next independent write lands".
+     * Before the durable correction, submitWriteThrough dropped the write on
+     * the lock and the ratchet existed only in memory: restarting would
+     * restore stale/missing ratchet state until the peer re-announced.
+     */
+    @Test
+    fun `upsertRatchet retries one transient SQLite lock and the durable ratchet state is present`() {
+        val dao = FailOnceThenCommitRatchetDao(
+            firstCallFailure = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // The security-relevant ratchet write must NOT be silently discarded on
+        // a transient lock: after one SQLiteDatabaseLockedException the durable
+        // ratchet state must be present (the write is retried and committed).
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+
+        val committed = dao.committed
+        assertNotNull(committed)
+        assertArrayEquals(byteArrayOf(1), committed!!.destHash)
+        assertArrayEquals(byteArrayOf(7, 8, 9), committed.ratchet)
+        assertEquals(42L, committed.timestamp)
+        // First attempt locked, retried and committed.
         assertEquals(2, dao.upsertCount)
     }
 
@@ -123,6 +168,31 @@ class RoomIdentityStoreTest {
             if (upsertCount == 1) throw firstCallFailure
         }
 
+        override fun getByHash(destHash: ByteArray): KnownDestinationEntity? = null
+        override fun getAll(): List<KnownDestinationEntity> = emptyList()
+        override fun count(): Int = 0
+    }
+
+    private class FailOnceThenCommitRatchetDao(
+        private val firstCallFailure: Exception,
+    ) : IdentityRatchetDao {
+        var upsertCount = 0
+        var committed: IdentityRatchetEntity? = null
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            if (upsertCount == 1) throw firstCallFailure
+            committed = entity
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
+            committed?.takeIf { it.destHash.contentEquals(destHash) }
+
+        override fun deleteExpiredBefore(thresholdMs: Long) = Unit
+    }
+
+    private class NoopKnownDestinationDao : KnownDestinationDao {
+        override fun upsert(entity: KnownDestinationEntity) = Unit
         override fun getByHash(destHash: ByteArray): KnownDestinationEntity? = null
         override fun getAll(): List<KnownDestinationEntity> = emptyList()
         override fun count(): Int = 0
