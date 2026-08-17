@@ -16,6 +16,18 @@ class RoomIdentityStore(
     private val writeExecutor: ExecutorService
 ) : IdentityStore {
 
+    // Instance-owned pending durable-write state. Scoping this to the store —
+    // rather than a process-global registry keyed by executor — means a retired
+    // store's executor/DAO/database references are released with this store's
+    // lifecycle ([dispose]) and a replacement store never observes or flushes
+    // the retired instance's backlog.
+    private val durableState = DurableWriteState()
+
+    /** Release this store's pending durable-write state (executor/DAO/DB refs). */
+    fun dispose() {
+        durableState.dispose()
+    }
+
     // ===== Known Destinations =====
 
     override fun upsertKnownDestination(destHash: ByteArray, data: IdentityData) {
@@ -27,6 +39,7 @@ class RoomIdentityStore(
             appData = data.appData?.copyOf()
         )
         writeExecutor.submitWriteThroughDurable(
+            durableState,
             "identity.upsertKnownDestination",
             DurableRowKey("knownDest", destHash.toKey())
         ) { knownDestDao.upsert(entity) }
@@ -64,6 +77,7 @@ class RoomIdentityStore(
             timestamp = timestampMs
         )
         writeExecutor.submitWriteThroughDurable(
+            durableState,
             "identity.upsertRatchet",
             DurableRowKey("ratchet", destHash.toKey())
         ) { ratchetDao.upsert(entity) }
@@ -77,6 +91,7 @@ class RoomIdentityStore(
     override fun removeExpiredRatchets(maxAgeMs: Long) {
         val threshold = System.currentTimeMillis() - maxAgeMs
         writeExecutor.submitWriteThroughDurable(
+            durableState,
             "identity.removeExpiredRatchets",
             // Range delete with no per-row key; a fixed marker key keeps it out
             // of the row-key namespace so it never collides with an upsert, and

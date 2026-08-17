@@ -280,6 +280,89 @@ class RoomIdentityStoreTest {
         }
     }
 
+    /**
+     * New regression (DeepSeek correction, lifecycle/isolation): a RETIRED
+     * store's pending durable backlog must be scoped to the owning
+     * writer/store lifecycle — never to the shared executor — so a replacement
+     * store on the SAME executor must not observe or flush the retired
+     * instance's DAO work. Pre-fix the pending backlog lives in a process-global
+     * `ConcurrentHashMap` keyed by `ExecutorService`, so two store generations
+     * sharing one executor share the same pending set: store B's successful
+     * write reconciles store A's retired pending entry and invokes store A's
+     * DAO again (upsertCount 4). Post-fix the pending state is owned by each
+     * store instance, so store B's flush touches only its own (empty) state and
+     * store A's retired DAO is never called (upsertCount stays 3). Deterministic
+     * via counting DAOs + DirectExecutorService — no sleeps, no GC timing.
+     */
+    @Test
+    fun `a replacement store sharing the same executor must never observe or flush the retired store's pending durable backlog`() {
+        val lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        val executor = DirectExecutorService()
+
+        // Store A on executor: seed a durable ratchet write whose whole bounded
+        // lock budget exhausts -> it goes PENDING (never dropped), DAO A called 3x.
+        val daoA = LockThenCommitRatchetDao(lockCalls = 3, lock = lock)
+        val storeA = RoomIdentityStore(NoopKnownDestinationDao(), daoA, executor)
+        storeA.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+        assertEquals(3, daoA.upsertCount)
+        assertNull(storeA.getRatchet(byteArrayOf(1)))
+
+        // Store A's lifecycle ends (retired). A replacement store B is created on
+        // the SAME executor. The retired backlog must stay scoped to store A and
+        // be released with it — store B's successful write must NOT flush it.
+        val daoB = LockThenCommitRatchetDao(lockCalls = 0, lock = lock)
+        val storeB = RoomIdentityStore(NoopKnownDestinationDao(), daoB, executor)
+        storeB.upsertRatchet(byteArrayOf(2), byteArrayOf(10, 11, 12), timestampMs = 99L)
+
+        // Retired store A's DAO must never be invoked by store B's flush.
+        // Pre-fix store B's flush re-attempts store A's pending entry and commits
+        // it (upsertCount 4) -> RED. Post-fix store B's own state is empty, so
+        // DAO A stays at 3.
+        assertEquals(3, daoA.upsertCount)
+
+        // store B's own write must have committed durably.
+        val second = storeB.getRatchet(byteArrayOf(2))
+        assertNotNull(second)
+        assertArrayEquals(byteArrayOf(10, 11, 12), second!!.first)
+        assertEquals(99L, second.second)
+    }
+
+    /**
+     * New regression (DeepSeek correction, explicit lifecycle release): calling
+     * [RoomIdentityStore.dispose] releases the store's pending durable state, so
+     * a later durable write on the same (retired) store must NOT reconcile the
+     * disposed backlog — the retired DAO work cannot be retained or flushed
+     * after disposal. Deterministic via counting DAO + DirectExecutorService.
+     */
+    @Test
+    fun `disposing a store releases its pending durable state so a later write cannot flush the retired backlog`() {
+        val lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        val executor = DirectExecutorService()
+        val daoA = LockThenCommitRatchetDao(lockCalls = 3, lock = lock)
+        val storeA = RoomIdentityStore(NoopKnownDestinationDao(), daoA, executor)
+
+        // Seed: dest_hash [1] exhausts the whole bounded budget -> PENDING.
+        storeA.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+        assertEquals(3, daoA.upsertCount)
+
+        // Explicit lifecycle boundary: release the store's pending state.
+        storeA.dispose()
+
+        // A later durable write on the same store must commit (DAO A is unlocked:
+        // upsert #4) but must NOT flush the disposed backlog for dest_hash [1].
+        storeA.upsertRatchet(byteArrayOf(2), byteArrayOf(10, 11, 12), timestampMs = 99L)
+        // 3 seed attempts + 1 new committed write, with NO reconciliation of the
+        // disposed [1] entry (that would be a 5th upsert).
+        assertEquals(4, daoA.upsertCount)
+        // The disposed backlog for [1] must not have been flushed.
+        assertNull(storeA.getRatchet(byteArrayOf(1)))
+        // The new write itself is durable.
+        val second = storeA.getRatchet(byteArrayOf(2))
+        assertNotNull(second)
+        assertArrayEquals(byteArrayOf(10, 11, 12), second!!.first)
+        assertEquals(99L, second.second)
+    }
+
     private fun sampleIdentityData() = IdentityData(
         timestamp = 1L,
         packetHash = byteArrayOf(2, 3),
