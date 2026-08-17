@@ -68,6 +68,13 @@ class ReticulumService : LifecycleService() {
     private var database: network.reticulum.android.db.ReticulumDatabase? = null
     private var dbWriteExecutor: java.util.concurrent.ExecutorService? = null
 
+    // The RoomIdentityStore instance backing Identity.identityStore. Kept as a
+    // concrete reference so its instance-owned durable-write state can be
+    // released ([dispose]) during teardown after the write executor is drained
+    // and before/with the database close — otherwise the retired store's
+    // executor, DAO-capturing lambdas, and RoomDatabase would stay retained.
+    private var identityStore: network.reticulum.android.db.store.RoomIdentityStore? = null
+
     // Pause/resume state tracking
     private var _isPaused = false
 
@@ -292,6 +299,14 @@ class ReticulumService : LifecycleService() {
         }
         dbWriteExecutor = null
 
+        // Release the durable-write state owned by the RoomIdentityStore
+        // (executor/DAO/database references) AFTER the write executor is drained
+        // and quiescent and BEFORE the database close. A replacement
+        // service/store/database must never observe or flush the retired
+        // instance's backlog.
+        identityStore?.dispose()
+        identityStore = null
+
         database?.close()
         database = null
 
@@ -353,8 +368,10 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.store.RoomAnnounceStore(db.announceCacheDao(), executor)
             network.reticulum.transport.Transport.discoveryStore =
                 network.reticulum.android.db.store.RoomDiscoveryStore(db.discoveredInterfaceDao(), executor)
-            network.reticulum.identity.Identity.identityStore =
-                network.reticulum.android.db.store.RoomIdentityStore(db.knownDestinationDao(), db.identityRatchetDao(), executor)
+            identityStore = network.reticulum.android.db.store.RoomIdentityStore(
+                db.knownDestinationDao(), db.identityRatchetDao(), executor
+            )
+            network.reticulum.identity.Identity.identityStore = identityStore
             network.reticulum.transport.Transport.destinationRatchetStore =
                 network.reticulum.android.db.store.RoomDestinationRatchetStore(db.destinationRatchetDao(), executor)
 
