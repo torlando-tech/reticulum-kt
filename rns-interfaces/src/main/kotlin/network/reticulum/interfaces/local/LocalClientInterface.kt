@@ -9,7 +9,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.IOException
@@ -300,10 +299,11 @@ class LocalClientInterface : Interface {
         try {
             while (online.value && !detached.get()) {
                 val sock = socket ?: break
-                // Blocking read wrapped in IO dispatcher
-                val bytesRead = withContext(Dispatchers.IO) {
-                    sock.getInputStream().read(buffer)
-                }
+                // The enclosing coroutine is launched on `ioScope` which is
+                // already bound to Dispatchers.IO; calling read() directly
+                // matches python's `LocalInterface.py:302 self.socket.recv(4096)`
+                // pattern without a redundant dispatcher hop per iteration.
+                val bytesRead = sock.getInputStream().read(buffer)
 
                 if (bytesRead > 0) {
                     val data = buffer.copyOf(bytesRead)
