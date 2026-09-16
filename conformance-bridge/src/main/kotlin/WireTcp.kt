@@ -116,7 +116,7 @@ private class WireInstance(
     val sharedClient: network.reticulum.interfaces.local.LocalClientInterface? = null,
     val sharedInstancePort: Int? = null,
     val destinations: MutableList<Pair<Identity, Destination>> = mutableListOf(),
-    // GROUP destinations keyed by hash hex — mirrors the python bridge's
+    // GROUP destinations keyed by hash hex - mirrors the python bridge's
     // inst["group_dests"] (wire_tcp.py cmd_wire_group_create). A GROUP
     // destination has no identity (symmetric key only), so it can't live in
     // `destinations` alongside the SINGLE ones; keep it in its own map.
@@ -134,7 +134,7 @@ private class WireInstance(
     // reference bridge's inst["out_resources"] (wire_tcp.py cmd_wire_resource_send /
     // cmd_wire_resource_cancel).
     val outResources: ConcurrentHashMap<String, Resource> = ConcurrentHashMap(),
-    // Initiator-side per-link channel state — mirrors the reference's
+    // Initiator-side per-link channel state - mirrors the reference's
     // inst["channels"] (_ensure_channel_state). Keyed by link_id hex.
     val channelStates: ConcurrentHashMap<String, ChannelState> = ConcurrentHashMap(),
 )
@@ -251,7 +251,7 @@ private const val WIRE_CHANNEL_MSGTYPE = 0x0101
 /** Fixed default stream id for Buffer streaming (reference _WIRE_BUFFER_STREAM_ID). */
 private const val WIRE_BUFFER_STREAM_ID = 0
 
-/** Bridge MessageBase carrying opaque bytes — mirrors the reference
+/** Bridge MessageBase carrying opaque bytes - mirrors the reference
  *  _WireChannelMessage (pack()=data, unpack stores raw). */
 private class WireChannelMessage(var data: ByteArray = ByteArray(0)) : MessageBase() {
     override val msgType = WIRE_CHANNEL_MSGTYPE
@@ -259,7 +259,7 @@ private class WireChannelMessage(var data: ByteArray = ByteArray(0)) : MessageBa
     override fun unpack(raw: ByteArray) { data = raw }
 }
 
-/** Bridge MessageBase with a caller-chosen msgType — mirrors the reference
+/** Bridge MessageBase with a caller-chosen msgType - mirrors the reference
  *  _AdHocChannelMessage (used by wire_channel_inject msgtype overrides). */
 private class AdHocMessage(override val msgType: Int, var data: ByteArray = ByteArray(0)) : MessageBase() {
     override fun pack(): ByteArray = data
@@ -413,7 +413,7 @@ private fun feedInboundLinkPacket(link: Link, plaintext: ByteArray, context: net
     link.receive(rx)
 }
 
-/** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
+/** Lifecycle snapshot of an RNS.Link - mirrors the reference _link_status_dict.
  *  keepalive_s/stale_time_s/rtt cross the boundary in SECONDS (kotlin millis). */
 private fun linkStatusDict(link: Link): JsonObject {
     val now = System.currentTimeMillis()
@@ -470,7 +470,7 @@ private class Listener(
     // side that did NOT initiate the close.
     val inboundLinks: ConcurrentLinkedDeque<Link> = ConcurrentLinkedDeque(),
     // Receiver-side proof log: the raw context byte of every inbound packet
-    // this listener's links PROVED, in order — mirrors the reference's
+    // this listener's links PROVED, in order - mirrors the reference's
     // listener["proof_log"] populated by wrapping link.prove_packet
     // (wire_tcp.py:1299-1317). Filled by the Link.proveTapForTest tap installed
     // in wire_listen; drained by wire_listener_proof_log.
@@ -507,16 +507,20 @@ private class Listener(
 private const val WIRE_RX_MAX_DECOMPRESSED = 256 * 1024
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
+// Per-handle cache: pristine raw frame built for `pristine_link_inbound`,
+// reused by `replay_reflag` so the replay tests the SAME wire bytes (a true
+// attacker capture) rather than a freshly-built packet. Keyed by link_id hex.
+private val wireReplayRawCache = ConcurrentHashMap<String, ByteArray>() // key: "$handle|$linkIdHex"
 
 /**
- * Request-handler invocation log, keyed "$handle|$destHex|$path" — mirrors the
+ * Request-handler invocation log, keyed "$handle|$destHex|$path" - mirrors the
  * reference bridge's _request_handler_log. The response generator appends one
  * JSON entry per request that reached the handler; wire_get_request_log drains
  * it. Cleared in resetWireState so it can't leak across tests sharing the JVM.
  */
 private val wireRequestHandlerLog = ConcurrentHashMap<String, MutableList<JsonObject>>()
 
-/** Last keepalive byte a link emitted/answered, keyed by link id hex — mirrors
+/** Last keepalive byte a link emitted/answered, keyed by link id hex - mirrors
  *  the reference's inst["keepalive_payloads"]. Cleared on reset. */
 private val wireKeepalivePayloads = ConcurrentHashMap<String, ByteArray>()
 
@@ -741,7 +745,7 @@ private fun parseStartConfig(p: JsonObject, defaultEnableTransport: Boolean): Pa
     return cfg to tuning
 }
 
-/** Fresh 8-byte hex receipt id token — mirrors the reference's
+/** Fresh 8-byte hex receipt id token - mirrors the reference's
  *  `secrets.token_hex(8)` keying inst["receipts"] (wire_tcp.py:3402). */
 private fun freshReceiptId(): String = defaultCryptoProvider().randomBytes(8).toHex()
 
@@ -1400,7 +1404,7 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                     }
                 }
                 // RawChannelReader for the DEFAULT stream 0 PLUS any extra
-                // requested ids — mirrors the reference, which always registers
+                // requested ids - mirrors the reference, which always registers
                 // the default reader and then each buffer_stream_id.
                 val ids = (listOf(WIRE_BUFFER_STREAM_ID) + (bufferStreamIds ?: emptyList())).distinct()
                 for (sid in ids) {
@@ -3186,10 +3190,20 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
         // link_id without checking destination_type re-delivers the replayed
         // payload (link-data replay).
         if (corruption == "pristine_link_inbound" || corruption == "replay_reflag") {
-            val inj = raw.copyOf()
+            val cacheKey = "$handle|$linkIdHex"
+            val cached = wireReplayRawCache[cacheKey]
+            val reused = cached != null
+            val inj = when {
+                corruption == "replay_reflag" && reused -> cached!!.copyOf()
+                else -> raw.copyOf()
+            }
             if (corruption == "replay_reflag") {
                 inj[0] = ((inj[0].toInt() and 0b11111001) or (0b00000010 shl 2)).toByte() // dest-type -> PLAIN
                 inj[1] = 0.toByte()                                                       // hops -> 0
+            } else {
+                // pristine_link_inbound: cache the pristine raw for the
+                // subsequent replay_reflag call (same bytes = true replay).
+                wireReplayRawCache[cacheKey] = raw.copyOf()
             }
             val rx2 = Packet.unpack(inj)
             val unpacked2 = rx2 != null
@@ -3200,12 +3214,17 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             }
             Thread.sleep(50)
             val after2 = listener.recvBuffer.size
+            if (corruption == "replay_reflag") {
+                wireReplayRawCache.remove(cacheKey)
+            }
             return@handleWireCmd3 result(
                 "corruption" to strVal(corruption),
                 "unpacked" to boolVal(unpacked2),
                 "delivered" to boolVal(after2 > before),
                 "link_active" to boolVal(link.status == LinkConstants.ACTIVE),
                 "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                "reused_raw" to boolVal(reused),
+                "raw_hex" to strVal(inj.toHex()),
             )
         }
 
