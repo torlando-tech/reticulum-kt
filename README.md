@@ -97,7 +97,7 @@ Interoperability is validated by automated tests against the Python reference.
 | Identity | Complete | X25519/Ed25519, ratchets (one per destination, persisted), known destinations with use tracking and eviction, atomic-replace storage |
 | Destination | Complete | All types (SINGLE, GROUP, PLAIN, LINK), request handlers, proof strategies, persisted peer ratchets consulted on encrypt |
 | Packet | Complete | Full wire format, HEADER_1/HEADER_2, receipts, proofs, zero-length data rejected |
-| Transport | Complete | Routing, path management, tunnels, announces, announce caching and retransmit, link management, IFAC, mode-based filtering, blackhole, traffic-class inbound queues, ingress/egress limiting, management and probe destinations |
+| Transport | Complete | Routing, path management with alternate paths retained per destination, tunnels, announces, announce caching and retransmit, link management, IFAC, mode-based filtering, blackhole, traffic-class inbound queues, ingress/egress limiting, management and probe destinations |
 | Link | Complete | Establishment, encryption, channels, resources, request/response with any msgpack value, MTU discovery, peer-supplied RTT/MTU clamped |
 | Channel | Complete | Windowed flow control, ordered delivery, retransmission, message type registry |
 | Buffer | Complete | Stream I/O over channels, partial writes re-driven |
@@ -110,7 +110,7 @@ Interoperability is validated by automated tests against the Python reference.
 
 | Interface | Status | Notes |
 |-----------|--------|-------|
-| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python, keepalive on server children, optional SOCKS5 proxy |
+| TCP Server/Client | Complete | HDLC framing, fixed five-second reconnect matching Python, spawned server children registered with Transport so a server can route to a connected client, keepalive on server children, optional SOCKS5 proxy |
 | Backbone | Complete | NIO selector listener, IFAC with configurable tag size on the parent and spawned clients, 1024-client cap, bounded HDLC deframer, coalescing transmit buffer |
 | UDP | Complete | Unicast, broadcast, multicast |
 | Local (Shared Instance) | Complete | Server/client IPC for sharing Reticulum across apps, bounded child deframer, accept loop survives transient errors |
@@ -122,7 +122,7 @@ Interoperability is validated by automated tests against the Python reference.
 | Bluetooth SPP | Complete | Bluetooth Classic RFCOMM with HDLC framing, client + server, decoupled transmit, 8-byte serial IFAC tag |
 | Pipe | Complete | HDLC over arbitrary byte streams (subprocess pipes, FIFOs, in-process testing) — Python-parity |
 | Auto (Discovery) | Complete | IPv6 multicast peer discovery, per-peer UDP connections, working multi-interface dedup |
-| I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels |
+| I2P | Complete | SAM API tunnels with HDLC-framed TCP, server tunnel + client tunnels, spawned peers registered with Transport (inbound peers deregistered on disconnect, outbound kept so a reconnect keeps its route) |
 | Nearby Connections | Present, scheduled for removal | Google Nearby Connections (WiFi Direct + BLE) — Kotlin-only. The Android driver pulls in `play-services` for a transport no consumer instantiates; the driver and dependency are slated to go, the abstract seam stays |
 | KISS Framing | Complete | Used by TCP, RNode and the KISS interfaces |
 | HDLC Framing | Complete | Bounded deframer, used by TCP, Backbone, SPP, Pipe and I2P |

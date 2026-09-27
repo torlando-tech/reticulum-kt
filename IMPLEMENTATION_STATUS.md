@@ -31,6 +31,11 @@ LXMF lives in a separate repository: [LXMF-kt](https://github.com/torlando-tech/
 - **Path management**: state machine (ACTIVE → UNRESPONSIVE → STALE), expiry by interface
   mode, path-request gates and discovery timeouts, waiting discovery requests answered on
   announce arrival, `MODE_INTERNAL` with the `announces_from/to_internal` knobs
+- **Alternate paths**: the rows the reference discards when a newer announce replaces a path
+  are kept per destination, so a destination heard over several interfaces has more than one
+  recorded way through. A path that fails is marked rather than dropped when another way is
+  held, and dropped outright when it is the only one, which is the reference's behaviour.
+  Alternates are pruned with the destination they belong to. See `port-deviations.md`
 - **Announces**: rebroadcast with the PATHFINDER retransmit machinery, announce cap and
   announce-rate limiter, replay to late-joining local clients
 - **Receipt management**: timeout tracking, MAX_RECEIPTS culling
