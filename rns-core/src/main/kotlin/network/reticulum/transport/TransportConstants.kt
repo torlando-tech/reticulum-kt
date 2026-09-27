@@ -218,4 +218,15 @@ object TransportConstants {
 
     /** Grace period after startup before interface-based path culling (30 seconds). */
     const val STARTUP_GRACE_PERIOD = 30_000L
+
+    /**
+     * Cap on alternate rows kept per destination, beyond the selected one.
+     *
+     * A node reaches a destination over an interface, so the natural bound is the number
+     * of registered interfaces and the real figure is small — a phone runs three. This is
+     * a backstop against a host with many interfaces multiplying a path table that already
+     * holds thousands of destinations, not a routing decision. Alternates are keyed by
+     * receiving interface, so a peer cannot push past it by announcing.
+     */
+    const val MAX_ALTERNATE_ROWS = 4
 }

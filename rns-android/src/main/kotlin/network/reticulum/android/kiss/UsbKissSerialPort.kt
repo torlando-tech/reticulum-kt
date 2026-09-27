@@ -95,7 +95,12 @@ class UsbKissSerialPort(
             val n = p.read(buf, READ_TIMEOUT_MS)
             if (n <= 0) ByteArray(0) else buf.copyOf(n)
         } catch (e: Exception) {
+            // Fires at most once per session: clearing openFlag ends KissInterface's
+            // `while (port.isOpen)` read loop, which returns normally — so the session
+            // tears down and reconnects with no record anywhere of why the TNC dropped.
+            // The open path logs its failures; this is the same fault, mid-session.
             openFlag = false
+            Log.w(TAG, "USB serial read failed; marking port closed", e)
             ByteArray(0)
         }
     }

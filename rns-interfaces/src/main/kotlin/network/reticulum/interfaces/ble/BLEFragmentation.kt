@@ -2,6 +2,7 @@ package network.reticulum.interfaces.ble
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 
 /**
  * BLE Fragmentation Protocol
@@ -235,7 +236,7 @@ class BLEReassembler(
             fragType == BLEFragmenter.TYPE_CONTINUE ||
             fragType == BLEFragmenter.TYPE_END
         ) {
-            "Invalid fragment type: 0x${String.format("%02x", fragType)}"
+            "Invalid fragment type: 0x${String.format(Locale.ROOT, "%02x", fragType)}"
         }
 
         // Validate sequence and total

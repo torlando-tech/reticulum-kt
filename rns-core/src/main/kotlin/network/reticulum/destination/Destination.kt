@@ -4,6 +4,7 @@ import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.RnsLog
 import network.reticulum.common.toHexString
 import network.reticulum.common.toKey
 import network.reticulum.crypto.Hashes
@@ -1467,6 +1468,22 @@ class Destination private constructor(
                     try {
                         callback(packet)
                     } catch (e: Exception) {
+                        // An application callback that raises silently turns every proof
+                        // this destination would have sent into no proof at all, and the
+                        // sender only sees its delivery confirmations stop arriving —
+                        // there is nothing else for either side to go on.
+                        //
+                        // Reported unconditionally, and at ERROR, which is where the
+                        // reference puts it (Transport.py:2605). The rest of this file
+                        // reports through `if (DEBUG) println`, and that is the right
+                        // idiom for tracing but the wrong one here: it is off unless
+                        // someone already suspected a problem, so matching it would mean
+                        // nobody learns. This is the first RnsLog call in this file.
+                        RnsLog.log(
+                            RnsLog.ERROR,
+                            "Destination",
+                            "Error while executing proof request callback for $this: ${e.message}",
+                        )
                         false
                     }
                 } ?: false

@@ -1,5 +1,6 @@
 package network.reticulum.channel
 
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.locks.ReentrantLock
@@ -180,14 +181,14 @@ class Channel(
             if (msgType >= 0xF000 && !isSystemType) {
                 throw ChannelException(
                     ChannelExceptionType.ME_INVALID_MSG_TYPE,
-                    "Message type ${String.format("0x%04X", msgType)} is in system-reserved range (>= 0xF000)"
+                    "Message type ${String.format(Locale.ROOT, "0x%04X", msgType)} is in system-reserved range (>= 0xF000)"
                 )
             }
 
             if (messageFactories.containsKey(msgType)) {
                 throw ChannelException(
                     ChannelExceptionType.ME_INVALID_MSG_TYPE,
-                    "Message type ${String.format("0x%04X", msgType)} already registered"
+                    "Message type ${String.format(Locale.ROOT, "0x%04X", msgType)} already registered"
                 )
             }
 
@@ -517,8 +518,7 @@ class Channel(
                     break
                 }
             } catch (e: Exception) {
-                println("[Channel] Error in message callback: ${e.message}")
-                e.printStackTrace()
+                println("[Channel] Error in message callback: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }

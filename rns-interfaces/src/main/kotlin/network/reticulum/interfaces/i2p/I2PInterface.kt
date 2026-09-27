@@ -10,6 +10,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
+import network.reticulum.interfaces.toRef
+import network.reticulum.transport.Transport
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -86,10 +88,16 @@ class I2PInterface(
     var b32: String? = null
         internal set
 
-    /** Called when a peer connects. Use to register spawned interface with Transport. */
+    /**
+     * Called when a peer connects, after it has been registered with Transport.
+     *
+     * A notification hook, not the registration mechanism. Registering again from here is
+     * harmless — `Transport.registerInterface` is idempotent, as the reference's
+     * `add_interface` is — but it is not needed.
+     */
     var onPeerConnected: ((Interface) -> Unit)? = null
 
-    /** Called when a peer disconnects. Use to deregister spawned interface from Transport. */
+    /** Called when a peer disconnects, after an inbound peer has been deregistered. */
     var onPeerDisconnected: ((Interface) -> Unit)? = null
 
     /** Called for each outbound peer created from the peers list. */
@@ -216,6 +224,21 @@ class I2PInterface(
         }
 
         spawnedInterfaces?.add(peer)
+
+        // Register with Transport, as the reference does for each configured peer:
+        //
+        //     peer_interface.parent_count = False
+        //     RNS.Transport.add_interface(peer_interface)
+        //
+        // This interface holds the only connection to that destination, and the parent's
+        // processOutgoing is a no-op, so without registration there is no route to the peer
+        // at all — it could be received from and never sent to.
+        //
+        // Before start(), not after: a connection that fails immediately tears the peer down,
+        // and a registration that lands afterwards adds an already-dead interface that
+        // nothing will remove.
+        Transport.registerInterface(peer.toRef())
+
         onOutboundPeerCreated?.invoke(peer)
 
         // Start the peer (it handles its own tunnel setup and connection)
@@ -242,6 +265,14 @@ class I2PInterface(
 
         spawnedInterfaces?.add(peer)
 
+        // As the reference does in incoming_connection, before the read loop starts:
+        //
+        //     RNS.Transport.add_interface(spawned_interface)
+        //
+        // spawnedInterfaces is the parent's own bookkeeping and nothing in Transport reads
+        // it, so adding a peer there does not make it routable. Only this does.
+        Transport.registerInterface(peer.toRef())
+
         onPeerConnected?.invoke(peer)
         log("Spawned I2P peer: $peerName")
 
@@ -254,6 +285,20 @@ class I2PInterface(
      */
     internal fun peerDisconnected(peer: I2PInterfacePeer) {
         spawnedInterfaces?.remove(peer)
+
+        // Only the spawned side is deregistered, which looks asymmetric and is deliberate.
+        // The reference gates it the same way, in I2PInterfacePeer.teardown:
+        //
+        //     if not self.initiator: RNS.Transport.remove_interface(self)
+        //
+        // An outbound peer is a configured interface that reconnects on its own; taking it
+        // out of Transport on a dropped connection would leave nothing to route to when it
+        // comes back. An inbound peer has no such second life — its socket is gone and the
+        // remote end will spawn a fresh interface if it returns.
+        if (!peer.isInitiator) {
+            Transport.deregisterInterface(peer.toRef())
+        }
+
         onPeerDisconnected?.invoke(peer)
         log("Peer disconnected: ${peer.name}")
     }
@@ -297,8 +342,17 @@ class I2PInterface(
         println("[$timestamp] [$name] $message")
     }
 
-    override fun toString(): String {
-        val addr = b32?.let { " @ $it.b32.i2p" } ?: ""
-        return "I2PInterface[$name$addr]"
-    }
+    /**
+     * Configuration only, and deliberately without the b32 address.
+     *
+     * [Interface.getHash] hashes this string and Transport keys the path table on the
+     * result. [b32] is assigned when the I2P tunnel comes up, so including it gave this
+     * interface one identity before the tunnel established and another after — not a race
+     * but a certainty, on every start. Every path learned over it in the first window
+     * would then name an interface that no longer exists.
+     *
+     * The address is still reported where it belongs: the discovery hook publishes it as
+     * the reachable-on value, and the tunnel logs it when it comes up.
+     */
+    override fun toString(): String = "I2PInterface[$name]"
 }

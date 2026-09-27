@@ -141,8 +141,7 @@ class AutoInterface(
             setOnline(true)
             log("AutoInterface started on ${linkLocalAddresses.size} interface(s)")
         } catch (e: Exception) {
-            log("Failed to start AutoInterface: ${e.message}")
-            e.printStackTrace()
+            log("Failed to start AutoInterface: ${e.javaClass.simpleName}: ${e.message}")
             running.set(false)
         }
     }
@@ -294,14 +293,12 @@ class AutoInterface(
                     linkLocalAddresses.remove(ifName)
                 }
             } catch (e: java.io.IOException) {
-                log("I/O error setting up sockets for $ifName: ${e.message}", "ERROR")
-                e.printStackTrace()
+                log("I/O error setting up sockets for $ifName: ${e.javaClass.simpleName}: ${e.message}", "ERROR")
             } catch (e: SecurityException) {
                 log("Permission denied for multicast on $ifName: ${e.message}", "ERROR")
                 log("AutoInterface requires INTERNET and MULTICAST permissions", "ERROR")
             } catch (e: Exception) {
-                log("Unexpected error setting up sockets for $ifName: ${e.message}", "ERROR")
-                e.printStackTrace()
+                log("Unexpected error setting up sockets for $ifName: ${e.javaClass.simpleName}: ${e.message}", "ERROR")
             }
         }
 
@@ -827,5 +824,23 @@ class AutoInterface(
         }
     }
 
-    override fun toString(): String = "AutoInterface[$name, ${peerCount()} peers]"
+    /**
+     * `AutoInterface[<name>]`, as the reference renders it (`AutoInterface.py:617`).
+     *
+     * The peer count used to be in here, and it could not stay: [Interface.getHash] is
+     * the full hash of this string, so the interface's identity moved as multicast
+     * discovery found peers. [InterfaceAdapter] captures the hash once at construction,
+     * which bounds the damage to a restart — but a restart is exactly when it bites.
+     * Columba's restartInterface builds a new interface and a new adapter, so the hash it
+     * captures depends on how many peers discovery happened to have found in that window.
+     * Two restarts on one LAN can capture different counts, and every persisted path
+     * learned over this interface then names an interface that no longer exists and is
+     * culled. That is the mechanism behind the "recreated with new hash after app
+     * restart" case in Transport.
+     *
+     * Every other interface here already renders from configuration alone, which is why
+     * only this one drifted. Peer count is observable through the interface's own stats;
+     * it does not belong in its identity.
+     */
+    override fun toString(): String = "AutoInterface[$name]"
 }

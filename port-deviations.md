@@ -524,3 +524,51 @@ matches the reference.
 
 **Re-evaluation:** if the reference ever makes `is_usable` track link status, `isClosed` becomes
 its mirror and this entry narrows to the writer's failure behaviour alone.
+
+### RNode flow-control queue is bounded — `rns-interfaces/.../rnode/RNodeInterface.kt::processOutgoing`, `OUTBOUND_QUEUE_CAPACITY`
+
+**Python reference:** `RNodeInterface.py:297` (`self.packet_queue = []`) and `:734`
+(`self.packet_queue.append(data)`) — a plain list, appended to with no cap.
+
+**Category:** stricter than the reference, deliberately
+
+**Description:** frames handed down while flow control has the gate shut are queued. The
+reference queue is unbounded, so a gate that never reopens — a board that stops sending its
+ready byte, or one whose ready is lost — grows it for as long as Transport keeps producing.
+This port caps it at `OUTBOUND_QUEUE_CAPACITY` frames and drops the newest past the cap,
+matching how the inbound path already drops rather than blocks. Below the cap the behaviour
+is the reference's: same FIFO, same one-frame-per-unlock release.
+
+This is the same gate shape, the same failure and the same cap as the KISS interface entry
+above. It is recorded separately because it is a separate interface a deployment may use
+without the other.
+
+**Re-evaluation:** if the reference bounds `packet_queue`, drop this entry and take the
+reference's own cap.
+
+### A failing path is marked rather than dropped when another way is held — `rns-core/.../transport/Transport.kt::failCurrentPath`
+
+**Python reference:** `LXMRouter.py:2746` calls `Reticulum.drop_path()` once opportunistic
+delivery has failed its pathless retries, and RNS has no other notion of reporting a path as
+bad. Dropping and rediscovering is the reference's only answer.
+
+**Category:** deliberate divergence, and conditional
+
+**Description:** dropping is correct while a node holds exactly one way to reach a
+destination, because finding a new one is the only way forward. It stops being correct once
+this port keeps the alternate rows the reference discards: dropping then destroys a working
+path along with the failing one and pays for a rediscovery it did not need.
+
+`failCurrentPath` therefore splits. With no usable alternate it drops the path, which is the
+reference's behaviour byte for byte, and is every case until path selection can choose among
+rows. With a usable alternate it marks the failing row instead and leaves the alternate to be
+selected.
+
+The divergence is the second branch only, and it is inert wherever the reference's assumption
+of one path per destination still holds. It belongs with the online-aware egress change: both
+are the same departure — that this port knows more than one way through and the reference
+does not — seen from the sending side and from the reporting side.
+
+**Re-evaluation:** if the reference gains alternate paths and a way to score them, which its
+own source asks for at `Transport.py:918-926`, this entry goes and the port takes the
+reference's mechanism.

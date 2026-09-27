@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.ble
 
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -188,7 +189,7 @@ class BLEInterface(
                 val newScore = peer.connectionScore()
 
                 if (newScore > lowestScore + BLEConstants.EVICTION_MARGIN) {
-                    log("Evicting ${lowestIdentity.take(8)} (score=${String.format("%.2f", lowestScore)}) for ${peer.address.takeLast(8)} (score=${String.format("%.2f", newScore)})")
+                    log("Evicting ${lowestIdentity.take(8)} (score=${String.format(Locale.ROOT, "%.2f", lowestScore)}) for ${peer.address.takeLast(8)} (score=${String.format(Locale.ROOT, "%.2f", newScore)})")
                     tearDownPeer(lowestIdentity)
                     // Fall through to connection attempt
                 } else {

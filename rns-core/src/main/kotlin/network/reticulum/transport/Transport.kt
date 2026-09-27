@@ -826,6 +826,7 @@ object Transport {
 
         // Clear all tables
         pathTable.clear()
+        pathAlternates.clear()
         linkTable.clear()
         reverseTable.clear()
         announceTable.clear()
@@ -1175,6 +1176,24 @@ object Transport {
      * Automatically detects and tracks local client interfaces (Python RNS compatibility).
      */
     fun registerInterface(interfaceRef: InterfaceRef) {
+        // Idempotent, as the reference is:
+        //
+        //     def add_interface(interface):
+        //         with Transport.interfaces_lock:
+        //             if not interface in Transport.interfaces:
+        //                 Transport.interfaces.append(interface)
+        //
+        // The membership check was dropped in the port, which was harmless only while
+        // nothing registered the same interface twice. Spawned server children now
+        // register themselves, and several consumers already register them from the
+        // outside, so without this an interface lands in `interfaces` twice and every
+        // broadcast iterates it twice — one transmit per duplicate.
+        //
+        // Identity comparison is the right one here: `Interface.toRef()` caches its
+        // adapter (InterfaceAdapter.getOrCreate), so both registrations of one
+        // interface pass the same InterfaceRef instance.
+        if (interfaceRef in interfaces) return
+
         interfaces.add(interfaceRef)
 
         // Python: Track interfaces spawned by local shared instance server
@@ -1637,6 +1656,93 @@ object Transport {
     }
 
     /**
+     * A link this node was transporting for someone else timed out before it validated.
+     *
+     * The transport-node half of the stale pending-link handling, mirroring python
+     * `Transport.py:884-950`. [deregisterLink] ports the other half, the leaf-node arm at
+     * `Transport.py:498-522`, which runs when a link *we* initiated fails; the two are
+     * separate and neither substitutes for the other.
+     *
+     * Four arms, in the reference's order, and only the last two mark:
+     *  - the path vanished while the link request was in flight: rediscover.
+     *  - the request came from a local client (`takenHops == 0`): rediscover.
+     *  - the destination was one hop away, so it was local to one of our interfaces and
+     *    has probably roamed: rediscover, and mark the old path unresponsive.
+     *  - the initiator was one hop away, so the topology moved: same.
+     *
+     * Marking is gated on this node being a transport node and on the receiving interface
+     * not being a boundary, exactly as the reference gates it (`Transport.py:927, :942`).
+     * A boundary interface exists to keep two networks apart, so a failure across it says
+     * nothing about the path on our side.
+     *
+     * Without this, [markPathUnresponsive] has no caller in the library at all: the path
+     * table's failure count never leaves zero, no path ever leaves ACTIVE, and the
+     * worse-hop announce branch that depends on [isPathUnresponsive] can never fire on a
+     * running node. The function and that branch are covered by the conformance suite,
+     * which drives the mark directly through the bridge, so what was missing is the
+     * wiring rather than the behaviour.
+     */
+    private fun handleStaleTransportedLink(
+        linkEntry: LinkEntry,
+        now: Long,
+    ) {
+        val destHash = linkEntry.destinationHash
+        val lastRequest = pathRequests[destHash.toKey()] ?: 0L
+        val throttled = now - lastRequest < TransportConstants.PATH_REQUEST_MI
+
+        var shouldRequest = false
+        var blockedInterface: InterfaceRef? = null
+
+        when {
+            !hasPath(destHash) -> {
+                log(
+                    "Rediscovering path to ${destHash.toHexString()}: a transported link " +
+                        "never established and the path is now missing",
+                )
+                shouldRequest = true
+            }
+
+            throttled -> return // every remaining arm is throttled; nothing to do
+
+            linkEntry.takenHops == 0 -> {
+                log(
+                    "Rediscovering path to ${destHash.toHexString()}: a transported link " +
+                        "from a local client never established",
+                )
+                shouldRequest = true
+            }
+
+            hopsTo(destHash) == 1 || linkEntry.takenHops == 1 -> {
+                log(
+                    "Rediscovering path to ${destHash.toHexString()}: a transported link " +
+                        "never established and the destination or its initiator was local " +
+                        "to one of our interfaces",
+                )
+                shouldRequest = true
+                blockedInterface = findInterfaceByHash(linkEntry.receivingInterfaceHash)
+                if (transportEnabled && blockedInterface?.mode != InterfaceMode.BOUNDARY) {
+                    markPathUnresponsive(destHash)
+                }
+            }
+        }
+
+        if (!shouldRequest) return
+
+        // The reference queues these and later requests on every interface except the one
+        // the failure came in on (`Transport.py:1229-1232, 1259-1263`). Asking the same
+        // interface again would re-learn the path that just failed.
+        if (blockedInterface == null) {
+            requestPath(destHash)
+        } else {
+            for (iface in interfaces) {
+                if (!iface.hash.contentEquals(blockedInterface.hash)) {
+                    requestPath(destHash, onInterface = iface)
+                }
+            }
+        }
+    }
+
+    /**
      * Find a link by ID.
      */
     fun findLink(linkId: ByteArray): Any? {
@@ -1755,9 +1861,195 @@ object Transport {
      * Expire (remove) a path.
      */
     fun expirePath(destinationHash: ByteArray) {
-        pathTable.remove(destinationHash.toKey())
+        val key = destinationHash.toKey()
+        pathTable.remove(key)
+        pathAlternates.remove(key)
         pathStore?.removePath(destinationHash)
     }
+
+    // ---- Reachability set (multi-link failover, phase B.1/B.2) ---------------------------
+    //
+    // The reference keeps exactly one path per destination and discards the loser of every
+    // comparison, so a node that can reach a destination two ways forgets one of them and
+    // has nothing to fall back to when the other dies. These are the rows it threw away.
+    //
+    // Deliberately a SEPARATE map rather than turning pathTable into a set. pathTable is
+    // read at 55 sites in this file alone and 60 more in tests, all of them expecting one
+    // entry, and the selected row genuinely is that entry. Widening the type would churn
+    // every one of those for no behaviour gain, and the public accessors — hasPath, hopsTo,
+    // nextHop, nextHopInterface* — must keep returning the selected row regardless. Keeping
+    // pathTable as the selected view means those sites and those accessors do not move.
+    //
+    // The cost is two structures to hold in step. Every place that drops a destination's
+    // path drops its alternates in the same breath: expirePath here, the cull, and the
+    // dangling-row prune. There is no path by which an alternate outlives its destination.
+    //
+    // Nothing selects from this set yet. B.2 fills it, B.3 selects, A.2 uses the selection.
+    // Until B.3 lands this is observation only, and behaviour is exactly the reference's.
+
+    /**
+     * Alternate rows per destination, one per interface, never including the selected row.
+     *
+     * Bounded twice over: an interface can hold at most one row, and [MAX_ALTERNATE_ROWS]
+     * caps the total. A destination is therefore bounded by the number of registered
+     * interfaces, which the node controls — an announcing peer cannot inflate it, because
+     * the key is the receiving interface and not anything the peer chooses. That is the
+     * answer to the state-exhaustion question the plan raises.
+     */
+    private val pathAlternates = ConcurrentHashMap<ByteArrayKey, MutableList<PathEntry>>()
+
+    /**
+     * Record a path this node learned but did not select.
+     *
+     * Called where the reference drops the losing announce. A row is an alternate only if
+     * it arrived on a different interface than the selected row: two announces over the
+     * same interface are the same way of reaching the destination, and keeping both would
+     * be a second row that fails at the same moment as the first.
+     */
+    private fun recordAlternatePath(
+        destinationHash: ByteArray,
+        candidate: PathEntry,
+    ) {
+        val key = destinationHash.toKey()
+        val selected = pathTable[key] ?: return
+        if (selected.receivingInterfaceHash.contentEquals(candidate.receivingInterfaceHash)) return
+        if (findInterfaceByHash(candidate.receivingInterfaceHash) == null) return
+
+        val rows = pathAlternates.computeIfAbsent(key) { CopyOnWriteArrayList() }
+        var firstForDestination = false
+        synchronized(rows) {
+            val existing = rows.indexOfFirst {
+                it.receivingInterfaceHash.contentEquals(candidate.receivingInterfaceHash)
+            }
+            when {
+                existing >= 0 -> rows[existing] = candidate
+                rows.size < TransportConstants.MAX_ALTERNATE_ROWS -> {
+                    firstForDestination = rows.isEmpty()
+                    rows.add(candidate)
+                }
+                else -> {
+                    // Full: replace the oldest, so a live interface can still take a slot
+                    // from one that has stopped announcing.
+                    val oldest = rows.indices.minByOrNull { rows[it].timestamp } ?: return
+                    if (rows[oldest].timestamp < candidate.timestamp) rows[oldest] = candidate
+                }
+            }
+        }
+
+        // Logged on the 0 -> 1 transition only, and outside the lock.
+        //
+        // This branch runs for every losing announce, on a node whose path table reaches
+        // thousands of destinations, so a line per call would bury the one line that
+        // matters. What matters is that a destination became reachable two ways at all:
+        // until something selects from this set, that is the only evidence the mechanism
+        // is alive on a real node rather than only in a test.
+        //
+        // It is deliberately paired with [alternatePathStats]. A count alone cannot tell
+        // "never learned" from "learned, then pruned away" -- both read zero -- and those
+        // are opposite defects. This line fires in the second case and not the first.
+        if (firstForDestination) {
+            val via = findInterfaceByHash(candidate.receivingInterfaceHash)?.name ?: "unknown"
+            log(
+                "First alternate path for ${destinationHash.toHexString().take(16)} " +
+                    "via $via at ${candidate.hops} hops",
+            )
+        }
+    }
+
+    /** Drop alternates whose interface has gone, and any left for a destination with no path. */
+    private fun pruneAlternates() {
+        for ((key, rows) in pathAlternates) {
+            if (pathTable[key] == null) {
+                pathAlternates.remove(key)
+                continue
+            }
+            synchronized(rows) {
+                rows.removeAll { row ->
+                    row.isExpired() || findInterfaceByHash(row.receivingInterfaceHash) == null ||
+                        pathTable[key]?.receivingInterfaceHash
+                            ?.contentEquals(row.receivingInterfaceHash) == true
+                }
+            }
+            if (rows.isEmpty()) pathAlternates.remove(key)
+        }
+    }
+
+    /**
+     * Every way this node currently knows of reaching [destinationHash], selected row
+     * first, or null if it knows none.
+     *
+     * A read-only snapshot, taken for observers: the AIDL surface a consumer's UI needs,
+     * and the shape a metric would later score. Callers get copies, so nothing they hold
+     * can move the routing state underneath Transport.
+     */
+    fun pathReachability(destinationHash: ByteArray): PathReachability? {
+        val key = destinationHash.toKey()
+        val selected = pathTable[key] ?: return null
+        val rows = mutableListOf(snapshotRow(selected, isSelected = true))
+        pathAlternates[key]?.let { alternates ->
+            synchronized(alternates) {
+                alternates.forEach { rows.add(snapshotRow(it, isSelected = false)) }
+            }
+        }
+        return PathReachability(destinationHash.copyOf(), rows)
+    }
+
+    private fun snapshotRow(
+        entry: PathEntry,
+        isSelected: Boolean,
+    ): PathRow =
+        PathRow(
+            interfaceHash = entry.receivingInterfaceHash.copyOf(),
+            interfaceName = findInterfaceByHash(entry.receivingInterfaceHash)?.name,
+            interfaceOnline = findInterfaceByHash(entry.receivingInterfaceHash)?.online ?: false,
+            nextHop = entry.nextHop.copyOf(),
+            hops = entry.hops,
+            learnedAt = entry.timestamp,
+            expiresAt = entry.expires,
+            state = entry.state,
+            failureCount = entry.failureCount,
+            selected = isSelected,
+        )
+
+    /**
+     * How many destinations currently hold an alternate, and how many rows in total.
+     *
+     * Production surface, not a test seam: a host polls this beside the path table size
+     * to answer whether failover has anything to fall back on in this deployment. Empty
+     * lists are not counted -- one exists transiently between a destination's first
+     * candidate being admitted and the row being added -- so a destination counts only
+     * once it genuinely holds a second way through.
+     */
+    fun alternatePathStats(): AlternatePathStats {
+        var destinations = 0
+        var rows = 0
+        for (entry in pathAlternates.values) {
+            val size = entry.size
+            if (size > 0) {
+                destinations++
+                rows += size
+            }
+        }
+        return AlternatePathStats(destinationsWithAlternate = destinations, alternateRows = rows)
+    }
+
+    /** Alternate rows held for a destination. Test seam; the snapshot is the public view. */
+    @network.reticulum.RnsTestSeam
+    fun alternatePathCountForTest(destinationHash: ByteArray): Int =
+        pathAlternates[destinationHash.toKey()]?.size ?: 0
+
+    /**
+     * Record an alternate directly, without driving an announce through.
+     *
+     * The invariants worth testing here are the container's — which rows are kept, what
+     * bounds them, when they are dropped. Reaching them through announce processing would
+     * exercise announce processing.
+     */
+    @network.reticulum.RnsTestSeam
+    fun recordAlternateForTest(
+        destinationHash: ByteArray,
+        candidate: PathEntry,
+    ) = recordAlternatePath(destinationHash, candidate)
 
     /**
      * Mark a path as unresponsive.
@@ -1784,6 +2076,53 @@ object Transport {
                 log("Path to ${destinationHash.toHexString()} marked UNRESPONSIVE (${entry.failureCount} failures)")
             }
         }
+    }
+
+    /**
+     * Report that the current way of reaching a destination is not working.
+     *
+     * For a caller that has tried and failed to deliver and wants the routing layer to do
+     * something about it. The reference's answer, in both RNS and LXMF, is to drop the
+     * path and rediscover: `LXMRouter.py:2746` calls `drop_path` after its pathless
+     * retries. That is right when there is only ever one path, because the only way
+     * forward is to find a new one.
+     *
+     * It stops being right once this node holds more than one way through. Dropping then
+     * throws away a working alternate along with the failing selection, and pays for a
+     * rediscovery it did not need.
+     *
+     * So the behaviour splits on whether there is anywhere else to go:
+     *
+     *  - **No usable alternate** — drop the path, exactly as the reference does and
+     *    exactly as [expirePath] does today. This is every case until B.3 makes the
+     *    reachability set selectable, so nothing observable changes yet.
+     *  - **A usable alternate exists** — mark the failing row instead, leaving the
+     *    alternate in place to be selected. Marking also lets a worse-hop announce
+     *    replace the path, which an ACTIVE one refuses.
+     *
+     * The second branch is a deliberate divergence from the reference, recorded in
+     * `port-deviations.md` alongside the online-aware egress it belongs with. The first
+     * branch exists so the divergence costs nothing where it buys nothing.
+     */
+    fun failCurrentPath(destinationHash: ByteArray) {
+        val key = destinationHash.toKey()
+        if (pathTable[key] == null) return
+
+        val alternates = pathReachability(destinationHash)?.usableAlternates.orEmpty()
+        if (alternates.isEmpty()) {
+            log(
+                "No alternate way to ${destinationHash.toHexString()}; " +
+                    "dropping the path and rediscovering, as the reference does",
+            )
+            expirePath(destinationHash)
+            return
+        }
+
+        log(
+            "Path to ${destinationHash.toHexString()} reported failing with " +
+                "${alternates.size} alternate(s) held; marking rather than dropping",
+        )
+        markPathUnresponsive(destinationHash)
     }
 
     /**
@@ -4589,6 +4928,29 @@ object Transport {
             }
 
         if (!shouldAdd) {
+            // The reference stops here and the announce is forgotten. Before dropping it,
+            // keep it as an alternate row if it arrived on a different interface than the
+            // selected path: that is this node reaching the same destination a second way,
+            // and it is precisely what there is nothing to fall back on today.
+            //
+            // Recording only. The path table, retransmission and everything on the wire
+            // are untouched, so behaviour here is still the reference's
+            // (`Transport.py:1620-1681`). B.3 makes the set selectable; until then this is
+            // observation that a consumer can read through pathReachability.
+            recordAlternatePath(
+                destHash,
+                PathEntry(
+                    timestamp = System.currentTimeMillis(),
+                    nextHop = receivedFrom,
+                    hops = packet.hops,
+                    expires = System.currentTimeMillis() +
+                        AnnounceFilter.pathExpiryForMode(interfaceRef.mode),
+                    randomBlobs = mutableListOf(announceData.randomHash),
+                    receivingInterfaceHash = interfaceRef.hash,
+                    announcePacketHash = packet.packetHash,
+                ),
+            )
+
             // Python: when should_add is False, no retransmission or path update happens.
             // Do NOT retransmit to local clients here — doing so would cause clients
             // to learn incorrect multi-hop paths to their own destinations from bounced
@@ -4626,7 +4988,20 @@ object Transport {
                 announcePacketHash = packet.packetHash,
             )
 
+        // The row being replaced is a way through too, and until now it was the selected
+        // one. It is displaced because this announce is more recent, not because the route
+        // stopped working — the reference takes the newest announce whatever its hop count
+        // (`Transport.py:2268`), so a node whose interfaces announce in turn replaces its
+        // path each time and, before this, forgot the previous one every time.
+        //
+        // Recording only the announces that should_add REJECTS, as the first version did,
+        // therefore missed the commonest source of a second route on a real node. Found by
+        // the failover rig: two interfaces announcing a second apart left the set empty.
+        // Recorded AFTER the new row is installed, not before: recordAlternatePath compares
+        // the candidate against the currently selected row and refuses a row on the same
+        // interface. Run first, it would be comparing the displaced row against itself.
         pathTable[destHash.toKey()] = pathEntry
+        existingEntry?.let { recordAlternatePath(destHash, it) }
         pathStore?.upsertPath(destHash, pathEntry)
 
         // python Transport.py:2478-2481 — the announce resolves any in-flight path request
@@ -6730,10 +7105,14 @@ object Transport {
                 log("Error enumerating blackhole-associated destinations: ${e.message}")
             }
         }
-        for (k in drop) pathTable.remove(k)
+        for (k in drop) {
+            pathTable.remove(k)
+            pathAlternates.remove(k)
+        }
         if (drop.isNotEmpty()) {
             log("Removed ${drop.size} destination(s) associated with blackholed identities from path table")
         }
+
     }
 
     /** Persist the locally-sourced blackhole entries to <storage>/blackhole/local
@@ -6871,6 +7250,7 @@ object Transport {
         linkTable.entries.removeIf { entry ->
             val linkEntry = entry.value
             if (!linkEntry.validated && now > linkEntry.proofTimeout) {
+                handleStaleTransportedLink(linkEntry, now)
                 log("Removing unvalidated link entry: ${entry.key}")
                 true
             } else if (linkEntry.validated &&
@@ -6924,6 +7304,18 @@ object Transport {
 
         // Remove expired tunnels
         cleanExpiredTunnels()
+
+        // Alternates follow the selected row's rules: gone when the destination goes, when
+        // their interface deregisters, or when they expire. Last in the cull, so the
+        // removals above — expiry and a dangling interface — have already happened and the
+        // rows naming those destinations go with them.
+        //
+        // This was first written inside removeBlackholedPaths, which was wrong twice over:
+        // that method returns immediately when nothing is blackholed, so the prune almost
+        // never ran, and it is not called from the cull at all. The rows leaked silently,
+        // which is exactly the failure that holding two structures in step invites.
+        // Blackholing prunes on its own path; see there.
+        pruneAlternates()
     }
 
     // ===== Tunnel Management =====

@@ -506,7 +506,18 @@ class ReticulumService : LifecycleService() {
                 sharedInterfaceField.isAccessible = true
                 sharedInterfaceField.set(rns, server)
             } catch (e: Exception) {
-                // Ignore if reflection fails
+                // The reflective `sharedInterface` write is the ONLY surviving handle to
+                // `server` — it is a local val here, and Reticulum.stop() detaches the
+                // shared interface through that field. If this fails the listening socket
+                // on $port is never torn down on stop, and the next start sees the port
+                // still bound and takes the client branch instead. Not fatal, but it must
+                // not be silent.
+                android.util.Log.e(
+                    "ReticulumService",
+                    "Failed to set shared-instance state via reflection; the server on port " +
+                        "$port will not be detached on stop: ${e.message}",
+                    e,
+                )
             }
 
             android.util.Log.i("ReticulumService", "Started shared instance server on port $port")

@@ -102,8 +102,8 @@ class TCPServerInterface(
     // participates in Transport.outbound iteration. Its own
     // `process_outgoing` is a `pass` (TCPInterface.py:627-628); the
     // spawned child interfaces are what actually write to the wire,
-    // each registered with Transport via `onClientConnected` so
-    // Transport.transmit addresses them directly.
+    // each registered with Transport as it is accepted (see
+    // `handleClient`) so Transport.transmit addresses them directly.
     //
     // Setting canSend=false here would exclude the parent from
     // Transport.interfaces iteration entirely, breaking any code that
@@ -114,7 +114,14 @@ class TCPServerInterface(
     override val canSend: Boolean = true
 
     /**
-     * Called when a new client connects. Use to register the spawned interface with Transport.
+     * Called when a new client connects, after the spawned interface has been registered
+     * with Transport and started.
+     *
+     * A notification hook, not the registration mechanism. It used to be the latter, which
+     * made routing to a connected client depend on the caller knowing to wire this up; the
+     * class now registers the child itself. Registering it again from here is harmless —
+     * `Transport.registerInterface` is idempotent, as the reference's `add_interface` is —
+     * but it is no longer needed.
      */
     var onClientConnected: ((Interface) -> Unit)? = null
 
@@ -204,6 +211,26 @@ class TCPServerInterface(
                     onPacketReceived?.invoke(data, iface)
                 }
 
+                // Register the child with Transport, and do it BEFORE starting it.
+                //
+                // This is what makes a connected client reachable at all. Transport routes
+                // to interfaces it knows about, and this child holds the only socket to
+                // that peer; the parent's processOutgoing is deliberately a pass, per the
+                // comment above, precisely because delivery is supposed to go through
+                // Transport's routing to the children. Without this the server can receive
+                // from a client forever and never send to it, and the deregistration in
+                // closeClient below is undoing something that never happened. The reference
+                // registers here too: `RNS.Transport.add_interface(spawned_interface)` in
+                // `TCPInterface.py`'s `incoming_connection`.
+                //
+                // Before start(), not after, for the reason LocalServerInterface documents
+                // at the same point: a probe that connects and closes at once can otherwise
+                // have its read loop hit EOF and detach — deregistering nothing, because
+                // registration has not happened yet — after which this line would add an
+                // already-detached interface that nothing ever removes. Registering first
+                // means the eventual detach can actually take it out again. See upstream #74.
+                Transport.registerInterface(clientInterface.toRef())
+
                 clientInterface.start()
                 onClientConnected?.invoke(clientInterface)
 
@@ -242,8 +269,9 @@ class TCPServerInterface(
      * Parent-level outbound is a no-op — mirrors Python
      * `TCPServerInterface.process_outgoing` (RNS/Interfaces/TCPInterface.py:627-628,
      * which is `pass`). Each spawned child is its own Transport-registered
-     * interface (via `onClientConnected`), so Transport.transmit addresses
-     * the correct child directly. Fanning out here would duplicate every
+     * interface — registered as it is accepted, the same as the reference does
+     * in `incoming_connection` — so Transport.transmit addresses the correct
+     * child directly. Fanning out here would duplicate every
      * Transport broadcast: once via this parent, again via each child that
      * Transport iterates independently — producing the path-layer invariant
      * violations that #46 set out to fix (cached-announce overwrite, PR

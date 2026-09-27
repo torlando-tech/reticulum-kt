@@ -1,5 +1,7 @@
 package network.reticulum.channel
 
+import java.util.Locale
+
 /**
  * Base interface for messages sent over a Channel.
  *
@@ -142,7 +144,7 @@ class Envelope(
         // Get factory for this message type
         val factory = factories[msgType] ?: throw ChannelException(
             ChannelExceptionType.ME_NOT_REGISTERED,
-            "No factory registered for message type ${String.format("0x%04X", msgType)}"
+            "No factory registered for message type ${String.format(Locale.ROOT, "0x%04X", msgType)}"
         )
 
         // Create and unpack message. Mirror python RNS Channel.Envelope.unpack

@@ -1,5 +1,6 @@
 package network.reticulum.identity
 
+import java.util.Locale
 import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.RnsConstants
 import network.reticulum.common.hexToByteArray
@@ -908,15 +909,14 @@ class Identity private constructor(
 
                 val saveTime = System.currentTimeMillis() - saveStart
                 val timeStr = if (saveTime < 1000) {
-                    String.format("%.2fms", saveTime.toDouble())
+                    String.format(Locale.ROOT, "%.2fms", saveTime.toDouble())
                 } else {
-                    String.format("%.2fs", saveTime / 1000.0)
+                    String.format(Locale.ROOT, "%.2fs", saveTime / 1000.0)
                 }
                 println("Saved known destinations to storage in $timeStr")
 
             } catch (e: Exception) {
-                println("Error while saving known destinations to disk: ${e.message}")
-                e.printStackTrace()
+                println("Error while saving known destinations to disk: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 savingKnownDestinations = false
             }
@@ -979,8 +979,7 @@ class Identity private constructor(
                 println("Loaded $loadedCount known destinations from storage")
 
             } catch (e: Exception) {
-                println("Error loading known destinations from disk, file will be recreated on exit: ${e.message}")
-                e.printStackTrace()
+                println("Error loading known destinations from disk, file will be recreated on exit: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
 

@@ -277,5 +277,12 @@ class NearbyInterface(
         println("[NearbyInterface][$name] $message")
     }
 
-    override fun toString(): String = "NearbyInterface[$name] (${peers.size} peers)"
+    /**
+     * Configuration only. [Interface.getHash] hashes this string and Transport keys the
+     * path table on the result, so anything here that moves at runtime moves the
+     * interface's identity and strands every path learned over it. The peer count used to
+     * be in here; see the same fix on AutoInterface. Peer count is available from the
+     * interface's own state for anyone who wants it.
+     */
+    override fun toString(): String = "NearbyInterface[$name]"
 }

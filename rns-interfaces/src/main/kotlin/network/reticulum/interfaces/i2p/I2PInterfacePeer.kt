@@ -225,7 +225,19 @@ class I2PInterfacePeer(
 
     private fun startReadLoop() {
         val sock = socket ?: return
-        val input = try { sock.getInputStream() } catch (e: Exception) { return }
+        val input = try {
+            sock.getInputStream()
+        } catch (e: Exception) {
+            // Neither the read loop nor the watchdog starts from here, so returning alone
+            // strands the peer: for an inbound connection start() has already called
+            // setOnline(true), leaving it registered and online with nothing that will
+            // ever close it. Transport can then select it as a route and the traffic
+            // disappears. Report it, and take the peer down the way every other
+            // unrecoverable path in this class does.
+            log("Could not open input stream, no read loop started: ${e.javaClass.name}: ${e.message}")
+            teardown()
+            return
+        }
 
         lastRead = System.currentTimeMillis()
         lastWrite = System.currentTimeMillis()

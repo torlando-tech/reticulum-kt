@@ -392,3 +392,87 @@ data class TunnelInfo(
 
     override fun hashCode(): Int = tunnelId.contentHashCode()
 }
+
+/**
+ * One way of reaching a destination, as an observer sees it.
+ *
+ * A snapshot, not a handle: the arrays are copies and nothing here writes back. Exists so
+ * a consumer can show which interface a destination is currently reached over and what
+ * else is available, without reaching into the routing tables.
+ */
+data class PathRow(
+    /** Interface this path was learned on, and would be sent over. */
+    val interfaceHash: ByteArray,
+    /** Resolved name, or null if the interface is no longer registered. */
+    val interfaceName: String?,
+    /** Whether that interface is online right now. */
+    val interfaceOnline: Boolean,
+    /** Next hop transport id, or the destination itself when it is one hop away. */
+    val nextHop: ByteArray,
+    val hops: Int,
+    val learnedAt: Long,
+    val expiresAt: Long,
+    val state: PathState,
+    val failureCount: Int,
+    /** True for the row traffic is using; exactly one row in a set has it. */
+    val selected: Boolean,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PathRow) return false
+        return interfaceHash.contentEquals(other.interfaceHash) &&
+            nextHop.contentEquals(other.nextHop) &&
+            interfaceName == other.interfaceName &&
+            interfaceOnline == other.interfaceOnline &&
+            hops == other.hops && learnedAt == other.learnedAt &&
+            expiresAt == other.expiresAt && state == other.state &&
+            failureCount == other.failureCount && selected == other.selected
+    }
+
+    override fun hashCode(): Int =
+        31 * interfaceHash.contentHashCode() + nextHop.contentHashCode()
+}
+
+/**
+ * Every way this node knows of reaching one destination, selected row first.
+ *
+ * [rows] always holds at least the selected row. Additional rows are alternates, one per
+ * interface, which is what bounds the set: an announcing peer cannot add rows, because a
+ * row is keyed by the interface it arrived on.
+ */
+data class PathReachability(
+    val destinationHash: ByteArray,
+    val rows: List<PathRow>,
+) {
+    val selected: PathRow get() = rows.first()
+
+    /** Alternates that could carry traffic now: a registered, online interface. */
+    val usableAlternates: List<PathRow>
+        get() = rows.drop(1).filter { it.interfaceOnline && it.state != PathState.STALE }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PathReachability) return false
+        return destinationHash.contentEquals(other.destinationHash) && rows == other.rows
+    }
+
+    override fun hashCode(): Int = 31 * destinationHash.contentHashCode() + rows.hashCode()
+}
+
+/**
+ * How much of this node's path table has a second way through.
+ *
+ * The question behind it is whether failover has anything to fall back on in practice.
+ * A node can hold thousands of paths and still have an alternate for none of them, in
+ * which case the machinery that selects between them is machinery for a case that does
+ * not arise. That is a property of a real deployment over days, not of a test.
+ *
+ * Aggregate on purpose. A count is safe to put in a status screen or a bug report; a
+ * list of destination hashes is a map of who the operator can reach.
+ */
+data class AlternatePathStats(
+    /** Destinations holding at least one alternate row. */
+    val destinationsWithAlternate: Int,
+    /** Alternate rows in total, never counting the selected row. */
+    val alternateRows: Int,
+)

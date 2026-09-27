@@ -355,8 +355,7 @@ class LocalClientInterface : Interface {
             }
         } catch (e: Exception) {
             if (!detached.get()) {
-                log("Error in read loop: ${e.message}")
-                e.printStackTrace()
+                log("Error in read loop: ${e.javaClass.simpleName}: ${e.message}")
                 detach()
             }
         }
