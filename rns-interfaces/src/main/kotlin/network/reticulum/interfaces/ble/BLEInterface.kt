@@ -598,6 +598,24 @@ class BLEInterface(
         log("Peer disconnected: ${peerInterface.name} (remaining: ${peers.size})")
     }
 
+    /**
+     * A peer's data-path liveness probe found the link dead (connected but no real data
+     * crossing). Force a real driver-level disconnect so it re-establishes -- mirrors
+     * python ble-reticulum's `driver.disconnect(address)` from `_run_data_path_probes`.
+     * The driver's `connectionLost` flow then tears the peer down ([collectDisconnections]
+     * -> [tearDownPeer]) and the reconnect backoff re-dials. (Android's `disconnect`
+     * cancels both a central GATT connection and a peripheral-side central, so this works
+     * regardless of which role we hold.)
+     */
+    internal suspend fun onDataPathDead(address: String) {
+        log("data-path dead for ${address.takeLast(8)} -- forcing reconnect via driver.disconnect")
+        try {
+            driver.disconnect(address)
+        } catch (e: Exception) {
+            log("onDataPathDead disconnect failed: ${e.message}")
+        }
+    }
+
     // ---- Blacklist and Backoff ----
 
     private fun isBlacklisted(address: String): Boolean {
