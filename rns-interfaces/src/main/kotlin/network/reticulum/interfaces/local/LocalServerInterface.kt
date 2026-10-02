@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.toRef
+import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import java.io.File
 import java.io.IOException
@@ -105,6 +106,14 @@ class LocalServerInterface : Interface {
 
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<LocalClientInterface>()
+
+    /**
+     * Test seam: when non-null, [handleNewClient] invokes this hook in place of
+     * [Transport.registerInterface] for the spawned client, so a test can
+     * simulate the registration-failure path (the failure mode the try/catch in
+     * [handleNewClient] was added to contain). Null in production.
+     */
+    internal var registerInterfaceForTest: ((InterfaceRef) -> Unit)? = null
 
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
@@ -337,12 +346,54 @@ class LocalServerInterface : Interface {
             onPacketReceived?.invoke(data, iface)
         }
 
-        clientInterface.start()
-
-        try {
-            Transport.registerInterface(clientInterface.toRef())
+        // Python parity: register with Transport BEFORE the read loop runs
+        // (LocalInterface.py:461-462 append vs :480 read_loop). In python the
+        // read_loop is synchronous so order is implicit; here `start()` launches
+        // it on ioScope, so an immediately-disconnecting probe socket could
+        // otherwise race detach() ahead of registerInterface() and leak the
+        // entry into Transport.localClientInterfaces forever.
+        //
+        // The kotlin port wraps registerInterface in try/catch (a pre-existing
+        // deviation from python — python lets the exception propagate and
+        // therefore never reaches read_loop). To keep the failure-path
+        // behavior consistent with python's invariants (read loop only runs
+        // for a Transport-registered interface; bookkeeping collections only
+        // hold registered interfaces), we gate `start()` on successful
+        // registration and roll back the prior `clients` / `spawnedInterfaces`
+        // adds if registration fails.
+        val registered = try {
+            // Test seam: when set, the hook replaces the Transport registration
+            // call so a test can simulate a registration failure (the failure
+            // mode the try/catch below was added to contain). Null in
+            // production - the real registerInterface runs.
+            val registerHook = registerInterfaceForTest
+            if (registerHook != null) {
+                registerHook.invoke(clientInterface.toRef())
+            } else {
+                Transport.registerInterface(clientInterface.toRef())
+            }
+            true
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
+            clients.remove(clientInterface)
+            spawnedInterfaces?.remove(clientInterface)
+            // Without start(), no read loop runs and detach() is never reached,
+            // so the accepted socket would stay open until GC. Python's
+            // socketserver framework closes the socket when the handler thread
+            // unwinds from an exception (LocalInterface.py:501-507 wraps the
+            // append+read_loop sequence in BaseRequestHandler.handle, which
+            // BaseServer.shutdown_request finalizes); the kotlin accept loop
+            // manages sockets manually, so close it explicitly here.
+            try {
+                socket.close()
+            } catch (closeEx: Exception) {
+                log("Could not close socket after registration failure: ${closeEx.message}")
+            }
+            false
+        }
+
+        if (registered) {
+            clientInterface.start()
         }
 
         log("Client connected: $clientName (total: ${clients.size})")
