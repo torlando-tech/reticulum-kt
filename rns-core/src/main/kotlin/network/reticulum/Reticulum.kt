@@ -191,6 +191,7 @@ class Reticulum private constructor(
         private var pendingLocalClientFactory: ((Int, String) -> Any)? = null
         private var pendingLocalServerFactory: ((Int) -> Any)? = null
         private var pendingInterfaceRegistrar: ((Any) -> Unit)? = null
+        private var pendingInterfaceDeregistrar: ((Any) -> Unit)? = null
 
         /**
          * Set the LocalClientInterface factory before calling start().
@@ -215,6 +216,18 @@ class Reticulum private constructor(
          */
         fun setInterfaceRegistrar(registrar: (Any) -> Unit) {
             pendingInterfaceRegistrar = registrar
+        }
+
+        /**
+         * Set an interface deregistrar that adapts and removes an interface from
+         * Transport. Symmetric to [setInterfaceRegistrar]. Used to roll back a
+         * client interface that was registered before its start() failed
+         * (issue #71): because registration now precedes start(), a failed
+         * start leaves a registered-but-dead client in Transport unless it is
+         * deregistered here.
+         */
+        fun setInterfaceDeregistrar(deregistrar: (Any) -> Unit) {
+            pendingInterfaceDeregistrar = deregistrar
         }
 
         /**
@@ -293,6 +306,7 @@ class Reticulum private constructor(
                 pendingLocalClientFactory?.let { rns.localClientInterfaceFactory = it }
                 pendingLocalServerFactory?.let { rns.localServerInterfaceFactory = it }
                 pendingInterfaceRegistrar?.let { rns.interfaceRegistrar = it }
+                pendingInterfaceDeregistrar?.let { rns.interfaceDeregistrar = it }
 
                 try {
                     rns.initialize()
@@ -381,6 +395,7 @@ class Reticulum private constructor(
             pendingLocalClientFactory = null
             pendingLocalServerFactory = null
             pendingInterfaceRegistrar = null
+            pendingInterfaceDeregistrar = null
         }
 
         /**
@@ -503,6 +518,9 @@ class Reticulum private constructor(
     /** Callback to adapt an interface and register it with Transport. */
     var interfaceRegistrar: ((Any) -> Unit)? = null
 
+    /** Callback to adapt an interface and remove it from Transport. */
+    var interfaceDeregistrar: ((Any) -> Unit)? = null
+
     /**
      * Initialize the Reticulum instance.
      */
@@ -618,25 +636,33 @@ class Reticulum private constructor(
             return false
         }
 
+        var registered = false
+        var clientInterface: Any? = null
         try {
-            val clientInterface = factory(sharedInstancePort, "127.0.0.1")
+            val client = factory(sharedInstancePort, "127.0.0.1")
+            clientInterface = client
 
             // Start Transport (without transport routing) so inbound() works
             Transport.start(transportIdentity = transportIdentity, enableTransport = false)
 
-            // Start the interface
-            clientInterface::class.java.getMethod("start").invoke(clientInterface)
-
-            // Register with Transport so packets flow through
+            // Register with Transport so packets flow through. This MUST run
+            // before start() below: start() connects the TCP socket and
+            // launches the read loop, so a frame arriving in the gap between
+            // start() and registrar wiring would hit a null onPacketReceived
+            // and be silently dropped (issue #71).
             val registrar = interfaceRegistrar
             if (registrar != null) {
-                registrar(clientInterface)
+                registrar(client)
+                registered = true
             } else {
                 log("WARNING: No interface registrar set, packets will not be processed")
             }
 
+            // Start the interface
+            client::class.java.getMethod("start").invoke(client)
+
             // Set state only after all steps succeed (matches Python Reticulum.py:414-416)
-            sharedInterface = clientInterface
+            sharedInterface = client
             isConnectedToSharedInstance = true
             Transport.isConnectedToSharedInstance = true
 
@@ -644,6 +670,20 @@ class Reticulum private constructor(
             return true
         } catch (e: Exception) {
             log("Failed to connect to shared instance: ${e.message}")
+            // Roll back: because registration precedes start() (issue #71), a
+            // failure here may have left a registered-but-dead client in
+            // Transport. Deregister it so standalone startup does not run with
+            // a dead interface. Best-effort - the deregistrar is app-provided
+            // and may be absent, and only applies if registration happened.
+            if (registered) {
+                clientInterface?.let { dead ->
+                    try {
+                        interfaceDeregistrar?.invoke(dead)
+                    } catch (_: Exception) {
+                        // Best-effort cleanup; never mask the original failure.
+                    }
+                }
+            }
             isConnectedToSharedInstance = false
             Transport.isConnectedToSharedInstance = false
             return false

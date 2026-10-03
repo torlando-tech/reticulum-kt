@@ -171,6 +171,11 @@ fun main() {
                     Transport.registerInterface(iface.toRef())
                 }
             }
+            Reticulum.setInterfaceDeregistrar { iface ->
+                if (iface is Interface) {
+                    Transport.deregisterInterface(iface.toRef())
+                }
+            }
 
             Reticulum.start(
                 configDir = configDir.absolutePath,

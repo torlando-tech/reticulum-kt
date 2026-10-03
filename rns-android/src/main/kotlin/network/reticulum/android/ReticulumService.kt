@@ -436,6 +436,12 @@ class ReticulumService : LifecycleService() {
                         network.reticulum.transport.Transport.registerInterface(ref)
                     }
                 }
+                Reticulum.setInterfaceDeregistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        val ref = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(iface)
+                        network.reticulum.transport.Transport.deregisterInterface(ref)
+                    }
+                }
 
                 reticulum = Reticulum.start(
                     configDir = configDir,

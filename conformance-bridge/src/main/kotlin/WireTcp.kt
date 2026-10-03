@@ -1025,6 +1025,11 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                         Transport.registerInterface(iface.toRef())
                     }
                 }
+                Reticulum.setInterfaceDeregistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        Transport.deregisterInterface(iface.toRef())
+                    }
+                }
 
                 rns = Reticulum.start(
                     configDir = configDir.absolutePath,
