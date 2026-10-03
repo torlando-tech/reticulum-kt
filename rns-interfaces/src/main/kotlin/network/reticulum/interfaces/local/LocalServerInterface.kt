@@ -106,6 +106,17 @@ class LocalServerInterface : Interface {
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<LocalClientInterface>()
 
+    /**
+     * The actual TCP port the server is bound to.
+     *
+     * When constructed with [tcpPort] = 0 the OS assigns an ephemeral port and
+     * this property returns that real port (read back from the bound
+     * [ServerSocket]) once [start] has completed. Returns 0 for non-TCP
+     * transports (Unix / abstract sockets) or before [start] has bound.
+     */
+    val boundPort: Int
+        get() = serverSocket?.takeIf { it.isBound }?.localPort ?: 0
+
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = true
