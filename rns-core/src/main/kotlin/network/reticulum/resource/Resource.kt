@@ -9,6 +9,8 @@ import network.reticulum.crypto.Hashes
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
 import network.reticulum.packet.Packet
+import network.reticulum.transport.InterfaceRef
+import network.reticulum.transport.Transport
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -101,6 +103,9 @@ class Resource private constructor(
          * @param autoCompress Whether to compress the data (default: true)
          * @param callback Callback when transfer completes
          * @param progressCallback Callback for progress updates
+         * @param failedCallback Callback when the transfer fails. Installed on
+         *   `callbacks.failed` before advertise() spawns the watchdog, so a
+         *   failure that fires during that window is propagated (issue #65).
          * @return The new Resource instance
          */
         fun create(
@@ -111,14 +116,22 @@ class Resource private constructor(
             autoCompress: Boolean = true,
             callback: ((Resource) -> Unit)? = null,
             progressCallback: ((Resource) -> Unit)? = null,
+            failedCallback: ((Resource) -> Unit)? = null,
             requestId: ByteArray? = null,
             isResponse: Boolean = false,
             timeout: Long? = null
         ): Resource {
             val resource = Resource(link, initiator = true)
 
+            // Install every callback BEFORE advertise() spawns the watchdog.
+            // advertise() -> doAdvertise() -> startWatchdog() starts the watchdog
+            // thread immediately; if the watchdog fires `failed` before the
+            // application installs callbacks.failed (issue #65), the callback is
+            // invoked on null (?. no-op) and the failure is never propagated up to
+            // LXMessage.state. Installing failedCallback here closes that window.
             callback?.let { resource.callbacks.completed = it }
             progressCallback?.let { resource.callbacks.progress = it }
+            failedCallback?.let { resource.callbacks.failed = it }
 
             resource.requestId = requestId
             resource.isResponse = isResponse
@@ -139,13 +152,17 @@ class Resource private constructor(
          * @param link The link the advertisement came from
          * @param callback Callback when transfer completes
          * @param progressCallback Callback for progress updates
+         * @param failedCallback Callback when the transfer fails. Installed on
+         *   `callbacks.failed` before startWatchdog(), so a failure that fires
+         *   during that window is propagated (issue #65).
          * @return The new Resource instance, or null if invalid
          */
         fun accept(
             advertisement: ResourceAdvertisement,
             link: Link,
             callback: ((Resource) -> Unit)? = null,
-            progressCallback: ((Resource) -> Unit)? = null
+            progressCallback: ((Resource) -> Unit)? = null,
+            failedCallback: ((Resource) -> Unit)? = null
         ): Resource? {
             // Dedupe duplicate advertisements before doing any setup work.
             // Mirrors python `RNS.Resource.accept`'s
@@ -182,8 +199,12 @@ class Resource private constructor(
             return try {
                 resource = Resource(link, initiator = false)
 
+                // Install every callback BEFORE startWatchdog() (below) so a
+                // watchdog failure that fires during the accept window is
+                // propagated (issue #65).
                 callback?.let { resource.callbacks.completed = it }
                 progressCallback?.let { resource.callbacks.progress = it }
+                failedCallback?.let { resource.callbacks.failed = it }
 
                 resource.initializeFromAdvertisement(advertisement)
                 // Python invokes resource_started synchronously after the
@@ -319,6 +340,14 @@ class Resource private constructor(
     private var lastPartSent: Long = 0
     private var startedTransferring: Long? = null
     private var retries: Int = 0
+    // Python parity (Resource.py:343): retries_left counts DOWN from max_retries
+    // (or max_adv_retries for the ADVERTISED phase, Resource.py:533). The sender
+    // watchdog's recovery branches are budgeted by it: ADVERTISED re-sends while
+    // retries_left > 0 (Resource.py:576-588) and AWAITING_PROOF cache queries
+    // while retries_left > 0 (Resource.py:646-658), cancelling once exhausted.
+    // The legacy [retries] counter (counts UP) is kept for the existing
+    // watchdog-exhaustion guard and the conformance instrumentation.
+    private var retriesLeft: Int = ResourceConstants.MAX_RETRIES
 
     // Request/response timing for RTT calculation
     private var reqSent: Long = 0
@@ -431,6 +460,10 @@ class Resource private constructor(
     private val requestNextEmitCount = AtomicInteger(0)
     private val hmuRequestsSent = AtomicInteger(0)
     private val hashmapUpdatesReceived = AtomicInteger(0)
+    // Counts the sender watchdog's AWAITING_PROOF cache queries (the recovery
+    // action at python Resource.py:651-657). Instrumented so a unit test can
+    // assert the recovery ran without needing a live network round-trip.
+    private val proofCacheQueries = AtomicInteger(0)
 
     // Test-only: when false, receivePart() does NOT auto-issue its follow-up
     // requestNext() on a window drain. Mirrors the reference harness shadowing
@@ -727,13 +760,19 @@ class Resource private constructor(
         doAdvertise()
     }
 
-    private fun doAdvertise() {
-        if (status != ResourceConstants.QUEUED) return
-
-        // Register with link
-        link.registerOutgoingResource(this)
-
-        status = ResourceConstants.ADVERTISED
+    /**
+     * Build and send a RESOURCE_ADV packet for this resource.
+     *
+     * Used by doAdvertise() for the initial advertisement AND by the sender
+     * watchdog's ADVERTISED-timeout recovery (python Resource.py:584-587: the
+     * watchdog rebuilds the advertisement packet and re-sends it). Keeping the
+     * build+send in one place means the re-send is byte-identical to the
+     * original except for the link's per-send encryption non-determinism.
+     *
+     * @return true if the packet was sent, false otherwise (the watchdog treats
+     *   a send failure as a cancel, mirroring python's except-branch).
+     */
+    private fun sendAdvertisement(): Boolean {
         val adv = ResourceAdvertisement.fromResource(this)
         val advData = adv.pack()
 
@@ -760,10 +799,34 @@ class Resource private constructor(
 
         log("  packet linkId=${link.linkId.toHexString()}, raw size=${packet.raw?.size ?: "null"}")
         log("  link status=${link.status}")
-        val receipt = packet.send()
-        log("  send result: receipt=${receipt != null}, packet.sent=${packet.sent}")
-        lastActivity = System.currentTimeMillis()
-        advSent = lastActivity
+        packet.send()
+        // RESOURCE_ADV packets are in the RESOURCE..RESOURCE_RCL context range,
+        // which the Transport receipt guard skips, so packet.send() returns a
+        // null receipt even on success. Use packet.sent (set by send() on
+        // success) as the authoritative success signal.
+        val ok = packet.sent
+        log("  send result: sent=${packet.sent}")
+        if (ok) {
+            lastActivity = System.currentTimeMillis()
+            advSent = lastActivity
+        }
+        return ok
+    }
+
+    private fun doAdvertise() {
+        if (status != ResourceConstants.QUEUED) return
+
+        // Register with link
+        link.registerOutgoingResource(this)
+
+        status = ResourceConstants.ADVERTISED
+        // Python __advertise_job (Resource.py:533) resets the ADVERTISED-phase
+        // retry budget to max_adv_retries once the advertisement is out. The
+        // watchdog's ADVERTISED timeout re-sends the advertisement while this
+        // budget has room and cancels when it is exhausted (Resource.py:576-591).
+        retriesLeft = ResourceConstants.MAX_ADV_RETRIES
+
+        sendAdvertisement()
 
         // Pre-prepare the next segment of a split transfer in the background
         // (python `advertise()`, Resource.py:528-530: a daemon thread runs
@@ -825,6 +888,8 @@ class Resource private constructor(
             receivingPart = true
             lastActivity = System.currentTimeMillis()
             retries = 0
+            // Python receive_part resets the retry budget (Resource.py:833).
+            retriesLeft = ResourceConstants.MAX_RETRIES
 
             // RTT calculation on first response
             if (reqResp == null) {
@@ -1067,6 +1132,8 @@ class Resource private constructor(
         }
 
         retries = 0
+        // Python request() resets the retry budget (Resource.py:992).
+        retriesLeft = ResourceConstants.MAX_RETRIES
 
         // Parse request format: [hmu_flag] [last_map_hash?] [resource_hash] [requested_hashes...]
         val wantsMoreHashmap = data[0].toInt() and 0xFF == ResourceConstants.HASHMAP_IS_EXHAUSTED
@@ -1207,6 +1274,8 @@ class Resource private constructor(
 
         lastActivity = System.currentTimeMillis()
         retries = 0
+        // Python hashmap_update_packet resets the retry budget (Resource.py:486).
+        retriesLeft = ResourceConstants.MAX_RETRIES
 
         // Parse: resource_hash (32 bytes) + msgpack([segment, hashmap])
         if (plaintext.size <= ResourceConstants.RESOURCE_HASH_LEN) return
@@ -1283,6 +1352,64 @@ class Resource private constructor(
     }
 
     /**
+     * Re-query the receiver's proof from the local network cache.
+     *
+     * Sender watchdog AWAITING_PROOF-timeout recovery (python Resource.py:651-657):
+     * the sender finished sending all parts but never heard back its resource
+     * proof. The recovery rebuilds the expected proof packet (hash + expected
+     * proof, PROOF/RESOURCE_PRF) and calls `Transport.cache_request` on its hash
+     * so a cached copy is replayed toward us. This is what lets a sender that
+     * missed a proof recover instead of just cancelling.
+     *
+     * The proof packet is packed (not sent) only so its packet_hash is computed
+     * for the cache lookup - exactly like python's `expected_proof_packet.pack()`.
+     */
+    private fun queryProofFromCache() {
+        val expected = expectedProof
+        if (expected == null) {
+            log("AWAITING_PROOF cache query skipped: no expected proof")
+            return
+        }
+        // python Resource.py:653-656: expected_data = hash + expected_proof,
+        // build a PROOF/RESOURCE_PRF packet and pack it to derive its hash.
+        val proofPacket = Packet.createRaw(
+            destinationHash = link.linkId,
+            data = hash + expected,
+            packetType = PacketType.PROOF,
+            destinationType = DestinationType.LINK,
+            context = PacketContext.RESOURCE_PRF,
+            mtu = link.mtu
+        )
+        proofPacket.pack()
+
+        // The proof travels over the link, so the cache query replays on the
+        // link's attached interface (or its next-hop path interface).
+        val iface = resolveProofRequestInterface()
+        if (iface != null) {
+            Transport.cacheRequest(proofPacket.packetHash, iface)
+        }
+        proofCacheQueries.incrementAndGet()
+        // python Resource.py:657: reset the AWAITING_PROOF timeout anchor.
+        lastPartSent = System.currentTimeMillis()
+    }
+
+    /**
+     * Resolve the interface the proof cache query should replay on.
+     *
+     * The proof is sent to the receiver over the link, so the natural replay
+     * interface is the link's attached interface (python's `cache_request`
+     * `destination` arg is `self.link`). Falls back to the next-hop path
+     * interface when the link carries no attached interface hash.
+     */
+    private fun resolveProofRequestInterface(): InterfaceRef? {
+        val attached = link.attachedInterfaceHash
+        if (attached != null) {
+            Transport.findInterfaceByHashForTest(attached)?.let { return it }
+        }
+        return Transport.nextHopInterface(link.linkId)
+    }
+
+    /**
      * Send proof of complete receipt to sender.
      * Called by receiver after successfully assembling all parts.
      * Matches Python: proof = full_hash(self.data + self.hash)
@@ -1324,19 +1451,29 @@ class Resource private constructor(
                 mtu = link.mtu
             )
 
+            // Bind the proof to the transfer's link so the Transport routes it to
+            // that link's own interface. Python's RNS.Packet(link, ...) sets
+            // packet.destination = link (Packet.py:136), and the Transport's
+            // LINK-packet interface filter (Transport.py:1031-1035) plus
+            // in-process loopback read that reference to send the proof only on
+            // the link's own interface. Packet.createRaw leaves packet.link null,
+            // which falls through to broadcast-on-all-interfaces
+            // (Transport.kt:3368) in a multi-interface production setup. This
+            // matches the Link.kt idiom (packet.link = this) used by the port's
+            // other link-bound packet sends.
+            packet.link = link
             // Observation-only: which link (by link_id) is the proof bound to at
-            // send time, or null if the packet carries no link reference. Python's
-            // RNS.Packet(link, ...) always sets packet.destination = link, and the
-            // Transport's LINK-packet routing (interface filter at
-            // Transport.py:1031-1035 and the in-process loopback) reads that
-            // reference to send the proof only on the link's own interface. A
-            // packet built without the reference (createRaw leaves link == null)
-            // falls through to broadcast-on-all-interfaces (Transport.kt:3368).
-            // Recording the link_id (not a boolean) lets the bridge assert the proof
-            // is bound to the transfer's actual link, not merely to some link.
+            // send time, or null if the packet carries no link reference. Recording
+            // the link_id (not a boolean) lets the bridge assert the proof is bound
+            // to the transfer's actual link, not merely to some link.
             lastProofLinkId = packet.link?.linkId?.copyOf()
 
             packet.send()
+            // python Resource.py:759: cache the proof packet (force_cache=True)
+            // so the sender's AWAITING_PROOF recovery (cache_request) can find
+            // it. Without this, queryProofFromCache is a no-op - no production
+            // path stores proofs in the cache, so the sender cannot recover.
+            Transport.cache(packet, forceCache = true)
             log("Sent proof for resource ${hash.toHexString()}")
 
         } catch (e: Exception) {
@@ -1925,6 +2062,12 @@ class Resource private constructor(
 
     /**
      * Watchdog job for timeout handling.
+     *
+     * Sleeps WATCHDOG_MAX_SLEEP between iterations and drives [watchdogTick]
+     * (the per-iteration timeout check + recovery). Splitting the iteration
+     * out of the loop makes the recovery actions deterministically unit-testable
+     * (issue #65) without a live link: a test primes the state and drives
+     * [watchdogTick] directly instead of waiting on a background thread.
      */
     private fun watchdogJob() {
         try {
@@ -1934,37 +2077,7 @@ class Resource private constructor(
 
                     if (!watchdogActive || status >= ResourceConstants.ASSEMBLING) break
 
-                    val now = System.currentTimeMillis()
-                    val idleTime = now - lastActivity
-
-                    // Check for timeout
-                    val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
-                    if (idleTime > timeout) {
-                        retries++
-                        if (retries > ResourceConstants.MAX_RETRIES) {
-                            // Mirrors python `Resource.py:578, 591, 628, 636, 648,
-                            // 667, 690` etc. — every retries-exhausted branch in
-                            // python's watchdog calls `self.cancel()`. Calling
-                            // cancel() (rather than the previous inline
-                            // `status = FAILED; callbacks.failed?.invoke`) ensures
-                            // `link.resourceConcluded(this)` runs, which removes
-                            // the resource from `incomingResources` so a future
-                            // RESOURCE_ADV with the same hash is no longer
-                            // dropped by the dedup guard inside
-                            // `Resource.accept`. Without this, a single
-                            // watchdog-fail leaves the hash registered for the
-                            // lifetime of the link, killing the recovery path.
-                            log("Resource ${hash.toHexString()} timed out after $retries retries")
-                            cancel()
-                            break
-                        } else {
-                            log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
-                            if (!initiator) {
-                                requestNext()
-                            }
-                        }
-                    }
-
+                    watchdogTick()
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
@@ -1976,6 +2089,111 @@ class Resource private constructor(
                 if (watchdogThread === Thread.currentThread()) {
                     watchdogActive = false
                     watchdogThread = null
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform one watchdog timeout check and dispatch the per-state recovery
+     * action.
+     *
+     * Brings the sender watchdog to python parity (Resource.py:560-670). The
+     * pre-fix kotlin watchdog only retried on the receiver side
+     * (`if (!initiator) requestNext()`); a sender in ADVERTISED or AWAITING_PROOF
+     * simply counted up to MAX_RETRIES and cancelled, with no recovery. Under
+     * real packet loss (lost initial request, lost proof) python recovers but
+     * kotlin gave up. Each recovery branch below mirrors the python watchdog:
+     *
+     * - ADVERTISED + timeout + retries left: re-send the advertisement
+     *   (Resource.py:583-588); cancel when the ADVERTISED budget (max_adv_retries)
+     *   is exhausted or the re-send fails (Resource.py:576-591).
+     * - AWAITING_PROOF + timeout + retries left: query the proof from the
+     *   network cache via Transport.cache_request (Resource.py:651-658); cancel
+     *   when the budget is exhausted (Resource.py:646-648).
+     * - TRANSFERRING / other + timeout: receiver retries part requests
+     *   (Resource.py:612-629); the sender cancels once the wait elapses
+     *   (Resource.py:634-637) - this is the pre-existing behaviour, preserved.
+     */
+    private fun watchdogTick() {
+        val now = System.currentTimeMillis()
+
+        // python parity: each watchdog state anchors its timeout on a different
+        // timestamp and factor. AWAITING_PROOF anchors on last_part_sent
+        // (Resource.py:644, re-anchored on every retry at Resource.py:657) with
+        // the proof timeout factor + sender grace, so each attempt gets a full
+        // window. Anchoring AWAITING_PROOF on last_activity (the old behaviour)
+        // kept the gate tripped after the first timeout - the proof branch then
+        // re-fired on every tick and burned all retries in ~16s, so a slow proof
+        // arrived only after the transfer had already failed.
+        val proofTimeout =
+            (link.rtt ?: 5000L) * ResourceConstants.PROOF_TIMEOUT_FACTOR +
+                ResourceConstants.SENDER_GRACE_TIME.toLong() * 1000L
+        val partTimeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
+
+        val timedOut = when (status) {
+            ResourceConstants.AWAITING_PROOF -> now - lastPartSent > proofTimeout
+            else -> now - lastActivity > partTimeout
+        }
+        if (!timedOut) return
+
+        // Timed out. Dispatch the recovery action by state (python parity).
+        when (status) {
+            // Sender advertised but the receiver never sent a part request.
+            // python Resource.py:574-591: re-send the advertisement while the
+            // ADVERTISED retry budget (max_adv_retries) has room, else cancel.
+            ResourceConstants.ADVERTISED -> {
+                if (retriesLeft <= 0) {
+                    log("Resource ${hash.toHexString()} timed out after sending advertisement")
+                    cancel()
+                } else {
+                    log("No part requests received, retrying resource advertisement (retries_left=$retriesLeft)")
+                    retriesLeft--
+                    if (!sendAdvertisement()) {
+                        log("Could not resend advertisement packet, cancelling resource")
+                        cancel()
+                    }
+                }
+            }
+            // Sender sent all parts but the proof never came back.
+            // python Resource.py:639-658: query the proof from the network cache
+            // while the budget has room, else cancel.
+            ResourceConstants.AWAITING_PROOF -> {
+                if (retriesLeft <= 0) {
+                    log("Resource ${hash.toHexString()} timed out waiting for proof")
+                    cancel()
+                } else {
+                    log("All parts sent, no resource proof received, querying network cache (retries_left=$retriesLeft)")
+                    retriesLeft--
+                    queryProofFromCache()
+                }
+            }
+            else -> {
+                // TRANSFERRING (and any other non-terminal active state).
+                // Pre-existing receiver-side retry + sender-side cancel, preserved
+                // exactly (python Resource.py:612-637). The legacy up-counter
+                // [retries] bounds both, as before.
+                retries++
+                if (retries > ResourceConstants.MAX_RETRIES) {
+                    // Mirrors python `Resource.py:578, 591, 628, 636, 648,
+                    // 667, 690` etc. — every retries-exhausted branch in
+                    // python's watchdog calls `self.cancel()`. Calling
+                    // cancel() (rather than the previous inline
+                    // `status = FAILED; callbacks.failed?.invoke`) ensures
+                    // `link.resourceConcluded(this)` runs, which removes
+                    // the resource from `incomingResources` so a future
+                    // RESOURCE_ADV with the same hash is no longer
+                    // dropped by the dedup guard inside
+                    // `Resource.accept`. Without this, a single
+                    // watchdog-fail leaves the hash registered for the
+                    // lifetime of the link, killing the recovery path.
+                    log("Resource ${hash.toHexString()} timed out after $retries retries")
+                    cancel()
+                } else {
+                    log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
+                    if (!initiator) {
+                        requestNext()
+                    }
                 }
             }
         }
@@ -2047,6 +2265,18 @@ class Resource private constructor(
     fun hashmapUpdatesReceivedForTest(): Int = hashmapUpdatesReceived.get()
     fun watchdogActiveForTest(): Boolean = watchdogActive
     fun startWatchdogForTest() = startWatchdog()
+    // Drive one watchdog timeout-check/recovery iteration synchronously.
+    // This is the issue-#65 test seam: a unit test primes the resource state
+    // (ADVERTISED / AWAITING_PROOF, lastActivity in the past, retry budget) and
+    // invokes this directly instead of waiting on the background watchdog
+    // thread, making the sender recovery actions deterministic.
+    fun watchdogTickForTest() = watchdogTick()
+    // The receiver-side proof sender, exposed so a test can drive prove()
+    // directly (with a primed uncompressedData) and assert it stores the proof
+    // packet in the transport cache (python Resource.py:759 force_cache=True).
+    fun proveForTest() = prove()
+    // The AWAITING_PROOF proof-cache query recovery counter (see proofCacheQueries).
+    fun proofCacheQueriesForTest(): Int = proofCacheQueries.get()
     fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
         cancelTransitionHookForTest = hook
     }

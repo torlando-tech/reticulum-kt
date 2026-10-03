@@ -323,6 +323,9 @@ object Transport {
 
     /** Last time cache was cleaned. */
     private var cacheLastCleaned: Long = 0
+    /** Last time the in-memory packet cache was swept (separate from the file
+     *  announce-cache sweep; cleanCache() is throttled independently). */
+    private var packetCacheLastCleaned: Long = 0
     private var identitiesLastSaved: Long = 0
 
     /** Cache path for persistent announce storage. Set by Reticulum during init. */
@@ -488,6 +491,7 @@ object Transport {
         startTime = System.currentTimeMillis()
         tablesLastCulled = startTime
         hashlistLastCleaned = startTime
+        packetCacheLastCleaned = startTime
 
         // Initialize path request destination
         initializeControlDestinations()
@@ -2208,11 +2212,18 @@ object Transport {
     }
 
     /**
-     * Clean expired packets from the cache.
+     * Clean expired packets from the in-memory packet cache.
+     *
+     * Scheduled from runJobs() (python Transport.py:951-956, which launches
+     * clean_cache() on the cache_clean_interval). Without this the in-memory
+     * packetCache only ever evicts lazily on read (getCachedPacket), so
+     * force-cached packets that nothing re-reads - e.g. one proof per completed
+     * transfer (Resource.prove) - accumulate for the process lifetime. TTL
+     * (PACKET_CACHE_TIMEOUT) bounds each entry; this sweep bounds the set.
      */
     fun cleanCache() {
         val now = System.currentTimeMillis()
-        if (now - cacheLastCleaned < TransportConstants.CACHE_CLEAN_INTERVAL) return
+        if (now - packetCacheLastCleaned < TransportConstants.CACHE_CLEAN_INTERVAL) return
 
         var removed = 0
         val iterator = packetCache.entries.iterator()
@@ -2228,7 +2239,7 @@ object Transport {
             log("Cleaned $removed expired packets from cache")
         }
 
-        cacheLastCleaned = now
+        packetCacheLastCleaned = now
     }
 
     /**
@@ -5102,6 +5113,14 @@ object Transport {
         if (now - cacheLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
             cleanAnnounceCache()
             cacheLastCleaned = now
+        }
+
+        // Clean expired entries from the in-memory packet cache periodically
+        // (python Transport.py:951-956). Without this, force-cached packets that
+        // nothing re-reads (one proof per completed transfer) accumulate for the
+        // process lifetime; the 5-minute sweep bounds the set.
+        if (now - packetCacheLastCleaned > TransportConstants.CACHE_CLEAN_INTERVAL) {
+            cleanCache()
         }
 
         // Persist known destinations periodically (every 5 minutes)
