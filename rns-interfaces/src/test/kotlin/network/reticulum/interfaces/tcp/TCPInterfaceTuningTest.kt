@@ -55,13 +55,14 @@ class TCPInterfaceTuningTest {
     fun `default mtu posture`() {
         val server = TCPServerInterface(name = "s", bindPort = 0)
         // python interface_post_init runs optimise_mtu() on every non-fixed
-        // interface (Reticulum.py:780); the 10 Mbps BITRATE_GUESS maps to 8192,
-        // NOT the class HW_MTU=262144 (that is only the pre-optimise default).
+        // interface (Reticulum.py:780); the 10 Mbps BITRATE_GUESS maps to
+        // 16384 (RNS 1.5.5 inclusive >= tiers), NOT the class
+        // HW_MTU=262144 (that is only the pre-optimise default).
         assertEquals(
             Interface.optimiseMtu(server.bitrate.toLong()) ?: TCPServerInterface.HW_MTU,
             server.hwMtu,
         )
-        assertEquals(8192, server.hwMtu)
+        assertEquals(16384, server.hwMtu)
         assertTrue(server.autoconfigureMtu)
         assertFalse(server.fixedMtu)
         assertTrue(server.supportsLinkMtuDiscovery)

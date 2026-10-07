@@ -89,19 +89,33 @@ object HDLC {
     /**
      * Create a frame deframer for streaming data.
      *
+     * @param hwMtu Upper bound on the unescaped frame size in bytes. A frame
+     *   longer than this is dropped, mirroring RNS 1.5.5's
+     *   `Interface.check_frame_len` (TCPInterface.py) upper cap
+     *   (`frame_len > HW_MTU + ifac_size -> drop`). Defaults to Int.MAX_VALUE
+     *   (no cap) so callers that don't have an HW MTU are unaffected.
      * @param onFrame Callback invoked with each complete deframed packet
      * @return Deframer instance
      */
-    fun createDeframer(onFrame: (ByteArray) -> Unit): Deframer {
-        return Deframer(onFrame)
+    fun createDeframer(
+        hwMtu: Int = Int.MAX_VALUE,
+        onFrame: (ByteArray) -> Unit,
+    ): Deframer {
+        return Deframer(hwMtu, onFrame)
     }
 
     /**
      * Streaming HDLC deframer.
      *
      * Accumulates incoming bytes and emits complete frames via callback.
+     * Frames whose unescaped length exceeds [hwMtu] are dropped (RNS 1.5.5
+     * check_frame_len upper cap); frames of HEADER_MIN_SIZE bytes or less are
+     * dropped (the runt guard below).
      */
-    class Deframer(private val onFrame: (ByteArray) -> Unit) {
+    class Deframer(
+        private val hwMtu: Int = Int.MAX_VALUE,
+        private val onFrame: (ByteArray) -> Unit,
+    ) {
         private var buffer = ByteArrayOutputStream()
         private var inFrame = false
 
@@ -118,9 +132,13 @@ object HDLC {
                         val frameData = buffer.toByteArray()
                         buffer.reset()
                         val unescaped = unescape(frameData)
-                        // Python RNS: Only accept frames larger than HEADER_MINSIZE (19 bytes)
-                        // Rejects malformed/tiny frames that can't contain a valid packet
-                        if (unescaped.size > network.reticulum.common.RnsConstants.HEADER_MIN_SIZE) {
+                        // RNS 1.5.5 check_frame_len: a frame of
+                        // HEADER_MIN_SIZE (19) bytes or less is malformed
+                        // (cannot hold a valid packet), and a frame exceeding
+                        // the interface HW MTU is dropped, not delivered.
+                        if (unescaped.size > network.reticulum.common.RnsConstants.HEADER_MIN_SIZE &&
+                            unescaped.size <= hwMtu
+                        ) {
                             onFrame(unescaped)
                         }
                     }

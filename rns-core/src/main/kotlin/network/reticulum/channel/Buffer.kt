@@ -29,6 +29,12 @@ class StreamDataMessage : MessageBase() {
         // Overhead: 2 for stream data message header, 6 for channel envelope
         const val OVERHEAD = 2 + 6
 
+        // RNS 1.5.5 (df801810): the raw-write chunk cap is derived from the
+        // LIVE channel MDU minus only the stream-data-message header (2 bytes),
+        // not the fixed MAX_DATA_LEN below. The header length the live cap
+        // subtracts (Buffer.py StreamDataMessage.HEADER_LEN).
+        const val HEADER_LEN = 2
+
         // MAX_DATA_LEN is calculated based on Link MDU
         // In Python: RNS.Link.MDU - OVERHEAD
         // Link.MDU is typically 431 bytes for default case
@@ -282,7 +288,11 @@ class RawChannelWriter(
 
     private val eofSent = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
-    private val mdu = channel.mdu - StreamDataMessage.OVERHEAD
+    // RNS 1.5.5 (df801810): the live raw-write chunk cap is channel.mdu minus
+    // only the stream-data-message header (2), not the full OVERHEAD. This is
+    // the cap writeInternal uses for both the compression gate and the
+    // uncompressed fallback chunk.
+    private val mdu = channel.mdu - StreamDataMessage.HEADER_LEN
 
     init {
         // Register stream data message type if not already registered.
@@ -328,8 +338,9 @@ class RawChannelWriter(
                 val compressedChunk = compressBZ2(limitedBytes.copyOf(chunkSegmentLength))
                 val compressedLength = compressedChunk.size
 
-                if (compressedLength < StreamDataMessage.MAX_DATA_LEN &&
-                    compressedLength < chunkSegmentLength) {
+                if (compressedLength < mdu &&
+                    compressedLength < chunkSegmentLength
+                ) {
                     compSuccess = true
                     chunk = compressedChunk
                     processedLength = chunkSegmentLength
@@ -339,9 +350,10 @@ class RawChannelWriter(
                 }
             }
 
-            // If compression didn't help, send uncompressed
+            // If compression didn't help, send uncompressed, capped at the
+            // LIVE channel MDU (RNS 1.5.5 df801810), not the fixed constant.
             if (!compSuccess) {
-                chunk = limitedBytes.copyOf(minOf(StreamDataMessage.MAX_DATA_LEN, limitedBytes.size))
+                chunk = limitedBytes.copyOf(minOf(mdu, limitedBytes.size))
                 processedLength = chunk.size
             }
 
