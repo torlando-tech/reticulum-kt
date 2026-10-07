@@ -93,6 +93,31 @@ object BLEConstants {
      */
     const val KEEPALIVE_INTERVAL_MS = 15_000L
 
+    // ---- Data-Path Liveness Probe (protocol v0.4.0) ----
+
+    /**
+     * A keepalive proves the *link* is up; it does not prove *data* still flows
+     * (under RF degradation 1-byte writes succeed while larger fragments fail, and
+     * the link layer keeps an idle connection alive). The data-path probe is an
+     * active 2-byte PING/PONG round-trip over the real data path: a healthy link
+     * round-trips it (which keeps the link fresh, so idle links are never reaped),
+     * a data-dead link does not (so it is detected and reconnected). The 2-byte
+     * frames are shorter than the 5-byte fragment header, so peers that predate the
+     * probe reject them as "too short" and are unaffected.
+     * Wire-compatible with the python ble-reticulum reference (BLE_PROTOCOL_v0.4.0.md).
+     */
+    const val PROBE_PING_BYTE: Byte = 0x04
+    const val PROBE_PONG_BYTE: Byte = 0x05
+
+    /** PING a link that has had no real data for this long. */
+    const val DATA_PATH_PROBE_INTERVAL_MS = 15_000L
+
+    /** Reconnect a probe-capable peer whose data path has been silent this long. */
+    const val DATA_PATH_TIMEOUT_MS = 45_000L
+
+    /** How often the per-peer probe/detect loop runs. */
+    const val DATA_PATH_PROBE_POLL_INTERVAL_MS = 10_000L
+
     // ---- Timeouts ----
 
     /**

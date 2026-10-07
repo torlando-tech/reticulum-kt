@@ -62,6 +62,24 @@ class BLEPeerInterface(
     @Volatile
     var lastTrafficReceived: Long = System.currentTimeMillis()
 
+    /**
+     * Last time *real data* crossed the link — a data fragment or a data-path probe
+     * frame, but NOT a keepalive or handshake. Drives the data-path liveness probe.
+     * ([lastTrafficReceived] counts keepalives and so cannot distinguish an
+     * idle-but-healthy link from a keepalive-alive-but-data-dead one; this clock can.)
+     * Mirrors python ble-reticulum `_last_real_data` (BLEInterface.py).
+     */
+    @Volatile
+    private var lastRealData: Long = System.currentTimeMillis()
+
+    /**
+     * Set once a PING/PONG has been seen from this peer (the peer speaks the data-path
+     * probe). Only probe-capable peers are reconnected on a dead path, so peers that
+     * predate the probe are never falsely reaped. Mirrors python `_probe_capable`.
+     */
+    @Volatile
+    private var probeCapable: Boolean = false
+
     // RSSI at discovery time, used for scoring/eviction decisions
     @Volatile
     var discoveryRssi: Int = -100
@@ -75,6 +93,7 @@ class BLEPeerInterface(
     var currentRssi: Int = -100
 
     private var rssiJob: Job? = null
+    private var probeJob: Job? = null
 
     init {
         this.parentInterface = parentBleInterface
@@ -89,6 +108,7 @@ class BLEPeerInterface(
 
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
+        probeJob = scope.launch { dataPathProbeLoop() }
         startRssiPolling()
     }
 
@@ -159,10 +179,16 @@ class BLEPeerInterface(
                     return@collect
                 }
 
+                // Data-path liveness probe frames (2-byte PING/PONG)
+                if (handleProbeFrame(fragment)) return@collect
+
                 // Skip identity handshake data (16 bytes exactly, already consumed by BLEInterface)
                 if (fragment.size == BLEConstants.IDENTITY_SIZE) {
                     return@collect
                 }
+
+                // Real data crossed the link -- refresh the data-path liveness clock.
+                lastRealData = System.currentTimeMillis()
 
                 try {
                     val packet = reassembler.receiveFragment(fragment, connection.address)
@@ -246,16 +272,98 @@ class BLEPeerInterface(
         }
     }
 
+    // ---- Data-Path Liveness Probe ----
+
+    /**
+     * Handle an inbound data-path liveness frame (2-byte PING/PONG). Returns true if
+     * [fragment] was a probe frame (and is now consumed). Receiving any probe frame
+     * proves the inbound data path is alive and that the peer speaks the probe, so the
+     * peer is marked probe-capable; a PING is echoed as a PONG.
+     *
+     * Mirrors python ble-reticulum `_handle_probe_frame` (BLEInterface.py). The python
+     * version also normalizes a "dev:"-prefixed peripheral address to resolve the peer's
+     * identity; here the frame already arrives on this peer's own connection, so no
+     * address lookup is needed.
+     *
+     * Visible as `internal` (rather than private) so unit tests can exercise the
+     * PING->PONG echo directly without driving the full receive coroutine loop (same
+     * pattern as [pollAndApplyRssi]).
+     */
+    internal suspend fun handleProbeFrame(fragment: ByteArray): Boolean {
+        if (fragment.size != 2) return false
+        val type = fragment[0]
+        if (type != BLEConstants.PROBE_PING_BYTE && type != BLEConstants.PROBE_PONG_BYTE) return false
+
+        // Any probe frame proves the data path is alive and the peer speaks the probe.
+        lastRealData = System.currentTimeMillis()
+        probeCapable = true
+
+        if (type == BLEConstants.PROBE_PING_BYTE) {
+            sendProbe(BLEConstants.PROBE_PONG_BYTE, fragment[1])
+        }
+        return true
+    }
+
+    /** Send a 2-byte data-path probe frame (PING/PONG) over the real data path. */
+    private suspend fun sendProbe(type: Byte, nonce: Byte) {
+        try {
+            connection.sendFragment(byteArrayOf(type, nonce))
+        } catch (e: Exception) {
+            log("Probe send failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Periodic data-path liveness sweep for this peer.
+     *
+     * - If the link has had no real data for [BLEConstants.DATA_PATH_PROBE_INTERVAL_MS],
+     *   send a PING; a healthy peer echoes a PONG, which refreshes [lastRealData] -- so
+     *   the probe is itself the traffic that keeps a genuinely idle-but-healthy link
+     *   from ever looking dead, and idle links are never reaped.
+     * - If a probe-capable peer's data path has been silent past
+     *   [BLEConstants.DATA_PATH_TIMEOUT_MS], the link is "connected but data-dead":
+     *   force a real reconnect via the driver.
+     *
+     * Mirrors python ble-reticulum `_run_data_path_probes` (BLEInterface.py). Python runs
+     * one timer in the parent interface iterating all peers; this kotlin port runs the
+     * loop per-peer (alongside the existing keepalive/RSSI jobs) to fit the per-peer
+     * structure. Reconnect goes through the parent's `driver.disconnect` (python parity),
+     * not the per-peer `detach()`/`close()` -- the parent owns the driver, and on Android
+     * `disconnect` cancels both a central GATT connection and a peripheral-side central.
+     */
+    private suspend fun dataPathProbeLoop() {
+        try {
+            while (online.value && !detached.get()) {
+                delay(BLEConstants.DATA_PATH_PROBE_POLL_INTERVAL_MS)
+                if (!online.value || detached.get()) break
+
+                val idle = System.currentTimeMillis() - lastRealData
+                if (idle > BLEConstants.DATA_PATH_PROBE_INTERVAL_MS) {
+                    // Low byte of the clock is a fine nonce; Long.toByte() truncates to it.
+                    sendProbe(BLEConstants.PROBE_PING_BYTE, System.currentTimeMillis().toByte())
+                }
+                if (probeCapable && idle > BLEConstants.DATA_PATH_TIMEOUT_MS) {
+                    log("data-path dead (no real data ${idle}ms) -- reconnecting")
+                    probeCapable = false
+                    parentBleInterface.onDataPathDead(connection.address)
+                }
+            }
+        } catch (e: CancellationException) {
+            // Normal cancellation
+        }
+    }
+
     /**
      * Update the underlying BLE connection (for MAC rotation).
      * Called by [BLEInterface] when the same identity connects from a new address.
      * Cancels old receive/keepalive, swaps connection, restarts loops.
      */
     fun updateConnection(newConnection: BLEPeerConnection, newAddress: String) {
-        // Cancel old receive/keepalive/rssi jobs
+        // Cancel old receive/keepalive/rssi/probe jobs
         receiveJob?.cancel()
         keepaliveJob?.cancel()
         rssiJob?.cancel()
+        probeJob?.cancel()
 
         // Close old connection
         try { connection.close() } catch (_: Exception) {}
@@ -265,12 +373,15 @@ class BLEPeerInterface(
         fragmenter = BLEFragmenter(newConnection.mtu)
         reassembler = BLEReassembler()
 
-        // MAC rotation proves liveness -- reset zombie detection timer
+        // MAC rotation proves liveness -- reset zombie + data-path timers, re-negotiate probe
         lastTrafficReceived = System.currentTimeMillis()
+        lastRealData = System.currentTimeMillis()
+        probeCapable = false
 
-        // Restart receive, keepalive, and RSSI polling
+        // Restart receive, keepalive, probe, and RSSI polling
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
+        probeJob = scope.launch { dataPathProbeLoop() }
         startRssiPolling()
 
         log("Connection updated to ${newAddress.takeLast(8)}")
@@ -288,6 +399,7 @@ class BLEPeerInterface(
         receiveJob?.cancel()
         keepaliveJob?.cancel()
         rssiJob?.cancel()
+        probeJob?.cancel()
         scope.cancel()
 
         // Close BLE connection
