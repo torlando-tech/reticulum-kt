@@ -182,7 +182,17 @@ class BLEPeerInterface(
                 // Data-path liveness probe frames (2-byte PING/PONG)
                 if (handleProbeFrame(fragment)) return@collect
 
-                // Skip identity handshake data (16 bytes exactly, already consumed by BLEInterface)
+                // Skip identity handshake data (16 bytes exactly, already consumed by BLEInterface).
+                //
+                // NOTE: [lastRealData] is intentionally NOT refreshed for identity-size
+                // fragments. On the current protocol the identity frame is always the
+                // first write on a connection, so a 16-byte fragment here is the
+                // handshake, not real data, and must not count toward liveness. If that
+                // ordering assumption ever breaks (a real data fragment of exactly
+                // IDENTITY_SIZE arriving mid-session), it would be silently skipped and
+                // the liveness clock would age as if nothing came in. Any protocol change
+                // that makes 16-byte data fragments possible must revisit this guard and
+                // the [lastRealData] update below together.
                 if (fragment.size == BLEConstants.IDENTITY_SIZE) {
                     return@collect
                 }
@@ -338,14 +348,19 @@ class BLEPeerInterface(
                 if (!online.value || detached.get()) break
 
                 val idle = System.currentTimeMillis() - lastRealData
-                if (idle > BLEConstants.DATA_PATH_PROBE_INTERVAL_MS) {
-                    // Low byte of the clock is a fine nonce; Long.toByte() truncates to it.
-                    sendProbe(BLEConstants.PROBE_PING_BYTE, System.currentTimeMillis().toByte())
-                }
                 if (probeCapable && idle > BLEConstants.DATA_PATH_TIMEOUT_MS) {
                     log("data-path dead (no real data ${idle}ms) -- reconnecting")
-                    probeCapable = false
-                    parentBleInterface.onDataPathDead(connection.address)
+                    // Only clear probeCapable once the disconnect is confirmed. If
+                    // the driver disconnect throws, the peer is still connected and
+                    // no PONG will arrive on the dead path to re-set probeCapable;
+                    // keeping it true lets the next poll tick retry the reconnect
+                    // instead of the probe silently giving up.
+                    if (parentBleInterface.onDataPathDead(connection.address)) {
+                        probeCapable = false
+                    }
+                } else if (idle > BLEConstants.DATA_PATH_PROBE_INTERVAL_MS) {
+                    // Low byte of the clock is a fine nonce; Long.toByte() truncates to it.
+                    sendProbe(BLEConstants.PROBE_PING_BYTE, System.currentTimeMillis().toByte())
                 }
             }
         } catch (e: CancellationException) {
