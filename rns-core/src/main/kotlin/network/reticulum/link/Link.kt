@@ -2306,10 +2306,25 @@ class Link private constructor(
             if (network.reticulum.resource.ResourceAdvertisement
                     .isRequest(plaintext)
             ) {
-                if (destination?.requestHandlerCount() == 0) {
-                    // No request handler registered: do not auto-accept. Fall
-                    // through to the general strategy check below (a request adv
-                    // with no pending request is rejected there).
+                // The reference (RNS 1.5.5 Link.py:1037) gates on the
+                // RECEIVING-side destination's request_handlers. For an
+                // incoming link that destination is `owner` (`destination` is
+                // null on the receiving side); for an outgoing link it is
+                // `destination`. Keying off a bare `destination` (null for
+                // incoming links) would always take the accept branch and let
+                // a receiver with no registered request handler download
+                // request resources even under ACCEPT_NONE. A positive handler
+                // count is required to auto-accept; a null receiving
+                // destination (no handler) rejects, matching the reference.
+                val receivingDestination =
+                    if (initiator) destination else owner
+                val hasRequestHandler =
+                    (receivingDestination?.requestHandlerCount() ?: 0) > 0
+                if (!hasRequestHandler) {
+                    // No request handler registered on the receiving
+                    // destination: do not auto-accept. Fall through to the
+                    // general strategy check below (a request adv with no
+                    // pending request is rejected there).
                 } else {
                     // This is a request being sent as a resource
                     val resource =
