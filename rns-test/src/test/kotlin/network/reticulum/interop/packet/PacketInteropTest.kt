@@ -528,23 +528,42 @@ class PacketInteropTest : InteropTestBase() {
         @DisplayName("Minimum size packet")
         fun `minimum size packet`() {
             val destHash = ByteArray(16)
-            val data = ByteArray(0)
 
-            val packet = Packet.createRaw(
+            // RNS 1.5.5 (commit d80245b6) rejects a zero-length data field in
+            // Packet.unpack ("Zero-length data field"), so the minimum unpackable
+            // HEADER_1 frame now carries a 1-byte payload: 19-byte overhead + 1.
+            val minimal = Packet.createRaw(
                 destinationHash = destHash,
-                data = data,
+                data = byteArrayOf(0),
                 packetType = PacketType.DATA,
                 destinationType = DestinationType.PLAIN
             )
-
-            val raw = packet.pack()
-            assert(raw.size >= RnsConstants.HEADER_MIN_SIZE) {
-                "Packet should be at least ${RnsConstants.HEADER_MIN_SIZE} bytes"
+            val raw = minimal.pack()
+            assert(raw.size == RnsConstants.HEADER_MIN_SIZE + 1) {
+                "A 1-byte-payload PLAIN HEADER_1 frame is ${raw.size} bytes; " +
+                    "must equal HEADER_MIN_SIZE + 1 == ${RnsConstants.HEADER_MIN_SIZE + 1}"
             }
-
             val unpacked = Packet.unpack(raw)
-            assert(unpacked != null) { "Minimum packet should unpack" }
-            assert(unpacked!!.data.isEmpty()) { "Data should be empty" }
+            assert(unpacked != null) { "A minimal non-empty HEADER_1 frame should unpack" }
+            assert(unpacked!!.data.size == 1) { "Data should be the 1-byte payload" }
+
+            // The empty-payload 19-byte frame (zero-length data field) is now
+            // REJECTED by RNS 1.5.5 - the 1.3.1 behavior of unpacking it with
+            // empty data is gone.
+            val empty = Packet.createRaw(
+                destinationHash = destHash,
+                data = ByteArray(0),
+                packetType = PacketType.DATA,
+                destinationType = DestinationType.PLAIN
+            )
+            val emptyRaw = empty.pack()
+            assert(emptyRaw.size == RnsConstants.HEADER_MIN_SIZE) {
+                "empty-payload PLAIN frame is ${emptyRaw.size} bytes; must equal " +
+                    "HEADER_MIN_SIZE == ${RnsConstants.HEADER_MIN_SIZE}"
+            }
+            assert(Packet.unpack(emptyRaw) == null) {
+                "an empty-payload HEADER_1 frame (zero-length data) must be rejected by RNS 1.5.5"
+            }
         }
 
         @Test

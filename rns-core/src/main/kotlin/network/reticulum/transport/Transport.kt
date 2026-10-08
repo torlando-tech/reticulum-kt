@@ -2544,9 +2544,13 @@ object Transport {
         val destHex = destinationHash.toHexString()
 
         // Python Transport.py:2697-2701 — determine if we should forward for unknown destinations
+        // RNS 1.5.5 added a MODE_BOUNDARY carve-out to the PR-search condition
+        // (Transport.py:3430-3432): boundary interfaces forward PRs for unknown
+        // destinations even though BOUNDARY is not in DISCOVER_PATHS_FOR.
         val shouldSearchForUnknown =
             transportEnabled &&
-                receivingInterface.mode in DISCOVER_PATHS_FOR
+                (receivingInterface.mode in DISCOVER_PATHS_FOR ||
+                    receivingInterface.mode == InterfaceMode.BOUNDARY)
 
         // Case 1: Local destination — announce it directly, targeted at the requesting interface
         // Python: local_destination.announce(path_response=True, tag=tag, attached_interface=attached_interface)
@@ -3369,6 +3373,16 @@ object Transport {
                     log("Attached interface ${targetInterface.name} is not available")
                 }
             } else {
+                // RNS 1.5.5 announce-broadcast gate (Transport.py:1458-1464): an
+                // unsolicited ANNOUNCE (no attached_interface) is blocked when the
+                // destination is not local and no next-hop interface exists - do not
+                // broadcast an announce with nowhere to go. This first branch is
+                // interface-independent, so it is checked once before the loop.
+                val announceBroadcastBlocked = packet.packetType == PacketType.ANNOUNCE &&
+                    packet.attachedInterface == null &&
+                    findDestination(packet.destinationHash) == null &&
+                    nextHopInterface(packet.destinationHash) == null
+                if (!announceBroadcastBlocked) {
                 // Broadcast on all interfaces
                 val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
                 log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
@@ -3403,6 +3417,7 @@ object Transport {
                     }
 
                     if (transmit(iface, packedData)) sent = true
+                }
                 }
             }
         }

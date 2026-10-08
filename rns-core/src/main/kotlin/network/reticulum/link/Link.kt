@@ -2296,21 +2296,48 @@ class Link private constructor(
                 return
             }
 
-            // Check if this is a request response
+            // Check if this is a request being sent as a resource
+            // RNS 1.5.5 (commit 3a36c367 "Improved resource handling") gated the
+            // is_request advertisement branch on `destination.request_handlers`
+            // being non-empty (Link.py:1037); 1.3.1 accepted a request adv
+            // unconditionally. Without a registered handler the adv falls
+            // through to the resource_strategy branches (so ACCEPT_NONE rejects
+            // it) - the negative control for the gate.
             if (network.reticulum.resource.ResourceAdvertisement
                     .isRequest(plaintext)
             ) {
-                // This is a request being sent as a resource
-                val resource =
-                    network.reticulum.resource.Resource.accept(
-                        advertisement = advertisement,
-                        link = this,
-                        callback = { res -> requestResourceConcluded(res) },
-                    )
-                if (resource != null) {
-                    registerIncomingResource(resource)
+                // The reference (RNS 1.5.5 Link.py:1037) gates on the
+                // RECEIVING-side destination's request_handlers. For an
+                // incoming link that destination is `owner` (`destination` is
+                // null on the receiving side); for an outgoing link it is
+                // `destination`. Keying off a bare `destination` (null for
+                // incoming links) would always take the accept branch and let
+                // a receiver with no registered request handler download
+                // request resources even under ACCEPT_NONE. A positive handler
+                // count is required to auto-accept; a null receiving
+                // destination (no handler) rejects, matching the reference.
+                val receivingDestination =
+                    if (initiator) destination else owner
+                val hasRequestHandler =
+                    (receivingDestination?.requestHandlerCount() ?: 0) > 0
+                if (!hasRequestHandler) {
+                    // No request handler registered on the receiving
+                    // destination: do not auto-accept. Fall through to the
+                    // general strategy check below (a request adv with no
+                    // pending request is rejected there).
+                } else {
+                    // This is a request being sent as a resource
+                    val resource =
+                        network.reticulum.resource.Resource.accept(
+                            advertisement = advertisement,
+                            link = this,
+                            callback = { res -> requestResourceConcluded(res) },
+                        )
+                    if (resource != null) {
+                        registerIncomingResource(resource)
+                    }
+                    return
                 }
-                return
             }
 
             // Check if this is a response to a pending request
@@ -2641,19 +2668,27 @@ class Link private constructor(
      * Process keepalive packets.
      */
     private fun processKeepalive(packet: Packet) {
-        // Receivers respond to keepalive requests
+        // Receivers respond to keepalive requests.
+        // RNS 1.5.5 (commit e64d8150) rate-limits the non-initiator's 0xFE
+        // answer: it only fires when the link's outbound keepalive timer is due
+        // (Link.py:1132, `now >= last_outbound + keepalive`), preventing
+        // keepalive storms. A probe on a fresh link (timer not yet due) is
+        // therefore suppressed - the receive body still runs (last_inbound
+        // advances) but no 0xFE is emitted.
         if (!initiator && packet.data.contentEquals(byteArrayOf(0xFF.toByte()))) {
-            val keepaliveResponse =
-                Packet.createRaw(
-                    destinationHash = linkId,
-                    data = byteArrayOf(0xFE.toByte()),
-                    packetType = PacketType.DATA,
-                    context = PacketContext.KEEPALIVE,
-                    destinationType = DestinationType.LINK,
-                )
-            keepaliveResponse.link = this
-            Transport.outbound(keepaliveResponse)
-            hadOutbound(isKeepalive = true)
+            if (System.currentTimeMillis() >= lastOutbound + keepalive) {
+                val keepaliveResponse =
+                    Packet.createRaw(
+                        destinationHash = linkId,
+                        data = byteArrayOf(0xFE.toByte()),
+                        packetType = PacketType.DATA,
+                        context = PacketContext.KEEPALIVE,
+                        destinationType = DestinationType.LINK,
+                    )
+                keepaliveResponse.link = this
+                Transport.outbound(keepaliveResponse)
+                hadOutbound(isKeepalive = true)
+            }
         }
         // Keepalives update last_inbound which is already handled in receive()
     }
@@ -3294,6 +3329,12 @@ class Link private constructor(
      *  identify()'s ACTIVE-only guard (reference wire_link_identify_pending). */
     fun setStatusForTest(newStatus: Int) {
         status = newStatus
+    }
+
+    /** Backdate last_outbound so a keepalive rate-limit gate is deterministically
+     *  due (reference wire_send_keepalive_probe force_keepalive_due). */
+    fun setLastOutboundForTest(ms: Long) {
+        lastOutbound = ms
     }
 
     /** This link's own ephemeral X25519 / Ed25519 public bytes (reference

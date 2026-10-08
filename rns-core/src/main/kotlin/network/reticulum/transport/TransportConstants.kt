@@ -124,10 +124,10 @@ object TransportConstants {
     // ===== Announce Queue Constants =====
 
     /** Maximum number of announces that can be queued per interface. */
-    const val MAX_QUEUED_ANNOUNCES = 16384
+    const val MAX_QUEUED_ANNOUNCES = 4096
 
-    /** Time in milliseconds after which a queued announce is considered stale (24 hours). */
-    const val QUEUED_ANNOUNCE_LIFE = 24L * 60 * 60 * 1000
+    /** Time in milliseconds after which a queued announce is considered stale (3 hours). */
+    const val QUEUED_ANNOUNCE_LIFE = 3L * 60 * 60 * 1000
 
     /** Default announce capacity as percentage of interface bitrate (2%). */
     const val ANNOUNCE_CAP = 0.02

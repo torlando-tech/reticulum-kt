@@ -3101,8 +3101,14 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             destinationType = DestinationType.SINGLE,
         )
         val raw = pkt.pack()
-        val rx = Packet.unpack(raw)
-            ?: throw IllegalStateException("could not unpack crafted link request packet")
+        // The reference's _craft_link_request_packet does `rx = Packet(raw);
+        // rx.unpack()` and IGNORES unpack()'s False return - it reads rx.data
+        // from the partially-set re-parse. A zero-length data field (the size_0
+        // variant) is rejected by RNS 1.5.5's Packet.unpack (commit d80245b6),
+        // leaving data empty; validate_request then drops it. So fall back to
+        // the constructed packet (whose .data carries the exact crafted bytes,
+        // empty for size_0) rather than failing the build.
+        val rx = Packet.unpack(raw) ?: pkt
         rx.hops = hops
         val iface = (inst.serverIface ?: inst.clientIface)
         rx.setReceivingInterfaceHashForTest(iface?.getHash())
@@ -3370,10 +3376,18 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
         val handle = p.str("handle")
         val linkIdHex = p.hex("link_id").toHex()
         val value = p.get("value")?.asString?.takeIf { it.isNotEmpty() }?.fromHex() ?: byteArrayOf(0xFF.toByte())
+        // RNS 1.5.5 (e64d8150) rate-limits the non-initiator's 0xFE answer on
+        // the outbound keepalive timer. force_keepalive_due backdates
+        // lastOutbound so the timer is (deterministically) due, exposing the
+        // answer path - it only changes the timer input, not the answer logic.
+        val forceKeepaliveDue = p.get("force_keepalive_due")?.asBoolean ?: false
         val inst = wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
         val link = findLinkByIdWaiting(inst, linkIdHex)
             ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        if (forceKeepaliveDue) {
+            link.setLastOutboundForTest(0)
+        }
 
         // KEEPALIVE packets carry their value unencrypted (Packet ciphertext==data).
         val pkt = Packet.createRaw(
@@ -5222,12 +5236,19 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
                 }
             } else {
                 val writer = RawChannelWriter(streamId, channel)
+                // RNS 1.5.5 (df801810): the writer chunks raw (incompressible)
+                // writes at the LIVE link MDU (writer.mdu = channel.mdu -
+                // StreamDataMessage.HEADER_LEN), not the fixed MAX_DATA_LEN.
+                // The eof_with_data "final write" decision must key off that
+                // same live cap, or the EOF flag lands on a separate empty
+                // message instead of the last data-bearing one.
+                val liveChunkCap = channel.mdu - StreamDataMessage.HEADER_LEN
                 var remaining = data
                 var total = 0
                 val writeReturns = JsonArray()
                 while (remaining.isNotEmpty() && System.currentTimeMillis() < deadline) {
                     if (!channel.isReadyToSend()) { Thread.sleep(20); continue }
-                    if (eofWithData && remaining.size <= StreamDataMessage.MAX_DATA_LEN) writer.flagEofForTest()
+                    if (eofWithData && remaining.size <= liveChunkCap) writer.flagEofForTest()
                     val nw = writer.writeChunkForTest(remaining)
                     if (nw > 0) {
                         remaining = remaining.copyOfRange(nw, remaining.size)
@@ -5252,7 +5273,15 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
                     "eof" to boolVal(true),
                     "manifest" to manifestJson(),
                     "write_returns" to writeReturns,
-                    "max_data_len" to intVal(StreamDataMessage.MAX_DATA_LEN),
+                    // RNS 1.5.5 (df801810) chunks raw writes at the live link
+                    // MDU, not the fixed constant. Report BOTH so a test can
+                    // verify the contract self-consistently: `max_data_len` is
+                    // the cap the writer actually used (writer.mdu =
+                    // channel.mdu - HEADER_LEN); `fixed_max_data_len` is the
+                    // StreamDataMessage.MAX_DATA_LEN constant (the 1.3.1 cap).
+                    "max_data_len" to intVal(channel.mdu - StreamDataMessage.HEADER_LEN),
+                    "fixed_max_data_len" to intVal(StreamDataMessage.MAX_DATA_LEN),
+                    "channel_mdu" to intVal(channel.mdu),
                     "max_chunk_len" to intVal(RawChannelWriter.MAX_CHUNK_LEN),
                     "compression_tries" to intVal(RawChannelWriter.COMPRESSION_TRIES),
                     "tx_ring_after" to intVal(channel.stateForTest().txRing),
@@ -6322,6 +6351,26 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
             else -> throw IllegalArgumentException("unknown adv-flags variant: $variant")
         }
         Resource.watchdogDisabledForTest = true
+        // RNS 1.5.5 (commit 3a36c367) gates the is_request advertisement branch
+        // on the link's destination having a registered request handler. Pass
+        // register_request_handler=True to register a minimal handler on the
+        // link's destination so the is_request-accepted path is observable (the
+        // "bypasses ACCEPT_NONE" property is unchanged - the is_request branch
+        // still runs before the strategy branches - only the precondition
+        // changed). The handler is deregistered afterwards, like the
+        // resource_strategy.
+        val registerRequestHandler = p.get("register_request_handler")?.asBoolean ?: false
+        val reqDest = link.destination
+        val handlerPath = "conformance/adv-flags"
+        val handlerRegistered = registerRequestHandler && reqDest != null
+        if (handlerRegistered) {
+            reqDest!!.registerRequestHandler(
+                handlerPath,
+                responseGenerator = { _, _, _, _, _, _ -> ByteArray(0) },
+                allow = network.reticulum.destination.RequestPolicy.ALLOW_ALL,
+                allowedList = null,
+            )
+        }
         val out: JsonObject
         try {
             val sender = Resource.create(
@@ -6346,6 +6395,12 @@ private fun handleWireCmd7(command: String, p: JsonObject): JsonObject? = when (
             )
         } finally {
             Resource.watchdogDisabledForTest = false
+            // Deregister the minimal request handler we added, restoring the
+            // destination's pre-existing handler set (like the reference's
+            // request_handlers save/restore).
+            if (handlerRegistered) {
+                runCatching { reqDest!!.deregisterRequestHandler(handlerPath) }
+            }
         }
         out
     }

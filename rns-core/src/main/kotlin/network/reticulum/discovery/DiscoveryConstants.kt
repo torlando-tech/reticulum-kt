@@ -33,7 +33,7 @@ object DiscoveryConstants {
     const val FLAG_ENCRYPTED: Byte = 0x02
 
     // PoW parameters
-    const val DEFAULT_STAMP_VALUE = 14
+    const val DEFAULT_STAMP_VALUE = 16
     const val WORKBLOCK_EXPAND_ROUNDS = 20
 
     // Status thresholds (seconds, matching Python)

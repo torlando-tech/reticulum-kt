@@ -2247,8 +2247,13 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
             packet.hops = hops
             val raw = packet.pack()
             // Read the fields back the way any receiver does — a real unpack.
-            val parsed = Packet.unpack(raw)
-                ?: throw IllegalStateException("library could not unpack its own packet")
+            // RNS 1.5.5 (commit d80245b6) rejects a zero-length data field in
+            // Packet.unpack, so an empty-payload build cannot round-trip. In
+            // that case the constructed packet already holds every field the
+            // reference's partially-set re-parse would report, so read from it
+            // rather than failing the build (the reference ignores unpack()'s
+            // return value and reads the pre-raise fields).
+            val parsed = Packet.unpack(raw) ?: packet
             packetFieldsJson(raw, parsed)
         }
 
@@ -2339,10 +2344,14 @@ fun handleCommand(command: String, p: JsonObject): JsonObject {
 
         "hdlc_deframe_stream" -> {
             // Drives the library's real streaming Deframer — the same class the
-            // kotlin TCP read path uses — including its runt-frame drop.
+            // kotlin TCP read path uses - including its runt-frame drop and the
+            // RNS 1.5.5 check_frame_len HW_MTU upper cap (a frame exceeding
+            // hw_mtu is dropped, not delivered). When the request supplies
+            // hw_mtu the deframer caps to it; absent, it stays uncapped.
             val stream = p.hex("stream")
+            val hwMtu = p.intOpt("hw_mtu") ?: Int.MAX_VALUE
             val frames = mutableListOf<ByteArray>()
-            HDLC.createDeframer { frames.add(it) }.process(stream)
+            HDLC.createDeframer(hwMtu) { frames.add(it) }.process(stream)
             result("frames" to JsonArray().apply { frames.forEach { add(it.toHex()) } })
         }
 

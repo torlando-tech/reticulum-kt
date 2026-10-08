@@ -390,6 +390,13 @@ class Packet private constructor(
                 context = PacketContext.entries.find { it.value == contextByte }
                     ?: PacketContext.UNKNOWN
 
+                // RNS 1.5.5 (commit d80245b6): a zero-length data field is
+                // malformed for any header type (Packet.unpack raises
+                // "Zero-length data field"). Mirror that rejection here.
+                if (data.isEmpty()) {
+                    return null
+                }
+
                 Packet(
                     packetType = packetType,
                     headerType = headerType,

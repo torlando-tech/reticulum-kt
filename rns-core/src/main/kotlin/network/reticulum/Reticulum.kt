@@ -106,13 +106,13 @@ class Reticulum private constructor(
         /**
          * Maximum queued announces.
          */
-        const val MAX_QUEUED_ANNOUNCES = 16384
+        const val MAX_QUEUED_ANNOUNCES = 4096
 
         /**
          * How long a queued announce survives before being purged as stale,
-         * in seconds (python: QUEUED_ANNOUNCE_LIFE = 60*60*24, Reticulum.py:111).
+         * in seconds (python: QUEUED_ANNOUNCE_LIFE = 60*60*3, Reticulum.py:112).
          */
-        const val QUEUED_ANNOUNCE_LIFE = 60 * 60 * 24
+        const val QUEUED_ANNOUNCE_LIFE = 60 * 60 * 3
 
         /**
          * Announce cap - maximum percentage of bandwidth for announces.

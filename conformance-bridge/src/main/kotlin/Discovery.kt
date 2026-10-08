@@ -118,7 +118,7 @@ private fun ensureTransportIdentity(p: JsonObject): Identity {
 private fun buildAnnounceAppdata(p: JsonObject): JsonObject {
     val interfaceType = p.str("interface_type")
     val fields = p.get("fields")?.takeIf { it.isJsonObject }?.asJsonObject ?: JsonObject()
-    val stampValue = p.intOpt("stamp_value") ?: 14
+    val stampValue = p.intOpt("stamp_value") ?: DiscoveryConstants.DEFAULT_STAMP_VALUE
     val encrypt = p.boolOpt("encrypt") ?: false
 
     Transport.transportEnabled = p.boolOpt("transport_enabled") ?: false
