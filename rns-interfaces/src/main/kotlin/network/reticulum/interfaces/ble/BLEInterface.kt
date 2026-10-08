@@ -607,12 +607,14 @@ class BLEInterface(
      * cancels both a central GATT connection and a peripheral-side central, so this works
      * regardless of which role we hold.)
      */
-    internal suspend fun onDataPathDead(address: String) {
+    internal suspend fun onDataPathDead(address: String): Boolean {
         log("data-path dead for ${address.takeLast(8)} -- forcing reconnect via driver.disconnect")
-        try {
+        return try {
             driver.disconnect(address)
+            true
         } catch (e: Exception) {
             log("onDataPathDead disconnect failed: ${e.message}")
+            false
         }
     }
 

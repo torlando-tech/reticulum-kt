@@ -182,7 +182,19 @@ class BLEPeerInterface(
                 // Data-path liveness probe frames (2-byte PING/PONG)
                 if (handleProbeFrame(fragment)) return@collect
 
-                // Skip identity handshake data (16 bytes exactly, already consumed by BLEInterface)
+                // Skip identity handshake data (16 bytes exactly, already consumed by BLEInterface).
+                //
+                // Known limitation (pre-dates this PR): the guard is size-only, so it
+                // cannot distinguish the 16-byte identity handshake from a real 16-byte
+                // data fragment. Real 16-byte data fragments are possible today -
+                // BLEFragmenter emits a 5-byte header plus a variable payload, so at the
+                // default MTU of 185 (maxPayload 180) a 191-byte packet fragments as
+                // [185, 16] and its last fragment is exactly 16 bytes. Such a fragment
+                // is silently dropped here and does NOT refresh [lastRealData], so the
+                // liveness clock ages as if nothing came in. On the current protocol the
+                // identity handshake is always the first write, so a 16-byte fragment at
+                // this point in the stream is normally the handshake, but the guard must
+                // be treated as able to drop real data.
                 if (fragment.size == BLEConstants.IDENTITY_SIZE) {
                     return@collect
                 }
@@ -313,40 +325,75 @@ class BLEPeerInterface(
         }
     }
 
+    // Test seams for [probeTick] - the liveness clock and probe-capability are private
+    // and time-driven, so unit tests backdate the clock and set probe capability
+    // directly instead of waiting on real intervals (same pattern as the ...ForTest
+    // seams elsewhere in this file).
+    internal fun setLastRealDataForTest(timestamp: Long) {
+        lastRealData = timestamp
+    }
+
+    internal fun setProbeCapableForTest(capable: Boolean) {
+        probeCapable = capable
+    }
+
     /**
-     * Periodic data-path liveness sweep for this peer.
-     *
-     * - If the link has had no real data for [BLEConstants.DATA_PATH_PROBE_INTERVAL_MS],
-     *   send a PING; a healthy peer echoes a PONG, which refreshes [lastRealData] -- so
-     *   the probe is itself the traffic that keeps a genuinely idle-but-healthy link
-     *   from ever looking dead, and idle links are never reaped.
-     * - If a probe-capable peer's data path has been silent past
-     *   [BLEConstants.DATA_PATH_TIMEOUT_MS], the link is "connected but data-dead":
-     *   force a real reconnect via the driver.
-     *
-     * Mirrors python ble-reticulum `_run_data_path_probes` (BLEInterface.py). Python runs
-     * one timer in the parent interface iterating all peers; this kotlin port runs the
-     * loop per-peer (alongside the existing keepalive/RSSI jobs) to fit the per-peer
-     * structure. Reconnect goes through the parent's `driver.disconnect` (python parity),
-     * not the per-peer `detach()`/`close()` -- the parent owns the driver, and on Android
-     * `disconnect` cancels both a central GATT connection and a peripheral-side central.
+     * Result of one data-path probe tick, so the per-tick decision is testable
+     * without driving the 10-second [dataPathProbeLoop] polling delay.
      */
+    internal enum class ProbeTickResult {
+        /** Path timed out and the driver disconnect was confirmed. */
+        Reconnected,
+
+        /** Path timed out but the driver disconnect threw; retry on a later tick. */
+        DisconnectFailed,
+
+        /** Path idle but not dead; a PING was sent. */
+        Pinged,
+
+        /** Path healthy (real data recent); no action. */
+        None,
+    }
+
+    /**
+     * One data-path probe decision, extracted from [dataPathProbeLoop] so it can be
+     * unit-tested directly.
+     *
+     * - If the peer is probe-capable and the path has been silent past
+     *   [BLEConstants.DATA_PATH_TIMEOUT_MS], the path is "connected but data-dead":
+     *   force a real reconnect via the parent driver. [probeCapable] is cleared only
+     *   once the disconnect is confirmed, so a thrown disconnect retries on a later
+     *   tick (see [ProbeTickResult.DisconnectFailed]) instead of the probe giving up.
+     * - Otherwise, if the path has been idle past
+     *   [BLEConstants.DATA_PATH_PROBE_INTERVAL_MS], send a PING.
+     *
+     * The two branches are mutually exclusive (`else if`): a dead path reconnects
+     * rather than wasting a PING that would be discarded on disconnect, and a PING is
+     * only sent while there is still time to wait for a PONG.
+     */
+    internal suspend fun probeTick(): ProbeTickResult {
+        val idle = System.currentTimeMillis() - lastRealData
+        if (probeCapable && idle > BLEConstants.DATA_PATH_TIMEOUT_MS) {
+            log("data-path dead (no real data ${idle}ms) -- reconnecting")
+            if (parentBleInterface.onDataPathDead(connection.address)) {
+                probeCapable = false
+                return ProbeTickResult.Reconnected
+            }
+            return ProbeTickResult.DisconnectFailed
+        } else if (idle > BLEConstants.DATA_PATH_PROBE_INTERVAL_MS) {
+            // Low byte of the clock is a fine nonce; Long.toByte() truncates to it.
+            sendProbe(BLEConstants.PROBE_PING_BYTE, System.currentTimeMillis().toByte())
+            return ProbeTickResult.Pinged
+        }
+        return ProbeTickResult.None
+    }
+
     private suspend fun dataPathProbeLoop() {
         try {
             while (online.value && !detached.get()) {
                 delay(BLEConstants.DATA_PATH_PROBE_POLL_INTERVAL_MS)
                 if (!online.value || detached.get()) break
-
-                val idle = System.currentTimeMillis() - lastRealData
-                if (idle > BLEConstants.DATA_PATH_PROBE_INTERVAL_MS) {
-                    // Low byte of the clock is a fine nonce; Long.toByte() truncates to it.
-                    sendProbe(BLEConstants.PROBE_PING_BYTE, System.currentTimeMillis().toByte())
-                }
-                if (probeCapable && idle > BLEConstants.DATA_PATH_TIMEOUT_MS) {
-                    log("data-path dead (no real data ${idle}ms) -- reconnecting")
-                    probeCapable = false
-                    parentBleInterface.onDataPathDead(connection.address)
-                }
+                probeTick()
             }
         } catch (e: CancellationException) {
             // Normal cancellation
