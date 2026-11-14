@@ -287,9 +287,16 @@ object Transport {
     /** Announce table: destination_hash -> AnnounceEntry. */
     val announceTable = ConcurrentHashMap<ByteArrayKey, AnnounceEntry>()
 
-    /** Packet hash list for duplicate detection. */
-    private val packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
-    private val packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
+    /**
+     * Packet hash list for duplicate detection.
+     *
+     * Two sets hold the two most recent dedup windows. On rotation the roles are
+     * swapped instead of copying one set into the other: `addAll` doubled the
+     * live entry count at exactly the moment the heap was tight, which is what
+     * OOMed on Android (columba#1222, `ConcurrentHashMap$KeySetView.addAll`).
+     */
+    private var packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
+    private var packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
 
     // ===== Packet Cache =====
 
@@ -4952,15 +4959,30 @@ object Transport {
         return false
     }
 
-    private fun addPacketHash(hash: ByteArray) {
-        val key = hash.toKey()
-        packetHashlist.add(key)
+    /** Test-only override of the dedup window budget; null uses the platform default. */
+    internal var hashlistLimitOverrideForTest: Int? = null
 
-        // Rotate hashlist if too large
-        if (packetHashlist.size > TransportConstants.HASHLIST_MAXSIZE) {
-            packetHashlistPrev.clear()
-            packetHashlistPrev.addAll(packetHashlist)
-            packetHashlist.clear()
+    @JvmStatic
+    fun setHashlistLimitForTest(limit: Int?) {
+        hashlistLimitOverrideForTest = limit
+    }
+
+    /** Combined entry count of both dedup windows. */
+    @JvmStatic
+    fun hashlistTotalSizeForTest(): Int = packetHashlist.size + packetHashlistPrev.size
+
+    private fun addPacketHash(hash: ByteArray) {
+        val current = packetHashlist
+        current.add(hash.toKey())
+
+        // Rotate the dedup windows once the current one exceeds the platform
+        // budget. Android recommends a far smaller budget than the flat desktop
+        // constant, and a 1M-entry set is what exhausted a 201 MB heap
+        // (columba#1222). Swapping the sets keeps the previous window without a
+        // copy, so rotation is O(1) in both time and allocated memory.
+        if (current.size > (hashlistLimitOverrideForTest ?: Platform.recommendedHashlistSize)) {
+            packetHashlistPrev = current
+            packetHashlist = ConcurrentHashMap.newKeySet()
         }
     }
 
