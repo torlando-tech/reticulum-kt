@@ -45,6 +45,13 @@ class TCPClientInterface(
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
     private val keepAlive: Boolean = true,
+    /**
+     * Optional SOCKS5 proxy (e.g. Orbot) for this client. Required for `.onion`
+     * targets, which cannot be resolved locally (columba#965). Null = direct.
+     */
+    private val socksProxyHost: String? = null,
+    /** SOCKS5 proxy port; only used when [socksProxyHost] is set. */
+    private val socksProxyPort: Int = 0,
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
@@ -228,7 +235,12 @@ class TCPClientInterface(
             }
 
             val sock = Socket()
-            sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
+            val dialHost = socksProxyHost ?: targetHost
+            val dialPort = if (socksProxyHost != null) socksProxyPort else targetPort
+            sock.connect(InetSocketAddress(dialHost, dialPort), connectTimeoutMs)
+            if (socksProxyHost != null) {
+                socks5Connect(sock, targetHost, targetPort)
+            }
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
             sock.soTimeout = 0 // Block on read
@@ -285,6 +297,80 @@ class TCPClientInterface(
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
             null
+        }
+    }
+
+    /**
+     * Perform a SOCKS5 CONNECT through the already-dialled proxy socket.
+     *
+     * The target is always sent as a domain name: `.onion` addresses only exist
+     * inside the proxy, so resolving them locally fails (columba#965).
+     */
+    private fun socks5Connect(sock: Socket, host: String, port: Int) {
+        val input = sock.getInputStream()
+        val output = sock.getOutputStream()
+        val previousTimeout = sock.soTimeout
+        sock.soTimeout = connectTimeoutMs
+        try {
+            // Greeting: SOCKS5, one method offered, "no authentication required".
+            output.write(byteArrayOf(0x05, 0x01, 0x00))
+            output.flush()
+            val greeting = ByteArray(2).also { readFully(input, it) }
+            if ((greeting[0].toInt() and 0xFF) != 0x05) {
+                throw IOException("SOCKS5 proxy answered with version ${greeting[0].toInt() and 0xFF}")
+            }
+            if ((greeting[1].toInt() and 0xFF) != 0x00) {
+                throw IOException("SOCKS5 proxy requires auth method ${greeting[1].toInt() and 0xFF}")
+            }
+
+            val hostBytes = host.toByteArray(Charsets.UTF_8)
+            if (hostBytes.isEmpty() || hostBytes.size > 255) {
+                throw IOException("SOCKS5 target host length ${hostBytes.size} is not encodable")
+            }
+            val request = ByteArray(5 + hostBytes.size + 2)
+            request[0] = 0x05 // version
+            request[1] = 0x01 // CONNECT
+            request[2] = 0x00 // reserved
+            request[3] = 0x03 // ATYP: domain name
+            request[4] = hostBytes.size.toByte()
+            hostBytes.copyInto(request, 5)
+            request[5 + hostBytes.size] = ((port ushr 8) and 0xFF).toByte()
+            request[6 + hostBytes.size] = (port and 0xFF).toByte()
+            output.write(request)
+            output.flush()
+
+            val reply = ByteArray(4).also { readFully(input, it) }
+            val status = reply[1].toInt() and 0xFF
+            if (status != 0x00) {
+                throw IOException("SOCKS5 CONNECT to $host:$port refused (status $status)")
+            }
+            val addressLength =
+                when (reply[3].toInt() and 0xFF) {
+                    0x01 -> 4
+                    0x04 -> 16
+                    0x03 -> 1 + readByte(input)
+                    else -> throw IOException("SOCKS5 answer with unknown address type ${reply[3]}")
+                }
+            readFully(input, ByteArray(addressLength))
+            readFully(input, ByteArray(2)) // bound port
+            log("SOCKS5 connect to $host:$port established via $socksProxyHost:$socksProxyPort")
+        } finally {
+            sock.soTimeout = previousTimeout
+        }
+    }
+
+    private fun readByte(input: java.io.InputStream): Int {
+        val value = input.read()
+        if (value < 0) throw java.io.EOFException("SOCKS5 proxy closed the connection mid-handshake")
+        return value
+    }
+
+    private fun readFully(input: java.io.InputStream, buffer: ByteArray) {
+        var offset = 0
+        while (offset < buffer.size) {
+            val read = input.read(buffer, offset, buffer.size - offset)
+            if (read < 0) throw java.io.EOFException("SOCKS5 proxy closed the connection mid-handshake")
+            offset += read
         }
     }
 
