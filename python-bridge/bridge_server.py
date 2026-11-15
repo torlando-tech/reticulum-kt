@@ -3161,6 +3161,18 @@ _received_messages = []
 _rns_module = None  # Cached RNS module
 
 
+def _safe_get_ratchet(RNS, destination_hash):
+    """Look up a ratchet only when a Reticulum instance exists.
+
+    Upstream get_ratchet() consults Reticulum.get_instance() whenever no
+    known-destinations store is loaded. Interop helpers can run before any
+    Reticulum() instance exists, where that lookup raises AttributeError
+    instead of reporting "no ratchet known".
+    """
+    if RNS.Reticulum.get_instance() is None:
+        return None
+    return RNS.Identity.get_ratchet(destination_hash)
+
 def _get_full_rns():
     """Import full RNS module for networking.
 
@@ -3739,7 +3751,7 @@ def cmd_destination_encrypt_debug(params):
     )
 
     # Check what ratchet will be used
-    selected_ratchet = RNS.Identity.get_ratchet(dest.hash)
+    selected_ratchet = _safe_get_ratchet(RNS, dest.hash)
 
     # Verify dest hash matches
     dest_hash_matches = (dest.hash == dest_hash)
@@ -3770,7 +3782,7 @@ def cmd_check_ratchet_for_dest(params):
     """
     RNS = _get_full_rns()
     dest_hash = hex_to_bytes(params['destination_hash'])
-    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    ratchet = _safe_get_ratchet(RNS, dest_hash)
     if ratchet is not None:
         return {
             'has_ratchet': True,
@@ -4780,7 +4792,7 @@ def cmd_check_known_ratchet(params):
     """Check if a ratchet is known for a destination hash."""
     RNS = _get_full_rns()
     dest_hash = hex_to_bytes(params['destination_hash'])
-    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    ratchet = _safe_get_ratchet(RNS, dest_hash)
     if ratchet:
         return {
             'has_ratchet': True,
@@ -4807,7 +4819,7 @@ def cmd_propagation_encrypt_for_recipient(params):
 
     dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
 
-    ratchet = RNS.Identity.get_ratchet(dest.hash)
+    ratchet = _safe_get_ratchet(RNS, dest.hash)
     used_ratchet = ratchet is not None
 
     # Manual encrypt to capture intermediate values
@@ -4937,7 +4949,7 @@ def cmd_extract_ratchet_from_announce(params):
     # Validate announce and extract ratchet
     if RNS.Identity.validate_announce(packet):
         # If validation succeeded and ratchet was present, get it from known_ratchets
-        stored_ratchet = RNS.Identity.get_ratchet(destination_hash)
+        stored_ratchet = _safe_get_ratchet(RNS, destination_hash)
         if stored_ratchet:
             return {"ratchet": stored_ratchet.hex()}
         else:
@@ -4977,7 +4989,7 @@ def cmd_debug_encryption_details(params):
     destination_hash = bytes.fromhex(params['destination_hash'])
 
     # Get stored ratchet
-    stored_ratchet = RNS.Identity.get_ratchet(destination_hash)
+    stored_ratchet = _safe_get_ratchet(RNS, destination_hash)
 
     return {
         "has_stored_ratchet": stored_ratchet is not None,
