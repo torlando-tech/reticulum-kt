@@ -40,7 +40,7 @@ class RNodeInterface(
     private val outputStream: OutputStream,
     private val frequency: Long,
     private val bandwidth: Long,
-    private val txPower: Int,
+    txPower: Int,
     private val spreadingFactor: Int,
     private val codingRate: Int,
     private val flowControl: Boolean = true,
@@ -76,6 +76,16 @@ class RNodeInterface(
     }
 
     override val hwMtu: Int = 508
+
+    /**
+     * Effective TX power in dBm. Starts at the configured value and is replaced by the
+     * value the firmware reports when it rewrites the request: the ceiling clamp
+     * (SX127x 17 dBm, SX1262 22 dBm, SX1280 13/20 dBm) and, on LoRa-PA boards, the
+     * quantisation through the PA gain table (issue #1255: 1 dBm configured, 11 dBm
+     * reported — the PA's lowest achievable output). Reconfiguration and
+     * [confirmedTxPower] therefore match what the radio actually transmits.
+     */
+    private var txPower = txPower
 
     // Discovery support
     override val supportsDiscovery: Boolean = true
@@ -359,9 +369,27 @@ class RNodeInterface(
             log("Bandwidth mismatch: configured=$bandwidth, reported=$rBandwidth")
             valid = false
         }
-        if (rTxpower != null && txPower != rTxpower) {
-            log("TX power mismatch: configured=$txPower, reported=$rTxpower")
-            valid = false
+        // TX power is the one radio parameter the firmware is allowed to rewrite: it
+        // clamps the request to the modem/PA ceiling, quantises it through the PA gain
+        // table on LoRa-PA boards, and echoes its own value when a device-owned config
+        // (TNC mode) is in charge. Treating that divergence as a failed configuration
+        // took the interface down before it ever went online while the radio itself
+        // was healthy (issue #1255: 1 dBm requested, 11 dBm reported). Adopt the value
+        // the device can actually transmit; the other parameters have no such
+        // legitimate re-write path and stay fatal.
+        val reportedTxPower = rTxpower
+        if (reportedTxPower != null && txPower != reportedTxPower) {
+            if (reportedTxPower in 0..37) {
+                log(
+                    "WARNING: TX power mismatch: configured=$txPower dBm, the device can only " +
+                        "transmit $reportedTxPower dBm — adopting the device value",
+                )
+                txPower = reportedTxPower
+            } else {
+                // 0xFF is the firmware's "not configured" sentinel, not a power level.
+                log("WARNING: TX power mismatch: configured=$txPower dBm, invalid reported=$reportedTxPower — keeping the configured value")
+                valid = false
+            }
         }
         if (rSf != null && spreadingFactor != rSf) {
             log("Spreading factor mismatch: configured=$spreadingFactor, reported=$rSf")
