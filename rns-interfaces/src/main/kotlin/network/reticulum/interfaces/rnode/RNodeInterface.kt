@@ -359,9 +359,16 @@ class RNodeInterface(
             log("Bandwidth mismatch: configured=$bandwidth, reported=$rBandwidth")
             valid = false
         }
+        // TX power is the one radio parameter the firmware is allowed to rewrite:
+        // it clamps the request to the modem/PA ceiling, quantises through the PA
+        // gain table on LoRa-PA boards, and echoes its own value when a device-owned
+        // config (TNC mode) is in charge. Treating that divergence as a failed
+        // configuration took the interface down before it ever went online while
+        // the radio itself was healthy (issue #1255: 1 dBm requested, 11 dBm
+        // reported, interface never came online). Log it and keep going; the other
+        // parameters have no such legitimate re-write path.
         if (rTxpower != null && txPower != rTxpower) {
-            log("TX power mismatch: configured=$txPower, reported=$rTxpower")
-            valid = false
+            log("WARNING: TX power mismatch: configured=$txPower, reported=$rTxpower (device rewrote it; continuing)")
         }
         if (rSf != null && spreadingFactor != rSf) {
             log("Spreading factor mismatch: configured=$spreadingFactor, reported=$rSf")
