@@ -60,6 +60,11 @@ class RNodeInterface(
         private const val REQUIRED_FW_VER_MIN = 52
         private const val FREQ_MIN = 137_000_000L
         private const val FREQ_MAX = 3_000_000_000L
+
+        /** Inclusive bound on the configured TX power (RNodeInterface.py:313@1.5.5). */
+        private const val TX_POWER_MIN = 0
+        private const val TX_POWER_MAX = 37
+
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
@@ -76,6 +81,13 @@ class RNodeInterface(
     }
 
     override val hwMtu: Int = 508
+
+    /**
+     * TX power as configured by the caller, kept apart from the effective [txPower]
+     * because the device echo replaces the latter during [validateRadioState].
+     * Configuration checks must see the requested value, never the adopted one.
+     */
+    private val requestedTxPower = txPower
 
     /**
      * Effective TX power in dBm. Starts at the configured value and is replaced by the
@@ -170,6 +182,14 @@ class RNodeInterface(
     private var readJob: Job? = null
 
     override fun start() {
+        try {
+            validateConfiguredTxPower()
+        } catch (e: IOException) {
+            log("Failed to configure RNode: ${e.message}")
+            setOnline(false)
+            return
+        }
+
         ioScope.launch {
             try {
                 configure()
@@ -179,6 +199,25 @@ class RNodeInterface(
                 log("Failed to configure RNode: ${e.message}")
                 setOnline(false)
             }
+        }
+    }
+
+    /**
+     * Reject an out-of-range configured TX power before any byte reaches the device.
+     *
+     * The reference (RNodeInterface.py:313-315,347-348@1.6.0, identical in 1.5.5 at
+     * :313-315,:348-349) logs "Invalid TX power configured for …" for a request
+     * outside 0..37 dBm, sets validcfg = False, and raises ValueError from `__init__`
+     * — before open_port() — so the detect/configure handshake never runs.
+     *
+     * Checks [requestedTxPower], not [txPower]: [validateRadioState] replaces the
+     * effective power with the device echo, and validating the adopted value would
+     * let an out-of-range request pass unnoticed.
+     */
+    private fun validateConfiguredTxPower() {
+        if (requestedTxPower < TX_POWER_MIN || requestedTxPower > TX_POWER_MAX) {
+            log("Invalid TX power configured for $this")
+            throw IOException("Invalid TX power configured for $this — interface is offline")
         }
     }
 
