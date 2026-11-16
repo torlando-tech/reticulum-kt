@@ -92,6 +92,38 @@ class TCPClientSocksProxyTest {
         }
     }
 
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `detach during a blocked socks5 handshake closes the socket and never reports online`() {
+        val proxy = FakeSocks5Proxy(silent = true)
+        try {
+            proxy.start()
+            val iface = newInterface("tor-detach", proxy)
+            iface.start()
+
+            val target = proxy.awaitConnect(10_000)
+            assertNotNull(target, "the proxy must receive a CONNECT before detach")
+            assertEquals(ONION, target!!.first)
+
+            // The proxy accepted the TCP connection and the CONNECT request but
+            // never replies, so the client is blocked in the SOCKS5 handshake.
+            iface.detach()
+
+            // detach() must close the in-flight handshake socket instead of
+            // waiting for the connect timeout: the proxy observes EOF promptly.
+            assertTrue(
+                proxy.awaitClientClosed(1_000),
+                "detach() must close the socket blocked in the SOCKS5 handshake",
+            )
+            assertFalse(
+                awaitOnline(iface, 500),
+                "a detached interface must never report the handshake online",
+            )
+        } finally {
+            proxy.stop()
+        }
+    }
+
     private fun newInterface(name: String, proxy: FakeSocks5Proxy): TCPClientInterface =
         TCPClientInterface(
             name = name,
@@ -129,7 +161,10 @@ class TCPClientSocksProxyTest {
      * requested target. Successful replies use the domain-name address form and
      * the connection stays open, echoing tunneled bytes back to the client.
      */
-    private class FakeSocks5Proxy(private val refuse: Boolean = false) {
+    private class FakeSocks5Proxy(
+        private val refuse: Boolean = false,
+        private val silent: Boolean = false,
+    ) {
         private val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
         private val connections = LinkedBlockingQueue<Pair<String, Int>>()
         private val clientClosed = LinkedBlockingQueue<Boolean>()
@@ -190,27 +225,43 @@ class TCPClientSocksProxyTest {
                 val port = input.readUnsignedShort()
                 connections.put(host to port)
 
-                if (refuse) {
-                    // SOCKS5 "connection refused" status.
-                    out.write(byteArrayOf(5, 0x05, 0, 1, 0, 0, 0, 0, 0, 0))
-                    out.flush()
-                } else {
-                    // Domain-form bound address (ATYP 0x03): the reply shape a
-                    // proxy returns for a name it resolved itself.
-                    val bound = "127.0.0.1".toByteArray()
-                    out.write(byteArrayOf(5, 0, 0, 3, bound.size.toByte()) + bound + byteArrayOf(0, 0))
-                    out.flush()
+                when {
+                    // Deliberately never answer the CONNECT: the client stays
+                    // blocked in the handshake until its socket is closed or
+                    // its read times out.
+                    silent -> Unit
+
+                    refuse -> {
+                        // SOCKS5 "connection refused" status.
+                        out.write(byteArrayOf(5, 0x05, 0, 1, 0, 0, 0, 0, 0, 0))
+                        out.flush()
+                    }
+
+                    else -> {
+                        // Domain-form bound address (ATYP 0x03): the reply shape
+                        // a proxy returns for a name it resolved itself.
+                        val bound = "127.0.0.1".toByteArray()
+                        out.write(byteArrayOf(5, 0, 0, 3, bound.size.toByte()) + bound + byteArrayOf(0, 0))
+                        out.flush()
+                    }
                 }
 
                 val buffer = ByteArray(4096)
                 while (true) {
-                    val read = input.read(buffer)
+                    val read =
+                        try {
+                            input.read(buffer)
+                        } catch (_: IOException) {
+                            // A reset/abort also means the client closed its end.
+                            clientClosed.put(true)
+                            break
+                        }
                     if (read < 0) {
                         // EOF: the client closed its end of the connection.
                         clientClosed.put(true)
                         break
                     }
-                    if (read > 0 && !refuse) {
+                    if (read > 0 && !refuse && !silent) {
                         out.write(buffer, 0, read)
                         out.flush()
                     }

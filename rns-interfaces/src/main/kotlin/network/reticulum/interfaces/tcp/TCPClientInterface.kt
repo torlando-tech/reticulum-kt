@@ -131,6 +131,15 @@ class TCPClientInterface(
     }
 
     private var socket: Socket? = null
+
+    // Socket dialled but not yet published: the SOCKS5 handshake runs before
+    // `socket` is assigned. Python assigns self.socket before connect()
+    // (TCPInterface.py:240@1.5.5) so detach() (TCPInterface.py:209-229@1.5.5)
+    // can abort an in-flight connect; this field gives Kotlin's detach() /
+    // closeSocket() the same reach.
+    @Volatile
+    private var handshakeSocket: Socket? = null
+
     private val reconnectState = AtomicReference(ReconnectState.IDLE)
     private val neverConnected = AtomicBoolean(true)
 
@@ -229,9 +238,10 @@ class TCPClientInterface(
     }
 
     private fun connect(initial: Boolean = false): EstablishedConnection? {
-        // The socket is local until the SOCKS5 handshake succeeds. Any failure
-        // before publication must close it here: `socket` is never assigned, so
-        // closeSocket() cannot reach a leaked handshake socket.
+        // The socket stays unpublished until the SOCKS5 handshake succeeds, so
+        // it is also recorded in handshakeSocket: detach() must be able to abort
+        // an in-flight handshake and close the socket (Python assigns
+        // self.socket before connect(), TCPInterface.py:240@1.5.5).
         var pendingSocket: Socket? = null
         return try {
             if (initial) {
@@ -240,6 +250,7 @@ class TCPClientInterface(
 
             val sock = Socket()
             pendingSocket = sock
+            handshakeSocket = sock
             val dialHost = socksProxyHost ?: targetHost
             val dialPort = if (socksProxyHost != null) socksProxyPort else targetPort
             sock.connect(InetSocketAddress(dialHost, dialPort), connectTimeoutMs)
@@ -253,6 +264,15 @@ class TCPClientInterface(
 
             // Get input stream immediately while we have the socket reference
             val inputStream = sock.getInputStream()
+
+            // detach() may have run while the handshake was blocked. It closes
+            // handshakeSocket, so publishing here would resurrect a socket the
+            // interface already abandoned and report online after detach.
+            if (detached.get()) {
+                log("Detached during handshake - dropping connection to $targetHost:$targetPort")
+                runCatching { sock.close() }
+                return null
+            }
 
             socket = sock
             pendingSocket = null
@@ -306,6 +326,10 @@ class TCPClientInterface(
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
             null
+        } finally {
+            // Whatever the outcome, this attempt's handshake socket is no longer
+            // in flight: either published as `socket` or closed above.
+            handshakeSocket = null
         }
     }
 
@@ -683,6 +707,16 @@ class TCPClientInterface(
             // Ignore
         }
         socket = null
+
+        // An in-flight handshake holds the only reference to its socket, so
+        // detach()/teardown() must close it here or it leaks.
+        val pending = handshakeSocket
+        handshakeSocket = null
+        try {
+            pending?.close()
+        } catch (e: Exception) {
+            // Ignore
+        }
     }
 
     private fun log(message: String) {
