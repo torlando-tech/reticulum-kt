@@ -108,6 +108,44 @@ if needed.
 
 ---
 
+## TCPClientInterface: SOCKS5 Proxy Support (columba#965)
+
+**Python behavior** (`RNS/Interfaces/TCPInterface.py`): TCP client
+interfaces dial the target directly with a plain `socket.connect()`.
+There is no SOCKS5 support anywhere in Reticulum 1.5.5, Reticulum
+1.6.0 or LXMF 1.2.0 (`git grep -i socks` returns nothing on those
+tags), and no proxy keys exist in `ReticulumConfig` or any interface
+config section.
+
+**Kotlin behavior** (`TCPClientInterface.kt`): the constructor takes
+optional `socksProxyHost`/`socksProxyPort` parameters. When set, the
+client dials the proxy instead of the target and performs a SOCKS5
+greeting plus CONNECT (`socks5Connect`), so `.onion` targets (which
+never resolve locally) can be reached through a local Tor SOCKS proxy.
+The target is always sent as a domain name (ATYP `0x03`) — including
+IP literals — and the CONNECT reply is parsed for ATYP `0x01`/`0x03`/
+`0x04` since proxies are free to answer in any address form.
+
+**Why**: columba#965 needs onion-target TCP interfaces (Tor/Orbot).
+Python has no equivalent, so this is an additive feature rather than a
+changed code path: with `socksProxyHost = null` the client dials the
+target directly, byte-for-byte like Python.
+
+**Config surface deviation**: the proxy is constructor-only. There is
+no `ReticulumConfig` field and no `InterfaceConfigFactory` key, so
+`.reticulum/config` files written for Python cannot express it. Wiring
+it through config would add a key Python does not understand; hosts
+that need it construct `TCPClientInterface` directly.
+
+**Risk**: Low. Direct connections are unaffected (defaults are null).
+ATYP `0x03` for IP literals relies on the proxy resolving a literal
+address, which RFC 1928 requires it to accept; a proxy that only
+handles ATYP `0x01` would reject CONNECT requests for IP targets, and
+the handshake failure closes the socket and reports offline (reconnect
+still applies).
+
+---
+
 ## Conformance Test Status
 
 78 of 79 conformance tests pass (only `bz2_compress` differs due to
