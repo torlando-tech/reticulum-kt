@@ -108,6 +108,43 @@ if needed.
 
 ---
 
+## Python Bridge: Ratchet Lookup Without a Reticulum Instance
+
+**Python behavior**:
+`Identity.get_ratchet()` is cache-first at Reticulum 1.5.5
+(`RNS/Identity.py:486/504`): it serves `Identity.known_ratchets` and,
+on a cache miss, returns `None` when no ratchet file exists. At 1.6.0
+the cache-first lookup is unchanged (`:619`), but the store-miss branch
+(`:636`) calls
+`RNS.Reticulum.get_instance().is_connected_to_shared_instance`, which
+raises `AttributeError: 'NoneType' object has no attribute
+'is_connected_to_shared_instance'` when no `Reticulum()` instance has
+been constructed.
+
+**Bridge behavior** (`python-bridge/bridge_server.py:_safe_get_ratchet`):
+The interop bridge delegates to `Identity.get_ratchet()` unchanged, so
+remembered ratchets are still served without an instance (the reference
+cache is consulted first and never touches `get_instance()`). Only the
+`AttributeError` from the missing-instance branch is translated into
+`None`, i.e. "no ratchet known".
+
+**Why**: The bridge legitimately runs crypto/interop commands
+(`destination_encrypt_debug`, `check_known_ratchet`,
+`check_ratchet_for_dest`, `propagation_encrypt_for_recipient`) before any
+`Reticulum()` exists, and Reticulum 1.6.0 moved the reference behavior
+underneath them. Reporting "no ratchet known" keeps the identity-key
+path the conformance/interop tests pin. The bridge deliberately does not
+read the private `Identity.known_ratchets` cache itself, so 1.6.0's
+reshaped store semantics stay upstream-owned.
+
+**Risk**: Low, and scoped to the bridge. On Reticulum 1.5.5 the branch
+is unreachable (a cache miss returns `None`). On 1.6.0 the bridge reports
+"unknown" where upstream would raise; once a `Reticulum()` instance
+exists, the delegation is byte-for-byte upstream. The Kotlin
+implementation is unaffected — this is not a stack deviation.
+
+---
+
 ## Conformance Test Status
 
 78 of 79 conformance tests pass (only `bz2_compress` differs due to
