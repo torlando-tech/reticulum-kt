@@ -229,12 +229,17 @@ class TCPClientInterface(
     }
 
     private fun connect(initial: Boolean = false): EstablishedConnection? {
+        // The socket is local until the SOCKS5 handshake succeeds. Any failure
+        // before publication must close it here: `socket` is never assigned, so
+        // closeSocket() cannot reach a leaked handshake socket.
+        var pendingSocket: Socket? = null
         return try {
             if (initial) {
                 log("Establishing TCP connection to $targetHost:$targetPort...")
             }
 
             val sock = Socket()
+            pendingSocket = sock
             val dialHost = socksProxyHost ?: targetHost
             val dialPort = if (socksProxyHost != null) socksProxyPort else targetPort
             sock.connect(InetSocketAddress(dialHost, dialPort), connectTimeoutMs)
@@ -250,6 +255,7 @@ class TCPClientInterface(
             val inputStream = sock.getInputStream()
 
             socket = sock
+            pendingSocket = null
             setOnline(true)
             onConnectionPublishedForTest?.invoke()
             neverConnected.set(false)
@@ -292,6 +298,9 @@ class TCPClientInterface(
 
             EstablishedConnection(sock, inputStream)
         } catch (e: Exception) {
+            // A refused/timed-out handshake (or any failure before publication)
+            // must not leak the local socket: nothing else holds a reference.
+            pendingSocket?.let { runCatching { it.close() } }
             if (initial) {
                 log("Initial connection failed: ${e.message}")
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
@@ -348,7 +357,7 @@ class TCPClientInterface(
                 when (reply[3].toInt() and 0xFF) {
                     0x01 -> 4
                     0x04 -> 16
-                    0x03 -> 1 + readByte(input)
+                    0x03 -> readByte(input) // consumes the length byte, which IS the address length
                     else -> throw IOException("SOCKS5 answer with unknown address type ${reply[3]}")
                 }
             readFully(input, ByteArray(addressLength))
