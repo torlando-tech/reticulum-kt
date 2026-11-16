@@ -1,7 +1,11 @@
 package network.reticulum.transport
 
+import network.reticulum.common.ByteArrayKey
 import network.reticulum.common.Platform
 import network.reticulum.common.toHexString
+import network.reticulum.common.toKey
+import network.reticulum.storage.InMemoryPathStore
+import network.reticulum.storage.PacketHashStore
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
@@ -30,6 +34,8 @@ class TransportHashlistBudgetTest {
     fun teardown() {
         Transport.setHashlistLimitForTest(null)
         Transport.clearPacketHashlist()
+        Transport.pathStore = null
+        Transport.packetHashStore = null
         Platform.isAndroidOverrideForTest = null
     }
 
@@ -194,6 +200,72 @@ class TransportHashlistBudgetTest {
             "loading must respect the total budget " +
                 "(${Transport.hashlistTotalSizeForTest()} entries)",
         )
+    }
+
+    /**
+     * The store branch must ask for a bounded load: copying both generations out
+     * of `loadAll()` and trimming afterwards would hold a pre-fix overhang in
+     * memory first — the spike that OOMed columba#1222. This asserts the store is
+     * asked with one window's share and that the live sets end up capped.
+     */
+    @Test
+    @DisplayName("loading from a store caps each generation without calling loadAll")
+    fun loadCapsStoreGenerations() {
+        Transport.clearPacketHashlist()
+        Transport.setHashlistLimitForTest(BUDGET)
+
+        val store = RecordingHashStore(
+            current = (0 until BUDGET * 3).mapTo(HashSet()) { hash(it).toKey() },
+            previous = (0 until BUDGET * 3).mapTo(HashSet()) { hash(it + BUDGET * 3).toKey() },
+        )
+        Transport.pathStore = InMemoryPathStore()
+        Transport.packetHashStore = store
+        try {
+            Transport.loadPersistedDataForTest()
+        } finally {
+            Transport.packetHashStore = null
+            Transport.pathStore = null
+        }
+
+        assertTrue(store.loadAllCalls == 0, "the load path must ask for a bounded load, not loadAll()")
+        assertTrue(
+            store.requestedLimit == BUDGET / 2,
+            "the store must be asked for one window's share, got ${store.requestedLimit}",
+        )
+        assertTrue(
+            Transport.packetHashlistSizeForTest() <= BUDGET / 2,
+            "a loaded generation must be capped to one window " +
+                "(${Transport.packetHashlistSizeForTest()} entries)",
+        )
+        assertTrue(
+            Transport.hashlistTotalSizeForTest() <= BUDGET + 2,
+            "loading must respect the total budget " +
+                "(${Transport.hashlistTotalSizeForTest()} entries)",
+        )
+    }
+
+    /** Records which load entry point the transport uses and how it caps it. */
+    private class RecordingHashStore(
+        private val current: Set<ByteArrayKey>,
+        private val previous: Set<ByteArrayKey>,
+    ) : PacketHashStore {
+        var loadAllCalls = 0
+        var requestedLimit: Int? = null
+
+        override fun saveAll(hashes: Set<ByteArrayKey>, generation: Int) = Unit
+
+        override fun loadAll(): Pair<Set<ByteArrayKey>, Set<ByteArrayKey>> {
+            loadAllCalls++
+            return current to previous
+        }
+
+        override fun loadCapped(limitPerGeneration: Int): Pair<Set<ByteArrayKey>, Set<ByteArrayKey>> {
+            requestedLimit = limitPerGeneration
+            return current.take(limitPerGeneration).toSet() to
+                previous.take(limitPerGeneration).toSet()
+        }
+
+        override fun clear() = Unit
     }
 
     private companion object {

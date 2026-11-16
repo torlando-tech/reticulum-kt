@@ -119,17 +119,19 @@ if needed.
 `packet_hashlist.raw` is loaded verbatim, with no size cap.
 
 **Kotlin behavior** (`Transport.kt:addPacketHash`, `Transport.kt:trimMemory`,
-`Transport.kt:loadPacketHashlist`, `Transport.kt:addCapped`):
+`Transport.kt:loadPacketHashlist`, `Transport.kt:addCapped`,
+`PacketHashStore.loadCapped`):
 The budget is read as a TOTAL, exactly like the reference: rotation runs at
 `budget // 2`, so both windows together stay near one budget. The budget source
 differs — `Platform.recommendedHashlistSize` is 1,000,000 on the JVM but 50,000
 on Android, so an Android device retains at most ~25,001 entries per window
 instead of 500,001. Loading a persisted hashlist retains at most `budget / 2`
 entries per generation while loading: the file branch streams lines and stops at
-one window, and the `PacketHashStore` branch copies at most one window out of the
-loaded sets. A file written by a pre-fix build against the flat constant can
-therefore not keep a multi-million-entry set alive, nor even be materialised in
-full.
+one window, and the `PacketHashStore` branch asks for a bounded load
+(`loadCapped`, a SQL `LIMIT` on Android) and copies at most one window out of
+what the store returns. A hashlist written by a pre-fix build against the flat
+constant can therefore not keep a multi-million-entry set alive, nor even be
+materialised in full.
 
 **Why**: columba#1222 was a `ConcurrentHashMap$KeySetView.addAll` OOM inside
 `addPacketHash` on a 201 MB Android heap; a 500k-entry dedup window plus the

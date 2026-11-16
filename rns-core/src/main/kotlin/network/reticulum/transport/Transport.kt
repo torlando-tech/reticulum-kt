@@ -655,6 +655,9 @@ object Transport {
         storagePath = path
     }
 
+    /** Drive the persisted-data load path (store or file) without start(). */
+    internal fun loadPersistedDataForTest() = loadPersistedDataFromStorage()
+
     // ===== Pluggable Storage Backends =====
 
     /** Persistent path table storage. When null, falls back to file-based persistence. */
@@ -6363,10 +6366,11 @@ object Transport {
             log("Loaded ${paths.size} path entries from store")
 
             packetHashStore?.let { hashStore ->
-                val (current, prev) = hashStore.loadAll()
-                // The store materialises both generations before returning
-                // (PacketHashStore.loadAll), but the live sets take only one
-                // window each, so a pre-fix overhang never reaches them.
+                // Bounded at the store: an oversized pre-fix generation must
+                // never be materialised in full (columba#1222). addCapped is
+                // the second line of defence for stores that only cap after
+                // loadAll (the interface's default implementation).
+                val (current, prev) = hashStore.loadCapped(hashlistBudget() / 2)
                 addCapped(packetHashlist, current)
                 addCapped(packetHashlistPrev, prev)
                 log(
