@@ -3162,13 +3162,23 @@ _rns_module = None  # Cached RNS module
 
 
 def _safe_get_ratchet(RNS, destination_hash):
-    """Look up a ratchet only when a Reticulum instance exists.
+    """Look up a ratchet, tolerating the absence of a Reticulum instance.
 
-    Upstream get_ratchet() consults Reticulum.get_instance() whenever no
+    Upstream get_ratchet() answers from the in-memory ratchet cache first, but
+    on a cache miss it consults Reticulum.get_instance() whenever no
     known-destinations store is loaded. Interop helpers can run before any
     Reticulum() instance exists, where that lookup raises AttributeError
     instead of reporting "no ratchet known".
+
+    Cached ratchets must still be served in that state: commands like
+    cmd_destination_encrypt_debug remember a ratchet without an instance
+    running and immediately look it back up, and the ratchet diagnostics rely
+    on the same lookup. Only a genuine cache miss falls back to "no ratchet
+    known".
     """
+    cached = RNS.Identity.known_ratchets.get(destination_hash)
+    if cached is not None:
+        return cached
     if RNS.Reticulum.get_instance() is None:
         return None
     return RNS.Identity.get_ratchet(destination_hash)

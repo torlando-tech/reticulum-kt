@@ -425,4 +425,58 @@ class RatchetLifecycleTest : InteropTestBase() {
         }
         noRatchetDecrypt shouldNotBe null
     }
+
+    @Test
+    @DisplayName("Step 7: Ratchet lookups still answer without a Reticulum instance")
+    fun `remembered ratchet stays visible without a Reticulum instance`() {
+        val identity = Identity.create(crypto)
+        val destination = Destination.create(
+            identity = identity,
+            direction = DestinationDirection.IN,
+            type = DestinationType.SINGLE,
+            appName = "lxmf",
+            "delivery"
+        )
+
+        val ratchetPublic = crypto.x25519PublicFromPrivate(crypto.randomBytes(32))
+        val plaintext = "Ratchet lookup without Reticulum instance".toByteArray()
+
+        // Nothing in this class starts a Reticulum instance, so the bridge
+        // process never has one. destination_encrypt_debug() remembers the
+        // ratchet in Identity.known_ratchets only; the ratchet lookups must
+        // keep answering from that cache instead of reporting "no ratchet
+        // known" just because no instance exists.
+        val encResult = python(
+            "destination_encrypt_debug",
+            "public_key" to identity.getPublicKey(),
+            "destination_hash" to destination.hash,
+            "plaintext" to plaintext,
+            "ratchet_public" to ratchetPublic
+        )
+
+        encResult.getBoolean("used_ratchet") shouldBe true
+        encResult.getString("ratchet_used") shouldBe ratchetPublic.toHex()
+
+        val knownResult = python(
+            "check_known_ratchet",
+            "destination_hash" to destination.hash
+        )
+        knownResult.getBoolean("has_ratchet") shouldBe true
+        knownResult.getBytes("ratchet_public").toHex() shouldBe ratchetPublic.toHex()
+
+        val forDestResult = python(
+            "check_ratchet_for_dest",
+            "destination_hash" to destination.hash
+        )
+        forDestResult.getBoolean("has_ratchet") shouldBe true
+        forDestResult.getBytes("ratchet_public").toHex() shouldBe ratchetPublic.toHex()
+
+        // A destination with no remembered ratchet must still answer
+        // "unknown" rather than raising on the absent instance.
+        val unknownResult = python(
+            "check_known_ratchet",
+            "destination_hash" to crypto.randomBytes(16)
+        )
+        unknownResult.getBoolean("has_ratchet") shouldBe false
+    }
 }
