@@ -119,28 +119,31 @@ if needed.
 `packet_hashlist.raw` is loaded verbatim, with no size cap.
 
 **Kotlin behavior** (`Transport.kt:addPacketHash`, `Transport.kt:trimMemory`,
-`Transport.kt:trimLoadedHashlist`):
+`Transport.kt:loadPacketHashlist`, `Transport.kt:addCapped`):
 The budget is read as a TOTAL, exactly like the reference: rotation runs at
 `budget // 2`, so both windows together stay near one budget. The budget source
 differs — `Platform.recommendedHashlistSize` is 1,000,000 on the JVM but 50,000
 on Android, so an Android device retains at most ~25,001 entries per window
-instead of 500,001. Loading a persisted hashlist (file or `PacketHashStore`)
-trims each generation to `budget / 2` entries, so a file written by a pre-fix
-build against the flat constant cannot keep a multi-million-entry set alive.
+instead of 500,001. Loading a persisted hashlist retains at most `budget / 2`
+entries per generation while loading: the file branch streams lines and stops at
+one window, and the `PacketHashStore` branch copies at most one window out of the
+loaded sets. A file written by a pre-fix build against the flat constant can
+therefore not keep a multi-million-entry set alive, nor even be materialised in
+full.
 
 **Why**: columba#1222 was a `ConcurrentHashMap$KeySetView.addAll` OOM inside
 `addPacketHash` on a 201 MB Android heap; a 500k-entry dedup window plus the
 rotation's copy filled it well before the flat 1M budget would have. Android
-needs the smaller budget to keep dedup working at all. The load-time trim
-closes the same hole for data persisted by the earlier build.
+needs the smaller budget to keep dedup working at all. The load-time cap closes
+the same hole for data persisted by the earlier build.
 
 **Risk**: Low. Dedup only needs to cover the packet lifetime of in-flight
 traffic; a smaller window can miss a duplicate that arrives more than a rotation
-later, which the reference also accepts at its own window boundary. Load-time
-trimming drops arbitrary entries (`ConcurrentHashMap` iteration order), so a
-duplicate from before a restart may be reprocessed — the same outcome as losing
-the persisted hashlist entirely, which `PacketHashStore`'s contract already
-accepts.
+later, which the reference also accepts at its own window boundary. The load cap
+drops arbitrary entries (`ConcurrentHashMap` iteration order for the store path,
+file order for the streaming path), so a duplicate from before a restart may be
+reprocessed — the same outcome as losing the persisted hashlist entirely, which
+`PacketHashStore`'s contract already accepts.
 
 **Resolution**: None planned. The Android budget is intentional; revisit only if
 a larger window becomes safe on modern Android heaps.

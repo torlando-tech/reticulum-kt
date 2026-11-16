@@ -2114,24 +2114,32 @@ object Transport {
     fun loadPacketHashlist(file: java.io.File) {
         if (!file.exists()) return
         try {
-            val lines = file.readLines().filter { it.isNotBlank() }
+            val windowLimit = hashlistBudget() / 2
             var loaded = 0
-            for (line in lines) {
-                try {
-                    val hash = hexToBytes(line.trim())
-                    packetHashlist.add(hash.toKey())
-                    loaded++
-                } catch (e: Exception) {
-                    // Skip malformed entries
+            var capped = false
+            // Stream the lines instead of `readLines()`: a file written by an
+            // older build used the flat 1M-entry constant with no load-time cap,
+            // so it can hold millions of entries, and materialising them all
+            // would OOM the very device this cap protects (columba#1222).
+            file.useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    if (packetHashlist.size >= windowLimit) {
+                        capped = true
+                        break
+                    }
+                    try {
+                        packetHashlist.add(hexToBytes(line.trim()).toKey())
+                        loaded++
+                    } catch (e: Exception) {
+                        // Skip malformed entries
+                    }
                 }
             }
-            // Older builds persisted against the flat 1M-entry constant, so the
-            // file can hold far more than the platform budget; keeping it would
-            // re-inflate the heap that columba#1222 exhausted.
-            trimLoadedHashlist(packetHashlist)
             log(
-                "Loaded $loaded packet hashes from ${file.absolutePath} " +
-                    "(retained ${packetHashlist.size})",
+                "Loaded $loaded packet hashes from ${file.absolutePath}" +
+                    (if (capped) " (capped to one window: $windowLimit)" else "") +
+                    " (retained ${packetHashlist.size})",
             )
         } catch (e: Exception) {
             log("Failed to load packet hashlist: ${e.message}")
@@ -2139,29 +2147,27 @@ object Transport {
     }
 
     /**
-     * Trim a freshly loaded hashlist generation to one window's share of the
-     * total budget (`hashlistBudget() / 2`), the same bound [addPacketHash]
-     * rotates at.
+     * Copy at most one window's share (`hashlistBudget() / 2`) of [source] into
+     * [destination] — the same bound [addPacketHash] rotates at.
      *
-     * A persisted hashlist written by an older build used the flat 1M-entry
-     * constant and no load-time cap, so it can hold millions of entries — far
-     * beyond the platform budget this build rotates at. Keeping them would
-     * re-inflate the heap that columba#1222 exhausted.
+     * The cap is applied while loading, not after: a persisted hashlist written
+     * by an older build used the flat 1M-entry constant and had no load-time
+     * cap, and trimming only after copying every entry into the live set would
+     * hold the full overhang in memory first — the exact spike that OOMed
+     * Android in columba#1222. The reference loads its hashlist verbatim
+     * (`RNS/Transport.py:339-348@1.5.5`); capping here keeps dedup alive across
+     * restarts while bounding the heap.
      *
-     * Removal order is arbitrary (`ConcurrentHashMap` iteration order): a
-     * dropped hash only costs one re-processed packet from before the restart,
-     * the same guarantee losing the persisted hashlist entirely would give — it
-     * exists purely to spare the network that reprocessing, not to be complete.
+     * Which entries are kept is arbitrary (iteration order): a dropped hash only
+     * costs one re-processed packet from before the restart, the same guarantee
+     * losing the persisted hashlist entirely would give — the persisted set
+     * exists to spare the network that reprocessing, not to be complete.
      */
-    private fun trimLoadedHashlist(generation: MutableSet<ByteArrayKey>) {
+    private fun addCapped(destination: MutableSet<ByteArrayKey>, source: Iterable<ByteArrayKey>) {
         val windowLimit = hashlistBudget() / 2
-        if (generation.size <= windowLimit) return
-        val iterator = generation.iterator()
-        repeat(generation.size - windowLimit) {
-            if (iterator.hasNext()) {
-                iterator.next()
-                iterator.remove()
-            }
+        for (key in source) {
+            if (destination.size >= windowLimit) break
+            destination.add(key)
         }
     }
 
@@ -6358,12 +6364,11 @@ object Transport {
 
             packetHashStore?.let { hashStore ->
                 val (current, prev) = hashStore.loadAll()
-                packetHashlist.addAll(current)
-                packetHashlistPrev.addAll(prev)
-                // Same pre-fix overhang as the file branch: a store row written
-                // against the flat constant is trimmed to one window each.
-                trimLoadedHashlist(packetHashlist)
-                trimLoadedHashlist(packetHashlistPrev)
+                // The store materialises both generations before returning
+                // (PacketHashStore.loadAll), but the live sets take only one
+                // window each, so a pre-fix overhang never reaches them.
+                addCapped(packetHashlist, current)
+                addCapped(packetHashlistPrev, prev)
                 log(
                     "Loaded ${current.size + prev.size} packet hashes from store " +
                         "(retained ${packetHashlist.size + packetHashlistPrev.size})",
