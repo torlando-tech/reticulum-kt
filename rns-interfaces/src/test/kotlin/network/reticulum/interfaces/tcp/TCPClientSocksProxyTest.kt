@@ -13,6 +13,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -251,6 +252,10 @@ class TCPClientSocksProxyTest {
                     val read =
                         try {
                             input.read(buffer)
+                        } catch (e: SocketTimeoutException) {
+                            // The proxy's own idle timeout says nothing about
+                            // the client: it is not evidence of a closure.
+                            throw e
                         } catch (_: IOException) {
                             // A reset/abort also means the client closed its end.
                             clientClosed.put(true)
