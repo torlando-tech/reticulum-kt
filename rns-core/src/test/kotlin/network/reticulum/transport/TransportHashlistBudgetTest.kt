@@ -1,15 +1,23 @@
 package network.reticulum.transport
 
 import network.reticulum.common.Platform
+import network.reticulum.common.toHexString
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
  * Regression guard for columba#1222: the packet dedup windows must stay inside
  * the platform budget and rotate without copying one window into the other.
+ *
+ * The budget is the TOTAL for both dedup windows, matching the reference
+ * (`RNS/Transport.py:831-834@1.5.5` rotates once `hashlist_maxsize // 2` is
+ * exceeded, retaining two windows of at most 500 001 entries), not a per-window
+ * cap. Rotation therefore runs at `budget / 2`.
  *
  * The reported Android OOM was `ConcurrentHashMap$KeySetView.addAll` inside
  * `Transport.addPacketHash`, on a phone whose whole heap was 201 MB: the flat
@@ -34,17 +42,30 @@ class TransportHashlistBudgetTest {
         }
 
     @Test
-    @DisplayName("both dedup windows stay within twice the configured budget")
+    @DisplayName("both dedup windows together stay within the total budget")
     fun windowsStayWithinBudget() {
         Transport.clearPacketHashlist()
         Transport.setHashlistLimitForTest(BUDGET)
 
-        repeat(BUDGET * 3) { Transport.addPacketHashForTest(hash(it)) }
-
-        assertTrue(
-            Transport.hashlistTotalSizeForTest() <= BUDGET * 2,
-            "retained ${Transport.hashlistTotalSizeForTest()} entries must fit two ${BUDGET}-entry windows",
-        )
+        // Two windows of at most BUDGET/2 entries each, plus the entry that
+        // triggers a rotation: BUDGET + 2 is the tight upper bound. Sampling
+        // after every add catches the phase where the previous window is full
+        // and the current one is filling — the phase a single end-of-loop
+        // assertion misses entirely.
+        repeat(BUDGET * 3) { index ->
+            Transport.addPacketHashForTest(hash(index))
+            val total = Transport.hashlistTotalSizeForTest()
+            assertTrue(
+                total <= BUDGET + 2,
+                "after add #${index + 1} the retained $total entries exceed the " +
+                    "$BUDGET-entry total budget",
+            )
+            assertTrue(
+                Transport.packetHashlistSizeForTest() <= BUDGET / 2 + 1,
+                "after add #${index + 1} the current window holds " +
+                    "${Transport.packetHashlistSizeForTest()} entries, more than half the budget",
+            )
+        }
     }
 
     @Test
@@ -52,26 +73,32 @@ class TransportHashlistBudgetTest {
     fun rotationKeepsOnePreviousWindow() {
         Transport.clearPacketHashlist()
         Transport.setHashlistLimitForTest(BUDGET)
+        // Rotation runs at half the total budget, so one window holds BUDGET/2.
+        val window = BUDGET / 2
 
-        // Window 1.
+        // Window 1 fills exactly one window; rotation has not happened yet.
         val firstHash = hash(0)
-        repeat(BUDGET) { Transport.addPacketHashForTest(hash(it)) }
+        repeat(window) { Transport.addPacketHashForTest(hash(it)) }
         assertTrue(Transport.packetHashlistContainsForTest(firstHash), "first window must be deduped")
 
-        // Window 2 starts with a fresh set and the filled window becomes previous.
-        Transport.addPacketHashForTest(hash(BUDGET))
+        // The add past one window's share rotates: window 1 becomes the previous
+        // window and the current window starts empty.
+        Transport.addPacketHashForTest(hash(window))
         assertTrue(Transport.packetHashlistContainsForTest(firstHash), "previous window still dedups")
 
-        // Window 3 rotates the older window out entirely.
-        repeat(BUDGET) { Transport.addPacketHashForTest(hash(BUDGET * 2 + it)) }
-        Transport.addPacketHashForTest(hash(BUDGET * 3))
+        // Fill window 2 and rotate once more: window 1 is forgotten entirely.
+        // The triggering add above rotated hash(window) into the previous window
+        // and left the current window empty, so a full window is `window` adds,
+        // and the add after that rotates again.
+        repeat(window) { Transport.addPacketHashForTest(hash(window + 1 + it)) }
+        Transport.addPacketHashForTest(hash(window * 2 + 1))
         assertFalse(
             Transport.packetHashlistContainsForTest(firstHash),
             "the window two rotations old must be forgotten",
         )
         assertTrue(
-            Transport.hashlistTotalSizeForTest() <= BUDGET * 2,
-            "only two windows are retained",
+            Transport.hashlistTotalSizeForTest() <= BUDGET + 2,
+            "only two windows are retained (${Transport.hashlistTotalSizeForTest()} entries)",
         )
     }
 
@@ -96,6 +123,8 @@ class TransportHashlistBudgetTest {
         Platform.isAndroidOverrideForTest = true
 
         val budget = Platform.recommendedHashlistSize
+        // Rotation runs at half the total budget, so one window holds budget/2.
+        val window = budget / 2
         // Guard the guard: if the simulated platform budget ever matched the flat
         // constant, this test could no longer tell the two sources apart.
         assertTrue(
@@ -104,34 +133,65 @@ class TransportHashlistBudgetTest {
                 "(${TransportConstants.HASHLIST_MAXSIZE}) for this test to discriminate",
         )
 
-        // Fill the first window exactly to the platform budget: no rotation yet.
+        // Fill one window's share of the platform budget: no rotation yet.
         val firstHash = hash(0)
-        repeat(budget) { Transport.addPacketHashForTest(hash(it)) }
+        repeat(window) { Transport.addPacketHashForTest(hash(it)) }
         assertTrue(Transport.packetHashlistContainsForTest(firstHash), "window 1 must be deduped")
 
-        // One more hash exceeds the budget, so window 1 becomes the previous window.
-        Transport.addPacketHashForTest(hash(budget))
+        // One more hash exceeds budget/2, so window 1 becomes the previous window.
+        Transport.addPacketHashForTest(hash(window))
         assertTrue(
             Transport.packetHashlistContainsForTest(firstHash),
-            "rotation must happen at $budget entries, so the previous window still dedups",
+            "rotation must happen at $window entries, so the previous window still dedups",
         )
         assertTrue(
-            Transport.hashlistTotalSizeForTest() <= budget + 1,
-            "one full window plus the triggering entry fits one budget (" +
+            Transport.hashlistTotalSizeForTest() <= window + 2,
+            "one full window plus the triggering entry fits one window (" +
                 "${Transport.hashlistTotalSizeForTest()} entries)",
         )
 
-        // Fill and exceed the second window: the first one is forgotten. With the
-        // flat 1M fallback nothing rotates inside ~100k hashes, so both of these
-        // assertions fail.
-        repeat(budget + 1) { Transport.addPacketHashForTest(hash(budget * 2 + it)) }
+        // Fill and exceed the second window: the first one is forgotten. The
+        // earlier rotation left the current window empty, so a full window is
+        // `window` adds. With the flat 1M fallback nothing rotates inside ~50k
+        // hashes, so this assertion fails.
+        repeat(window) { Transport.addPacketHashForTest(hash(window + 1 + it)) }
+        Transport.addPacketHashForTest(hash(window * 2 + 1))
         assertFalse(
             Transport.packetHashlistContainsForTest(firstHash),
-            "the window two rotations old must be forgotten after 2 x ($budget + 1) hashes",
+            "the window two rotations old must be forgotten after 2 x ($window + 1) hashes",
         )
         assertTrue(
-            Transport.hashlistTotalSizeForTest() <= budget + 1,
+            Transport.hashlistTotalSizeForTest() <= budget + 2,
             "only the newest window is retained, not the 1M-entry flat constant " +
+                "(${Transport.hashlistTotalSizeForTest()} entries)",
+        )
+    }
+
+    /**
+     * A hashlist persisted by a pre-fix build used the flat 1M-entry constant and
+     * had no load-time cap, so the file can be far larger than the platform
+     * budget. Loading it verbatim would re-inflate the heap that columba#1222
+     * exhausted.
+     */
+    @Test
+    @DisplayName("loading an oversized persisted hashlist is trimmed to the budget")
+    fun loadCapsOversizedPersistedHashlist(@TempDir tempDir: File) {
+        Transport.clearPacketHashlist()
+        Transport.setHashlistLimitForTest(BUDGET)
+
+        val file = File(tempDir, "packet_hashlist")
+        file.writeText((0 until BUDGET * 3).joinToString("\n") { hash(it).toHexString() })
+
+        Transport.loadPacketHashlist(file)
+
+        assertTrue(
+            Transport.packetHashlistSizeForTest() <= BUDGET / 2,
+            "a loaded generation must be trimmed to one window " +
+                "(${Transport.packetHashlistSizeForTest()} entries)",
+        )
+        assertTrue(
+            Transport.hashlistTotalSizeForTest() <= BUDGET + 2,
+            "loading must respect the total budget " +
                 "(${Transport.hashlistTotalSizeForTest()} entries)",
         )
     }

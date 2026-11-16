@@ -294,6 +294,10 @@ object Transport {
      * swapped instead of copying one set into the other: `addAll` doubled the
      * live entry count at exactly the moment the heap was tight, which is what
      * OOMed on Android (columba#1222, `ConcurrentHashMap$KeySetView.addAll`).
+     *
+     * The platform budget is the total for BOTH windows, not a per-window cap
+     * (`hashlistBudget()`); each window is rotated at budget/2, so together they
+     * retain roughly one budget's worth of hashes.
      */
     private var packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
     private var packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
@@ -690,7 +694,11 @@ object Transport {
         network.reticulum.common.ByteArrayPool
             .clear()
 
-        // Trim packet hashlists (keep recent, drop old)
+        // Trim packet hashlists (keep recent, drop old). budget/2 is one
+        // window's share of the total budget — the bound addPacketHash rotates
+        // at — so trimming and rotation agree on the target size. This path runs
+        // in production, so it reads the platform budget directly rather than
+        // the test-only override.
         val now = System.currentTimeMillis()
         val maxHashlistSize = network.reticulum.common.Platform.recommendedHashlistSize / 2
 
@@ -2117,9 +2125,43 @@ object Transport {
                     // Skip malformed entries
                 }
             }
-            log("Loaded $loaded packet hashes from ${file.absolutePath}")
+            // Older builds persisted against the flat 1M-entry constant, so the
+            // file can hold far more than the platform budget; keeping it would
+            // re-inflate the heap that columba#1222 exhausted.
+            trimLoadedHashlist(packetHashlist)
+            log(
+                "Loaded $loaded packet hashes from ${file.absolutePath} " +
+                    "(retained ${packetHashlist.size})",
+            )
         } catch (e: Exception) {
             log("Failed to load packet hashlist: ${e.message}")
+        }
+    }
+
+    /**
+     * Trim a freshly loaded hashlist generation to one window's share of the
+     * total budget (`hashlistBudget() / 2`), the same bound [addPacketHash]
+     * rotates at.
+     *
+     * A persisted hashlist written by an older build used the flat 1M-entry
+     * constant and no load-time cap, so it can hold millions of entries — far
+     * beyond the platform budget this build rotates at. Keeping them would
+     * re-inflate the heap that columba#1222 exhausted.
+     *
+     * Removal order is arbitrary (`ConcurrentHashMap` iteration order): a
+     * dropped hash only costs one re-processed packet from before the restart,
+     * the same guarantee losing the persisted hashlist entirely would give — it
+     * exists purely to spare the network that reprocessing, not to be complete.
+     */
+    private fun trimLoadedHashlist(generation: MutableSet<ByteArrayKey>) {
+        val windowLimit = hashlistBudget() / 2
+        if (generation.size <= windowLimit) return
+        val iterator = generation.iterator()
+        repeat(generation.size - windowLimit) {
+            if (iterator.hasNext()) {
+                iterator.next()
+                iterator.remove()
+            }
         }
     }
 
@@ -4959,8 +5001,17 @@ object Transport {
         return false
     }
 
-    /** Test-only override of the dedup window budget; null uses the platform default. */
+    /** Test-only override of the dedup budget; null uses the platform default. */
     internal var hashlistLimitOverrideForTest: Int? = null
+
+    /**
+     * Total entry budget for both dedup windows, mirroring the reference's
+     * `Transport.hashlist_maxsize` (`RNS/Transport.py:247@1.5.5`). Each window is
+     * bounded by half of it, because rotation happens once a window exceeds
+     * `budget / 2`.
+     */
+    private fun hashlistBudget(): Int =
+        hashlistLimitOverrideForTest ?: Platform.recommendedHashlistSize
 
     @JvmStatic
     fun setHashlistLimitForTest(limit: Int?) {
@@ -4975,12 +5026,16 @@ object Transport {
         val current = packetHashlist
         current.add(hash.toKey())
 
-        // Rotate the dedup windows once the current one exceeds the platform
-        // budget. Android recommends a far smaller budget than the flat desktop
+        // The budget is the TOTAL for both dedup windows, exactly as the
+        // reference reads it (`RNS/Transport.py:831-834@1.5.5` rotates once
+        // `len(packet_hashlist) > hashlist_maxsize//2`): each window holds at
+        // most ~budget/2 entries, and the two together stay near the budget.
+        // trimMemory() trims a single window to this same budget/2 bound.
+        // Android recommends a far smaller budget than the flat desktop
         // constant, and a 1M-entry set is what exhausted a 201 MB heap
         // (columba#1222). Swapping the sets keeps the previous window without a
         // copy, so rotation is O(1) in both time and allocated memory.
-        if (current.size > (hashlistLimitOverrideForTest ?: Platform.recommendedHashlistSize)) {
+        if (current.size > hashlistBudget() / 2) {
             packetHashlistPrev = current
             packetHashlist = ConcurrentHashMap.newKeySet()
         }
@@ -6305,7 +6360,14 @@ object Transport {
                 val (current, prev) = hashStore.loadAll()
                 packetHashlist.addAll(current)
                 packetHashlistPrev.addAll(prev)
-                log("Loaded ${current.size + prev.size} packet hashes from store")
+                // Same pre-fix overhang as the file branch: a store row written
+                // against the flat constant is trimmed to one window each.
+                trimLoadedHashlist(packetHashlist)
+                trimLoadedHashlist(packetHashlistPrev)
+                log(
+                    "Loaded ${current.size + prev.size} packet hashes from store " +
+                        "(retained ${packetHashlist.size + packetHashlistPrev.size})",
+                )
             }
             return
         }
