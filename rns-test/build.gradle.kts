@@ -73,5 +73,15 @@ tasks.test {
     environment("PYTHON_LXMF_PATH", lxmfPath)
     inputs.property("pythonRnsPath", rnsPath)
     inputs.property("pythonLxmfPath", lxmfPath)
+    // A pin bump checks each release out into the SAME directory, so the path
+    // properties above stay identical and cannot invalidate the cache. Key the
+    // task on the reference sources themselves: a different release pair has
+    // different Python files, so a green result from another pin can never be
+    // replayed for the new one.
+    inputs.files(
+        listOf(rnsPath, lxmfPath).map { dir ->
+            project.fileTree(dir) { include("**/*.py") }
+        },
+    ).withPropertyName("pythonReferenceSources")
     useJUnitPlatform()
 }
