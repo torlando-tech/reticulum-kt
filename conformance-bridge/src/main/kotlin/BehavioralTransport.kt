@@ -659,6 +659,39 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         )
     }
 
+    // ===== Dedup-window budget / retention =====
+    //
+    // Mirror reference/behavioral_transport.py: the budget is the TOTAL for
+    // both generations (rotation happens at budget/2, Transport.kt
+    // addPacketHash), so a test can pin a small budget and drive rotations
+    // with a handful of packets instead of the platform default.
+
+    "behavioral_hashlist_limit" -> {
+        inst(p)
+        val limit = p.intOpt("limit")
+        Transport.setHashlistLimitForTest(limit)
+        Transport.clearPacketHashlist()
+        val current = Transport.packetHashlistSizeForTest()
+        result(
+            "limit" to (limit?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "current" to intVal(current),
+            "previous" to intVal(0),
+            "total" to intVal(Transport.hashlistTotalSizeForTest()),
+        )
+    }
+
+    "behavioral_hashlist_stats" -> {
+        inst(p)
+        val current = Transport.packetHashlistSizeForTest()
+        val total = Transport.hashlistTotalSizeForTest()
+        result(
+            "limit" to JsonNull.INSTANCE,
+            "current" to intVal(current),
+            "previous" to intVal(total - current),
+            "total" to intVal(total),
+        )
+    }
+
     "behavioral_ifac_mask" -> {
         val inst = inst(p)
         val ifaceId = p.str("iface_id")
