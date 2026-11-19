@@ -24,16 +24,27 @@ jobs:
           repository: torlando-tech/reticulum-conformance
           path: reticulum-conformance
 
+      # The audited reference pair comes from the conformance suite's single
+      # source of truth (reference-pins.env) — never a literal here.
+      - name: Read audited reference pins
+        id: pins
+        working-directory: reticulum-conformance
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "rns=$RNS" >> "$GITHUB_OUTPUT"
+          echo "lxmf=$LXMF" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: markqvist/Reticulum
-          ref: "1.5.5"
+          ref: ${{ steps.pins.outputs.rns }}
           path: Reticulum
 
       - uses: actions/checkout@v4
         with:
           repository: markqvist/LXMF
-          ref: "1.2.0"
+          ref: ${{ steps.pins.outputs.lxmf }}
           path: LXMF
 
       - name: Set up JDK 21
