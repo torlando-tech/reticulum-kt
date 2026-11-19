@@ -244,6 +244,15 @@ class TCPClientInterface(
         // self.socket before connect(), TCPInterface.py:240@1.5.5).
         var pendingSocket: Socket? = null
         return try {
+            // A direct dial gets InetSocketAddress's own range check, but a
+            // proxied target is written straight into the SOCKS5 request, where
+            // only the low 16 bits survive (70000 would request port 4464) and
+            // the tunnel could open to the wrong service. Reject out-of-range
+            // ports before dialling anything.
+            if (targetPort !in 1..65535) {
+                throw IllegalArgumentException("TCP target port $targetPort is out of range 1..65535")
+            }
+
             if (initial) {
                 log("Establishing TCP connection to $targetHost:$targetPort...")
             }

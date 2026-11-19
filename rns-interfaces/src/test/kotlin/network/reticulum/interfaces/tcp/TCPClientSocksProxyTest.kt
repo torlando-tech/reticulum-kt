@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
@@ -61,6 +62,37 @@ class TCPClientSocksProxyTest {
             iface.processOutgoing(payload)
             val echoed = awaitPayload(received, payload, 5_000)
             assertArrayEquals(payload, echoed, "the payload must round-trip through the tunnel")
+        } finally {
+            proxy.stop()
+        }
+    }
+
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `an out-of-range target port is rejected before the proxy is dialled`() {
+        val proxy = FakeSocks5Proxy()
+        try {
+            proxy.start()
+            val iface =
+                TCPClientInterface(
+                    name = "tor-bad-port",
+                    targetHost = ONION,
+                    targetPort = 70_000,
+                    connectTimeoutMs = 2_000,
+                    maxReconnectAttempts = 1,
+                    socksProxyHost = "127.0.0.1",
+                    socksProxyPort = proxy.port,
+                ).also { interfaces += it }
+            iface.start()
+
+            // 70000 would survive the SOCKS5 request as its low 16 bits (4464):
+            // the client must refuse the target instead of tunnelling to a
+            // different service.
+            assertNull(
+                proxy.awaitConnect(1_000),
+                "an out-of-range target port must never reach the proxy as a CONNECT",
+            )
+            assertFalse(iface.online.value, "an invalid target port must not report the interface online")
         } finally {
             proxy.stop()
         }
