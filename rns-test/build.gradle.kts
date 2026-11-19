@@ -45,7 +45,13 @@ dependencies {
 }
 
 tasks.test {
-    // Set environment variable for Python RNS path
+    // The Python peers ARE the reference implementation: the checkouts chosen
+    // by PYTHON_RNS_PATH / PYTHON_LXMF_PATH decide the interop semantics, so a
+    // different release pair changes test outcomes. Both paths are declared
+    // task inputs — without that, a green result produced against another pin
+    // is replayed from the build cache (org.gradle.caching=true), masking
+    // upstream drift and making a pin bump look tested when it was not.
+
     // Try env var first, then common absolute paths, then relative path
     val rnsPath = System.getenv("PYTHON_RNS_PATH")
         ?: listOf(
@@ -55,6 +61,17 @@ tasks.test {
         ).find { it.exists() && File(it, "RNS").exists() }?.absolutePath
         ?: "${rootProject.projectDir}/../../../Reticulum"
 
+    val lxmfPath = System.getenv("PYTHON_LXMF_PATH")
+        ?: listOf(
+            File(System.getProperty("user.home"), "repos/LXMF"),
+            File("${rootProject.projectDir}/../../../LXMF"),
+            File("${rootProject.projectDir}/../LXMF")
+        ).find { it.exists() && File(it, "LXMF").exists() }?.absolutePath
+        ?: "${rootProject.projectDir}/../../../LXMF"
+
     environment("PYTHON_RNS_PATH", rnsPath)
+    environment("PYTHON_LXMF_PATH", lxmfPath)
+    inputs.property("pythonRnsPath", rnsPath)
+    inputs.property("pythonLxmfPath", lxmfPath)
     useJUnitPlatform()
 }
