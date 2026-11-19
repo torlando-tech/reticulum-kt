@@ -204,6 +204,12 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         }
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_behav_").toFile()
+        // The dedup budget set by behavioral_hashlist_limit is per-session test
+        // state. Clear it before Reticulum.start() loads saved data so a later
+        // session rotates at the platform recommendation — otherwise a small
+        // limit from an earlier test leaks into every subsequent session and
+        // makes dedup checks depend on test order.
+        Transport.setHashlistLimitForTest(null)
         val rns = Reticulum.start(
             configDir = configDir.absolutePath,
             enableTransport = enableTransport,
@@ -685,7 +691,10 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         val current = Transport.packetHashlistSizeForTest()
         val total = Transport.hashlistTotalSizeForTest()
         result(
-            "limit" to JsonNull.INSTANCE,
+            // The budget in force right now: the behavioral_hashlist_limit
+            // override when set, else the platform recommendation. Parity with
+            // the reference's hashlist_maxsize (behavioral_transport.py:2314).
+            "limit" to intVal(Transport.hashlistBudgetForTest()),
             "current" to intVal(current),
             "previous" to intVal(total - current),
             "total" to intVal(total),

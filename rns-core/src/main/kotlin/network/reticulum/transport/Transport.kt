@@ -5027,6 +5027,10 @@ object Transport {
         hashlistLimitOverrideForTest = limit
     }
 
+    /** The dedup budget in force: the test override when set, else the platform recommendation. */
+    @JvmStatic
+    fun hashlistBudgetForTest(): Int = hashlistBudget()
+
     /** Combined entry count of both dedup windows. */
     @JvmStatic
     fun hashlistTotalSizeForTest(): Int = packetHashlist.size + packetHashlistPrev.size
