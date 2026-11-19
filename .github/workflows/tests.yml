@@ -55,6 +55,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The e2e Python peers interop against the Reticulum/LXMF reference. The
+      # release pair is the conformance suite's single source of truth
+      # (reticulum-conformance/reference-pins.env); this repo never hardcodes
+      # it. Cloning upstream master here previously turned every PR red
+      # whenever markqvist pushed an announce/path-table change.
+      - uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/reticulum-conformance
+          path: reticulum-conformance
+
+      - name: Read audited reference pins
+        id: pins
+        working-directory: reticulum-conformance
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "rns=$RNS" >> "$GITHUB_OUTPUT"
+          echo "lxmf=$LXMF" >> "$GITHUB_OUTPUT"
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -67,25 +86,38 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install rns
+        # Pin the PyPI install to the same releases as the source checkouts so
+        # site-packages and PYTHON_*_PATH can never disagree.
+        run: pip install "rns==${{ steps.pins.outputs.rns }}" "lxmf==${{ steps.pins.outputs.lxmf }}"
 
-      - name: Clone Reticulum reference implementation
-        run: git clone --depth 1 https://github.com/markqvist/Reticulum.git /tmp/Reticulum
+      - name: Check out Reticulum reference implementation
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          ref: ${{ steps.pins.outputs.rns }}
+          path: Reticulum
 
-      - name: Clone LXMF reference implementation
-        run: git clone --depth 1 https://github.com/markqvist/LXMF.git /tmp/LXMF
+      - name: Check out LXMF reference implementation
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          ref: ${{ steps.pins.outputs.lxmf }}
+          path: LXMF
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run rns-test tests with aggregated coverage
         env:
-          PYTHON_RNS_PATH: /tmp/Reticulum
-          PYTHON_LXMF_PATH: /tmp/LXMF
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         # Root-level koverXmlReport aggregates execution data across rns-core,
         # rns-interfaces, and rns-test. `-x :rns-core:test -x :rns-interfaces:test`
         # keeps the coverage job fast by not re-running unit tests already
         # covered in the unit-tests job — codecov merges both uploads.
+        # The reference checkout paths are declared test-task inputs in
+        # rns-test/build.gradle.kts, so the build cache cannot replay a green
+        # result produced against a different pin.
         run: ./gradlew :rns-test:test koverXmlReport -x :rns-core:test -x :rns-interfaces:test
 
       - name: Upload coverage to Codecov
