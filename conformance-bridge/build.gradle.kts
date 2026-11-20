@@ -41,6 +41,9 @@ dependencies {
 
     // BZ2 compression (already in rns-core)
     implementation("org.apache.commons:commons-compress:1.26.0")
+
+    // Behavioral-session state tests (behavioral_hashlist_limit reset).
+    testImplementation(kotlin("test"))
 }
 
 kotlin {

@@ -7,11 +7,8 @@ package network.reticulum.common
  * particularly for Android vs JVM differences in memory limits and threading.
  */
 object Platform {
-    /**
-     * Detect if running on Android.
-     * Checks for Android-specific classes in the classpath.
-     */
-    val isAndroid: Boolean by lazy {
+    /** Result of the one-time classpath probe; see [isAndroid]. */
+    private val androidDetected: Boolean by lazy {
         try {
             Class.forName("android.os.Build")
             true
@@ -19,6 +16,22 @@ object Platform {
             false
         }
     }
+
+    /**
+     * Test-only override of [isAndroid]; null keeps the classpath probe.
+     *
+     * A JVM test cannot load `android.os.Build`, so this is the only way to
+     * observe the Android branches of the platform recommendations (for
+     * example [recommendedHashlistSize]) outside an Android device.
+     */
+    internal var isAndroidOverrideForTest: Boolean? = null
+
+    /**
+     * Detect if running on Android.
+     * Checks for Android-specific classes in the classpath.
+     */
+    val isAndroid: Boolean
+        get() = isAndroidOverrideForTest ?: androidDetected
 
     /**
      * Detect if running on a server/desktop JVM (not Android).
