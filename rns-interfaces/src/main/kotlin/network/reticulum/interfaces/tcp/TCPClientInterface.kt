@@ -45,6 +45,13 @@ class TCPClientInterface(
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
     private val keepAlive: Boolean = true,
+    /**
+     * Optional SOCKS5 proxy (e.g. Orbot) for this client. Required for `.onion`
+     * targets, which cannot be resolved locally (columba#965). Null = direct.
+     */
+    private val socksProxyHost: String? = null,
+    /** SOCKS5 proxy port; only used when [socksProxyHost] is set. */
+    private val socksProxyPort: Int = 0,
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
@@ -124,6 +131,15 @@ class TCPClientInterface(
     }
 
     private var socket: Socket? = null
+
+    // Socket dialled but not yet published: the SOCKS5 handshake runs before
+    // `socket` is assigned. Python assigns self.socket before connect()
+    // (TCPInterface.py:240@1.5.5) so detach() (TCPInterface.py:209-229@1.5.5)
+    // can abort an in-flight connect; this field gives Kotlin's detach() /
+    // closeSocket() the same reach.
+    @Volatile
+    private var handshakeSocket: Socket? = null
+
     private val reconnectState = AtomicReference(ReconnectState.IDLE)
     private val neverConnected = AtomicBoolean(true)
 
@@ -222,13 +238,34 @@ class TCPClientInterface(
     }
 
     private fun connect(initial: Boolean = false): EstablishedConnection? {
+        // The socket stays unpublished until the SOCKS5 handshake succeeds, so
+        // it is also recorded in handshakeSocket: detach() must be able to abort
+        // an in-flight handshake and close the socket (Python assigns
+        // self.socket before connect(), TCPInterface.py:240@1.5.5).
+        var pendingSocket: Socket? = null
         return try {
+            // A direct dial gets InetSocketAddress's own range check, but a
+            // proxied target is written straight into the SOCKS5 request, where
+            // only the low 16 bits survive (70000 would request port 4464) and
+            // the tunnel could open to the wrong service. Reject out-of-range
+            // ports before dialling anything.
+            if (targetPort !in 1..65535) {
+                throw IllegalArgumentException("TCP target port $targetPort is out of range 1..65535")
+            }
+
             if (initial) {
                 log("Establishing TCP connection to $targetHost:$targetPort...")
             }
 
             val sock = Socket()
-            sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
+            pendingSocket = sock
+            handshakeSocket = sock
+            val dialHost = socksProxyHost ?: targetHost
+            val dialPort = if (socksProxyHost != null) socksProxyPort else targetPort
+            sock.connect(InetSocketAddress(dialHost, dialPort), connectTimeoutMs)
+            if (socksProxyHost != null) {
+                socks5Connect(sock, targetHost, targetPort)
+            }
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
             sock.soTimeout = 0 // Block on read
@@ -237,7 +274,17 @@ class TCPClientInterface(
             // Get input stream immediately while we have the socket reference
             val inputStream = sock.getInputStream()
 
+            // detach() may have run while the handshake was blocked. It closes
+            // handshakeSocket, so publishing here would resurrect a socket the
+            // interface already abandoned and report online after detach.
+            if (detached.get()) {
+                log("Detached during handshake - dropping connection to $targetHost:$targetPort")
+                runCatching { sock.close() }
+                return null
+            }
+
             socket = sock
+            pendingSocket = null
             setOnline(true)
             onConnectionPublishedForTest?.invoke()
             neverConnected.set(false)
@@ -280,11 +327,92 @@ class TCPClientInterface(
 
             EstablishedConnection(sock, inputStream)
         } catch (e: Exception) {
+            // A refused/timed-out handshake (or any failure before publication)
+            // must not leak the local socket: nothing else holds a reference.
+            pendingSocket?.let { runCatching { it.close() } }
             if (initial) {
                 log("Initial connection failed: ${e.message}")
                 log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
             null
+        } finally {
+            // Whatever the outcome, this attempt's handshake socket is no longer
+            // in flight: either published as `socket` or closed above.
+            handshakeSocket = null
+        }
+    }
+
+    /**
+     * Perform a SOCKS5 CONNECT through the already-dialled proxy socket.
+     *
+     * The target is always sent as a domain name: `.onion` addresses only exist
+     * inside the proxy, so resolving them locally fails (columba#965).
+     */
+    private fun socks5Connect(sock: Socket, host: String, port: Int) {
+        val input = sock.getInputStream()
+        val output = sock.getOutputStream()
+        val previousTimeout = sock.soTimeout
+        sock.soTimeout = connectTimeoutMs
+        try {
+            // Greeting: SOCKS5, one method offered, "no authentication required".
+            output.write(byteArrayOf(0x05, 0x01, 0x00))
+            output.flush()
+            val greeting = ByteArray(2).also { readFully(input, it) }
+            if ((greeting[0].toInt() and 0xFF) != 0x05) {
+                throw IOException("SOCKS5 proxy answered with version ${greeting[0].toInt() and 0xFF}")
+            }
+            if ((greeting[1].toInt() and 0xFF) != 0x00) {
+                throw IOException("SOCKS5 proxy requires auth method ${greeting[1].toInt() and 0xFF}")
+            }
+
+            val hostBytes = host.toByteArray(Charsets.UTF_8)
+            if (hostBytes.isEmpty() || hostBytes.size > 255) {
+                throw IOException("SOCKS5 target host length ${hostBytes.size} is not encodable")
+            }
+            val request = ByteArray(5 + hostBytes.size + 2)
+            request[0] = 0x05 // version
+            request[1] = 0x01 // CONNECT
+            request[2] = 0x00 // reserved
+            request[3] = 0x03 // ATYP: domain name
+            request[4] = hostBytes.size.toByte()
+            hostBytes.copyInto(request, 5)
+            request[5 + hostBytes.size] = ((port ushr 8) and 0xFF).toByte()
+            request[6 + hostBytes.size] = (port and 0xFF).toByte()
+            output.write(request)
+            output.flush()
+
+            val reply = ByteArray(4).also { readFully(input, it) }
+            val status = reply[1].toInt() and 0xFF
+            if (status != 0x00) {
+                throw IOException("SOCKS5 CONNECT to $host:$port refused (status $status)")
+            }
+            val addressLength =
+                when (reply[3].toInt() and 0xFF) {
+                    0x01 -> 4
+                    0x04 -> 16
+                    0x03 -> readByte(input) // consumes the length byte, which IS the address length
+                    else -> throw IOException("SOCKS5 answer with unknown address type ${reply[3]}")
+                }
+            readFully(input, ByteArray(addressLength))
+            readFully(input, ByteArray(2)) // bound port
+            log("SOCKS5 connect to $host:$port established via $socksProxyHost:$socksProxyPort")
+        } finally {
+            sock.soTimeout = previousTimeout
+        }
+    }
+
+    private fun readByte(input: java.io.InputStream): Int {
+        val value = input.read()
+        if (value < 0) throw java.io.EOFException("SOCKS5 proxy closed the connection mid-handshake")
+        return value
+    }
+
+    private fun readFully(input: java.io.InputStream, buffer: ByteArray) {
+        var offset = 0
+        while (offset < buffer.size) {
+            val read = input.read(buffer, offset, buffer.size - offset)
+            if (read < 0) throw java.io.EOFException("SOCKS5 proxy closed the connection mid-handshake")
+            offset += read
         }
     }
 
@@ -588,6 +716,16 @@ class TCPClientInterface(
             // Ignore
         }
         socket = null
+
+        // An in-flight handshake holds the only reference to its socket, so
+        // detach()/teardown() must close it here or it leaks.
+        val pending = handshakeSocket
+        handshakeSocket = null
+        try {
+            pending?.close()
+        } catch (e: Exception) {
+            // Ignore
+        }
     }
 
     private fun log(message: String) {
