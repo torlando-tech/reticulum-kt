@@ -3161,6 +3161,32 @@ _received_messages = []
 _rns_module = None  # Cached RNS module
 
 
+def _safe_get_ratchet(RNS, destination_hash):
+    """Look up a ratchet, tolerating the absence of a Reticulum instance.
+
+    Delegate to the reference Identity.get_ratchet() and translate only its
+    missing-instance failure into "no ratchet known". get_ratchet() is
+    cache-first at Reticulum 1.5.5 (RNS/Identity.py:486/504) and 1.6.0
+    (:619), so ratchets the bridge has already remembered are still served
+    without an instance running. The 1.6.0 store-miss branch (:636) calls
+    RNS.Reticulum.get_instance().is_connected_to_shared_instance, which raises
+    AttributeError when no Reticulum() instance exists; interop helpers
+    legitimately run in that state and must report "no ratchet known" instead
+    of crashing. Reaching into the private Identity.known_ratchets cache here
+    instead would re-implement upstream semantics that 1.6.0 itself reshaped.
+    """
+    try:
+        return RNS.Identity.get_ratchet(destination_hash)
+    except AttributeError:
+        # get_ratchet() only reaches RNS.Reticulum.get_instance() when the
+        # SQLite known-destinations store is not initialised yet, i.e. before
+        # any Reticulum() exists. Re-raise anything else: an AttributeError
+        # raised once an instance is running is a real defect in the reference
+        # or the store, and must not be silently reported as "no ratchet".
+        if RNS.Reticulum.get_instance() is None:
+            return None
+        raise
+
 def _get_full_rns():
     """Import full RNS module for networking.
 
@@ -3739,7 +3765,7 @@ def cmd_destination_encrypt_debug(params):
     )
 
     # Check what ratchet will be used
-    selected_ratchet = RNS.Identity.get_ratchet(dest.hash)
+    selected_ratchet = _safe_get_ratchet(RNS, dest.hash)
 
     # Verify dest hash matches
     dest_hash_matches = (dest.hash == dest_hash)
@@ -3770,7 +3796,7 @@ def cmd_check_ratchet_for_dest(params):
     """
     RNS = _get_full_rns()
     dest_hash = hex_to_bytes(params['destination_hash'])
-    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    ratchet = _safe_get_ratchet(RNS, dest_hash)
     if ratchet is not None:
         return {
             'has_ratchet': True,
@@ -4780,7 +4806,7 @@ def cmd_check_known_ratchet(params):
     """Check if a ratchet is known for a destination hash."""
     RNS = _get_full_rns()
     dest_hash = hex_to_bytes(params['destination_hash'])
-    ratchet = RNS.Identity.get_ratchet(dest_hash)
+    ratchet = _safe_get_ratchet(RNS, dest_hash)
     if ratchet:
         return {
             'has_ratchet': True,
@@ -4807,7 +4833,7 @@ def cmd_propagation_encrypt_for_recipient(params):
 
     dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
 
-    ratchet = RNS.Identity.get_ratchet(dest.hash)
+    ratchet = _safe_get_ratchet(RNS, dest.hash)
     used_ratchet = ratchet is not None
 
     # Manual encrypt to capture intermediate values
