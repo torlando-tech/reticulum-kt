@@ -40,7 +40,7 @@ class RNodeInterface(
     private val outputStream: OutputStream,
     private val frequency: Long,
     private val bandwidth: Long,
-    private val txPower: Int,
+    txPower: Int,
     private val spreadingFactor: Int,
     private val codingRate: Int,
     private val flowControl: Boolean = true,
@@ -60,6 +60,11 @@ class RNodeInterface(
         private const val REQUIRED_FW_VER_MIN = 52
         private const val FREQ_MIN = 137_000_000L
         private const val FREQ_MAX = 3_000_000_000L
+
+        /** Inclusive bound on the configured TX power (RNodeInterface.py:313@1.5.5). */
+        private const val TX_POWER_MIN = 0
+        private const val TX_POWER_MAX = 37
+
         private const val DETECT_TIMEOUT_MS = 5_000L
         private const val VALIDATE_TIMEOUT_MS = 2_000L
         private const val READ_TIMEOUT_MS = 1_250L
@@ -76,6 +81,23 @@ class RNodeInterface(
     }
 
     override val hwMtu: Int = 508
+
+    /**
+     * TX power as configured by the caller, kept apart from the effective [txPower]
+     * because the device echo replaces the latter during [validateRadioState].
+     * Configuration checks must see the requested value, never the adopted one.
+     */
+    private val requestedTxPower = txPower
+
+    /**
+     * Effective TX power in dBm. Starts at the configured value and is replaced by the
+     * value the firmware reports when it rewrites the request: the ceiling clamp
+     * (SX127x 17 dBm, SX1262 22 dBm, SX1280 13/20 dBm) and, on LoRa-PA boards, the
+     * quantisation through the PA gain table (issue #1255: 1 dBm configured, 11 dBm
+     * reported — the PA's lowest achievable output). Reconfiguration and
+     * [confirmedTxPower] therefore match what the radio actually transmits.
+     */
+    private var txPower = txPower
 
     // Discovery support
     override val supportsDiscovery: Boolean = true
@@ -160,6 +182,14 @@ class RNodeInterface(
     private var readJob: Job? = null
 
     override fun start() {
+        try {
+            validateConfiguredTxPower()
+        } catch (e: IOException) {
+            log("Failed to configure RNode: ${e.message}")
+            setOnline(false)
+            return
+        }
+
         ioScope.launch {
             try {
                 configure()
@@ -169,6 +199,25 @@ class RNodeInterface(
                 log("Failed to configure RNode: ${e.message}")
                 setOnline(false)
             }
+        }
+    }
+
+    /**
+     * Reject an out-of-range configured TX power before any byte reaches the device.
+     *
+     * The reference (RNodeInterface.py:313-315,347-348@1.6.0, identical in 1.5.5 at
+     * :313-315,:348-349) logs "Invalid TX power configured for …" for a request
+     * outside 0..37 dBm, sets validcfg = False, and raises ValueError from `__init__`
+     * — before open_port() — so the detect/configure handshake never runs.
+     *
+     * Checks [requestedTxPower], not [txPower]: [validateRadioState] replaces the
+     * effective power with the device echo, and validating the adopted value would
+     * let an out-of-range request pass unnoticed.
+     */
+    private fun validateConfiguredTxPower() {
+        if (requestedTxPower < TX_POWER_MIN || requestedTxPower > TX_POWER_MAX) {
+            log("Invalid TX power configured for $this")
+            throw IOException("Invalid TX power configured for $this — interface is offline")
         }
     }
 
@@ -359,9 +408,27 @@ class RNodeInterface(
             log("Bandwidth mismatch: configured=$bandwidth, reported=$rBandwidth")
             valid = false
         }
-        if (rTxpower != null && txPower != rTxpower) {
-            log("TX power mismatch: configured=$txPower, reported=$rTxpower")
-            valid = false
+        // TX power is the one radio parameter the firmware is allowed to rewrite: it
+        // clamps the request to the modem/PA ceiling, quantises it through the PA gain
+        // table on LoRa-PA boards, and echoes its own value when a device-owned config
+        // (TNC mode) is in charge. Treating that divergence as a failed configuration
+        // took the interface down before it ever went online while the radio itself
+        // was healthy (issue #1255: 1 dBm requested, 11 dBm reported). Adopt the value
+        // the device can actually transmit; the other parameters have no such
+        // legitimate re-write path and stay fatal.
+        val reportedTxPower = rTxpower
+        if (reportedTxPower != null && txPower != reportedTxPower) {
+            if (reportedTxPower in 0..37) {
+                log(
+                    "WARNING: TX power mismatch: configured=$txPower dBm, the device can only " +
+                        "transmit $reportedTxPower dBm — adopting the device value",
+                )
+                txPower = reportedTxPower
+            } else {
+                // 0xFF is the firmware's "not configured" sentinel, not a power level.
+                log("WARNING: TX power mismatch: configured=$txPower dBm, invalid reported=$reportedTxPower — keeping the configured value")
+                valid = false
+            }
         }
         if (rSf != null && spreadingFactor != rSf) {
             log("Spreading factor mismatch: configured=$spreadingFactor, reported=$rSf")
