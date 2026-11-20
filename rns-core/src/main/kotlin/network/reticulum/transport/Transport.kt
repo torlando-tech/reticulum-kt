@@ -287,9 +287,20 @@ object Transport {
     /** Announce table: destination_hash -> AnnounceEntry. */
     val announceTable = ConcurrentHashMap<ByteArrayKey, AnnounceEntry>()
 
-    /** Packet hash list for duplicate detection. */
-    private val packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
-    private val packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
+    /**
+     * Packet hash list for duplicate detection.
+     *
+     * Two sets hold the two most recent dedup windows. On rotation the roles are
+     * swapped instead of copying one set into the other: `addAll` doubled the
+     * live entry count at exactly the moment the heap was tight, which is what
+     * OOMed on Android (columba#1222, `ConcurrentHashMap$KeySetView.addAll`).
+     *
+     * The platform budget is the total for BOTH windows, not a per-window cap
+     * (`hashlistBudget()`); each window is rotated at budget/2, so together they
+     * retain roughly one budget's worth of hashes.
+     */
+    private var packetHashlist = ConcurrentHashMap.newKeySet<ByteArrayKey>()
+    private var packetHashlistPrev = ConcurrentHashMap.newKeySet<ByteArrayKey>()
 
     // ===== Packet Cache =====
 
@@ -644,6 +655,9 @@ object Transport {
         storagePath = path
     }
 
+    /** Drive the persisted-data load path (store or file) without start(). */
+    internal fun loadPersistedDataForTest() = loadPersistedDataFromStorage()
+
     // ===== Pluggable Storage Backends =====
 
     /** Persistent path table storage. When null, falls back to file-based persistence. */
@@ -683,7 +697,11 @@ object Transport {
         network.reticulum.common.ByteArrayPool
             .clear()
 
-        // Trim packet hashlists (keep recent, drop old)
+        // Trim packet hashlists (keep recent, drop old). budget/2 is one
+        // window's share of the total budget — the bound addPacketHash rotates
+        // at — so trimming and rotation agree on the target size. This path runs
+        // in production, so it reads the platform budget directly rather than
+        // the test-only override.
         val now = System.currentTimeMillis()
         val maxHashlistSize = network.reticulum.common.Platform.recommendedHashlistSize / 2
 
@@ -2099,20 +2117,60 @@ object Transport {
     fun loadPacketHashlist(file: java.io.File) {
         if (!file.exists()) return
         try {
-            val lines = file.readLines().filter { it.isNotBlank() }
+            val windowLimit = hashlistBudget() / 2
             var loaded = 0
-            for (line in lines) {
-                try {
-                    val hash = hexToBytes(line.trim())
-                    packetHashlist.add(hash.toKey())
-                    loaded++
-                } catch (e: Exception) {
-                    // Skip malformed entries
+            var capped = false
+            // Stream the lines instead of `readLines()`: a file written by an
+            // older build used the flat 1M-entry constant with no load-time cap,
+            // so it can hold millions of entries, and materialising them all
+            // would OOM the very device this cap protects (columba#1222).
+            file.useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    if (packetHashlist.size >= windowLimit) {
+                        capped = true
+                        break
+                    }
+                    try {
+                        packetHashlist.add(hexToBytes(line.trim()).toKey())
+                        loaded++
+                    } catch (e: Exception) {
+                        // Skip malformed entries
+                    }
                 }
             }
-            log("Loaded $loaded packet hashes from ${file.absolutePath}")
+            log(
+                "Loaded $loaded packet hashes from ${file.absolutePath}" +
+                    (if (capped) " (capped to one window: $windowLimit)" else "") +
+                    " (retained ${packetHashlist.size})",
+            )
         } catch (e: Exception) {
             log("Failed to load packet hashlist: ${e.message}")
+        }
+    }
+
+    /**
+     * Copy at most one window's share (`hashlistBudget() / 2`) of [source] into
+     * [destination] — the same bound [addPacketHash] rotates at.
+     *
+     * The cap is applied while loading, not after: a persisted hashlist written
+     * by an older build used the flat 1M-entry constant and had no load-time
+     * cap, and trimming only after copying every entry into the live set would
+     * hold the full overhang in memory first — the exact spike that OOMed
+     * Android in columba#1222. The reference loads its hashlist verbatim
+     * (`RNS/Transport.py:339-348@1.5.5`); capping here keeps dedup alive across
+     * restarts while bounding the heap.
+     *
+     * Which entries are kept is arbitrary (iteration order): a dropped hash only
+     * costs one re-processed packet from before the restart, the same guarantee
+     * losing the persisted hashlist entirely would give — the persisted set
+     * exists to spare the network that reprocessing, not to be complete.
+     */
+    private fun addCapped(destination: MutableSet<ByteArrayKey>, source: Iterable<ByteArrayKey>) {
+        val windowLimit = hashlistBudget() / 2
+        for (key in source) {
+            if (destination.size >= windowLimit) break
+            destination.add(key)
         }
     }
 
@@ -4952,15 +5010,47 @@ object Transport {
         return false
     }
 
-    private fun addPacketHash(hash: ByteArray) {
-        val key = hash.toKey()
-        packetHashlist.add(key)
+    /** Test-only override of the dedup budget; null uses the platform default. */
+    internal var hashlistLimitOverrideForTest: Int? = null
 
-        // Rotate hashlist if too large
-        if (packetHashlist.size > TransportConstants.HASHLIST_MAXSIZE) {
-            packetHashlistPrev.clear()
-            packetHashlistPrev.addAll(packetHashlist)
-            packetHashlist.clear()
+    /**
+     * Total entry budget for both dedup windows, mirroring the reference's
+     * `Transport.hashlist_maxsize` (`RNS/Transport.py:247@1.5.5`). Each window is
+     * bounded by half of it, because rotation happens once a window exceeds
+     * `budget / 2`.
+     */
+    private fun hashlistBudget(): Int =
+        hashlistLimitOverrideForTest ?: Platform.recommendedHashlistSize
+
+    @JvmStatic
+    fun setHashlistLimitForTest(limit: Int?) {
+        hashlistLimitOverrideForTest = limit
+    }
+
+    /** The dedup budget in force: the test override when set, else the platform recommendation. */
+    @JvmStatic
+    fun hashlistBudgetForTest(): Int = hashlistBudget()
+
+    /** Combined entry count of both dedup windows. */
+    @JvmStatic
+    fun hashlistTotalSizeForTest(): Int = packetHashlist.size + packetHashlistPrev.size
+
+    private fun addPacketHash(hash: ByteArray) {
+        val current = packetHashlist
+        current.add(hash.toKey())
+
+        // The budget is the TOTAL for both dedup windows, exactly as the
+        // reference reads it (`RNS/Transport.py:831-834@1.5.5` rotates once
+        // `len(packet_hashlist) > hashlist_maxsize//2`): each window holds at
+        // most ~budget/2 entries, and the two together stay near the budget.
+        // trimMemory() trims a single window to this same budget/2 bound.
+        // Android recommends a far smaller budget than the flat desktop
+        // constant, and a 1M-entry set is what exhausted a 201 MB heap
+        // (columba#1222). Swapping the sets keeps the previous window without a
+        // copy, so rotation is O(1) in both time and allocated memory.
+        if (current.size > hashlistBudget() / 2) {
+            packetHashlistPrev = current
+            packetHashlist = ConcurrentHashMap.newKeySet()
         }
     }
 
@@ -6280,10 +6370,17 @@ object Transport {
             log("Loaded ${paths.size} path entries from store")
 
             packetHashStore?.let { hashStore ->
-                val (current, prev) = hashStore.loadAll()
-                packetHashlist.addAll(current)
-                packetHashlistPrev.addAll(prev)
-                log("Loaded ${current.size + prev.size} packet hashes from store")
+                // Bounded at the store: an oversized pre-fix generation must
+                // never be materialised in full (columba#1222). addCapped is
+                // the second line of defence for stores that only cap after
+                // loadAll (the interface's default implementation).
+                val (current, prev) = hashStore.loadCapped(hashlistBudget() / 2)
+                addCapped(packetHashlist, current)
+                addCapped(packetHashlistPrev, prev)
+                log(
+                    "Loaded ${current.size + prev.size} packet hashes from store " +
+                        "(retained ${packetHashlist.size + packetHashlistPrev.size})",
+                )
             }
             return
         }

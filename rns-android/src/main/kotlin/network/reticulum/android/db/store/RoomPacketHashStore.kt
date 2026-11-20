@@ -29,6 +29,19 @@ class RoomPacketHashStore(
         return current to prev
     }
 
+    /**
+     * Bounded startup load: the SQL LIMIT keeps an oversized pre-fix generation
+     * (up to the flat 1M-entry constant) out of memory instead of loading it and
+     * trimming afterwards (columba#1222).
+     */
+    override fun loadCapped(limitPerGeneration: Int): Pair<Set<ByteArrayKey>, Set<ByteArrayKey>> {
+        val current = dao.getByGenerationLimited(0, limitPerGeneration)
+            .map { it.hash.toKey() }.toSet()
+        val prev = dao.getByGenerationLimited(1, limitPerGeneration)
+            .map { it.hash.toKey() }.toSet()
+        return current to prev
+    }
+
     override fun clear() {
         writeExecutor.submitWriteThrough("packetHash.deleteAll") { dao.deleteAll() }
     }

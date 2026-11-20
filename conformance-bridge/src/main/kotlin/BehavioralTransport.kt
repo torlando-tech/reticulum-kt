@@ -204,6 +204,12 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         }
 
         val configDir = java.nio.file.Files.createTempDirectory("rns_behav_").toFile()
+        // The dedup budget set by behavioral_hashlist_limit is per-session test
+        // state. Clear it before Reticulum.start() loads saved data so a later
+        // session rotates at the platform recommendation — otherwise a small
+        // limit from an earlier test leaks into every subsequent session and
+        // makes dedup checks depend on test order.
+        Transport.setHashlistLimitForTest(null)
         val rns = Reticulum.start(
             configDir = configDir.absolutePath,
             enableTransport = enableTransport,
@@ -656,6 +662,42 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
             "packet_hash" to (packetHash?.let { hexVal(it) } ?: JsonNull.INSTANCE),
             "in_hashlist" to boolVal(
                 packetHash != null && Transport.packetHashlistContainsForTest(packetHash)),
+        )
+    }
+
+    // ===== Dedup-window budget / retention =====
+    //
+    // Mirror reference/behavioral_transport.py: the budget is the TOTAL for
+    // both generations (rotation happens at budget/2, Transport.kt
+    // addPacketHash), so a test can pin a small budget and drive rotations
+    // with a handful of packets instead of the platform default.
+
+    "behavioral_hashlist_limit" -> {
+        inst(p)
+        val limit = p.intOpt("limit")
+        Transport.setHashlistLimitForTest(limit)
+        Transport.clearPacketHashlist()
+        val current = Transport.packetHashlistSizeForTest()
+        result(
+            "limit" to (limit?.let { intVal(it) } ?: JsonNull.INSTANCE),
+            "current" to intVal(current),
+            "previous" to intVal(0),
+            "total" to intVal(Transport.hashlistTotalSizeForTest()),
+        )
+    }
+
+    "behavioral_hashlist_stats" -> {
+        inst(p)
+        val current = Transport.packetHashlistSizeForTest()
+        val total = Transport.hashlistTotalSizeForTest()
+        result(
+            // The budget in force right now: the behavioral_hashlist_limit
+            // override when set, else the platform recommendation. Parity with
+            // the reference's hashlist_maxsize (behavioral_transport.py:2314).
+            "limit" to intVal(Transport.hashlistBudgetForTest()),
+            "current" to intVal(current),
+            "previous" to intVal(total - current),
+            "total" to intVal(total),
         )
     }
 
