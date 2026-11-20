@@ -147,6 +147,50 @@ implementation is unaffected — this is not a stack deviation.
 
 ---
 
+## RNodeInterface: Device-Echoed TX Power Adopted Instead of Fatal
+
+**Python behavior** (`RNodeInterface.py:684-685@1.5.5`, unchanged at
+`:684-685@1.6.0`): `validate_radio_state()` compares the requested
+`txpower` with the value the firmware echoes back and treats *any*
+mismatch as fatal (`TX power mismatch`, `validcfg = False`). Python never
+adopts `r_txpower`; the configured value stays authoritative, so a
+successful validation means the device accepted the request verbatim.
+
+**Kotlin behavior** (`RNodeInterface.validateRadioState`): when the echo
+differs from the request but is a real power level (`0..37`), the echo is
+adopted as the interface's effective TX power, logged at warning level
+with both values, and re-sent by later reconfiguration. The `0xFF`
+not-configured sentinel is not adopted and stays fatal. Out-of-range
+*configured* powers (`txpower < 0 or > 37`) are rejected before any
+handshake, matching the reference's constructor-time `ValueError`.
+
+**Why**: RNode firmware rewrites the requested power instead of echoing
+it back verbatim: it clamps above the modem/PA ceiling (SX1262 22 dBm,
+SX127x 17 dBm, SX1280 13/20 dBm) and on LoRa-PA boards quantises the
+request through the PA gain table (`PA_MAX_OUTPUT` / `PA_GC1109_VALUES`;
+e.g. a 1 dBm request is reported as 11 dBm, the lowest achievable
+output). Python's fatal mismatch check therefore takes a healthy,
+correctly configured radio offline in a reconnect loop that retries the
+same rejected power forever. Adopting the echo keeps the interface
+online at the power the radio actually transmits (columba#1255).
+
+**Risk**: Medium. The requested power is no longer retained after
+adoption — `txPower`, `sendTxPower()` and `confirmedTxPower` all reflect
+the device's echo, so the configuration no longer records what the user
+asked for. If a firmware ever echoes a value that differs for a reason
+other than clamping/quantisation (e.g. TNC mode owning the radio
+config), the port silently follows the device instead of surfacing the
+mismatch that the reference would flag. Frequency, bandwidth, spreading
+factor, coding rate and radio state keep their fatal mismatch check —
+none of them has a legitimate device-side rewrite path.
+
+**Resolution**: Keep the reference's fatal check for every parameter the
+firmware does not own; revisit if RNode firmware starts echoing
+requested values verbatim, or gate adoption behind a configurable
+"follow device" switch.
+
+---
+
 ## Transport: Platform Hashlist Budget and Load-Time Trim
 
 **Python behavior** (`Transport.py:247`, `Transport.py:831-834`,
