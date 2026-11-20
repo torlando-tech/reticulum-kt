@@ -126,7 +126,9 @@ The interop bridge delegates to `Identity.get_ratchet()` unchanged, so
 remembered ratchets are still served without an instance (the reference
 cache is consulted first and never touches `get_instance()`). Only the
 `AttributeError` from the missing-instance branch is translated into
-`None`, i.e. "no ratchet known".
+`None`, and only while `RNS.Reticulum.get_instance()` is still `None`;
+any other `AttributeError` is re-raised, so a defect inside a running
+stack still surfaces instead of being reported as "no ratchet known".
 
 **Why**: The bridge legitimately runs crypto/interop commands
 (`destination_encrypt_debug`, `check_known_ratchet`,

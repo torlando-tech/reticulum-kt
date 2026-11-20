@@ -3178,7 +3178,14 @@ def _safe_get_ratchet(RNS, destination_hash):
     try:
         return RNS.Identity.get_ratchet(destination_hash)
     except AttributeError:
-        return None
+        # get_ratchet() only reaches RNS.Reticulum.get_instance() when the
+        # SQLite known-destinations store is not initialised yet, i.e. before
+        # any Reticulum() exists. Re-raise anything else: an AttributeError
+        # raised once an instance is running is a real defect in the reference
+        # or the store, and must not be silently reported as "no ratchet".
+        if RNS.Reticulum.get_instance() is None:
+            return None
+        raise
 
 def _get_full_rns():
     """Import full RNS module for networking.
